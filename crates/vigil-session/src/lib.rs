@@ -8,7 +8,7 @@ use std::path::Path;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionSignal, Session};
 use smithay::reexports::rustix::fs::OFlags;
-use vigil_core::SessionEvent;
+use vigil_core::{DeviceOpener, SessionEvent};
 
 /// The libseat notifier, re-exported opaquely for the binary to register as
 /// a calloop event source. Its events translate via [`translate`].
@@ -57,6 +57,16 @@ impl SessionManager {
     /// away).
     pub fn is_active(&self) -> bool {
         self.session.is_active()
+    }
+}
+
+impl DeviceOpener for SessionManager {
+    fn open(&mut self, path: &Path, _flags: i32) -> Result<OwnedFd, String> {
+        self.open_device(path).map_err(|error| error.to_string())
+    }
+
+    fn close(&mut self, fd: OwnedFd) {
+        let _ = self.session.close(fd);
     }
 }
 

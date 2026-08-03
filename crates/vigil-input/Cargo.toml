@@ -9,4 +9,7 @@ repository.workspace = true
 [dependencies]
 vigil-core.workspace = true
 smithay = { workspace = true, features = ["backend_libinput"] }
+# Smithay re-exports this package, but backend_libinput alone does not enable
+# its udev context constructor. This only unifies a feature on that same crate.
+input = { version = "0.9", default-features = false, features = ["udev"] }
 xkbcommon.workspace = true

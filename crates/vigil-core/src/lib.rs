@@ -83,6 +83,16 @@ pub trait Presenter {
 // Input
 // ---------------------------------------------------------------------------
 
+use std::os::fd::OwnedFd;
+use std::path::Path;
+
+/// Opens input device nodes on behalf of libinput. The session subsystem
+/// implements this so vigil-input does not depend on a particular seat API.
+pub trait DeviceOpener {
+    fn open(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, String>;
+    fn close(&mut self, fd: OwnedFd);
+}
+
 /// Normalized input, decoupled from libinput/xkb types. Key repeat is
 /// synthesized by vigil-input and arrives as ordinary `Key` events.
 #[derive(Debug, Clone, PartialEq)]
