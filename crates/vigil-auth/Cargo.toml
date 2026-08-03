@@ -1,0 +1,11 @@
+[package]
+name = "vigil-auth"
+description = "greetd_ipc auth state machine; drives AuthUi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+greetd_ipc.workspace = true

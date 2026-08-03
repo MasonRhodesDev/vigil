@@ -1,0 +1,12 @@
+[package]
+name = "vigil-ui"
+description = "Slint Platform glue, per-output windows, backgrounds, software cursor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+slint.workspace = true
+image.workspace = true

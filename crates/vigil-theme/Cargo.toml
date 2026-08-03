@@ -1,0 +1,12 @@
+[package]
+name = "vigil-theme"
+description = "Theme contract validation, slint-interpreter loader, compiled-in default"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+slint.workspace = true
+slint-interpreter.workspace = true

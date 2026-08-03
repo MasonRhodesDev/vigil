@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/MasonRhodesDev/vigil"
+
+[workspace.dependencies]
+vigil-core = { path = "crates/vigil-core" }
+smithay = { version = "0.7.0", default-features = false }
+# default display-info feature needs system libdisplay-info < 0.3 (Fedora 44 ships 0.3).
+# We only need DrmScanner; EDID names come in M2 via libdisplay-info 0.3 directly.
+smithay-drm-extras = { version = "0.1", default-features = false }
+slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "renderer-software"] }
+slint-interpreter = { version = "1.17", default-features = false, features = ["std", "compat-1-2"] }
+greetd_ipc = { version = "0.10", features = ["sync-codec"] }
+xkbcommon = "0.9"
+calloop = "0.14"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

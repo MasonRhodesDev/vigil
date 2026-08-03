@@ -1,0 +1,38 @@
+// vigil default theme — contract v1 (DESIGN.md §6).
+// This component is compiled into the binary as the fallback and doubles as
+// the reference implementation of the contract. It must always validate.
+//
+// Renderer limits (software baseline): no Path, no drop-shadow, no
+// border-radius combined with clip, western-script text only.
+
+export component DefaultTheme inherits Window {
+    // ---- inputs (set by vigil) ------------------------------------------
+    in property <string> output-name;
+    in property <bool> panel-visible: true;
+    in property <image> background-source;
+    in property <string> clock-text;
+    in property <string> auth-state: "idle";
+    in property <string> prompt-text;
+    in property <bool> prompt-is-secret: true;
+    in property <string> info-message;
+    in property <string> error-message;
+    in property <[string]> sessions;
+    in property <int> selected-session;
+    in property <bool> caps-lock;
+    in property <string> status-banner;
+
+    // ---- outputs (invoked by the theme) ---------------------------------
+    callback submit(string);
+    callback cancel();
+    callback session-changed(int);
+    callback power-action(string);
+
+    background: #0f151c;
+
+    // M1 layout: background image, centered login card, clock, banner.
+    Image {
+        source: root.background-source;
+        width: 100%;
+        height: 100%;
+    }
+}

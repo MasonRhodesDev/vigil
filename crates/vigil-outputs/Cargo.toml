@@ -1,0 +1,12 @@
+[package]
+name = "vigil-outputs"
+description = "udev scan, DRM device/surface, output manager; consumes Presenter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+smithay = { workspace = true, features = ["backend_drm", "backend_gbm", "backend_udev"] }
+smithay-drm-extras.workspace = true

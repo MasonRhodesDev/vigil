@@ -1,0 +1,10 @@
+[package]
+name = "vigil-present-gl"
+description = "GbmGlPresenter (M3): FemtoVG over GBM/EGL behind the same Presenter trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true

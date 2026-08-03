@@ -1,0 +1,12 @@
+[package]
+name = "vigil-input"
+description = "libinput + xkbcommon; key repeat/compose -> normalized InputEvents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+smithay = { workspace = true, features = ["backend_libinput"] }
+xkbcommon.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "vigil"
+description = "Multi-monitor greetd greeter rendering directly on KMS/DRM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+vigil-session = { path = "../vigil-session" }
+vigil-outputs = { path = "../vigil-outputs" }
+vigil-present-dumb = { path = "../vigil-present-dumb" }
+vigil-input = { path = "../vigil-input" }
+vigil-auth = { path = "../vigil-auth" }
+vigil-theme = { path = "../vigil-theme" }
+vigil-ui = { path = "../vigil-ui" }
+calloop.workspace = true
