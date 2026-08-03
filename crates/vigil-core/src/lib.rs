@@ -73,10 +73,15 @@ impl std::error::Error for PresentError {}
 pub trait Presenter {
     fn size(&self) -> (u32, u32);
 
-    /// Hand the caller a target to draw this frame into, then submit it
-    /// (page flip). Completion is reported via the event loop, not by
-    /// blocking here.
-    fn with_frame(&mut self, draw: &mut dyn FnMut(FrameTarget<'_>)) -> Result<(), PresentError>;
+    /// Hand the caller a target to draw this frame into; the closure returns
+    /// whether it actually drew. A frame that drew is submitted (page flip)
+    /// and `Ok(true)` is returned; a frame that didn't is skipped without
+    /// flipping (`Ok(false)`), so an idle scene never presents stale buffers.
+    /// Flip completion is reported via the event loop, not by blocking here.
+    fn with_frame(
+        &mut self,
+        draw: &mut dyn FnMut(FrameTarget<'_>) -> bool,
+    ) -> Result<bool, PresentError>;
 }
 
 // ---------------------------------------------------------------------------

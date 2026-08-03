@@ -60,6 +60,36 @@ impl SessionManager {
     }
 }
 
+/// Cloneable seat-brokered device opener, so vigil-input can own an opener
+/// while the SessionManager stays in the event-loop state.
+#[derive(Clone)]
+pub struct SessionDeviceOpener {
+    session: LibSeatSession,
+}
+
+impl SessionManager {
+    pub fn device_opener(&self) -> SessionDeviceOpener {
+        SessionDeviceOpener {
+            session: self.session.clone(),
+        }
+    }
+}
+
+impl DeviceOpener for SessionDeviceOpener {
+    fn open(&mut self, path: &Path, _flags: i32) -> Result<OwnedFd, String> {
+        self.session
+            .open(
+                path,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn close(&mut self, fd: OwnedFd) {
+        let _ = self.session.close(fd);
+    }
+}
+
 impl DeviceOpener for SessionManager {
     fn open(&mut self, path: &Path, _flags: i32) -> Result<OwnedFd, String> {
         self.open_device(path).map_err(|error| error.to_string())

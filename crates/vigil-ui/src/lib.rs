@@ -17,7 +17,9 @@ use slint::platform::{
 };
 use slint::{ComponentHandle, Image, LogicalPosition, PhysicalSize, Rgba8Pixel, SharedPixelBuffer};
 use slint_interpreter::{ComponentInstance, Value};
-use vigil_core::{AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputId};
+use vigil_core::{
+    AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputId, PowerAction, UiMessage,
+};
 
 /// The custom Slint platform. Window adapters are created one at a time and
 /// captured per output (M0b's adapter-capture pattern).
@@ -43,7 +45,9 @@ impl VigilPlatform {
 
 impl Platform for VigilPlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
-        let adapter = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+        let adapter = // Full repaint per frame: correct with a double-buffered swapchain we
+        // don't age-track yet; damage-tracked swapchain is a later optimization.
+        MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
         self.adapters.borrow_mut().push(adapter.clone());
         Ok(adapter)
     }
@@ -175,6 +179,56 @@ impl OutputWindow {
             (self.pointer_x / f64::from(self.scale)) as f32,
             (self.pointer_y / f64::from(self.scale)) as f32,
         )
+    }
+
+    /// Wire the theme's contract callbacks (submit/cancel/session-changed/
+    /// power-action) into a single sink of [`UiMessage`]s.
+    pub fn on_ui_message(&self, sink: std::rc::Rc<dyn Fn(UiMessage)>) {
+        let s = sink.clone();
+        let r = self.component.set_callback("submit", move |args| {
+            if let Some(Value::String(text)) = args.first() {
+                s(UiMessage::Respond(text.to_string()));
+            }
+            Value::Void
+        });
+        debug_assert!(r.is_ok());
+        let s = sink.clone();
+        let r = self.component.set_callback("cancel", move |_| {
+            s(UiMessage::Cancel);
+            Value::Void
+        });
+        debug_assert!(r.is_ok());
+        let s = sink.clone();
+        let r = self.component.set_callback("session-changed", move |args| {
+            if let Some(Value::Number(index)) = args.first()
+                && *index >= 0.0
+            {
+                s(UiMessage::SelectSession(*index as usize));
+            }
+            Value::Void
+        });
+        debug_assert!(r.is_ok());
+        let r = self.component.set_callback("power-action", move |args| {
+            if let Some(Value::String(action)) = args.first() {
+                match action.as_str() {
+                    "reboot" => sink(UiMessage::Power(PowerAction::Reboot)),
+                    "poweroff" => sink(UiMessage::Power(PowerAction::Poweroff)),
+                    _ => {}
+                }
+            }
+            Value::Void
+        });
+        debug_assert!(r.is_ok());
+    }
+
+    /// Theme contract `clock-text`.
+    pub fn set_clock(&mut self, text: &str) {
+        self.set_property("clock-text", Value::String(text.into()));
+    }
+
+    /// Theme contract `caps-lock`.
+    pub fn set_caps_lock(&mut self, on: bool) {
+        self.set_property("caps-lock", Value::Bool(on));
     }
 
     fn set_property(&self, name: &str, value: Value) {

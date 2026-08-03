@@ -114,6 +114,13 @@ impl InputSystem {
     }
 }
 
+impl std::os::fd::AsFd for InputSystem {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: the libinput context owns this fd for the life of self.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.as_raw_fd()) }
+    }
+}
+
 impl AsRawFd for InputSystem {
     fn as_raw_fd(&self) -> RawFd {
         self.libinput.as_raw_fd()

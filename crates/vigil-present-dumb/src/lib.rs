@@ -89,10 +89,13 @@ impl Presenter for DumbBufferPresenter {
         (self.width, self.height)
     }
 
-    fn with_frame(&mut self, draw: &mut dyn FnMut(FrameTarget<'_>)) -> Result<(), PresentError> {
+    fn with_frame(
+        &mut self,
+        draw: &mut dyn FnMut(FrameTarget<'_>) -> bool,
+    ) -> Result<bool, PresentError> {
         let slot = &mut self.slots[self.back];
 
-        {
+        let drew = {
             let stride = slot.buffer.pitch() as usize;
             let mut mapping = self
                 .surface
@@ -103,7 +106,10 @@ impl Presenter for DumbBufferPresenter {
                 width: self.width,
                 height: self.height,
                 stride,
-            });
+            })
+        };
+        if !drew {
+            return Ok(false);
         }
 
         let fb = slot.fb;
@@ -120,6 +126,6 @@ impl Presenter for DumbBufferPresenter {
 
         self.modeset_done = true;
         self.back ^= 1;
-        Ok(())
+        Ok(true)
     }
 }

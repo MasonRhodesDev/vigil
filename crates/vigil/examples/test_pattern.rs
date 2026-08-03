@@ -54,7 +54,11 @@ fn main() {
 
     // Frame 1: gradient (modeset commit).
     for p in presenters.iter_mut() {
-        p.with_frame(&mut |t| gradient(t, 0)).expect("frame 1");
+        p.with_frame(&mut |t| {
+            gradient(t, 0);
+            true
+        })
+        .expect("frame 1");
     }
     println!(
         "frame 1 committed (modeset) on {} output(s)",
@@ -64,7 +68,11 @@ fn main() {
 
     // Frame 2: shifted gradient (page flip).
     for p in presenters.iter_mut() {
-        p.with_frame(&mut |t| gradient(t, 128)).expect("frame 2");
+        p.with_frame(&mut |t| {
+            gradient(t, 128);
+            true
+        })
+        .expect("frame 2");
     }
     println!("frame 2 flipped");
     std::thread::sleep(std::time::Duration::from_secs(hold_secs));

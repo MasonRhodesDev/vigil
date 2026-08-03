@@ -19,6 +19,23 @@ use vigil_core::{OutputEvent, OutputId, OutputInfo};
 /// without naming smithay itself.
 pub use smithay::backend::drm::DrmSurface;
 
+/// Opaque udev monitor: a calloop event source firing on GPU/connector
+/// changes. The binary registers it and calls [`OutputManager::scan`] on any
+/// event without naming smithay types.
+pub use smithay::backend::udev::UdevBackend as UdevMonitor;
+
+/// Path of the seat's primary GPU DRM node.
+pub fn primary_gpu_path(seat: &str) -> Result<std::path::PathBuf, OutputsError> {
+    smithay::backend::udev::primary_gpu(seat)
+        .map_err(err)?
+        .ok_or_else(|| OutputsError(format!("no GPU found on seat {seat}")))
+}
+
+/// A udev monitor for the seat's DRM subsystem.
+pub fn udev_monitor(seat: &str) -> Result<UdevMonitor, OutputsError> {
+    smithay::backend::udev::UdevBackend::new(seat).map_err(err)
+}
+
 #[derive(Debug)]
 pub struct OutputsError(pub String);
 
