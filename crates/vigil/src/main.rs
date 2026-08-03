@@ -18,7 +18,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use vigil_auth::AuthMachine;
 use vigil_core::{
-    AuthUi, BackgroundFit, InputEvent, OutputEvent, OutputId, PresentError, Presenter,
+    AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputEvent, OutputId, PresentError, Presenter,
     SessionEvent, UiMessage,
 };
 use vigil_input::InputSystem;
@@ -318,7 +318,27 @@ impl App {
             let Entry {
                 presenter, window, ..
             } = entry;
-            match presenter.with_frame(&mut |target| window.render_if_needed(target)) {
+            let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
+            match presenter.with_frame(&mut |target| {
+                let (mid, row_len, stride) = (
+                    target.stride * (target.height as usize / 2),
+                    target.width as usize * 4,
+                    target.stride,
+                );
+                let _ = stride;
+                let drew = window.render_if_needed(FrameTarget {
+                    buffer: target.buffer,
+                    width: target.width,
+                    height: target.height,
+                    stride: target.stride,
+                });
+                if drew && debug_frames {
+                    let row = &target.buffer[mid..mid + row_len];
+                    let sum: u64 = row.iter().map(|&b| b as u64).sum();
+                    eprintln!("vigil: frame drawn, mid-row byte sum {sum}");
+                }
+                drew
+            }) {
                 Ok(_) => {}
                 Err(PresentError::DeviceLost) => dead.push(i),
                 Err(e) => eprintln!("vigil: present: {e}"),
@@ -419,6 +439,10 @@ fn run() -> Result<i32, String> {
             Generic::new(input_fd, Interest::READ, Mode::Level),
             |_, _, app: &mut App| {
                 let events = app.input.dispatch();
+                // Never log event contents: keystrokes include the password.
+                if std::env::var_os("VIGIL_DEBUG_FRAMES").is_some() && !events.is_empty() {
+                    eprintln!("vigil: input ready: {} event(s)", events.len());
+                }
                 app.route(events);
                 Ok(PostAction::Continue)
             },

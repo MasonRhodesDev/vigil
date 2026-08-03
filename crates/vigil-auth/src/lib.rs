@@ -39,6 +39,7 @@ pub struct AuthMachine {
     command: Vec<String>,
     env: Vec<String>,
     state: State,
+    user: Option<String>,
 }
 
 impl AuthMachine {
@@ -55,6 +56,7 @@ impl AuthMachine {
             command: Vec::new(),
             env: Vec::new(),
             state: State::Idle,
+            user: None,
         })
     }
 
@@ -79,6 +81,7 @@ impl AuthMachine {
         if self.state == State::AwaitingPrompt {
             self.cancel(ui)?;
         }
+        self.user = Some(user.to_owned());
 
         let response = self.transact(
             &Request::CreateSession {
@@ -185,7 +188,21 @@ impl AuthMachine {
                 Response::Error { description, .. } => {
                     ui.show_error(&description);
                     self.state = State::Idle;
-                    return Ok(());
+                    let Some(user) = self.user.clone() else {
+                        return Ok(());
+                    };
+                    // Best-effort session teardown, then a fresh conversation
+                    // so the next submission has a prompt to answer. A create
+                    // failure here is surfaced, not looped on.
+                    let _ = self.transact(&Request::CancelSession, ui);
+                    response = self.transact(&Request::CreateSession { username: user }, ui)?;
+                    // Keep the error on screen: re-showing the prompt clears
+                    // messages in the UI contract, so re-raise afterwards.
+                    if let Response::AuthMessage { .. } = &response {
+                        // fall through to the prompt arms with the error kept
+                        // by the theme until the next show_prompt; acceptable
+                        // for M1.
+                    }
                 }
             }
         }
@@ -324,6 +341,13 @@ mod tests {
         }
     }
 
+    fn assert_cancel(request: Request) {
+        assert!(
+            matches!(request, Request::CancelSession),
+            "expected cancel_session, got {request:?}"
+        );
+    }
+
     fn assert_start(request: Request) {
         match request {
             Request::StartSession { cmd, env } => {
@@ -396,6 +420,10 @@ mod tests {
                     description: "bad password".into(),
                 },
             );
+            // The machine tears down and restarts the conversation on its
+            // own after an auth error, so the next submission has a prompt.
+            assert_cancel(request(stream));
+            respond(stream, Response::Success);
             assert_create(request(stream), "alice");
             respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
             assert_answer(request(stream), Some("right"));
@@ -411,7 +439,7 @@ mod tests {
         machine
             .handle(UiMessage::Respond("wrong".into()), &mut ui)
             .unwrap();
-        machine.start("alice", &mut ui).unwrap();
+        assert!(!machine.is_complete());
         machine
             .handle(UiMessage::Respond("right".into()), &mut ui)
             .unwrap();

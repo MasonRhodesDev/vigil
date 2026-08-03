@@ -158,14 +158,29 @@ impl OutputWindow {
 
     /// Render into the target if dirty; returns whether pixels changed.
     pub fn render_if_needed(&mut self, target: FrameTarget<'_>) -> bool {
+        let debug = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
         if target.width != self.width
             || target.height != self.height
             || !target.stride.is_multiple_of(4)
             || target.buffer.len() < target.stride.saturating_mul(target.height as usize)
         {
+            if debug {
+                eprintln!(
+                    "vigil-ui: target mismatch: got {}x{} stride {} len {}, want {}x{}",
+                    target.width,
+                    target.height,
+                    target.stride,
+                    target.buffer.len(),
+                    self.width,
+                    self.height
+                );
+            }
             return false;
         }
         let Ok(pixels) = bytemuck::try_cast_slice_mut::<u8, Xrgb8888>(target.buffer) else {
+            if debug {
+                eprintln!("vigil-ui: buffer not 4-byte aligned");
+            }
             return false;
         };
         let pixel_stride = target.stride / 4;
@@ -291,9 +306,9 @@ fn pointer_button(button: u32) -> PointerEventButton {
 }
 
 fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
-    if let Some(text) = utf8.filter(|text| !text.is_empty()) {
-        return Some(text.into());
-    }
+    // Special keys FIRST: xkb yields control utf8 for these ("\r", "\x08", …)
+    // which would shadow the slint key codes slint actually listens for
+    // (e.g. TextInput `accepted` wants Key::Return = '\n', not '\r').
     let key = match keysym {
         0xff0d => Key::Return,
         0xff08 => Key::Backspace,
@@ -306,7 +321,11 @@ fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
         0xffff => Key::Delete,
         0xff50 => Key::Home,
         0xff57 => Key::End,
-        _ => return None,
+        _ => {
+            return utf8
+                .filter(|text| !text.is_empty() && !text.chars().all(char::is_control))
+                .map(Into::into);
+        }
     };
     Some(key.into())
 }
