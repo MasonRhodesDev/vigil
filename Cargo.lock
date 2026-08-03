@@ -4335,8 +4335,10 @@ dependencies = [
 name = "vigil-ui"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "image",
  "slint",
+ "slint-interpreter",
  "vigil-core",
 ]
 

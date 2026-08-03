@@ -9,4 +9,6 @@ repository.workspace = true
 [dependencies]
 vigil-core.workspace = true
 slint.workspace = true
+slint-interpreter.workspace = true
 image.workspace = true
+bytemuck = "1.25"
