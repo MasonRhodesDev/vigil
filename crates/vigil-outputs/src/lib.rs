@@ -1,12 +1,23 @@
-//! Output manager (DESIGN.md §5): udev GPU discovery, DRM device/surface
-//! ownership, connector hotplug via `DrmScanner`, modesetting, and
-//! suspend/resume re-modeset. Emits [`vigil_core::OutputEvent`]s and hands
-//! each output a `Presenter`.
+//! Output manager (DESIGN.md §5): DRM device/surface ownership, connector
+//! hotplug via `DrmScanner`, modesetting, and suspend/resume re-modeset.
+//! Emits [`vigil_core::OutputEvent`]s; surfaces are handed to the binary,
+//! which pairs each with a `Presenter`.
 //!
 //! Architectural commitment: multi-output is the core object model — a
 //! single monitor is the N=1 case of the same code (DESIGN.md §3).
 
-use vigil_core::{OutputEvent, OutputId};
+use std::collections::HashMap;
+use std::os::fd::OwnedFd;
+
+use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier};
+use smithay::reexports::drm::control::{Mode, ModeTypeFlags, connector, crtc};
+use smithay::utils::DeviceFd;
+use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
+use vigil_core::{OutputEvent, OutputId, OutputInfo};
+
+/// Re-exported opaquely so the binary can hand surfaces to a presenter
+/// without naming smithay itself.
+pub use smithay::backend::drm::DrmSurface;
 
 #[derive(Debug)]
 pub struct OutputsError(pub String);
@@ -18,35 +29,156 @@ impl std::fmt::Display for OutputsError {
 }
 impl std::error::Error for OutputsError {}
 
-/// Owns every connected output: DRM surface, presenter, per-output state.
+fn err(e: impl std::fmt::Display) -> OutputsError {
+    OutputsError(e.to_string())
+}
+
+struct Entry {
+    connector: connector::Handle,
+    crtc: crtc::Handle,
+    mode: Mode,
+    info: OutputInfo,
+}
+
+/// Owns the DRM device for one GPU and every connected output on it.
 pub struct OutputManager {
-    _private: (),
+    device: DrmDevice,
+    scanner: DrmScanner,
+    entries: HashMap<OutputId, Entry>,
 }
 
 impl OutputManager {
-    /// Open the primary GPU for `_seat` and modeset all connected outputs.
-    pub fn new(_seat: &str) -> Result<Self, OutputsError> {
-        todo!("M1: udev primary GPU + DrmDevice + initial connector scan")
+    /// Take ownership of an opened DRM node (from vigil-session in
+    /// production; opened directly in dev harnesses) and prepare it for
+    /// modesetting. Returns the notifier the binary registers for vblank
+    /// events.
+    pub fn new(fd: OwnedFd) -> Result<(Self, DrmDeviceNotifier), OutputsError> {
+        let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+        let (device, notifier) = DrmDevice::new(fd, true).map_err(err)?;
+        Ok((
+            Self {
+                device,
+                scanner: DrmScanner::new(),
+                entries: HashMap::new(),
+            },
+            notifier,
+        ))
     }
 
-    /// React to a udev change event (connector hotplug); returns lifecycle
-    /// events for the binary to route to the UI.
-    pub fn handle_hotplug(&mut self) -> Vec<OutputEvent> {
-        todo!("M1: DrmScanner rescan -> Added/Removed")
+    /// Rescan connectors (startup and on udev hotplug). Returns lifecycle
+    /// events for the binary to act on.
+    pub fn scan(&mut self) -> Result<Vec<OutputEvent>, OutputsError> {
+        let mut events = Vec::new();
+        for scan_event in self.scanner.scan_connectors(&self.device).map_err(err)? {
+            match scan_event {
+                DrmScanEvent::Connected {
+                    connector,
+                    crtc: Some(crtc),
+                } => {
+                    let Some(mode) = preferred_mode(&connector) else {
+                        continue;
+                    };
+                    let id = OutputId(connector.handle().into());
+                    let (w, h) = mode.size();
+                    let info = OutputInfo {
+                        connector: connector_name(&connector),
+                        width: w as u32,
+                        height: h as u32,
+                        refresh_mhz: mode.vrefresh() * 1000,
+                        scale: 1.0,
+                    };
+                    self.entries.insert(
+                        id,
+                        Entry {
+                            connector: connector.handle(),
+                            crtc,
+                            mode,
+                            info: info.clone(),
+                        },
+                    );
+                    events.push(OutputEvent::Added(id, info));
+                }
+                DrmScanEvent::Disconnected { connector, .. } => {
+                    let id = OutputId(connector.handle().into());
+                    if self.entries.remove(&id).is_some() {
+                        events.push(OutputEvent::Removed(id));
+                    }
+                }
+                // Connected without a free CRTC: more monitors than the GPU
+                // can drive; skip (logged by the binary via the event gap).
+                DrmScanEvent::Connected { crtc: None, .. } => {}
+            }
+        }
+        Ok(events)
+    }
+
+    /// Create the DRM surface for an output; the binary wraps it in a
+    /// presenter. Call once per `OutputEvent::Added`.
+    pub fn create_surface(&mut self, id: OutputId) -> Result<DrmSurface, OutputsError> {
+        let entry = self
+            .entries
+            .get(&id)
+            .ok_or_else(|| OutputsError(format!("unknown output {id:?}")))?;
+        self.device
+            .create_surface(entry.crtc, entry.mode, &[entry.connector])
+            .map_err(err)
+    }
+
+    /// Facts about a live output.
+    pub fn info(&self, id: OutputId) -> Option<&OutputInfo> {
+        self.entries.get(&id).map(|e| &e.info)
     }
 
     /// Session paused (VT switch/suspend): stop touching DRM.
     pub fn pause(&mut self) {
-        todo!("M1")
+        self.device.pause();
     }
 
-    /// Session activated: re-modeset everything and request full redraws.
+    /// Session activated: reclaim the device. Surfaces need a fresh modeset;
+    /// the binary requests redraws (presenters re-commit on next frame).
     pub fn activate(&mut self) -> Vec<OutputEvent> {
-        todo!("M1")
+        // `false` = do not reset state; surfaces re-commit themselves.
+        if self.device.activate(false).is_err() {
+            return Vec::new();
+        }
+        self.entries
+            .keys()
+            .map(|id| OutputEvent::NeedsRedraw(*id))
+            .collect()
     }
 
-    /// Iterate the live output ids.
+    /// Live output ids.
     pub fn ids(&self) -> Vec<OutputId> {
-        todo!("M1")
+        self.entries.keys().copied().collect()
     }
+}
+
+/// The connector's preferred mode, falling back to its first (largest) mode.
+fn preferred_mode(conn: &connector::Info) -> Option<Mode> {
+    conn.modes()
+        .iter()
+        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+        .or_else(|| conn.modes().first())
+        .copied()
+}
+
+/// Human name matching kernel conventions, e.g. `DP-1`, `eDP-2`, `Virtual-1`.
+fn connector_name(conn: &connector::Info) -> String {
+    use connector::Interface as I;
+    let prefix = match conn.interface() {
+        I::HDMIA => "HDMI-A",
+        I::HDMIB => "HDMI-B",
+        I::DisplayPort => "DP",
+        I::EmbeddedDisplayPort => "eDP",
+        I::DVID => "DVI-D",
+        I::DVII => "DVI-I",
+        I::DVIA => "DVI-A",
+        I::LVDS => "LVDS",
+        I::VGA => "VGA",
+        I::Virtual => "Virtual",
+        I::DSI => "DSI",
+        I::DPI => "DPI",
+        _ => "Unknown",
+    };
+    format!("{}-{}", prefix, conn.interface_id())
 }
