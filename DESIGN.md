@@ -344,13 +344,19 @@ Designed in from M1, not retrofitted:
 Ordered slices of the architecture in §3. Each leaves production-shaped
 code; none is scaffolding to be torn out later.
 
-- **M0 — de-risk spike.** Explicitly disposable, never merged (validating
-  unknowns is the one place throwaway code is correct):
+- **M0 — de-risk spike. ✅ Passed 2026-08-03** (risk register #1–2).
+  Explicitly disposable, never merged (validating unknowns is the one
+  place throwaway code is correct):
   - *M0a*: a fresh project compiles smithay with only `backend_drm`,
     `backend_libinput`, `backend_session_libseat`, `backend_udev` and
     links no `wayland-server`.
   - *M0b*: two Slint `Window`s with independent `SoftwareRenderer`s under
     one custom `Platform` render distinct scenes at runtime.
+  - Version notes for M1: smithay 0.7.0 from crates.io suffices (no git
+    pin needed yet). Slint 1.17.1 works — no need for the 1.14 pin the
+    slint-headless spike carried; note `software_renderer` now lives in
+    the `i-slint-renderer-software` crate and `Rgb8Pixel` is exported at
+    the slint crate root, not from the renderer module.
 - **M1 — architecture skeleton, end-to-end.** Every module boundary in
   its final shape: workspace + crates as in §5, multi-output-native
   output manager, `Presenter` + `DumbBufferPresenter`, `vigil-input`
@@ -371,8 +377,8 @@ Every unverified assumption has a named task that resolves it:
 
 | # | Risk | Resolved by | Mitigation if it bites |
 |---|---|---|---|
-| 1 | Smithay backend features don't actually compile standalone in a fresh project | **M0a** | fall back to raw `drm`/`input`/`libseat` crates (more glue LOC, same architecture) |
-| 2 | Multiple Slint windows under one custom `Platform` misbehave at runtime | **M0b** | one Slint window rendered N times with per-output property sets (uglier, same contract) |
+| 1 | Smithay backend features don't actually compile standalone in a fresh project | **M0a — PASSED 2026-08-03**: smithay 0.7.0, `default-features = false` + the five backend features compiles and links; `cargo tree -i wayland-server` is empty; libseat runtime path verified | (moot) |
+| 2 | Multiple Slint windows under one custom `Platform` misbehave at runtime | **M0b — PASSED 2026-08-03**: slint 1.17.1, two `MinimalSoftwareWindow`s under one custom Platform rendered distinct scenes at distinct sizes with independent dirty tracking (touched window repaints, untouched doesn't) | (moot) |
 | 3 | Smithay release cadence / API churn | pin exact version + `cargo vendor` snapshot committed | the backend half churns far less than the wayland half; upgrades can wait indefinitely |
 | 4 | vkms (configfs/writeback) unavailable on CI runner kernels | M1 CI bring-up | pure-headless golden images still gate merges; vkms job becomes best-effort |
 | 5 | `SoftwareRenderer` opacity/gradient support too narrow for the default theme | M1 golden images | contract limits (§6) already exclude the known gaps; default theme sticks to verified primitives |
