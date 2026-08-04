@@ -529,10 +529,17 @@ required surface, so old themes keep working.
 
 ### Milestones
 
-- **L0 — spike (disposable):** sctk's session_lock example shape — lock,
-  solid-color SlotPool surface per output, unlock on keypress, exit.
-  Validates protocol availability, configure sizes vs scale, and the
-  unlock-roundtrip ordering on Hyprland (+ sway headless).
+- **L0 — spike (disposable). ✅ Passed 2026-08-04** (nested headless
+  Hyprland): lock granted, per-output gradient surfaces, `locked`
+  received, failsafe unlock + roundtrip + clean exit; the hotplug path
+  was exercised incidentally (the nested output enumerated after lock,
+  so the surface came from `new_output`). Also observed: Hyprland denies
+  screencopy while locked — correct, and confirms backgrounds must be
+  captured pre-lock (hyprlock's design). sctk 0.21 note: the per-protocol
+  delegate macros are gone; the pattern is `delegate_registry!` +
+  `delegate_noop!(wl_buffer)` + one blanket `delegate_dispatch2!`.
+  Still to confirm live: key-unlock and configure sizing on scaled
+  outputs (nested ran at scale 1).
 - **L1 — usable lock:** the three crates above. Themed per-output render
   (integer scale), PAM password auth with retry, caps-lock, key repeat,
   hotplug-while-locked, clock. Exits only after locked → auth success →
