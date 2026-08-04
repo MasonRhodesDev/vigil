@@ -14,6 +14,15 @@ successful `start_session` handoff. Architecture, interfaces, and
 milestones are in [DESIGN.md](DESIGN.md); next up is the on-metal VT
 test, then M2 (hotplug polish, runtime themes, session list).
 
+## The pair
+
+vigil is designed as two surfaces of one product: the **greeter** (this
+binary, on bare KMS at boot) and **vigil-lock**, a session lockscreen
+speaking `ext-session-lock-v1` under your compositor — same theme file,
+same contract, same auth seam, so login and lock are one visual identity.
+Each works without the other. The locker is specified in
+[DESIGN.md §12](DESIGN.md) (milestones L0–L2).
+
 ## Why
 
 Graphical Wayland greeters need a compositor, and running a desktop

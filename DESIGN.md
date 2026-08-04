@@ -90,6 +90,7 @@ rework. Each has a named seam it will land behind:
 | Session listing and selection from `/usr/share/wayland-sessions` (honoring `NoDisplay=true`) | Contract `sessions` property + `vigil-auth` session launch path |
 | On-screen status/banner channel for host integrations (e.g. an approval daemon reporting "sent to your phone…" — impossible with cage+regreet, which has no banner surface) | Reserved `status-banner` contract property + a line-oriented input the binary watches |
 | Per-output HiDPI scale | Scale factor is a per-output field in the output manager; Slint windows already carry a scale factor |
+| A session lockscreen with the same themed identity (§12) | `Presenter` (wl_shm impl), `AuthUi` (PAM backend), unchanged theme contract |
 
 ## 3. Architecture
 
@@ -380,6 +381,8 @@ code; none is scaffolding to be torn out later.
   `NoDisplay`), input completeness (compose, layout config).
 - **M3 — fidelity + integrations.** `GbmGlPresenter`, `status-banner`
   input channel, packaging (PKGBUILD + RPM spec), user/theming docs.
+- **L0–L2 — the lockscreen track** (§12): independent of M2/M3; shares
+  the seams, not the schedule.
 
 ## 10. Risk register
 
@@ -437,7 +440,122 @@ packaging deps (vigil package; cage + regreet stay forever).
 Runtime deps of the vigil binary: libseat, libinput, libxkbcommon
 (+ libudev). No GL, no GBM, no Wayland libraries in the MVP.
 
-## 12. License
+## 12. vigil-lock — the session lockscreen
+
+The same product, second surface: a screen locker that renders the same
+`theme.slint`, drives the same contract, and authenticates through the same
+`AuthUi` seam — so login and lock are one visual identity. Each binary is
+independently usable (the locker runs under any ext-session-lock compositor
+regardless of which greeter logged you in; the greeter needs no locker), but
+the intended UX is the pair.
+
+### Why it cannot be a DRM app — and why that costs almost nothing
+
+While a session runs, the compositor owns DRM master, so a locker is
+necessarily a Wayland client of the user's compositor speaking
+`ext-session-lock-v1` (universal on 2026 compositors: Hyprland, sway, niri,
+KWin 6.6, Mutter 49.2, COSMIC, Weston 14). This is the one place vigil
+deliberately talks to the user's compositor: a locker failing can never
+brick the boot path, so the isolation requirement that forced the greeter
+onto bare KMS does not apply. The compositor also carries the security
+contract: if the lock client dies, the session stays locked (spec-mandated)
+— a crashed locker is a recovery inconvenience, never an exposure.
+
+### Architecture
+
+```
+vigil-lock (calloop, mirrors the greeter binary's wiring)
+├─ vigil-wayland ── smithay-client-toolkit (pinned) glue:
+│   ├─ SessionLockState: lock → per-output lock surfaces (created on lock
+│   │   AND on output hotplug), configure/ack, unlock → roundtrip → exit
+│   ├─ WlShmPresenter: THIRD Presenter impl — SlotPool buffer mapped as
+│   │   FrameTarget (wl_shm XRGB8888 is byte-identical to the dumb-buffer
+│   │   layout; OutputWindow::render_if_needed works unchanged), commit
+│   │   gated on drew exactly like the DRM path
+│   └─ seat glue: sctk keyboard (compositor keymap + sctk's calloop key
+│       repeat) + pointer → vigil_core::InputEvent; pointer-enter picks the
+│       panel output (replaces the greeter's layout::Row)
+├─ vigil-pam ── auth worker thread per attempt: pam-client Context
+│   (service "vigil-lock" → `auth include login`, runtime fallback to
+│   "login"), conversation bridged over calloop::channel to the SAME AuthUi
+│   fan-out the greeter uses; UiMessage::Respond feeds the blocked
+│   conversation; cancel drops the channel → clean PAM abort
+└─ vigil-theme + vigil-ui + vigil-core ── unchanged. Same theme file, same
+    contract v1, same per-output Slint windows.
+```
+
+Bespoke budget: ~500–650 LOC vigil-wayland, ~200–250 vigil-pam, ~250–300
+vigil-lock. vigil-core/-theme/-ui need zero changes; vigil-input none until
+compose (M2) extracts a shared keymap-agnostic `XkbCore`.
+
+### Protocol invariants (from the hyprlock/swaylock study — never violate)
+
+1. Never commit a lock surface before acking its first configure; every
+   commit matches the last acked size; never a null buffer.
+2. Never plain-destroy the lock after `locked`; never `unlock_and_destroy`
+   before it; handle `finished` at any time (before `locked` = another
+   locker/denied → exit nonzero; after = unlock and exit).
+3. After unlock: `wl_display` roundtrip BEFORE exiting, or the unlock can
+   be lost and the session stays locked (both hyprlock and swaylock do
+   this; sctk's example too).
+4. A lock surface for every output, including ones appearing mid-lock —
+   promptly, or users see black/flashing monitors (top hyprlock bug class).
+5. "I painted" ≠ "locked": readiness signaling (for
+   `hypridle before_sleep` chaining) waits for the compositor's `locked`
+   event. `--ready-fd`/daemonize lands in L2 for exactly that.
+6. Auth never blocks the frame loop, the client never rate-limits password
+   attempts (that is pam_faillock's job), and password buffers are wiped
+   on every path.
+7. No panic after `locked` if humanly avoidable; on panic do NOT
+   auto-unlock (matching hyprlock/swaylock: lockout beats exposure).
+
+### Trigger integration (this machine, and in general)
+
+hypridle listens for login1's `Lock` signal and runs `lock_cmd` — adopting
+vigil-lock is a one-string change (`lock_cmd = vigil-lock`, plus the
+Super+L bind). Recommended and documented: `before_sleep_cmd = loginctl
+lock-session` so a manual suspend locks too (currently absent from the
+local config). Media keys keep working because they are compositor-side
+`locked` binds — not the locker's concern. Native login1 `Lock` signal
+subscription + `SetLockedHint` is L2 (zbus, optional feature).
+
+### Theme contract note
+
+The same `theme.slint` drives both binaries — that IS the style
+inheritance. The locker sets `sessions` empty and ignores `SelectSession`.
+A future backward-compatible contract addition (`mode: "greet" | "lock"`)
+lets one theme differentiate the two surfaces; validation only checks
+required surface, so old themes keep working.
+
+### Milestones
+
+- **L0 — spike (disposable):** sctk's session_lock example shape — lock,
+  solid-color SlotPool surface per output, unlock on keypress, exit.
+  Validates protocol availability, configure sizes vs scale, and the
+  unlock-roundtrip ordering on Hyprland (+ sway headless).
+- **L1 — usable lock:** the three crates above. Themed per-output render
+  (integer scale), PAM password auth with retry, caps-lock, key repeat,
+  hotplug-while-locked, clock. Exits only after locked → auth success →
+  unlock → roundtrip. Render states join the existing headless matrix;
+  PAM state machine tested against scripted conversations.
+- **L2 — hyprlock-essentials parity:** grace period, `--ready-fd`/
+  daemonize-after-locked, login1 Lock/SetLockedHint, fractional scale
+  (manual wp_fractional_scale + viewporter binding), Power policy,
+  `/etc/pam.d/vigil-lock` packaging + systemd user unit. Fingerprint is
+  deferred: `auth include login` already routes pam_fprintd prompts
+  through our conversation verbatim; a native fprintd listener is additive.
+
+### Lock-specific risks
+
+| Risk | Mitigation |
+|---|---|
+| sctk 0.21 API churn (delegate-macro rework; wayland-rs major looming) | pin `=0.21.1` + vendor, same policy as smithay |
+| Crash-while-locked = lockout (by spec) | greeter-grade crash discipline; systemd user unit `Restart=on-failure`; whether re-lock after a dead locker succeeds is compositor-dependent (Hyprland: `misc:allow_session_lock_restore`) — verify in L0 |
+| pam-client unmaintained since 2022 | libpam ABI is frozen; cosmic-greeter ships it in production; nonstick is the fallback behind vigil-pam's one-file seam |
+| Locking with a DPMS-off output (hyprlock's top bug class) | rely on compositor `locked` timeout (Hyprland: 5s), commit placeholder frames immediately, never gate lock() on slow resource loads |
+| Fractional-scale outputs render soft at integer scale in L1 | accepted (greeter has the same model); manual protocol binding in L2 |
+
+## 13. License
 
 vigil is GPL-3.0 (this repository's LICENSE). Slint is triple-licensed
 (GPLv3 / royalty-free desktop / commercial); vigil links Slint under its
@@ -445,7 +563,7 @@ GPLv3 option, which makes the licensing story unambiguous for a system
 greeter — no dependence on whether the royalty-free desktop tier covers
 login managers.
 
-## 13. Deferred alternatives
+## 14. Deferred alternatives
 
 Recorded so a future stall has a known exit:
 
@@ -462,7 +580,7 @@ Recorded so a future stall has a known exit:
   follow the pointer (and kiosk-shell cannot draw image backgrounds at
   all). Recorded because it keeps coming up; the answer is no.
 
-## 14. References
+## 15. References
 
 - [Smithay's anvil example, `udev.rs`](https://github.com/Smithay/smithay/blob/master/anvil/src/udev.rs)
   — the wiring template for session + udev + DRM + libinput in one
