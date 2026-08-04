@@ -281,7 +281,13 @@ Outputs (invoked by the theme):
 Contract constraints (a consequence of the software renderer being the
 permanent baseline): themes must not rely on `Path` elements, drop
 shadows, or border-radius combined with `clip`; text is western-script
-only for now. Themes render through the software path everywhere — GL
+only for now. Two rules found the hard way in M1: the login `TextInput`
+must be reachable via `forward-focus` on the root and kept alive with
+`visible:` bindings, NOT `if` conditionals (a destroyed subtree loses
+keyboard focus, and `init => focus()` is unreliable under the
+interpreter); and vigil maps special keysyms (Return, Backspace, …) to
+Slint key codes BEFORE xkb utf8, because xkb's control characters
+("\r") are not what Slint listens for (`accepted` wants '\n'). Themes render through the software path everywhere — GL
 (M3) adds fidelity (gradients, opacity blending breadth) but a theme must
 degrade gracefully rather than gate on it. These limits are contract
 documentation, verified by rendering the default theme in CI golden
@@ -357,7 +363,11 @@ code; none is scaffolding to be torn out later.
     slint-headless spike carried; note `software_renderer` now lives in
     the `i-slint-renderer-software` crate and `Rgb8Pixel` is exported at
     the slint crate root, not from the renderer module.
-- **M1 — architecture skeleton, end-to-end.** Every module boundary in
+- **M1 — architecture skeleton, end-to-end. ✅ Code complete, validated
+  in QEMU 2026-08-03** (`tests/e2e/run.sh`: real binary + virtio-gpu +
+  seatd + fake greetd; wrong password → error + conversation restart →
+  correct password → start_session → exit 0). Remaining before "shipped":
+  on-metal VT login on real hardware. Every module boundary in
   its final shape: workspace + crates as in §5, multi-output-native
   output manager, `Presenter` + `DumbBufferPresenter`, `vigil-input`
   full API (repeat implemented; compose stubbed behind the API), complete

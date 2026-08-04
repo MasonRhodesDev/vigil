@@ -246,6 +246,12 @@ impl OutputWindow {
         self.set_property("caps-lock", Value::Bool(on));
     }
 
+    /// Theme contract `status-banner` (reserved host-integration line;
+    /// empty hides it).
+    pub fn set_status_banner(&mut self, text: &str) {
+        self.set_property("status-banner", Value::String(text.into()));
+    }
+
     fn set_property(&self, name: &str, value: Value) {
         let result = self.component.set_property(name, value);
         debug_assert!(result.is_ok());

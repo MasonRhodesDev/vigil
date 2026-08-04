@@ -7,10 +7,12 @@ preferred mode, and draws an independent [Slint](https://slint.dev) scene on
 each: per-output backgrounds, a login panel that follows the pointer, and
 runtime `.slint` themes with a compiled-in fallback.
 
-**Status: design phase.** No implementation yet — the architecture, module
-layout, interfaces, testing strategy, and milestones are specified in
-[DESIGN.md](DESIGN.md). Code starts with the M0 de-risk spike described
-there.
+**Status: M1 code complete.** The full login works end-to-end in QEMU
+(`tests/e2e/run.sh`): modeset on virtio-gpu, themed login card, keyboard
+via libinput/xkb, wrong-password error with automatic retry, and a
+successful `start_session` handoff. Architecture, interfaces, and
+milestones are in [DESIGN.md](DESIGN.md); next up is the on-metal VT
+test, then M2 (hotplug polish, runtime themes, session list).
 
 ## Why
 

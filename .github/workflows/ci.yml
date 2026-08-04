@@ -20,7 +20,32 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # M1: golden-image job (pure headless, gates merges).
-  # M1: vkms job — modprobe vkms, run the real binary, writeback screenshots.
-  #     Best-effort if the runner kernel lacks vkms (risk register #4).
-  # M2: QEMU virtio-gpu max_outputs=2 — hotplug + panel-migration tests.
+  # The render-state matrix (crates/vigil/tests/theme_states.rs) runs in the
+  # `check` job's cargo test — headless, no GPU, gates merges.
+
+  # Best-effort KMS smoke test: runner kernels may lack vkms (risk #4), so
+  # this must never block a merge; the QEMU e2e (tests/e2e/) needs KVM and
+  # stays a local/manual gate for now.
+  vkms:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseat-dev libinput-dev libxkbcommon-dev \
+            libudev-dev libgbm-dev libdrm-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Load vkms
+        id: vkms
+        run: sudo modprobe vkms && echo "have=1" >> "$GITHUB_OUTPUT" || echo "have=0" >> "$GITHUB_OUTPUT"
+      - name: Modeset + page-flip on vkms
+        if: steps.vkms.outputs.have == '1'
+        run: |
+          cargo build -p vigil --example test_pattern
+          card=$(for c in /sys/class/drm/card[0-9]; do \
+            readlink "$c/device/driver" 2>/dev/null | grep -q vkms && basename "$c" && break; done)
+          test -n "$card"
+          sudo ./target/debug/examples/test_pattern "/dev/dri/$card" 1
