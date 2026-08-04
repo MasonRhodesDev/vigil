@@ -538,16 +538,20 @@ required surface, so old themes keep working.
   captured pre-lock (hyprlock's design). sctk 0.21 note: the per-protocol
   delegate macros are gone; the pattern is `delegate_registry!` +
   `delegate_noop!(wl_buffer)` + one blanket `delegate_dispatch2!`.
-  Still to confirm live: key-unlock and configure sizing on scaled
-  outputs (nested ran at scale 1).
+  **Live run 2026-08-04 (3 outputs, all fractional-scale)**: lock +
+  unlock cycle clean; configure sizes confirmed LOGICAL (2560x1440 for
+  3840x2160@1.5, 1600x1000 for 2560x1600@1.6); every output arrived via
+  `new_output` — the "hotplug" path is simply the normal path. Because
+  this machine's outputs are ALL fractionally scaled, logical-size
+  buffers would render soft everywhere: fractional-scale via
+  wp_fractional_scale_v1 + wp_viewporter is promoted from L2 into L1.
 - **L1 — usable lock:** the three crates above. Themed per-output render
   (integer scale), PAM password auth with retry, caps-lock, key repeat,
   hotplug-while-locked, clock. Exits only after locked → auth success →
   unlock → roundtrip. Render states join the existing headless matrix;
   PAM state machine tested against scripted conversations.
 - **L2 — hyprlock-essentials parity:** grace period, `--ready-fd`/
-  daemonize-after-locked, login1 Lock/SetLockedHint, fractional scale
-  (manual wp_fractional_scale + viewporter binding), Power policy,
+  daemonize-after-locked, login1 Lock/SetLockedHint, Power policy,
   `/etc/pam.d/vigil-lock` packaging + systemd user unit. Fingerprint is
   deferred: `auth include login` already routes pam_fprintd prompts
   through our conversation verbatim; a native fprintd listener is additive.
@@ -560,7 +564,7 @@ required surface, so old themes keep working.
 | Crash-while-locked = lockout (by spec) | greeter-grade crash discipline; systemd user unit `Restart=on-failure`; whether re-lock after a dead locker succeeds is compositor-dependent (Hyprland: `misc:allow_session_lock_restore`) — verify in L0 |
 | pam-client unmaintained since 2022 | libpam ABI is frozen; cosmic-greeter ships it in production; nonstick is the fallback behind vigil-pam's one-file seam |
 | Locking with a DPMS-off output (hyprlock's top bug class) | rely on compositor `locked` timeout (Hyprland: 5s), commit placeholder frames immediately, never gate lock() on slow resource loads |
-| Fractional-scale outputs render soft at integer scale in L1 | accepted (greeter has the same model); manual protocol binding in L2 |
+| Fractional-scale outputs render soft at integer scale | promoted into L1 after the live L0 run (every local output is fractional); manual wp_fractional_scale_v1 + wp_viewporter binding (~120 LOC) |
 
 ## 13. License
 
