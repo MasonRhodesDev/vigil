@@ -1,0 +1,14 @@
+[package]
+name = "vigil-lock"
+description = "Session lockscreen sharing vigil's theme and auth seams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+vigil-wayland = { path = "../vigil-wayland" }
+vigil-pam = { path = "../vigil-pam" }
+vigil-theme = { path = "../vigil-theme" }
+vigil-ui = { path = "../vigil-ui" }

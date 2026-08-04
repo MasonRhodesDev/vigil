@@ -148,6 +148,21 @@ pub enum UiMessage {
     Power(PowerAction),
 }
 
+/// Events flowing from an auth backend's worker (PAM conversation thread)
+/// to the UI loop. The greetd backend drives `AuthUi` in-loop and does not
+/// need these; the PAM backend crosses a thread boundary and does.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthEvent {
+    Prompt {
+        text: String,
+        secret: bool,
+    },
+    Info(String),
+    Error(String),
+    /// The attempt finished: `Ok` = authenticated, `Err` = failure message.
+    Done(Result<(), String>),
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
