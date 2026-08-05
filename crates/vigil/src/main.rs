@@ -27,7 +27,7 @@ use vigil_outputs::OutputManager;
 use vigil_present_dumb::DumbBufferPresenter;
 use vigil_session::SessionManager;
 use vigil_theme::Theme;
-use vigil_ui::{OutputWindow, VigilPlatform};
+use vigil_ui::{OutputWindow, UiSnapshot, VigilPlatform};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -79,32 +79,6 @@ struct Entry {
     window: OutputWindow,
 }
 
-/// Last state pushed through [`AuthUi`], kept so scenes rebuilt after a VT
-/// switch or hotplug can be brought back to what the user was looking at
-/// (a fresh theme instance starts blank).
-#[derive(Default)]
-struct UiSnapshot {
-    prompt: (String, bool),
-    info: String,
-    error: String,
-    busy: bool,
-}
-
-impl UiSnapshot {
-    fn apply(&self, window: &mut OutputWindow) {
-        window.show_prompt(&self.prompt.0, self.prompt.1);
-        if !self.info.is_empty() {
-            window.show_info(&self.info);
-        }
-        if !self.error.is_empty() {
-            window.show_error(&self.error);
-        }
-        if self.busy {
-            window.set_busy(true);
-        }
-    }
-}
-
 /// Fan-out AuthUi: every monitor mirrors the auth state.
 struct FanUi<'a> {
     entries: &'a mut [Entry],
@@ -113,9 +87,7 @@ struct FanUi<'a> {
 
 impl AuthUi for FanUi<'_> {
     fn show_prompt(&mut self, text: &str, secret: bool) {
-        self.snapshot.prompt = (text.to_owned(), secret);
-        self.snapshot.info.clear();
-        self.snapshot.error.clear();
+        self.snapshot.on_prompt(text, secret);
         for e in self.entries.iter_mut() {
             e.window.show_prompt(text, secret);
         }

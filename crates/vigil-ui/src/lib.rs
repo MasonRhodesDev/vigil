@@ -513,6 +513,41 @@ fn fit_background(source: &DynamicImage, fit: BackgroundFit, out_w: u32, out_h: 
     }
 }
 
+/// Last state pushed through [`AuthUi`], kept so scenes rebuilt after a VT
+/// switch, resume, or hotplug can be brought back to what the user was
+/// looking at — a fresh theme instance starts blank (found twice: greeter
+/// VT round trip, then the lockscreen's post-resume "bare password box").
+#[derive(Default)]
+pub struct UiSnapshot {
+    pub prompt: (String, bool),
+    pub info: String,
+    pub error: String,
+    pub busy: bool,
+}
+
+impl UiSnapshot {
+    /// Record an [`AuthUi`] call so `apply` can replay it later. Callers'
+    /// AuthUi impls forward each method here alongside their fan-out.
+    pub fn on_prompt(&mut self, text: &str, secret: bool) {
+        self.prompt = (text.to_owned(), secret);
+        self.info.clear();
+        self.error.clear();
+    }
+
+    pub fn apply(&self, window: &mut OutputWindow) {
+        window.show_prompt(&self.prompt.0, self.prompt.1);
+        if !self.info.is_empty() {
+            window.show_info(&self.info);
+        }
+        if !self.error.is_empty() {
+            window.show_error(&self.error);
+        }
+        if self.busy {
+            window.set_busy(true);
+        }
+    }
+}
+
 /// Advance Slint timers and animations at the start of an event-loop iteration.
 pub fn advance_timers() {
     slint::platform::update_timers_and_animations();

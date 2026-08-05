@@ -13,7 +13,7 @@ use vigil_core::{
 };
 use vigil_pam::PamAttempt;
 use vigil_theme::Theme;
-use vigil_ui::{OutputWindow, VigilPlatform};
+use vigil_ui::{OutputWindow, UiSnapshot, VigilPlatform};
 use vigil_wayland::{LockOutcome, LockSession};
 
 struct Cli {
@@ -89,6 +89,9 @@ struct Locker {
     unlocked: bool,
     last_clock: (Instant, String),
     ready_fd: Option<i32>,
+    /// Auth state to replay onto scenes rebuilt mid-lock (resume/resize
+    /// recreates outputs; a fresh theme instance starts blank).
+    snapshot: UiSnapshot,
 }
 
 impl Locker {
@@ -112,6 +115,7 @@ impl Locker {
             unlocked: false,
             last_clock: (Instant::now(), clock_text()),
             ready_fd: cli.ready_fd,
+            snapshot: UiSnapshot::default(),
         })
     }
 
@@ -138,15 +142,24 @@ impl Locker {
         while let Ok(event) = self.auth_rx.try_recv() {
             match event {
                 AuthEvent::Prompt { text, secret } => {
+                    self.snapshot.on_prompt(&text, secret);
                     self.each_window(|w| w.show_prompt(&text, secret));
                 }
-                AuthEvent::Info(text) => self.each_window(|w| w.show_info(&text)),
-                AuthEvent::Error(text) => self.each_window(|w| w.show_error(&text)),
+                AuthEvent::Info(text) => {
+                    self.snapshot.info = text.clone();
+                    self.each_window(|w| w.show_info(&text));
+                }
+                AuthEvent::Error(text) => {
+                    self.snapshot.error = text.clone();
+                    self.each_window(|w| w.show_error(&text));
+                }
                 AuthEvent::Done(Ok(())) => {
                     self.unlocked = true;
                     return;
                 }
                 AuthEvent::Done(Err(message)) => {
+                    self.snapshot.error = message.clone();
+                    self.snapshot.busy = false;
                     self.each_window(|w| {
                         w.show_error(&message);
                         w.set_busy(false);
@@ -166,6 +179,7 @@ impl Locker {
             match msg {
                 UiMessage::Respond(text) => {
                     if self.attempt.is_some() {
+                        self.snapshot.busy = true;
                         self.each_window(|w| w.set_busy(true));
                     }
                     if let Some(attempt) = &self.attempt {
@@ -205,6 +219,7 @@ impl LockSession for Locker {
             window.set_clock(&self.last_clock.1);
             window.set_caps_lock(self.caps_lock);
             window.set_panel_visible(false);
+            self.snapshot.apply(&mut window);
             let queue = self.queue.clone();
             window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
             Ok(window)
