@@ -44,6 +44,7 @@ package() {
   install -Dm755 target/release/vigil-lock "$pkgdir/usr/bin/vigil-lock"
 
   install -Dm644 dist/vigil.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/vigil.conf"
+  install -Dm644 dist/vigil-lock.pam "$pkgdir/etc/pam.d/vigil-lock"
   install -Dm644 dist/vigil.toml.example "$pkgdir/usr/share/vigil/vigil.toml.example"
   install -Dm644 themes/default/theme.slint "$pkgdir/usr/share/vigil/themes/default.slint"
 

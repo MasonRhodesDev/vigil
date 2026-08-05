@@ -5,8 +5,9 @@
 # The package installs files only: binaries, the tmpfiles.d snippet for the
 # greeter-writable state dir, and reference copies of the example config and
 # default theme. The real /etc/greetd/vigil.toml stays operator-owned
-# (greetd owns that directory); /etc/pam.d/vigil-lock arrives with the L2
-# lock work, and the spec deliberately does not reserve it yet.
+# (greetd owns that directory). /etc/pam.d/vigil-lock ships as a
+# pass-through hook (auth include login) — a named place for operator
+# policy, not an opinion about it.
 #
 # The test suite runs by default; disable for a one-off build with
 # --without check.
@@ -60,6 +61,7 @@ output, runtime .slint themes with a compiled-in fallback.
 (cd crates/vigil-lock && %cargo_install)
 
 install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
+install -Dpm0644 dist/vigil-lock.pam %{buildroot}%{_sysconfdir}/pam.d/vigil-lock
 install -Dpm0644 dist/vigil.toml.example %{buildroot}%{_datadir}/vigil/vigil.toml.example
 install -Dpm0644 themes/default/theme.slint %{buildroot}%{_datadir}/vigil/themes/default.slint
 
@@ -77,6 +79,7 @@ install -Dpm0644 themes/default/theme.slint %{buildroot}%{_datadir}/vigil/themes
 %{_bindir}/vigil
 %{_bindir}/vigil-lock
 %{_tmpfilesdir}/vigil.conf
+%config(noreplace) %{_sysconfdir}/pam.d/vigil-lock
 %{_datadir}/vigil/
 
 %changelog

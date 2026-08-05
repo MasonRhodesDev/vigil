@@ -1,0 +1,9 @@
+# vigil-lock PAM service: a named hook, not a policy. vigil only runs the
+# conversation; WHAT authenticates (password, fingerprint, anything PAM
+# can express) is operator configuration. By default the lock behaves
+# exactly like login. Edit this file to give the lockscreen its own rules.
+#
+# Only the auth phase: a locker re-authenticates an already-logged-in
+# user; account validity was settled at login (and pam_unix account
+# needs privileges a user-service context does not have).
+auth     include   login
