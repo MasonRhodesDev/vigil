@@ -15,7 +15,7 @@ use smithay::reexports::input;
 use smithay::reexports::input::event::keyboard::{KeyState, KeyboardEventTrait};
 use smithay::reexports::input::event::pointer::{ButtonState, PointerEvent};
 use smithay::reexports::input::{LibinputInterface, event};
-use vigil_core::{DeviceOpener, InputEvent};
+use vigil_core::{DeviceOpener, InputEvent, KeymapSettings};
 use xkbcommon::xkb;
 
 const REPEAT_DELAY: Duration = Duration::from_millis(500);
@@ -39,7 +39,11 @@ pub struct InputSystem {
 }
 
 impl InputSystem {
-    pub fn new(seat: &str, opener: Box<dyn DeviceOpener>) -> Result<Self, InputError> {
+    pub fn new(
+        seat: &str,
+        opener: Box<dyn DeviceOpener>,
+        keymap: &KeymapSettings,
+    ) -> Result<Self, InputError> {
         let mut libinput = input::Libinput::new_with_udev(OpenerAdapter(opener));
         libinput
             .udev_assign_seat(seat)
@@ -47,7 +51,7 @@ impl InputSystem {
 
         Ok(Self {
             libinput,
-            keyboard: KeyboardState::new()?,
+            keyboard: KeyboardState::new(keymap)?,
             compose_locale: None,
         })
     }
@@ -166,19 +170,37 @@ struct Repeat {
     deadline: Instant,
 }
 
+fn compile_keymap(context: &xkb::Context, settings: &KeymapSettings) -> Option<xkb::Keymap> {
+    let options = (!settings.options.is_empty()).then(|| settings.options.clone());
+    xkb::Keymap::new_from_names(
+        context,
+        &settings.rules,
+        &settings.model,
+        &settings.layout,
+        &settings.variant,
+        options,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+}
+
 impl KeyboardState {
-    fn new() -> Result<Self, InputError> {
+    fn new(settings: &KeymapSettings) -> Result<Self, InputError> {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let keymap = xkb::Keymap::new_from_names(
-            &context,
-            "",
-            "",
-            "",
-            "",
-            None,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .ok_or_else(|| InputError("could not compile the system xkb keymap".into()))?;
+        // A bad user-supplied layout must never brick the greeter: fall back
+        // to the system keymap with a log line (same philosophy as config
+        // and theme fallbacks).
+        let keymap = compile_keymap(&context, settings)
+            .or_else(|| {
+                if *settings != KeymapSettings::default() {
+                    eprintln!(
+                        "vigil-input: keymap {settings:?} did not compile; using system default"
+                    );
+                    compile_keymap(&context, &KeymapSettings::default())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| InputError("could not compile the system xkb keymap".into()))?;
         let state = xkb::State::new(&keymap);
         Ok(Self {
             keymap,
@@ -265,7 +287,7 @@ mod tests {
 
     #[test]
     fn translates_letters_shift_and_return() {
-        let mut keyboard = KeyboardState::new().unwrap();
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         let now = Instant::now();
         assert_eq!(
             key_parts(keyboard.key(KEY_A, true, now)),
@@ -289,7 +311,7 @@ mod tests {
 
     #[test]
     fn caps_lock_state_toggles() {
-        let mut keyboard = KeyboardState::new().unwrap();
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         let now = Instant::now();
         assert!(!keyboard.caps_lock());
         keyboard.key(KEY_CAPSLOCK, true, now);
@@ -302,7 +324,7 @@ mod tests {
 
     #[test]
     fn repeat_arms_ticks_rearms_and_releases() {
-        let mut keyboard = KeyboardState::new().unwrap();
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         let now = Instant::now();
         keyboard.key(KEY_A, true, now);
         let first = now + REPEAT_DELAY;
@@ -318,8 +340,34 @@ mod tests {
 
     #[test]
     fn non_repeating_key_never_arms() {
-        let mut keyboard = KeyboardState::new().unwrap();
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         keyboard.key(KEY_LEFTSHIFT, true, Instant::now());
         assert_eq!(keyboard.next_repeat_deadline(), None);
+    }
+
+    #[test]
+    fn bad_layout_falls_back_to_defaults() {
+        let mut keyboard = KeyboardState::new(&KeymapSettings {
+            layout: "definitely-not-a-real-layout".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            key_parts(keyboard.key(KEY_A, true, Instant::now())),
+            ('a' as u32, Some("a".into()), true)
+        );
+    }
+
+    #[test]
+    fn explicit_layout_compiles() {
+        let mut keyboard = KeyboardState::new(&KeymapSettings {
+            layout: "us".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            key_parts(keyboard.key(KEY_A, true, Instant::now())),
+            ('a' as u32, Some("a".into()), true)
+        );
     }
 }

@@ -98,6 +98,17 @@ pub trait DeviceOpener {
     fn close(&mut self, fd: OwnedFd);
 }
 
+/// XKB keymap selection (RMLVO). Empty fields mean "system default" —
+/// xkbcommon resolves each empty name itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeymapSettings {
+    pub rules: String,
+    pub model: String,
+    pub layout: String,
+    pub variant: String,
+    pub options: String,
+}
+
 /// Normalized input, decoupled from libinput/xkb types. Key repeat is
 /// synthesized by vigil-input and arrives as ordinary `Key` events.
 #[derive(Debug, Clone, PartialEq)]

@@ -565,8 +565,15 @@ fn run() -> Result<i32, String> {
     let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
     let theme = Theme::load_or_default(resolved.theme.as_deref());
 
-    let input =
-        InputSystem::new(&seat, Box::new(session.device_opener())).map_err(|e| e.to_string())?;
+    let keymap = vigil_core::KeymapSettings {
+        rules: config.keyboard.rules.clone(),
+        model: config.keyboard.model.clone(),
+        layout: config.keyboard.layout.clone(),
+        variant: config.keyboard.variant.clone(),
+        options: config.keyboard.options.clone(),
+    };
+    let input = InputSystem::new(&seat, Box::new(session.device_opener()), &keymap)
+        .map_err(|e| e.to_string())?;
     let input_fd = input
         .as_fd()
         .try_clone_to_owned()
