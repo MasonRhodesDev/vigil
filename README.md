@@ -36,6 +36,34 @@ is its own display backend, so the login path depends only on the kernel,
 libseat, libinput, xkbcommon, and greetd — none of which a desktop upgrade
 touches.
 
+## Installation
+
+Arch, from the [mason] pacman repo:
+
+```ini
+# /etc/pacman.conf
+[mason]
+SigLevel = Optional TrustAll
+Server = https://masonrhodesdev.github.io/arch-repo/x86_64
+```
+
+```bash
+sudo pacman -Sy vigil
+```
+
+Fedora:
+
+```bash
+sudo dnf copr enable solaris765/vigil
+sudo dnf install vigil
+```
+
+The package installs files only. Point greetd at the greeter
+(`command = "/usr/bin/vigil"` in `/etc/greetd/config.toml`, then restart
+greetd — it reads its config once at startup), and hypridle/your lock
+keybind at `vigil-lock`. An example `vigil.toml` ships at
+`/usr/share/vigil/vigil.toml.example`.
+
 ## License
 
 [GPL-3.0](LICENSE). Slint is used under its GPLv3 license option — see

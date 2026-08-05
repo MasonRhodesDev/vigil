@@ -1,0 +1,54 @@
+# vigil example configuration — copy to /etc/greetd/vigil.toml.
+# Every key is optional; a missing file or broken value falls back to the
+# built-in default and can never block login. CLI flags override config.
+# The lockscreen reads ~/.config/vigil/config.toml first, then this file
+# (shared [look] = one visual identity for greeter and lock).
+
+[look]
+# Runtime theme; falls back to the compiled-in default on any error.
+#theme = "/etc/greetd/theme.slint"
+# Background image shown on every output (see [output."NAME"] to override).
+#background = "/etc/greetd/bg.png"
+# One of: stretch | fill | fit | center | tile
+#fit = "fill"
+# strftime format for the clock.
+#clock_format = "%H:%M"
+
+[keyboard]
+# XKB keymap for the greeter (RMLVO). Empty fields mean system default.
+# A layout that fails to compile logs and falls back — it cannot brick login.
+#layout = "us"
+#variant = ""
+#options = "caps:escape"
+#model = ""
+#rules = ""
+
+[sessions]
+# Extra session directories; empty = /usr/share/wayland-sessions +
+# /usr/share/xsessions. A directory whose basename is `xsessions` lists as X11.
+#dirs = []
+# Preselect the last successful user/session (needs a writable state_file;
+# the package ships tmpfiles.d for /var/lib/vigil).
+#remember = true
+#state_file = "/var/lib/vigil/state.toml"
+
+[power]
+# false = the greeter's Restart/Shut Down buttons log instead of acting.
+#enabled = true
+
+[greeter]
+# Non-empty user = kiosk mode: skip the username stage.
+#user = ""
+# Non-empty cmd = fixed session command; hides the session picker.
+#cmd = []
+
+[lock]
+# Seconds after locking during which a key/click unlocks without auth
+# (0 = disabled). Never survives suspend.
+#grace_secs = 0
+
+# Per-output overrides, keyed by connector name (`vigil` logs names at
+# startup, e.g. "DP-1"). Overrides beat [look]; CLI flags beat both.
+#[output."DP-1"]
+#background = "/etc/greetd/side.png"
+#fit = "center"

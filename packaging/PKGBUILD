@@ -1,0 +1,51 @@
+# Maintainer: Mason Rhodes <mrhodesdev@gmail.com>
+#
+# Arch package for vigil. Same payload as the Fedora RPM
+# (packaging/vigil.spec); all paths are identical across both distros. The
+# package installs files only — pointing greetd's `command =` at
+# /usr/bin/vigil (and hypridle at vigil-lock) is operator configuration.
+
+pkgname=vigil
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Compositor-less greetd greeter and matching session lockscreen"
+arch=('x86_64')
+url="https://github.com/MasonRhodesDev/vigil"
+license=('GPL-3.0-only')
+depends=('greetd' 'seatd' 'libinput' 'libxkbcommon' 'systemd-libs' 'libdrm' 'mesa' 'pam')
+makedepends=('cargo' 'clang' 'systemd')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/MasonRhodesDev/vigil/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP') # pin on release: updpkgsums
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --workspace
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release --workspace
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  install -Dm755 target/release/vigil "$pkgdir/usr/bin/vigil"
+  install -Dm755 target/release/vigil-lock "$pkgdir/usr/bin/vigil-lock"
+
+  install -Dm644 dist/vigil.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/vigil.conf"
+  install -Dm644 dist/vigil.toml.example "$pkgdir/usr/share/vigil/vigil.toml.example"
+  install -Dm644 themes/default/theme.slint "$pkgdir/usr/share/vigil/themes/default.slint"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

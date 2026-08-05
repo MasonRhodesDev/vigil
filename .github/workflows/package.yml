@@ -1,0 +1,25 @@
+name: Package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: package-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arch-ci:
+    uses: MasonRhodesDev/packaging-workflows/.github/workflows/rust-ci.yml@main
+    with:
+      # smithay backends + xkbcommon + pam (bindgen needs clang)
+      pacman-deps: seatd libinput libxkbcommon systemd libdrm mesa pam clang
+
+  arch:
+    uses: MasonRhodesDev/packaging-workflows/.github/workflows/arch-package.yml@main
+
+  rpm:
+    uses: MasonRhodesDev/packaging-workflows/.github/workflows/rpm-check.yml@main
+    with:
+      spec-name: vigil
