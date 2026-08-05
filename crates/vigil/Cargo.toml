@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 vigil-core.workspace = true
+vigil-config.workspace = true
 vigil-session = { path = "../vigil-session" }
 vigil-outputs = { path = "../vigil-outputs" }
 vigil-present-dumb = { path = "../vigil-present-dumb" }

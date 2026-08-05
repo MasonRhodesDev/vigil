@@ -23,24 +23,30 @@ pub struct SessionEntry {
 /// `VIGIL_SESSION_DIRS` (colon-separated) overrides the standard directories
 /// (tests, unusual distros); a directory whose basename is `xsessions`
 /// counts as X11.
-pub fn enumerate() -> Vec<SessionEntry> {
-    let dirs: Vec<(std::path::PathBuf, SessionKind)> = match std::env::var_os("VIGIL_SESSION_DIRS")
-    {
-        Some(paths) => std::env::split_paths(&paths)
-            .map(|dir| {
-                let kind = if dir.file_name().is_some_and(|n| n == "xsessions") {
-                    SessionKind::X11
-                } else {
-                    SessionKind::Wayland
-                };
-                (dir, kind)
-            })
-            .collect(),
-        None => vec![
-            ("/usr/share/wayland-sessions".into(), SessionKind::Wayland),
-            ("/usr/share/xsessions".into(), SessionKind::X11),
-        ],
+pub fn enumerate(config_dirs: &[String]) -> Vec<SessionEntry> {
+    let mapping = |dir: std::path::PathBuf| {
+        let kind = if dir.file_name().is_some_and(|n| n == "xsessions") {
+            SessionKind::X11
+        } else {
+            SessionKind::Wayland
+        };
+        (dir, kind)
     };
+    let dirs: Vec<(std::path::PathBuf, SessionKind)> =
+        if let Some(paths) = std::env::var_os("VIGIL_SESSION_DIRS") {
+            std::env::split_paths(&paths).map(mapping).collect()
+        } else if !config_dirs.is_empty() {
+            config_dirs
+                .iter()
+                .map(std::path::PathBuf::from)
+                .map(mapping)
+                .collect()
+        } else {
+            vec![
+                ("/usr/share/wayland-sessions".into(), SessionKind::Wayland),
+                ("/usr/share/xsessions".into(), SessionKind::X11),
+            ]
+        };
     let mut sessions = Vec::new();
     for (dir, kind) in dirs {
         let mut batch = read_dir_entries(&dir, kind);

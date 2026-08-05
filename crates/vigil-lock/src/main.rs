@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use vigil_config::Config;
 use vigil_core::{
     AuthEvent, AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputId, OutputInfo, UiMessage,
 };
@@ -18,9 +19,10 @@ use vigil_wayland::{LockOutcome, LockSession};
 
 struct Cli {
     user: String,
+    config: Option<PathBuf>,
     theme: Option<PathBuf>,
     background: Option<PathBuf>,
-    bg_mode: BackgroundFit,
+    bg_mode: Option<BackgroundFit>,
     /// Write one byte here once the compositor confirms the lock (systemd/
     /// hypridle readiness protocol).
     ready_fd: Option<i32>,
@@ -33,9 +35,10 @@ struct Cli {
 fn parse_cli() -> Result<Cli, String> {
     let mut cli = Cli {
         user: whoami()?,
+        config: None,
         theme: None,
         background: None,
-        bg_mode: BackgroundFit::default(),
+        bg_mode: None,
         ready_fd: None,
         daemonize: false,
     };
@@ -44,11 +47,12 @@ fn parse_cli() -> Result<Cli, String> {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
             "--user" => cli.user = value("--user")?,
+            "--config" => cli.config = Some(PathBuf::from(value("--config")?)),
             "--theme" => cli.theme = Some(PathBuf::from(value("--theme")?)),
             "--background" => cli.background = Some(PathBuf::from(value("--background")?)),
             "--bg-mode" => {
                 let v = value("--bg-mode")?;
-                cli.bg_mode = BackgroundFit::parse(&v).ok_or(format!("unknown bg-mode {v}"))?;
+                cli.bg_mode = Some(BackgroundFit::parse(&v).ok_or(format!("unknown bg-mode {v}"))?);
             }
             "--ready-fd" => {
                 let v = value("--ready-fd")?;
@@ -81,6 +85,7 @@ struct Locker {
     user: String,
     background: Option<PathBuf>,
     bg_mode: BackgroundFit,
+    clock_format: String,
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
     auth_rx: mpsc::Receiver<AuthEvent>,
@@ -95,7 +100,7 @@ struct Locker {
 }
 
 impl Locker {
-    fn new(cli: Cli) -> Result<Self, String> {
+    fn new(cli: Cli, clock_format: String) -> Result<Self, String> {
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
         let (auth_tx, auth_rx) = mpsc::channel();
@@ -106,14 +111,15 @@ impl Locker {
             panel: 0,
             user: cli.user,
             background: cli.background,
-            bg_mode: cli.bg_mode,
+            bg_mode: cli.bg_mode.unwrap_or_default(),
+            clock_format: clock_format.clone(),
             caps_lock: false,
             queue: Rc::default(),
             auth_rx,
             auth_tx,
             attempt: None,
             unlocked: false,
-            last_clock: (Instant::now(), clock_text()),
+            last_clock: (Instant::now(), clock_text(&clock_format)),
             ready_fd: cli.ready_fd,
             snapshot: {
                 // Show a usable password prompt from the first frame: with
@@ -303,7 +309,7 @@ impl LockSession for Locker {
     fn tick(&mut self) {
         vigil_ui::advance_timers();
         if self.last_clock.0.elapsed() >= Duration::from_secs(1) {
-            let text = clock_text();
+            let text = clock_text(&self.clock_format);
             if text != self.last_clock.1 {
                 self.each_window(|w| w.set_clock(&text));
             }
@@ -326,9 +332,9 @@ impl LockSession for Locker {
     }
 }
 
-fn clock_text() -> String {
+fn clock_text(format: &str) -> String {
     std::process::Command::new("date")
-        .arg("+%H:%M")
+        .arg(format!("+{format}"))
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -376,7 +382,7 @@ fn daemonize() -> ! {
 }
 
 fn main() {
-    let cli = match parse_cli() {
+    let mut cli = match parse_cli() {
         Ok(cli) => cli,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
@@ -386,7 +392,18 @@ fn main() {
     if cli.daemonize {
         daemonize();
     }
-    let mut locker = match Locker::new(cli) {
+    let config = Config::load_layered(cli.config.as_deref());
+    cli.theme = cli.theme.or(config.look.theme.clone());
+    cli.background = cli.background.or(config.look.background.clone());
+    let fit = config.look.fit.as_deref().and_then(|s| {
+        let parsed = BackgroundFit::parse(s);
+        if parsed.is_none() {
+            eprintln!("vigil-lock: config: unknown fit `{s}`");
+        }
+        parsed
+    });
+    cli.bg_mode = Some(cli.bg_mode.or(fit).unwrap_or_default());
+    let mut locker = match Locker::new(cli, config.look.clock_format) {
         Ok(locker) => locker,
         Err(e) => {
             eprintln!("vigil-lock: {e}");

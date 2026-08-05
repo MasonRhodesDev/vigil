@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 vigil-core.workspace = true
+vigil-config.workspace = true
 vigil-wayland = { path = "../vigil-wayland" }
 vigil-pam = { path = "../vigil-pam" }
 vigil-theme = { path = "../vigil-theme" }

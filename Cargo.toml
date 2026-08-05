@@ -10,6 +10,9 @@ repository = "https://github.com/MasonRhodesDev/vigil"
 
 [workspace.dependencies]
 vigil-core = { path = "crates/vigil-core" }
+vigil-config = { path = "crates/vigil-config" }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 smithay = { version = "0.7.0", default-features = false }
 # default display-info feature needs system libdisplay-info < 0.3 (Fedora 44 ships 0.3).
 # We only need DrmScanner; EDID names come in M2 via libdisplay-info 0.3 directly.

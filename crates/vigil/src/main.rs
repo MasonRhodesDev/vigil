@@ -18,6 +18,7 @@ use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use vigil_auth::AuthMachine;
+use vigil_config::Config;
 use vigil_core::{
     AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputEvent, OutputId, PowerAction,
     PresentError, Presenter, SessionEvent, UiMessage,
@@ -34,9 +35,10 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 struct Cli {
     user: Option<String>,
     socket: Option<String>,
+    config: Option<PathBuf>,
     theme: Option<PathBuf>,
     background: Option<PathBuf>,
-    bg_mode: BackgroundFit,
+    bg_mode: Option<BackgroundFit>,
     cmd: Vec<String>,
 }
 
@@ -45,9 +47,10 @@ fn parse_cli() -> Result<Cli, String> {
     let mut cli = Cli {
         user: None,
         socket: None,
+        config: None,
         theme: None,
         background: None,
-        bg_mode: BackgroundFit::default(),
+        bg_mode: None,
         cmd: Vec::new(),
     };
     while let Some(arg) = args.next() {
@@ -55,11 +58,12 @@ fn parse_cli() -> Result<Cli, String> {
         match arg.as_str() {
             "--user" => cli.user = Some(value("--user")?),
             "--socket" => cli.socket = Some(value("--socket")?),
+            "--config" => cli.config = Some(PathBuf::from(value("--config")?)),
             "--theme" => cli.theme = Some(PathBuf::from(value("--theme")?)),
             "--background" => cli.background = Some(PathBuf::from(value("--background")?)),
             "--bg-mode" => {
                 let v = value("--bg-mode")?;
-                cli.bg_mode = BackgroundFit::parse(&v).ok_or(format!("unknown bg-mode {v}"))?;
+                cli.bg_mode = Some(BackgroundFit::parse(&v).ok_or(format!("unknown bg-mode {v}"))?);
             }
             "--cmd" => {
                 cli.cmd = args.by_ref().collect();
@@ -68,6 +72,46 @@ fn parse_cli() -> Result<Cli, String> {
         }
     }
     Ok(cli)
+}
+
+/// Effective settings after CLI-over-config-over-default merge.
+struct Resolved {
+    user: Option<String>,
+    theme: Option<PathBuf>,
+    background: Option<PathBuf>,
+    bg_mode: BackgroundFit,
+    cmd: Vec<String>,
+    power_enabled: bool,
+    clock_format: String,
+}
+
+fn resolve(cli: &Cli, config: &Config) -> Resolved {
+    let fit = config.look.fit.as_deref().and_then(|s| {
+        let parsed = BackgroundFit::parse(s);
+        if parsed.is_none() {
+            eprintln!("vigil: config: unknown fit `{s}`");
+        }
+        parsed
+    });
+    Resolved {
+        user: cli
+            .user
+            .clone()
+            .or_else(|| (!config.greeter.user.is_empty()).then(|| config.greeter.user.clone())),
+        theme: cli.theme.clone().or_else(|| config.look.theme.clone()),
+        background: cli
+            .background
+            .clone()
+            .or_else(|| config.look.background.clone()),
+        bg_mode: cli.bg_mode.or(fit).unwrap_or_default(),
+        cmd: if cli.cmd.is_empty() {
+            config.greeter.cmd.clone()
+        } else {
+            cli.cmd.clone()
+        },
+        power_enabled: config.power.enabled && std::env::var_os("VIGIL_POWER_INHIBIT").is_none(),
+        clock_format: config.look.clock_format.clone(),
+    }
 }
 
 /// One live output: its swapchain and its scene.
@@ -130,6 +174,8 @@ struct App {
     queue: Rc<RefCell<VecDeque<UiMessage>>>,
     background: Option<PathBuf>,
     bg_mode: BackgroundFit,
+    power_enabled: bool,
+    clock_format: String,
     caps_lock: bool,
     last_clock: (Instant, String),
     snapshot: UiSnapshot,
@@ -369,13 +415,13 @@ impl App {
 
     /// Power actions go through logind (the greeter's session is active on
     /// the seat, so polkit's allow_active rule applies — no root needed).
-    /// `VIGIL_POWER_INHIBIT` turns them into log lines for test harnesses.
+    /// Config and `VIGIL_POWER_INHIBIT` can turn them into log lines.
     fn power(&mut self, action: PowerAction) {
         let arg = match action {
             PowerAction::Reboot => "reboot",
             PowerAction::Poweroff => "poweroff",
         };
-        if std::env::var_os("VIGIL_POWER_INHIBIT").is_some() {
+        if !self.power_enabled {
             eprintln!("vigil: power action inhibited: systemctl {arg}");
             return;
         }
@@ -415,7 +461,7 @@ impl App {
             }
         }
         if self.last_clock.0.elapsed() >= Duration::from_secs(1) {
-            let text = clock_text();
+            let text = clock_text(&self.clock_format);
             if text != self.last_clock.1 {
                 for e in self.entries.iter_mut() {
                     e.window.set_clock(&text);
@@ -475,9 +521,9 @@ impl App {
 
 /// HH:MM via `date`; std has no local-time formatting and a chrono dependency
 /// is not worth it for a clock string (M2 revisits with proper config).
-fn clock_text() -> String {
+fn clock_text(format: &str) -> String {
     std::process::Command::new("date")
-        .arg("+%H:%M")
+        .arg(format!("+{format}"))
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -487,6 +533,8 @@ fn clock_text() -> String {
 
 fn run() -> Result<i32, String> {
     let cli = parse_cli()?;
+    let config = Config::load(cli.config.as_deref());
+    let resolved = resolve(&cli, &config);
 
     let (session, notifier) = SessionManager::new().map_err(|e| e.to_string())?;
     let seat = session.seat_name();
@@ -515,7 +563,7 @@ fn run() -> Result<i32, String> {
     let udev = vigil_outputs::udev_monitor(&seat).map_err(|e| e.to_string())?;
 
     let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
-    let theme = Theme::load_or_default(cli.theme.as_deref());
+    let theme = Theme::load_or_default(resolved.theme.as_deref());
 
     let input =
         InputSystem::new(&seat, Box::new(session.device_opener())).map_err(|e| e.to_string())?;
@@ -527,12 +575,12 @@ fn run() -> Result<i32, String> {
     // `--cmd` pins a single fixed session (kiosk/test mode); otherwise the
     // installed wayland-/x-session entries are offered, defaulting to the
     // first. The list is never empty (login-shell fallback).
-    let session_list = if cli.cmd.is_empty() {
-        sessions::enumerate()
+    let session_list = if resolved.cmd.is_empty() {
+        sessions::enumerate(&config.sessions.dirs)
     } else {
         vec![sessions::SessionEntry {
             name: "Custom".into(),
-            cmd: cli.cmd.clone(),
+            cmd: resolved.cmd.clone(),
             env: Vec::new(),
         }]
     };
@@ -558,10 +606,12 @@ fn run() -> Result<i32, String> {
         cursor: (0.0, 0.0),
         panel: 0,
         queue: Rc::new(RefCell::new(VecDeque::new())),
-        background: cli.background.clone(),
-        bg_mode: cli.bg_mode,
+        background: resolved.background.clone(),
+        bg_mode: resolved.bg_mode,
+        power_enabled: resolved.power_enabled,
+        clock_format: resolved.clock_format.clone(),
         caps_lock: false,
-        last_clock: (Instant::now(), clock_text()),
+        last_clock: (Instant::now(), clock_text(&resolved.clock_format)),
         snapshot: UiSnapshot::default(),
         active: true,
         signal: event_loop.get_signal(),
@@ -575,7 +625,7 @@ fn run() -> Result<i32, String> {
             snapshot: &mut app.snapshot,
         };
         app.auth
-            .begin(cli.user.as_deref(), &mut fan)
+            .begin(resolved.user.as_deref(), &mut fan)
             .map_err(|e| e.to_string())?;
     }
 
@@ -630,5 +680,74 @@ fn main() {
             eprintln!("vigil: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn cli_overrides_config() {
+        let cli = Cli {
+            user: Some("kiosk".into()),
+            socket: None,
+            config: None,
+            theme: Some("/cli.slint".into()),
+            background: None,
+            bg_mode: None,
+            cmd: Vec::new(),
+        };
+        let config = vigil_config::parse(
+            "[look]\ntheme=\"/cfg.slint\"\nbackground=\"/cfg.png\"\nfit=\"tile\"\n\
+             [greeter]\nuser=\"other\"\ncmd=[\"x\"]",
+        )
+        .unwrap();
+        let resolved = resolve(&cli, &config);
+        assert_eq!(resolved.theme, Some(PathBuf::from("/cli.slint")));
+        assert_eq!(resolved.background, Some(PathBuf::from("/cfg.png")));
+        assert_eq!(resolved.bg_mode, BackgroundFit::Tile);
+        assert_eq!(resolved.user.as_deref(), Some("kiosk"));
+        assert_eq!(resolved.cmd, ["x"]);
+    }
+
+    #[test]
+    fn config_fills_when_cli_absent() {
+        let cli = Cli {
+            user: None,
+            socket: None,
+            config: None,
+            theme: None,
+            background: None,
+            bg_mode: None,
+            cmd: Vec::new(),
+        };
+        let config = vigil_config::parse(
+            "[look]\ntheme=\"/cfg.slint\"\nbackground=\"/cfg.png\"\nfit=\"tile\"\n\
+             [greeter]\nuser=\"other\"\ncmd=[\"x\"]",
+        )
+        .unwrap();
+        let resolved = resolve(&cli, &config);
+        assert_eq!(resolved.theme, Some(PathBuf::from("/cfg.slint")));
+        assert_eq!(resolved.user.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn defaults_when_both_absent() {
+        let cli = Cli {
+            user: None,
+            socket: None,
+            config: None,
+            theme: None,
+            background: None,
+            bg_mode: None,
+            cmd: Vec::new(),
+        };
+        let config = Config::default();
+        let resolved = resolve(&cli, &config);
+        assert_eq!(resolved.bg_mode, BackgroundFit::Fill);
+        assert!(resolved.power_enabled);
+        assert_eq!(resolved.clock_format, "%H:%M");
+        assert_eq!(resolved.user, None);
     }
 }
