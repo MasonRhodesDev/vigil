@@ -520,8 +520,21 @@ impl<S: LockSession> SeatHandler for App<S> {
         capability: Capability,
     ) {
         match capability {
-            Capability::Keyboard => self.keyboard = None,
-            Capability::Pointer => self.pointer = None,
+            // MUST release, not just drop: the compositor keeps delivering
+            // events to an unreleased wl_keyboard, so after a seat
+            // capability bounce (observed across suspend/resume) the next
+            // `new_capability` binds a second one and every keystroke
+            // arrives twice — doubled password characters.
+            Capability::Keyboard => {
+                if let Some(keyboard) = self.keyboard.take() {
+                    keyboard.release();
+                }
+            }
+            Capability::Pointer => {
+                if let Some(pointer) = self.pointer.take() {
+                    pointer.release();
+                }
+            }
             _ => {}
         }
     }

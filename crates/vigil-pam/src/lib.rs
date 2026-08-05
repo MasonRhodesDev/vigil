@@ -109,11 +109,12 @@ impl Drop for PamAttempt {
 fn authenticate<E: Fn(AuthEvent)>(user: &str, bridge: Bridge<&E>) -> Result<(), String> {
     let mut ctx = Context::new(service_name(), Some(user), bridge)
         .map_err(|e| format!("pam context: {e}"))?;
+    // Authentication ONLY — deliberately no `acct_mgmt`, matching hyprlock/
+    // swaylock. The user is already logged in (account validity was settled
+    // at login), and pam_unix's account phase needs the setuid unix_chkpwd
+    // helper, which fails from a systemd user-service context (hypridle →
+    // vigil-lock): the correct password would be REJECTED at unlock.
     ctx.authenticate(Flag::NONE).map_err(|e| e.to_string())?;
-    // A locker opens no session; account validity is advisory here.
-    if let Err(e) = ctx.acct_mgmt(Flag::NONE) {
-        return Err(e.to_string());
-    }
     Ok(())
 }
 
