@@ -5,6 +5,7 @@
 //! `command =` line carries them).
 
 mod layout;
+mod sessions;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -18,8 +19,8 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use vigil_auth::AuthMachine;
 use vigil_core::{
-    AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputEvent, OutputId, PresentError, Presenter,
-    SessionEvent, UiMessage,
+    AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputEvent, OutputId, PowerAction,
+    PresentError, Presenter, SessionEvent, UiMessage,
 };
 use vigil_input::InputSystem;
 use vigil_outputs::OutputManager;
@@ -31,7 +32,7 @@ use vigil_ui::{OutputWindow, VigilPlatform};
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 struct Cli {
-    user: String,
+    user: Option<String>,
     socket: Option<String>,
     theme: Option<PathBuf>,
     background: Option<PathBuf>,
@@ -42,7 +43,7 @@ struct Cli {
 fn parse_cli() -> Result<Cli, String> {
     let mut args = std::env::args().skip(1);
     let mut cli = Cli {
-        user: String::new(),
+        user: None,
         socket: None,
         theme: None,
         background: None,
@@ -52,7 +53,7 @@ fn parse_cli() -> Result<Cli, String> {
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
-            "--user" => cli.user = value("--user")?,
+            "--user" => cli.user = Some(value("--user")?),
             "--socket" => cli.socket = Some(value("--socket")?),
             "--theme" => cli.theme = Some(PathBuf::from(value("--theme")?)),
             "--background" => cli.background = Some(PathBuf::from(value("--background")?)),
@@ -66,12 +67,6 @@ fn parse_cli() -> Result<Cli, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if cli.user.is_empty() {
-        return Err("--user is required".into());
-    }
-    if cli.cmd.is_empty() {
-        cli.cmd = vec!["/bin/sh".into(), "-l".into()];
-    }
     Ok(cli)
 }
 
@@ -84,36 +79,74 @@ struct Entry {
     window: OutputWindow,
 }
 
+/// Last state pushed through [`AuthUi`], kept so scenes rebuilt after a VT
+/// switch or hotplug can be brought back to what the user was looking at
+/// (a fresh theme instance starts blank).
+#[derive(Default)]
+struct UiSnapshot {
+    prompt: (String, bool),
+    info: String,
+    error: String,
+    busy: bool,
+}
+
+impl UiSnapshot {
+    fn apply(&self, window: &mut OutputWindow) {
+        window.show_prompt(&self.prompt.0, self.prompt.1);
+        if !self.info.is_empty() {
+            window.show_info(&self.info);
+        }
+        if !self.error.is_empty() {
+            window.show_error(&self.error);
+        }
+        if self.busy {
+            window.set_busy(true);
+        }
+    }
+}
+
 /// Fan-out AuthUi: every monitor mirrors the auth state.
-struct FanUi<'a>(&'a mut [Entry]);
+struct FanUi<'a> {
+    entries: &'a mut [Entry],
+    snapshot: &'a mut UiSnapshot,
+}
 
 impl AuthUi for FanUi<'_> {
     fn show_prompt(&mut self, text: &str, secret: bool) {
-        for e in self.0.iter_mut() {
+        self.snapshot.prompt = (text.to_owned(), secret);
+        self.snapshot.info.clear();
+        self.snapshot.error.clear();
+        for e in self.entries.iter_mut() {
             e.window.show_prompt(text, secret);
         }
     }
     fn show_info(&mut self, text: &str) {
-        for e in self.0.iter_mut() {
+        self.snapshot.info = text.to_owned();
+        for e in self.entries.iter_mut() {
             e.window.show_info(text);
         }
     }
     fn show_error(&mut self, text: &str) {
-        for e in self.0.iter_mut() {
+        self.snapshot.error = text.to_owned();
+        for e in self.entries.iter_mut() {
             e.window.show_error(text);
         }
     }
     fn set_busy(&mut self, busy: bool) {
-        for e in self.0.iter_mut() {
+        self.snapshot.busy = busy;
+        for e in self.entries.iter_mut() {
             e.window.set_busy(busy);
         }
     }
 }
 
 struct App {
+    session: SessionManager,
     outputs: OutputManager,
     input: InputSystem,
     auth: AuthMachine,
+    sessions: Vec<sessions::SessionEntry>,
+    selected_session: usize,
     theme: Theme,
     platform: VigilPlatform,
     entries: Vec<Entry>,
@@ -125,6 +158,9 @@ struct App {
     bg_mode: BackgroundFit,
     caps_lock: bool,
     last_clock: (Instant, String),
+    snapshot: UiSnapshot,
+    /// False while VT-switched away: DRM is paused, rendering must stop.
+    active: bool,
     signal: LoopSignal,
     exit_code: i32,
 }
@@ -132,9 +168,28 @@ struct App {
 impl App {
     fn on_session(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::Pause => self.outputs.pause(),
+            SessionEvent::Pause => {
+                self.active = false;
+                self.input.suspend();
+                self.outputs.pause();
+            }
             SessionEvent::Activate => {
+                self.active = true;
+                if let Err(e) = self.input.resume() {
+                    eprintln!("vigil: {e}");
+                }
                 let _ = self.outputs.activate();
+                // A render racing the pause can hit DeviceInactive and drop
+                // its entry, and no udev event replays a VT switch — so any
+                // output the manager still knows but we lost gets rebuilt.
+                for id in self.outputs.ids() {
+                    if !self.entries.iter().any(|e| e.id == id)
+                        && let Err(e) = self.add_output(id)
+                    {
+                        eprintln!("vigil: rebuilding output {id:?}: {e}");
+                    }
+                }
+                self.rebuild_row();
                 // Presenters re-commit on the next drawn frame; force one.
                 for e in self.entries.iter_mut() {
                     e.window.set_panel_visible(false);
@@ -188,6 +243,10 @@ impl App {
         window.set_clock(&self.last_clock.1);
         window.set_caps_lock(self.caps_lock);
         window.set_panel_visible(false);
+        let names: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
+        window.set_sessions(&names);
+        window.set_session_index(self.selected_session);
+        self.snapshot.apply(&mut window);
         let queue = self.queue.clone();
         window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
 
@@ -231,9 +290,27 @@ impl App {
     }
 
     fn route(&mut self, events: Vec<InputEvent>) {
+        // XF86Switch_VT_1..=XF86Switch_VT_12: the greeter owns Ctrl+Alt+Fn
+        // because taking libinput disabled the kernel's handling. Without
+        // this the greeter VT is a roach motel.
+        const VT_FIRST: u32 = 0x1008_FE01;
+        const VT_LAST: u32 = 0x1008_FE0C;
+        const ESCAPE: u32 = 0xff1b;
         for event in events {
             match event {
-                InputEvent::Key { .. } => {
+                InputEvent::Key {
+                    keysym, pressed, ..
+                } => {
+                    if pressed && (VT_FIRST..=VT_LAST).contains(&keysym) {
+                        let vt = (keysym - VT_FIRST + 1) as i32;
+                        if let Err(e) = self.session.change_vt(vt) {
+                            eprintln!("vigil: change vt {vt}: {e}");
+                        }
+                        continue;
+                    }
+                    if pressed && keysym == ESCAPE {
+                        self.queue.borrow_mut().push_back(UiMessage::Cancel);
+                    }
                     if let Some(e) = self.entries.get_mut(self.panel) {
                         e.window.dispatch(event);
                     }
@@ -274,7 +351,18 @@ impl App {
         loop {
             let msg = self.queue.borrow_mut().pop_front();
             let Some(msg) = msg else { break };
-            let mut fan = FanUi(&mut self.entries);
+            if let UiMessage::SelectSession(index) = msg {
+                self.select_session(index);
+                continue;
+            }
+            if let UiMessage::Power(action) = msg {
+                self.power(action);
+                continue;
+            }
+            let mut fan = FanUi {
+                entries: &mut self.entries,
+                snapshot: &mut self.snapshot,
+            };
             if let Err(e) = self.auth.handle(msg, &mut fan) {
                 eprintln!("vigil: auth: {e}");
             }
@@ -283,6 +371,40 @@ impl App {
                 self.signal.stop();
                 return;
             }
+        }
+    }
+
+    /// Power actions go through logind (the greeter's session is active on
+    /// the seat, so polkit's allow_active rule applies — no root needed).
+    /// `VIGIL_POWER_INHIBIT` turns them into log lines for test harnesses.
+    fn power(&mut self, action: PowerAction) {
+        let arg = match action {
+            PowerAction::Reboot => "reboot",
+            PowerAction::Poweroff => "poweroff",
+        };
+        if std::env::var_os("VIGIL_POWER_INHIBIT").is_some() {
+            eprintln!("vigil: power action inhibited: systemctl {arg}");
+            return;
+        }
+        eprintln!("vigil: power: systemctl {arg}");
+        match std::process::Command::new("systemctl").arg(arg).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!("vigil: systemctl {arg} exited {status}"),
+            Err(e) => eprintln!("vigil: systemctl {arg}: {e}"),
+        }
+    }
+
+    /// Session choice is the binary's product logic: remember it, hand the
+    /// command line to the auth machine, and mirror it on every output.
+    fn select_session(&mut self, index: usize) {
+        let Some(session) = self.sessions.get(index) else {
+            return;
+        };
+        self.selected_session = index;
+        self.auth
+            .set_session(session.cmd.clone(), session.env.clone());
+        for e in self.entries.iter_mut() {
+            e.window.set_session_index(index);
         }
     }
 
@@ -313,6 +435,9 @@ impl App {
     }
 
     fn render(&mut self) {
+        if !self.active {
+            return;
+        }
         let mut dead = Vec::new();
         for (i, entry) in self.entries.iter_mut().enumerate() {
             let Entry {
@@ -388,17 +513,33 @@ fn run() -> Result<i32, String> {
         .try_clone_to_owned()
         .map_err(|e| format!("dup input fd: {e}"))?;
 
+    // `--cmd` pins a single fixed session (kiosk/test mode); otherwise the
+    // installed wayland-/x-session entries are offered, defaulting to the
+    // first. The list is never empty (login-shell fallback).
+    let session_list = if cli.cmd.is_empty() {
+        sessions::enumerate()
+    } else {
+        vec![sessions::SessionEntry {
+            name: "Custom".into(),
+            cmd: cli.cmd.clone(),
+            env: Vec::new(),
+        }]
+    };
+
     let mut auth = AuthMachine::connect(cli.socket.as_deref()).map_err(|e| e.to_string())?;
-    auth.set_session(cli.cmd.clone(), Vec::new());
+    auth.set_session(session_list[0].cmd.clone(), session_list[0].env.clone());
 
     let mut event_loop: EventLoop<App> =
         EventLoop::try_new().map_err(|e| format!("event loop: {e}"))?;
     let handle = event_loop.handle();
 
     let mut app = App {
+        session,
         outputs,
         input,
         auth,
+        sessions: session_list,
+        selected_session: 0,
         theme,
         platform,
         entries: Vec::new(),
@@ -410,15 +551,20 @@ fn run() -> Result<i32, String> {
         bg_mode: cli.bg_mode,
         caps_lock: false,
         last_clock: (Instant::now(), clock_text()),
+        snapshot: UiSnapshot::default(),
+        active: true,
         signal: event_loop.get_signal(),
         exit_code: 1,
     };
 
     app.rescan();
     {
-        let mut fan = FanUi(&mut app.entries);
+        let mut fan = FanUi {
+            entries: &mut app.entries,
+            snapshot: &mut app.snapshot,
+        };
         app.auth
-            .start(&cli.user, &mut fan)
+            .begin(cli.user.as_deref(), &mut fan)
             .map_err(|e| e.to_string())?;
     }
 

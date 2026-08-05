@@ -5,8 +5,9 @@
 #
 #   tests/e2e/run.sh [workdir]
 #
-# PASSES when the guest log ends with VIGIL-EXIT:0 after drive.py runs the
-# wrong-then-right password sequence. Cannot run inside a desktop session's
+# PASSES when the guest log ends with VIGIL-EXIT:0 after drive.py walks the
+# full greeter-spec flow (username stage, error path, Escape, mouse-driven
+# session picker, correct password). Cannot run inside a desktop session's
 # DRM devices — it doesn't need to; the guest has its own virtio-gpu.
 #
 # If QEMU fails with "Failed to initialize io_uring: Cannot allocate
@@ -24,7 +25,7 @@ QMP=$WORK/qmp.sock
 rm -f "$QMP"
 VIGIL_REPO=$REPO VIGIL_E2E_DIR=$WORK vng --run --disable-microvm --user root -m 1G --cpus 2 \
     --rwdir="$WORK" \
-    --qemu-opts="-device virtio-gpu-pci -qmp unix:$QMP,server=on,wait=off" \
+    --qemu-opts="-device virtio-gpu-pci -device usb-ehci -device usb-tablet -qmp unix:$QMP,server=on,wait=off" \
     -e "VIGIL_REPO=$REPO VIGIL_E2E_DIR=$WORK $REPO/tests/e2e/guest.sh" &
 VM=$!
 for i in $(seq 120); do grep -q "vigil: output" "$WORK/vigil.log" 2>/dev/null && break; sleep 1; done
@@ -32,4 +33,9 @@ grep -q "vigil: output" "$WORK/vigil.log" 2>/dev/null || { echo "vigil never cam
 sleep 2
 python3 "$REPO/tests/e2e/drive.py" "$QMP" "$WORK"
 wait $VM || true
-grep -q "VIGIL-EXIT:0" "$WORK/vigil.log" && echo "E2E PASS ($WORK)" || { echo "E2E FAIL ($WORK)"; exit 1; }
+# Full-spec pass: clean exit AND the session picked by mouse (Test DE ->
+# /bin/true, not the default-sorted Other DE -> /bin/false) was started.
+grep -q "VIGIL-EXIT:0" "$WORK/vigil.log" || { echo "E2E FAIL: no clean exit ($WORK)"; exit 1; }
+grep -q "START_SESSION cmd=\['/bin/true'\]" "$WORK/vigil.log" || {
+    echo "E2E FAIL: picked session was not started ($WORK)"; exit 1; }
+echo "E2E PASS ($WORK)"

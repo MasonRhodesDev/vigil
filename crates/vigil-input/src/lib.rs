@@ -52,6 +52,19 @@ impl InputSystem {
         })
     }
 
+    /// Session paused (VT switch away): seat devices are being revoked.
+    pub fn suspend(&mut self) {
+        self.libinput.suspend();
+    }
+
+    /// Session re-activated: reopen the seat's devices through the opener.
+    /// Without this, input stays dead after returning from another VT.
+    pub fn resume(&mut self) -> Result<(), InputError> {
+        self.libinput
+            .resume()
+            .map_err(|()| InputError("could not resume libinput after reactivation".into()))
+    }
+
     /// Drain pending libinput events and translate the supported ones.
     pub fn dispatch(&mut self) -> Vec<InputEvent> {
         if self.libinput.dispatch().is_err() {

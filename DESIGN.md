@@ -375,10 +375,33 @@ code; none is scaffolding to be torn out later.
   auth state machine, theme contract v1 + compiled-in default theme.
   Login works end-to-end on real hardware. CI live: golden images, fake
   greetd, vkms.
+- **M1.5 — greeter-spec compliance. ✅ Validated in QEMU 2026-08-05.**
+  Pulled forward from M2 after the first on-metal run proved a
+  fixed-user greeter is not a usable DM. The full spec flow, e2e-driven
+  (username stage → wrong password → Escape → session picker by mouse →
+  login):
+  - *Username stage*: no `--user` → the greeter itself prompts
+    `Username` (greetd is not contacted until submit); Escape cancels
+    the conversation and returns to it; typed text never carries across
+    prompts (secret → visible leak).
+  - *Session selection*: `/usr/share/{wayland-,x}sessions` `.desktop`
+    enumeration (`VIGIL_SESSION_DIRS` override for tests), theme picker
+    cycler, chosen `Exec` + `XDG_SESSION_*`/`XDG_CURRENT_DESKTOP` env to
+    `start_session`. `--cmd` still pins a single kiosk session.
+  - *VT switching*: `XF86Switch_VT_n` keysyms → libseat `change_vt` —
+    mandatory, since taking libinput swallows the kernel's Ctrl+Alt+Fn
+    (first on-metal run needed a reboot to escape). Round trip works:
+    render gates on session active, dropped scenes rebuild on activate
+    (`UiSnapshot` restores auth state), libinput suspend/resume.
+  - *Power actions*: theme Restart/Shut Down buttons → `systemctl`
+    (logind allow_active; `VIGIL_POWER_INHIBIT` for harnesses).
+  - *Error persistence*: auth failure survives the auto-restarted
+    conversation's fresh prompt (re-raised after it, not flash-cleared).
 - **M2 — product completeness.** Runtime theme loading + validation,
   background fit modes, pointer-follows-panel, connector hotplug,
-  VT-switch/suspend re-modeset, session list (wayland-sessions +
-  `NoDisplay`), input completeness (compose, layout config).
+  suspend re-modeset, multi-GPU outputs (on-metal finding: DP-1 lives on
+  the second amdgpu and stays dark), session list polish (remember last
+  choice), input completeness (compose, layout config).
 - **M3 — fidelity + integrations.** `GbmGlPresenter`, `status-banner`
   input channel, packaging (PKGBUILD + RPM spec), user/theming docs.
 - **L0–L2 — the lockscreen track** (§12): independent of M2/M3; shares

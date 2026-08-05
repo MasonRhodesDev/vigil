@@ -28,9 +28,15 @@ impl std::error::Error for AuthError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
+    /// The greeter itself is asking who is logging in; greetd has not been
+    /// contacted yet. Entered only when no fixed user was configured.
+    AwaitingUser,
     AwaitingPrompt,
     Complete,
 }
+
+/// Prompt text for the greeter-owned username stage.
+pub const USERNAME_PROMPT: &str = "Username";
 
 /// One greetd conversation. Connects to the explicitly supplied socket, or
 /// falls back to `$GREETD_SOCK` when no path is supplied.
@@ -40,6 +46,9 @@ pub struct AuthMachine {
     env: Vec<String>,
     state: State,
     user: Option<String>,
+    /// Whether the user was fixed at startup (kiosk/autologin style). When
+    /// false, the machine owns a username stage and Cancel returns to it.
+    fixed_user: bool,
 }
 
 impl AuthMachine {
@@ -57,6 +66,7 @@ impl AuthMachine {
             env: Vec::new(),
             state: State::Idle,
             user: None,
+            fixed_user: false,
         })
     }
 
@@ -70,6 +80,28 @@ impl AuthMachine {
     /// Whether greetd accepted `start_session` and the greeter may finish.
     pub fn is_complete(&self) -> bool {
         self.state == State::Complete
+    }
+
+    /// Begin the greeter conversation. With a fixed `user` (kiosk/autologin
+    /// style) this goes straight to greetd; without one the greeter asks for
+    /// the username first — greetd is not contacted until it is submitted.
+    pub fn begin(&mut self, user: Option<&str>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+        match user {
+            Some(user) => {
+                self.fixed_user = true;
+                self.start(user, ui)
+            }
+            None => {
+                self.fixed_user = false;
+                self.prompt_username(ui);
+                Ok(())
+            }
+        }
+    }
+
+    fn prompt_username(&mut self, ui: &mut dyn AuthUi) {
+        ui.show_prompt(USERNAME_PROMPT, false);
+        self.state = State::AwaitingUser;
     }
 
     /// Begin a conversation for `user`. After a failure or cancellation the
@@ -96,6 +128,14 @@ impl AuthMachine {
     /// a visible or secret prompt is outstanding.
     pub fn handle(&mut self, msg: UiMessage, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         match msg {
+            UiMessage::Respond(username) if self.state == State::AwaitingUser => {
+                let username = username.trim();
+                if username.is_empty() {
+                    self.prompt_username(ui);
+                    return Ok(());
+                }
+                self.start(username, ui)
+            }
             UiMessage::Respond(response) if self.state == State::AwaitingPrompt => {
                 let response = self.transact(
                     &Request::PostAuthMessageResponse {
@@ -105,12 +145,23 @@ impl AuthMachine {
                 )?;
                 self.process_response(response, ui)
             }
-            UiMessage::Cancel if self.state == State::AwaitingPrompt => self.cancel(ui),
-            UiMessage::Respond(_) => Err(AuthError("no authentication prompt is pending".into())),
-            UiMessage::Cancel => Ok(()),
-            UiMessage::SelectSession(_) => {
-                Err(AuthError("session selection is not implemented yet".into()))
+            UiMessage::Cancel if self.state == State::AwaitingPrompt => {
+                self.cancel(ui)?;
+                if !self.fixed_user {
+                    self.prompt_username(ui);
+                }
+                Ok(())
             }
+            UiMessage::Respond(_) => Err(AuthError("no authentication prompt is pending".into())),
+            UiMessage::Cancel => {
+                if self.state == State::Idle && !self.fixed_user {
+                    self.prompt_username(ui);
+                }
+                Ok(())
+            }
+            // Session choice is the binary's product logic (it owns the
+            // enumerated list); it never reaches greetd through here.
+            UiMessage::SelectSession(_) => Ok(()),
             UiMessage::Power(_) => Err(AuthError("power actions are not authentication".into())),
         }
     }
@@ -132,6 +183,10 @@ impl AuthMachine {
         mut response: Response,
         ui: &mut dyn AuthUi,
     ) -> Result<(), AuthError> {
+        // An auth failure restarts the conversation, and the fresh prompt
+        // clears UI messages per the contract — so the failure is re-raised
+        // AFTER that prompt or the user never sees why they are retyping.
+        let mut pending_error: Option<String> = None;
         loop {
             match response {
                 Response::AuthMessage {
@@ -139,6 +194,9 @@ impl AuthMachine {
                     auth_message,
                 } => {
                     ui.show_prompt(&auth_message, false);
+                    if let Some(error) = pending_error.take() {
+                        ui.show_error(&error);
+                    }
                     self.state = State::AwaitingPrompt;
                     return Ok(());
                 }
@@ -147,6 +205,9 @@ impl AuthMachine {
                     auth_message,
                 } => {
                     ui.show_prompt(&auth_message, true);
+                    if let Some(error) = pending_error.take() {
+                        ui.show_error(&error);
+                    }
                     self.state = State::AwaitingPrompt;
                     return Ok(());
                 }
@@ -195,14 +256,8 @@ impl AuthMachine {
                     // so the next submission has a prompt to answer. A create
                     // failure here is surfaced, not looped on.
                     let _ = self.transact(&Request::CancelSession, ui);
+                    pending_error = Some(description);
                     response = self.transact(&Request::CreateSession { username: user }, ui)?;
-                    // Keep the error on screen: re-showing the prompt clears
-                    // messages in the UI contract, so re-raise afterwards.
-                    if let Response::AuthMessage { .. } = &response {
-                        // fall through to the prompt arms with the error kept
-                        // by the theme until the next show_prompt; acceptable
-                        // for M1.
-                    }
                 }
             }
         }
@@ -440,6 +495,13 @@ mod tests {
             .handle(UiMessage::Respond("wrong".into()), &mut ui)
             .unwrap();
         assert!(!machine.is_complete());
+        // The failure must still be on screen after the restarted
+        // conversation re-prompts, not flash-and-cleared by it.
+        assert_eq!(
+            ui.0.last(),
+            Some(&UiCall::Error("bad password".into())),
+            "error must be re-raised after the retry prompt"
+        );
         machine
             .handle(UiMessage::Respond("right".into()), &mut ui)
             .unwrap();
@@ -523,6 +585,72 @@ mod tests {
                 &UiCall::Prompt("Password:".into(), true)
             ]
         );
+    }
+
+    #[test]
+    fn username_stage_asks_before_contacting_greetd() {
+        let Some(server) = FakeServer::spawn(|stream| {
+            // greetd sees nothing until the username is submitted.
+            assert_create(request(stream), "alice");
+            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
+            assert_answer(request(stream), Some("hunter2"));
+            respond(stream, Response::Success);
+            assert_start(request(stream));
+            respond(stream, Response::Success);
+        }) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        machine.begin(None, &mut ui).unwrap();
+        assert_eq!(
+            ui.0.first(),
+            Some(&UiCall::Prompt(USERNAME_PROMPT.into(), false))
+        );
+        // Empty and whitespace submissions re-prompt without a connection.
+        machine
+            .handle(UiMessage::Respond("  ".into()), &mut ui)
+            .unwrap();
+        assert_eq!(
+            ui.0.last(),
+            Some(&UiCall::Prompt(USERNAME_PROMPT.into(), false))
+        );
+        machine
+            .handle(UiMessage::Respond(" alice ".into()), &mut ui)
+            .unwrap();
+        machine
+            .handle(UiMessage::Respond("hunter2".into()), &mut ui)
+            .unwrap();
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn cancel_returns_to_username_stage() {
+        let Some(server) = FakeServer::spawn(|stream| {
+            assert_create(request(stream), "alice");
+            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
+            assert_cancel(request(stream));
+            respond(stream, Response::Success);
+            assert_create(request(stream), "bob");
+            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
+        }) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        machine.begin(None, &mut ui).unwrap();
+        machine
+            .handle(UiMessage::Respond("alice".into()), &mut ui)
+            .unwrap();
+        machine.handle(UiMessage::Cancel, &mut ui).unwrap();
+        assert_eq!(
+            ui.0.last(),
+            Some(&UiCall::Prompt(USERNAME_PROMPT.into(), false))
+        );
+        machine
+            .handle(UiMessage::Respond("bob".into()), &mut ui)
+            .unwrap();
+        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password:".into(), true)));
     }
 
     #[test]

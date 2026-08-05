@@ -52,10 +52,11 @@ impl Scene {
     }
 }
 
-// Card geometry at 1280x800: 400x240 centered -> x 440..840, y 280..520.
-const CARD: (u32, u32, u32, u32) = (445, 285, 835, 515);
-// Input field interior row.
-const FIELD_Y: u32 = 368;
+// Card geometry at 1280x800: 400x300 centered -> x 440..840, y 250..550.
+const CARD: (u32, u32, u32, u32) = (445, 255, 835, 545);
+// Input field interior row (card top 250 + 28 padding + prompt line + 14
+// spacing + half the 44px field).
+const FIELD_Y: u32 = 336;
 
 #[test]
 fn default_theme_state_matrix() {
@@ -133,6 +134,28 @@ fn default_theme_state_matrix() {
         "status banner must render bottom-center"
     );
     scene.window.set_status_banner("");
+
+    // --- session picker: appears once there is more than one session ---
+    let below_field = |s: &Scene| -> Vec<(u8, u8, u8)> {
+        (365..415)
+            .step_by(2)
+            .flat_map(|y| (455..825).step_by(2).map(move |x| (x, y)))
+            .map(|(x, y)| s.px(x, y))
+            .collect()
+    };
+    scene.window.set_sessions(&["Hyprland".into()]);
+    scene.window.set_session_index(0);
+    assert!(scene.render());
+    let single = below_field(&scene);
+    scene
+        .window
+        .set_sessions(&["Hyprland".into(), "Sway".into()]);
+    assert!(scene.render(), "second session must dirty the scene");
+    assert_ne!(
+        single,
+        below_field(&scene),
+        "session picker must render below the input field"
+    );
 
     // --- panel hidden: card region collapses to pure background ---
     scene.window.set_panel_visible(false);

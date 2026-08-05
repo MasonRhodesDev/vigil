@@ -252,6 +252,23 @@ impl OutputWindow {
         self.set_property("status-banner", Value::String(text.into()));
     }
 
+    /// Theme contract `sessions`: display names of the launchable sessions.
+    pub fn set_sessions(&mut self, names: &[String]) {
+        let model: Vec<Value> = names
+            .iter()
+            .map(|n| Value::String(n.as_str().into()))
+            .collect();
+        self.set_property(
+            "sessions",
+            Value::Model(slint::ModelRc::new(slint::VecModel::from(model))),
+        );
+    }
+
+    /// Theme contract `selected-session`.
+    pub fn set_session_index(&mut self, index: usize) {
+        self.set_property("selected-session", Value::Number(index as f64));
+    }
+
     fn set_property(&self, name: &str, value: Value) {
         let result = self.component.set_property(name, value);
         debug_assert!(result.is_ok());

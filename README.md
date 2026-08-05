@@ -7,12 +7,16 @@ preferred mode, and draws an independent [Slint](https://slint.dev) scene on
 each: per-output backgrounds, a login panel that follows the pointer, and
 runtime `.slint` themes with a compiled-in fallback.
 
-**Status: M1 code complete.** The full login works end-to-end in QEMU
-(`tests/e2e/run.sh`): modeset on virtio-gpu, themed login card, keyboard
-via libinput/xkb, wrong-password error with automatic retry, and a
-successful `start_session` handoff. Architecture, interfaces, and
-milestones are in [DESIGN.md](DESIGN.md); next up is the on-metal VT
-test, then M2 (hotplug polish, runtime themes, session list).
+**Status: greeter-spec complete (M1.5).** The full DM flow works
+end-to-end in QEMU (`tests/e2e/run.sh`): username entry, wrong-password
+error with automatic retry, Escape back to the username stage, a
+mouse-driven session picker over the installed
+wayland-sessions/xsessions, VT switching away and back (Ctrl+Alt+Fn),
+power buttons, and a successful `start_session` handoff with
+`XDG_SESSION_*` env. Architecture, interfaces, and milestones are in
+[DESIGN.md](DESIGN.md); next up is the on-metal VT test
+(`tests/vt/run.sh`), then M2 (hotplug polish, multi-GPU, runtime
+themes).
 
 ## The pair
 

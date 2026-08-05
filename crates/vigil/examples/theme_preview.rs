@@ -24,6 +24,8 @@ fn main() {
     window.on_ui_message(std::rc::Rc::new(|m| println!("ui-message: {m:?}")));
     window.set_panel_visible(true);
     window.set_clock("13:37");
+    window.set_sessions(&["Other DE".into(), "Test DE".into()]);
+    window.set_session_index(0);
     use vigil_core::AuthUi;
     window.show_prompt("Password:", true);
 
@@ -43,6 +45,29 @@ fn main() {
         keysym: 0xff0d,
         utf8: Some("\r".into()),
         pressed: true,
+    });
+
+    // Click where the e2e driver aims for the session picker's "›" button;
+    // a `ui-message: SelectSession(1)` line proves the coordinates are right.
+    window.dispatch(vigil_core::InputEvent::PointerAbsolute { x: 797.0, y: 387.0 });
+    window.dispatch(vigil_core::InputEvent::PointerButton {
+        button: 0x110,
+        pressed: true,
+    });
+    window.dispatch(vigil_core::InputEvent::PointerButton {
+        button: 0x110,
+        pressed: false,
+    });
+
+    // And the Restart power button bottom-left: expect Power(Reboot).
+    window.dispatch(vigil_core::InputEvent::PointerAbsolute { x: 70.0, y: 745.0 });
+    window.dispatch(vigil_core::InputEvent::PointerButton {
+        button: 0x110,
+        pressed: true,
+    });
+    window.dispatch(vigil_core::InputEvent::PointerButton {
+        button: 0x110,
+        pressed: false,
     });
 
     vigil_ui::advance_timers();

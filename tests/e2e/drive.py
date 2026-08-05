@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Host-side driver: QMP keyboard injection + screendumps against the VM
-launched by run.sh. Wrong password first (error path), then the correct one;
-success is the guest printing VIGIL-EXIT:0."""
+"""Host-side driver: QMP keyboard/tablet injection + screendumps against the
+VM launched by run.sh, walking the full greeter-spec flow:
+
+  username stage -> wrong password (error path) -> Escape (back to username)
+  -> username again -> cycle the session picker by mouse -> correct password
+  -> start_session
+
+Success is the guest printing VIGIL-EXIT:0 with the picked session's cmd in
+the fake-greetd log (asserted by run.sh)."""
 import json, socket, sys, time
 
 qmp_path, outdir = sys.argv[1], sys.argv[2]
@@ -21,16 +27,61 @@ def cmd(c, **args):
 def sendkey(k):
     return cmd("human-monitor-command", **{"command-line": f"sendkey {k}"})
 
+def typestr(text):
+    for k in text:
+        sendkey(k)
+        time.sleep(0.15)
+
+def click(x, y, width=1280, height=800):
+    """Absolute click via the usb-tablet (QMP abs axes are 0..32767)."""
+    ax, ay = int(x / width * 32767), int(y / height * 32767)
+    events = [
+        {"type": "abs", "data": {"axis": "x", "value": ax}},
+        {"type": "abs", "data": {"axis": "y", "value": ay}},
+    ]
+    cmd("input-send-event", events=events)
+    time.sleep(0.3)
+    cmd("input-send-event", events=[{"type": "btn", "data": {"down": True, "button": "left"}}])
+    time.sleep(0.15)
+    cmd("input-send-event", events=[{"type": "btn", "data": {"down": False, "button": "left"}}])
+    time.sleep(0.3)
+
 cmd("qmp_capabilities")
-cmd("screendump", filename=f"{outdir}/1-login.ppm")
-for k in "wrong":
-    sendkey(k); time.sleep(0.15)
+
+# Username stage.
+cmd("screendump", filename=f"{outdir}/1-username.ppm")
+typestr("demo")
+sendkey("ret"); time.sleep(1.5)
+cmd("screendump", filename=f"{outdir}/2-password.ppm")
+
+# VT round trip: the greeter owns Ctrl+Alt+Fn (libinput swallows the
+# kernel's handling). Away to the VT2 text console, back via the kernel's
+# text-mode switching, and the greeter must re-modeset and redraw.
+sendkey("ctrl-alt-f2"); time.sleep(2.0)
+cmd("screendump", filename=f"{outdir}/2b-vt2.ppm")
+sendkey("ctrl-alt-f1"); time.sleep(2.0)
+cmd("screendump", filename=f"{outdir}/2c-back.ppm")
+
+# Wrong password: error surfaces, conversation auto-restarts.
+typestr("wrong")
 sendkey("ret"); time.sleep(2.0)
-cmd("screendump", filename=f"{outdir}/2-error.ppm")
-for k in ["h", "u", "n", "t", "e", "r", "2"]:
-    sendkey(k); time.sleep(0.15)
+cmd("screendump", filename=f"{outdir}/3-error.ppm")
+
+# Escape returns to the username stage.
+sendkey("esc"); time.sleep(1.0)
+cmd("screendump", filename=f"{outdir}/4-username-again.ppm")
+typestr("demo")
+sendkey("ret"); time.sleep(1.5)
+
+# Cycle the session picker: "›" button center at 1280x800 with the default
+# theme (card 400x300 centered; content column 468..812; row y ~372..402).
+click(797, 387)
+cmd("screendump", filename=f"{outdir}/5-picker.ppm")
+
+# Correct password.
+typestr("hunter2")
 time.sleep(0.4)
-cmd("screendump", filename=f"{outdir}/3-typed.ppm")
+cmd("screendump", filename=f"{outdir}/6-typed.ppm")
 sendkey("ret")
 time.sleep(4)
 print("driven; check guest log for VIGIL-EXIT:0")

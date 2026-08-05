@@ -58,6 +58,15 @@ impl SessionManager {
     pub fn is_active(&self) -> bool {
         self.session.is_active()
     }
+
+    /// Switch to another virtual terminal. A greeter that takes libinput
+    /// swallows the kernel's Ctrl+Alt+Fn handling, so it MUST offer this
+    /// itself or the machine has no way off the greeter VT.
+    pub fn change_vt(&mut self, vt: i32) -> Result<(), SessionError> {
+        self.session
+            .change_vt(vt)
+            .map_err(|e| SessionError(e.to_string()))
+    }
 }
 
 /// Cloneable seat-brokered device opener, so vigil-input can own an opener
