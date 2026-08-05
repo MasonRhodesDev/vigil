@@ -23,6 +23,7 @@ struct Cli {
     theme: Option<PathBuf>,
     background: Option<PathBuf>,
     bg_mode: Option<BackgroundFit>,
+    grace: Option<u64>,
     /// Write one byte here once the compositor confirms the lock (systemd/
     /// hypridle readiness protocol).
     ready_fd: Option<i32>,
@@ -39,6 +40,7 @@ fn parse_cli() -> Result<Cli, String> {
         theme: None,
         background: None,
         bg_mode: None,
+        grace: None,
         ready_fd: None,
         daemonize: false,
     };
@@ -53,6 +55,10 @@ fn parse_cli() -> Result<Cli, String> {
             "--bg-mode" => {
                 let v = value("--bg-mode")?;
                 cli.bg_mode = Some(BackgroundFit::parse(&v).ok_or(format!("unknown bg-mode {v}"))?);
+            }
+            "--grace" => {
+                let v = value("--grace")?;
+                cli.grace = Some(v.parse().map_err(|_| format!("bad --grace {v}"))?);
             }
             "--ready-fd" => {
                 let v = value("--ready-fd")?;
@@ -94,13 +100,49 @@ struct Locker {
     unlocked: bool,
     last_clock: (Instant, String),
     ready_fd: Option<i32>,
+    grace_secs: u64,
+    grace: Option<Grace>,
     /// Auth state to replay onto scenes rebuilt mid-lock (resume/resize
     /// recreates outputs; a fresh theme instance starts blank).
     snapshot: UiSnapshot,
 }
 
+/// Grace window: unlock without auth shortly after locking. Two deadlines
+/// on two clocks: Instant freezes during suspend while SystemTime does
+/// not, so requiring BOTH keeps a pre-suspend grace from surviving into
+/// the resume — the lock-before-sleep guarantee stays intact without
+/// logind integration.
+struct Grace {
+    deadline_mono: Instant,
+    deadline_wall: std::time::SystemTime,
+}
+
+impl Grace {
+    fn new(secs: u64) -> Self {
+        let secs = Duration::from_secs(secs);
+        Self {
+            deadline_mono: Instant::now() + secs,
+            deadline_wall: std::time::SystemTime::now() + secs,
+        }
+    }
+
+    /// Presses dismiss; motion and releases never do.
+    fn dismisses(
+        &self,
+        event: &InputEvent,
+        now_mono: Instant,
+        now_wall: std::time::SystemTime,
+    ) -> bool {
+        let live = now_mono < self.deadline_mono && now_wall < self.deadline_wall;
+        live && matches!(
+            event,
+            InputEvent::Key { pressed: true, .. } | InputEvent::PointerButton { pressed: true, .. }
+        )
+    }
+}
+
 impl Locker {
-    fn new(cli: Cli, clock_format: String) -> Result<Self, String> {
+    fn new(cli: Cli, clock_format: String, grace_secs: u64) -> Result<Self, String> {
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
         let (auth_tx, auth_rx) = mpsc::channel();
@@ -121,6 +163,8 @@ impl Locker {
             unlocked: false,
             last_clock: (Instant::now(), clock_text(&clock_format)),
             ready_fd: cli.ready_fd,
+            grace_secs,
+            grace: None,
             snapshot: {
                 // Show a usable password prompt from the first frame: with
                 // pam_fprintd in the stack the real prompt only arrives
@@ -279,6 +323,14 @@ impl LockSession for Locker {
     }
 
     fn input(&mut self, event: InputEvent) {
+        if let Some(grace) = &self.grace
+            && grace.dismisses(&event, Instant::now(), std::time::SystemTime::now())
+        {
+            // Dismissed inside the grace window: unlock and swallow the
+            // event so the keystroke never reaches a PAM response.
+            self.unlocked = true;
+            return;
+        }
         if let Some(e) = self.entries.get_mut(self.panel) {
             e.window.dispatch(event);
         }
@@ -303,6 +355,9 @@ impl LockSession for Locker {
             let _ = ready.write_all(b"1");
             // Dropping closes the fd; a --daemonize parent unblocks on
             // either the byte or the EOF.
+        }
+        if self.grace_secs > 0 {
+            self.grace = Some(Grace::new(self.grace_secs));
         }
     }
 
@@ -403,7 +458,8 @@ fn main() {
         parsed
     });
     cli.bg_mode = Some(cli.bg_mode.or(fit).unwrap_or_default());
-    let mut locker = match Locker::new(cli, config.look.clock_format) {
+    let grace_secs = cli.grace.unwrap_or(config.lock.grace_secs);
+    let mut locker = match Locker::new(cli, config.look.clock_format, grace_secs) {
         Ok(locker) => locker,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
@@ -425,5 +481,75 @@ fn main() {
             eprintln!("vigil-lock: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn key() -> InputEvent {
+        InputEvent::Key {
+            keysym: 'a' as u32,
+            utf8: Some("a".into()),
+            pressed: true,
+        }
+    }
+
+    #[test]
+    fn press_inside_window_dismisses() {
+        assert!(Grace::new(5).dismisses(&key(), Instant::now(), SystemTime::now()));
+        assert!(Grace::new(5).dismisses(
+            &InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+            },
+            Instant::now(),
+            SystemTime::now(),
+        ));
+    }
+
+    #[test]
+    fn expired_window_never_dismisses() {
+        assert!(!Grace::new(5).dismisses(
+            &key(),
+            Instant::now() + Duration::from_secs(6),
+            SystemTime::now() + Duration::from_secs(6),
+        ));
+    }
+
+    #[test]
+    fn wall_clock_jump_kills_grace() {
+        assert!(!Grace::new(5).dismisses(
+            &key(),
+            Instant::now(),
+            SystemTime::now() + Duration::from_secs(6),
+        ));
+    }
+
+    #[test]
+    fn motion_and_releases_never_dismiss() {
+        let events = [
+            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
+            InputEvent::PointerAbsolute { x: 0.5, y: 0.5 },
+            InputEvent::Key {
+                keysym: 'a' as u32,
+                utf8: Some("a".into()),
+                pressed: false,
+            },
+            InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+            },
+        ];
+        for event in events {
+            assert!(!Grace::new(5).dismisses(&event, Instant::now(), SystemTime::now()));
+        }
+    }
+
+    #[test]
+    fn zero_grace_never_dismisses() {
+        assert!(!Grace::new(0).dismisses(&key(), Instant::now(), SystemTime::now()));
     }
 }

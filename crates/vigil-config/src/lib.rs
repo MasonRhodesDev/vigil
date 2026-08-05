@@ -15,6 +15,7 @@ pub struct Config {
     pub sessions: Sessions,
     pub power: Power,
     pub greeter: Greeter,
+    pub lock: Lock,
     pub output: HashMap<String, OutputOverride>,
 }
 
@@ -87,6 +88,14 @@ pub struct Greeter {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(default)]
+pub struct Lock {
+    /// Seconds after locking during which a key/click unlocks without
+    /// auth (0 = disabled). Never survives suspend (dual-clock deadline).
+    pub grace_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(default)]
 pub struct OutputOverride {
     pub background: Option<PathBuf>,
     pub fit: Option<String>,
@@ -152,6 +161,7 @@ mod tests {
         assert_eq!(config.look.clock_format, "%H:%M");
         assert!(config.power.enabled);
         assert!(config.sessions.remember);
+        assert_eq!(config.lock.grace_secs, 0);
         assert_eq!(
             config.sessions.state_file,
             PathBuf::from("/var/lib/vigil/state.toml")
@@ -183,6 +193,8 @@ enabled = false
 [greeter]
 user = "kiosk"
 cmd = ["sway"]
+[lock]
+grace_secs = 5
 [output."DP-1"]
 background = "/side.png"
 fit = "center"
@@ -207,6 +219,7 @@ fit = "center"
         assert!(!config.power.enabled);
         assert_eq!(config.greeter.user, "kiosk");
         assert_eq!(config.greeter.cmd, ["sway"]);
+        assert_eq!(config.lock.grace_secs, 5);
         let output = &config.output["DP-1"];
         assert_eq!(output.background, Some(PathBuf::from("/side.png")));
         assert_eq!(output.fit.as_deref(), Some("center"));
