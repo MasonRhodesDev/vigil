@@ -17,6 +17,7 @@ use smithay::reexports::input::event::pointer::{ButtonState, PointerEvent};
 use smithay::reexports::input::{LibinputInterface, event};
 use vigil_core::{DeviceOpener, InputEvent, KeymapSettings};
 use xkbcommon::xkb;
+use xkbcommon::xkb::compose;
 
 const REPEAT_DELAY: Duration = Duration::from_millis(500);
 const REPEAT_INTERVAL: Duration = Duration::from_millis(33);
@@ -80,7 +81,9 @@ impl InputSystem {
             match input_event {
                 event::Event::Keyboard(event::KeyboardEvent::Key(key)) => {
                     let pressed = key.key_state() == KeyState::Pressed;
-                    translated.push(self.keyboard.key(key.key(), pressed, Instant::now()));
+                    if let Some(event) = self.keyboard.key(key.key(), pressed, Instant::now()) {
+                        translated.push(event);
+                    }
                 }
                 event::Event::Pointer(PointerEvent::Motion(motion)) => {
                     translated.push(InputEvent::PointerMotion {
@@ -118,11 +121,13 @@ impl InputSystem {
         self.keyboard.tick_repeat(now)
     }
 
-    /// Configure the locale that the compose table will use. Compose
-    /// processing lands in M2; retaining the setting now keeps that work
-    /// behind this crate's established API.
+    /// Rebuilds the compose table immediately; None restores the environment default.
     pub fn set_compose_locale(&mut self, locale: Option<&str>) {
         self.compose_locale = locale.map(str::to_owned);
+        let locale = locale
+            .map(str::to_owned)
+            .unwrap_or_else(default_compose_locale);
+        self.keyboard.compose = compose_state(&locale);
     }
 
     /// Current caps-lock state (theme contract `caps-lock`).
@@ -161,6 +166,7 @@ impl LibinputInterface for OpenerAdapter {
 struct KeyboardState {
     keymap: xkb::Keymap,
     state: xkb::State,
+    compose: Option<compose::State>,
     repeat: Option<Repeat>,
 }
 
@@ -181,6 +187,31 @@ fn compile_keymap(context: &xkb::Context, settings: &KeymapSettings) -> Option<x
         options,
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
+}
+
+/// Build a compose state for `locale`, or None (logged) if the table
+/// does not load — typing must work without compose.
+fn compose_state(locale: &str) -> Option<compose::State> {
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    match compose::Table::new_from_locale(
+        &context,
+        std::ffi::OsStr::new(locale),
+        compose::COMPILE_NO_FLAGS,
+    ) {
+        Ok(table) => Some(compose::State::new(&table, compose::STATE_NO_FLAGS)),
+        Err(()) => {
+            eprintln!("vigil-input: no compose table for locale {locale}; compose disabled");
+            None
+        }
+    }
+}
+
+/// LC_ALL > LC_CTYPE > LANG > "C", the glibc resolution order.
+fn default_compose_locale() -> String {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| "C".into())
 }
 
 impl KeyboardState {
@@ -205,11 +236,12 @@ impl KeyboardState {
         Ok(Self {
             keymap,
             state,
+            compose: compose_state(&default_compose_locale()),
             repeat: None,
         })
     }
 
-    fn key(&mut self, evdev_keycode: u32, pressed: bool, now: Instant) -> InputEvent {
+    fn key(&mut self, evdev_keycode: u32, pressed: bool, now: Instant) -> Option<InputEvent> {
         let keycode = xkb::Keycode::new(evdev_keycode + 8);
         self.state.update_key(
             keycode,
@@ -220,6 +252,39 @@ impl KeyboardState {
             },
         );
 
+        // Compose sees only presses; releases pass straight through (their
+        // keysym text is filtered downstream anyway).
+        if pressed
+            && let Some(state) = &mut self.compose
+            && state.feed(self.state.key_get_one_sym(keycode)) == compose::FeedResult::Accepted
+        {
+            match state.status() {
+                compose::Status::Composing => {
+                    // Mid-sequence keys are swallowed and never arm repeat.
+                    self.repeat = None;
+                    return None;
+                }
+                compose::Status::Composed => {
+                    let utf8 = state.utf8();
+                    let keysym = state.keysym().map(|k| k.raw());
+                    state.reset();
+                    // A composed character does not repeat.
+                    self.repeat = None;
+                    return Some(InputEvent::Key {
+                        keysym: keysym.unwrap_or_else(|| self.state.key_get_one_sym(keycode).raw()),
+                        utf8: utf8.filter(|text| !text.is_empty()),
+                        pressed: true,
+                    });
+                }
+                compose::Status::Cancelled => {
+                    state.reset();
+                    self.repeat = None;
+                    return None;
+                }
+                compose::Status::Nothing => {}
+            }
+        }
+
         if pressed {
             self.repeat = self.keymap.key_repeats(keycode).then_some(Repeat {
                 keycode,
@@ -229,7 +294,7 @@ impl KeyboardState {
             self.repeat = None;
         }
 
-        self.event(keycode, pressed)
+        Some(self.event(keycode, pressed))
     }
 
     fn event(&self, keycode: xkb::Keycode, pressed: bool) -> InputEvent {
@@ -269,6 +334,7 @@ mod tests {
     use super::*;
 
     const KEY_A: u32 = 30;
+    const KEY_GRAVE: u32 = 41;
     const KEY_LEFTSHIFT: u32 = 42;
     const KEY_CAPSLOCK: u32 = 58;
     const KEY_ENTER: u32 = 28;
@@ -285,26 +351,35 @@ mod tests {
         (keysym, utf8, pressed)
     }
 
+    fn intl_keyboard() -> KeyboardState {
+        KeyboardState::new(&KeymapSettings {
+            layout: "us".into(),
+            variant: "intl".into(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
     #[test]
     fn translates_letters_shift_and_return() {
         let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         let now = Instant::now();
         assert_eq!(
-            key_parts(keyboard.key(KEY_A, true, now)),
+            key_parts(keyboard.key(KEY_A, true, now).expect("event")),
             ('a' as u32, Some("a".into()), true)
         );
-        keyboard.key(KEY_A, false, now);
-        keyboard.key(KEY_LEFTSHIFT, true, now);
+        let _ = keyboard.key(KEY_A, false, now);
+        let _ = keyboard.key(KEY_LEFTSHIFT, true, now);
         assert_eq!(
-            key_parts(keyboard.key(KEY_A, true, now)),
+            key_parts(keyboard.key(KEY_A, true, now).expect("event")),
             ('A' as u32, Some("A".into()), true)
         );
-        keyboard.key(KEY_A, false, now);
-        keyboard.key(KEY_LEFTSHIFT, false, now);
+        let _ = keyboard.key(KEY_A, false, now);
+        let _ = keyboard.key(KEY_LEFTSHIFT, false, now);
 
         // xkbcommon represents Return text as carriage return, not line feed.
         assert_eq!(
-            key_parts(keyboard.key(KEY_ENTER, true, now)),
+            key_parts(keyboard.key(KEY_ENTER, true, now).expect("event")),
             (0xff0d, Some("\r".into()), true)
         );
     }
@@ -314,11 +389,11 @@ mod tests {
         let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         let now = Instant::now();
         assert!(!keyboard.caps_lock());
-        keyboard.key(KEY_CAPSLOCK, true, now);
-        keyboard.key(KEY_CAPSLOCK, false, now);
+        let _ = keyboard.key(KEY_CAPSLOCK, true, now);
+        let _ = keyboard.key(KEY_CAPSLOCK, false, now);
         assert!(keyboard.caps_lock());
-        keyboard.key(KEY_CAPSLOCK, true, now);
-        keyboard.key(KEY_CAPSLOCK, false, now);
+        let _ = keyboard.key(KEY_CAPSLOCK, true, now);
+        let _ = keyboard.key(KEY_CAPSLOCK, false, now);
         assert!(!keyboard.caps_lock());
     }
 
@@ -326,7 +401,7 @@ mod tests {
     fn repeat_arms_ticks_rearms_and_releases() {
         let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         let now = Instant::now();
-        keyboard.key(KEY_A, true, now);
+        let _ = keyboard.key(KEY_A, true, now);
         let first = now + REPEAT_DELAY;
         assert_eq!(keyboard.next_repeat_deadline(), Some(first));
         assert_eq!(keyboard.tick_repeat(first).len(), 1);
@@ -334,14 +409,14 @@ mod tests {
             keyboard.next_repeat_deadline(),
             Some(first + REPEAT_INTERVAL)
         );
-        keyboard.key(KEY_A, false, first);
+        let _ = keyboard.key(KEY_A, false, first);
         assert_eq!(keyboard.next_repeat_deadline(), None);
     }
 
     #[test]
     fn non_repeating_key_never_arms() {
         let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
-        keyboard.key(KEY_LEFTSHIFT, true, Instant::now());
+        let _ = keyboard.key(KEY_LEFTSHIFT, true, Instant::now());
         assert_eq!(keyboard.next_repeat_deadline(), None);
     }
 
@@ -353,7 +428,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            key_parts(keyboard.key(KEY_A, true, Instant::now())),
+            key_parts(keyboard.key(KEY_A, true, Instant::now()).expect("event")),
             ('a' as u32, Some("a".into()), true)
         );
     }
@@ -366,7 +441,69 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            key_parts(keyboard.key(KEY_A, true, Instant::now())),
+            key_parts(keyboard.key(KEY_A, true, Instant::now()).expect("event")),
+            ('a' as u32, Some("a".into()), true)
+        );
+    }
+
+    #[test]
+    fn dead_key_composes_accent() {
+        let mut kb = intl_keyboard();
+        if kb.compose.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        assert_eq!(kb.key(KEY_GRAVE, true, now), None);
+        assert!(kb.key(KEY_GRAVE, false, now).is_some());
+        assert_eq!(
+            key_parts(kb.key(KEY_A, true, now).expect("event")),
+            (0x00e0, Some("à".into()), true)
+        );
+    }
+
+    #[test]
+    fn cancelled_sequence_swallows() {
+        let mut kb = intl_keyboard();
+        if kb.compose.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        assert_eq!(kb.key(KEY_GRAVE, true, now), None);
+        assert_eq!(kb.key(KEY_ENTER, true, now), None);
+        assert_eq!(
+            key_parts(kb.key(KEY_ENTER, true, now).expect("event")),
+            (0xff0d, Some("\r".into()), true)
+        );
+    }
+
+    #[test]
+    fn plain_typing_unaffected_with_compose() {
+        let mut kb = intl_keyboard();
+        if kb.compose.is_none() {
+            return;
+        }
+        assert_eq!(
+            key_parts(kb.key(KEY_A, true, Instant::now()).expect("event")),
+            ('a' as u32, Some("a".into()), true)
+        );
+    }
+
+    #[test]
+    fn composing_never_arms_repeat() {
+        let mut kb = intl_keyboard();
+        if kb.compose.is_none() {
+            return;
+        }
+        let _ = kb.key(KEY_GRAVE, true, Instant::now());
+        assert!(kb.next_repeat_deadline().is_none());
+    }
+
+    #[test]
+    fn bad_locale_disables_compose() {
+        let mut kb = KeyboardState::new(&KeymapSettings::default()).unwrap();
+        kb.compose = compose_state("xx_NOT_A_LOCALE.UTF-8");
+        assert_eq!(
+            key_parts(kb.key(KEY_A, true, Instant::now()).expect("event")),
             ('a' as u32, Some("a".into()), true)
         );
     }
