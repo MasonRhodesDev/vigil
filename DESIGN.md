@@ -440,30 +440,29 @@ config-symlink swap for autologin game sessions — are orthogonal: they
 change *which* greetd config is active, never how vigil works. vigil
 needs no knowledge of them.
 
-### Deployment fallback (defense in depth)
+### Deployment fallback — DROPPED (user decision, 2026-08-05)
 
-greetd's crash-loop protection means a greeter that dies immediately
-takes greetd down with it — so hardened deployments point greetd at a
-launcher instead of vigil directly:
+Earlier drafts specified a `vigil-launch` crash-streak launcher that
+demoted to `cage -s -m last -d -- regreet` (greetd's crash-loop
+protection kills greetd if the greeter dies instantly, leaving no
+graphical login). After the full on-metal validation campaign
+(M1.5 spec flow + multi-GPU + QEMU e2e in CI), the founding deployment
+runs vigil directly — no launcher, no cage/regreet on the machine's
+login path.
 
-```toml
-command = "/usr/bin/vigil-launch"
-```
+Accepted consequence and recovery: if a vigil build crash-loops, greetd
+gives up and the machine has no graphical login until fixed from a VT
+getty (Ctrl+Alt+F3) or SSH — restore a known-good
+`/usr/local/bin/vigil` (or point `command =` back at any greeter) and
+`sudo systemctl restart greetd`. `.pre-vigil` backups of both greetd
+configs are left beside them. vigil itself still carries the
+crash-robustness requirement in §1; the launcher pattern above stays
+documented for deployments that want it.
 
-`vigil-launch` (~40-line sh, shipped by the deployment, not this repo):
-run vigil and timestamp the start; on exit, update a crash-streak marker
-(a run ≥60s resets it) and `exec` a fallback greeter in the same session
-process (`cage -s -m last -d -- regreet`); if the marker already shows ≥3
-consecutive fast exits, skip vigil and exec the fallback directly. A
-broken vigil build converges to a working (degraded) greeter within
-seconds and login always works. This is deployment policy: vigil itself
-must still satisfy the crash-robustness requirement in §1.
-
-Concrete touch points for the greetd_game_mode deployment (changed at M1,
-not before): `greetd/config_default.toml` + `greetd/game_mode_login.toml`
-(`command =` lines, in lockstep), `setup.rs verify_greeter_binaries()`
-(add vigil + vigil-launch; keep cage/regreet — they are the fallback),
-packaging deps (vigil package; cage + regreet stay forever).
+Concrete touch points for the greetd_game_mode deployment (applied
+2026-08-05): `greetd/config_default.toml` + `greetd/game_mode_login.toml`
+(`command =` lines, in lockstep — the config-symlink swap itself is
+untouched), packaging deps (vigil package).
 
 Runtime deps of the vigil binary: libseat, libinput, libxkbcommon
 (+ libudev). No GL, no GBM, no Wayland libraries in the MVP.
@@ -578,11 +577,23 @@ required surface, so old themes keep working.
   hotplug-while-locked, clock. Exits only after locked → auth success →
   unlock → roundtrip. Render states join the existing headless matrix;
   PAM state machine tested against scripted conversations.
-- **L2 — hyprlock-essentials parity:** grace period, `--ready-fd`/
-  daemonize-after-locked, login1 Lock/SetLockedHint, Power policy,
-  `/etc/pam.d/vigil-lock` packaging + systemd user unit. Fingerprint is
-  deferred: `auth include login` already routes pam_fprintd prompts
-  through our conversation verbatim; a native fprintd listener is additive.
+- **L2 — hyprlock-essentials parity:** grace period, login1
+  Lock/SetLockedHint, Power policy, `/etc/pam.d/vigil-lock` packaging +
+  systemd user unit. Fingerprint is deferred: `auth include login`
+  already routes pam_fprintd prompts through our conversation verbatim;
+  a native fprintd listener is additive.
+  - *`--ready-fd` / `--daemonize`: ✅ done 2026-08-05.* `--ready-fd N`
+    writes one byte the moment the compositor confirms `locked` (the
+    security property: from that event the session cannot be revealed
+    without `unlock_and_destroy`, painted or not). `--daemonize`
+    re-execs the locker as a child with its stdout on a socketpair and
+    exits 0 only on the ready byte — EOF first propagates the child's
+    failure code, so callers can trust exit 0 == screen secured. That
+    is the blocking `before_sleep_cmd` hypridle needs: its logind sleep
+    inhibitor is held until the command returns, so a suspend can never
+    outrun the lock. Wired into hypr-DE's hypridle.conf (which
+    previously had NO before_sleep_cmd — lid-close before the idle
+    timeout suspended unlocked).
 
 ### Lock-specific risks
 

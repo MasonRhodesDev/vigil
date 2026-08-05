@@ -21,6 +21,13 @@ struct Cli {
     theme: Option<PathBuf>,
     background: Option<PathBuf>,
     bg_mode: BackgroundFit,
+    /// Write one byte here once the compositor confirms the lock (systemd/
+    /// hypridle readiness protocol).
+    ready_fd: Option<i32>,
+    /// Re-exec as a background child and exit 0 only once it is locked —
+    /// the blocking form a `before_sleep_cmd` needs: the caller's sleep
+    /// inhibitor is not released until the screen is already secured.
+    daemonize: bool,
 }
 
 fn parse_cli() -> Result<Cli, String> {
@@ -29,6 +36,8 @@ fn parse_cli() -> Result<Cli, String> {
         theme: None,
         background: None,
         bg_mode: BackgroundFit::default(),
+        ready_fd: None,
+        daemonize: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -41,6 +50,11 @@ fn parse_cli() -> Result<Cli, String> {
                 let v = value("--bg-mode")?;
                 cli.bg_mode = BackgroundFit::parse(&v).ok_or(format!("unknown bg-mode {v}"))?;
             }
+            "--ready-fd" => {
+                let v = value("--ready-fd")?;
+                cli.ready_fd = Some(v.parse().map_err(|_| format!("bad --ready-fd {v}"))?);
+            }
+            "--daemonize" => cli.daemonize = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -74,6 +88,7 @@ struct Locker {
     attempt: Option<PamAttempt>,
     unlocked: bool,
     last_clock: (Instant, String),
+    ready_fd: Option<i32>,
 }
 
 impl Locker {
@@ -96,6 +111,7 @@ impl Locker {
             attempt: None,
             unlocked: false,
             last_clock: (Instant::now(), clock_text()),
+            ready_fd: cli.ready_fd,
         })
     }
 
@@ -244,6 +260,17 @@ impl LockSession for Locker {
 
     fn locked(&mut self) {
         eprintln!("vigil-lock: session locked");
+        // Readiness: the compositor holds the lock from this moment — it
+        // will never reveal the session again without unlock_and_destroy,
+        // even if we have not painted yet. Safe to let a suspend proceed.
+        if let Some(fd) = self.ready_fd.take() {
+            use std::io::Write;
+            use std::os::fd::FromRawFd;
+            let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
+            let _ = ready.write_all(b"1");
+            // Dropping closes the fd; a --daemonize parent unblocks on
+            // either the byte or the EOF.
+        }
     }
 
     fn tick(&mut self) {
@@ -282,6 +309,45 @@ fn clock_text() -> String {
         .unwrap_or_default()
 }
 
+/// The blocking half of `--daemonize`: spawn the real locker as a child
+/// whose stdout is our socketpair, and return only when it reports locked
+/// (one byte) or dies first (EOF). Exit 0 here == the session IS locked.
+fn daemonize() -> ! {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let result = (|| -> Result<i32, String> {
+        let (mut parent_end, child_end) =
+            UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let mut child = std::process::Command::new(exe)
+            .args(std::env::args().skip(1).filter(|a| a != "--daemonize"))
+            .args(["--ready-fd", "1"])
+            .stdout(std::process::Stdio::from(OwnedFd::from(child_end)))
+            .spawn()
+            .map_err(|e| format!("spawn locker: {e}"))?;
+        let mut byte = [0u8; 1];
+        match parent_end.read_exact(&mut byte) {
+            Ok(()) => Ok(0),
+            Err(_) => {
+                // EOF without the ready byte: the locker died before the
+                // compositor confirmed the lock. Propagate its exit code so
+                // the caller knows the screen is NOT secured.
+                let status = child.wait().map_err(|e| format!("wait locker: {e}"))?;
+                Ok(status.code().unwrap_or(1).max(1))
+            }
+        }
+    })();
+    match result {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("vigil-lock: daemonize: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let cli = match parse_cli() {
         Ok(cli) => cli,
@@ -290,6 +356,9 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if cli.daemonize {
+        daemonize();
+    }
     let mut locker = match Locker::new(cli) {
         Ok(locker) => locker,
         Err(e) => {
