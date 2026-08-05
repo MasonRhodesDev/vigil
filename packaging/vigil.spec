@@ -33,6 +33,7 @@ BuildRequires:  libdrm-devel
 BuildRequires:  mesa-libgbm-devel
 BuildRequires:  pam-devel
 BuildRequires:  clang-devel
+BuildRequires:  fontconfig-devel
 # The greeter runs as greetd's `greeter` user on greetd's socket.
 Requires:       greetd
 
