@@ -31,10 +31,14 @@ export component DefaultTheme inherits Window {
     default-font-size: 15px;
     forward-focus: input;
 
+    // Local: whether a secret prompt is temporarily revealed.
+    property <bool> reveal: false;
+
     // A new prompt is a new question: never carry typed text across (a
-    // password typed at a secret prompt must not surface at a visible one).
-    changed prompt-text => { input.text = ""; }
-    changed prompt-is-secret => { input.text = ""; }
+    // password typed at a secret prompt must not surface at a visible one),
+    // and never carry the reveal state either.
+    changed prompt-text => { input.text = ""; root.reveal = false; }
+    changed prompt-is-secret => { input.text = ""; root.reveal = false; }
 
     Image {
         source: root.background-source;
@@ -84,15 +88,37 @@ export component DefaultTheme inherits Window {
 
                 input := TextInput {
                     x: 14px;
-                    width: parent.width - 28px;
+                    width: parent.width - 28px - (root.prompt-is-secret ? 56px : 0px);
                     vertical-alignment: center;
                     color: #eef2f7;
                     font-size: 16px;
                     single-line: true;
-                    input-type: root.prompt-is-secret ? InputType.password : InputType.text;
+                    input-type: root.prompt-is-secret && !root.reveal
+                        ? InputType.password : InputType.text;
                     accepted => {
                         root.submit(self.text);
                         self.text = "";
+                    }
+                }
+
+                // Reveal toggle, secret prompts only.
+                if root.prompt-is-secret: Rectangle {
+                    x: parent.width - 56px;
+                    width: 48px;
+                    height: parent.height - 12px;
+                    y: 6px;
+                    background: root.reveal ? #33455a : transparent;
+                    border-radius: 6px;
+                    Text {
+                        text: root.reveal ? "hide" : "show";
+                        color: #9fb3c8;
+                        width: 100%;
+                        height: 100%;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    TouchArea {
+                        clicked => { root.reveal = !root.reveal; }
                     }
                 }
             }

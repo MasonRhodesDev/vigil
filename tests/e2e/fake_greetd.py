@@ -38,6 +38,14 @@ while True:
         if req.get("response") == password:
             send(c, {"type": "success"})
         else:
+            # Diagnostic: length only, NEVER contents — a tester may type a
+            # real password by muscle memory.
+            got = req.get("response") or ""
+            print(
+                "fake-greetd: wrong password (got %d chars, expected %d)"
+                % (len(got), len(password)),
+                flush=True,
+            )
             send(c, {"type": "error", "error_type": "auth_error", "description": "Wrong password"})
     elif t == "start_session":
         print("fake-greetd: START_SESSION cmd=%s" % (req.get("cmd"),), flush=True)

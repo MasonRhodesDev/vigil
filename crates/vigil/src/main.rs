@@ -286,6 +286,8 @@ impl App {
     fn apply_panel(&mut self) {
         for (i, e) in self.entries.iter_mut().enumerate() {
             e.window.set_panel_visible(i == self.panel);
+            // The panel output is by construction the one under the pointer.
+            e.window.set_cursor_visible(i == self.panel);
         }
     }
 

@@ -61,9 +61,35 @@ pub struct OutputWindow {
     scale: f32,
     pointer_x: f64,
     pointer_y: f64,
+    cursor_visible: bool,
     adapter: Rc<MinimalSoftwareWindow>,
     component: ComponentInstance,
 }
+
+/// The software cursor (DESIGN.md §3: scene element, no cursor plane).
+/// `X` outline, `#` fill, `.` transparent; scaled by the output's HiDPI
+/// factor at blit time.
+const CURSOR: &[&[u8]] = &[
+    b"X...........",
+    b"XX..........",
+    b"X#X.........",
+    b"X##X........",
+    b"X###X.......",
+    b"X####X......",
+    b"X#####X.....",
+    b"X######X....",
+    b"X#######X...",
+    b"X########X..",
+    b"X#########X.",
+    b"X#####XXXXXX",
+    b"X##X##X.....",
+    b"X#X.X##X....",
+    b"XX..X##X....",
+    b"X....X##X...",
+    b".....X##X...",
+    b"......X##X..",
+    b"......XX....",
+];
 
 impl OutputWindow {
     /// Bind an interpreter component to the adapter captured while it was instantiated.
@@ -90,9 +116,20 @@ impl OutputWindow {
             scale,
             pointer_x: 0.0,
             pointer_y: 0.0,
+            cursor_visible: false,
             adapter,
             component,
         })
+    }
+
+    /// Whether this output draws the software cursor (the one under the
+    /// pointer). A change or a pointer move dirties the scene so the cursor
+    /// repaints even when nothing else changed.
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        if self.cursor_visible != visible {
+            self.cursor_visible = visible;
+            self.adapter.request_redraw();
+        }
     }
 
     /// Set the pre-fit background bitmap (from `background` below).
@@ -121,6 +158,9 @@ impl OutputWindow {
                 window.dispatch_event(WindowEvent::PointerMoved {
                     position: self.pointer_position(),
                 });
+                if self.cursor_visible {
+                    self.adapter.request_redraw();
+                }
             }
             InputEvent::PointerAbsolute { x, y } => {
                 self.pointer_x = x.clamp(0.0, self.width.saturating_sub(1) as f64);
@@ -128,6 +168,9 @@ impl OutputWindow {
                 window.dispatch_event(WindowEvent::PointerMoved {
                     position: self.pointer_position(),
                 });
+                if self.cursor_visible {
+                    self.adapter.request_redraw();
+                }
             }
             InputEvent::PointerButton { button, pressed } => {
                 let button = pointer_button(button);
@@ -184,9 +227,40 @@ impl OutputWindow {
             return false;
         };
         let pixel_stride = target.stride / 4;
-        self.adapter.draw_if_needed(|renderer| {
+        let drew = self.adapter.draw_if_needed(|renderer| {
             renderer.render(pixels, pixel_stride);
-        })
+        });
+        if drew && self.cursor_visible {
+            self.blit_cursor(pixels, pixel_stride);
+        }
+        drew
+    }
+
+    /// Overlay the software cursor into the just-rendered frame, scaled to
+    /// the output's HiDPI factor (nearest neighbor — it is a pointer).
+    fn blit_cursor(&self, pixels: &mut [Xrgb8888], pixel_stride: usize) {
+        let scale = f64::from(self.scale.max(1.0));
+        let out_w = (CURSOR[0].len() as f64 * scale) as usize;
+        let out_h = (CURSOR.len() as f64 * scale) as usize;
+        let (base_x, base_y) = (self.pointer_x as usize, self.pointer_y as usize);
+        for oy in 0..out_h {
+            let py = base_y + oy;
+            if py >= self.height as usize {
+                break;
+            }
+            let row = CURSOR[((oy as f64 / scale) as usize).min(CURSOR.len() - 1)];
+            for ox in 0..out_w {
+                let px = base_x + ox;
+                if px >= self.width as usize {
+                    break;
+                }
+                match row[((ox as f64 / scale) as usize).min(row.len() - 1)] {
+                    b'X' => pixels[py * pixel_stride + px] = Xrgb8888(0),
+                    b'#' => pixels[py * pixel_stride + px] = Xrgb8888(0x00ff_ffff),
+                    _ => {}
+                }
+            }
+        }
     }
 
     fn pointer_position(&self) -> LogicalPosition {
