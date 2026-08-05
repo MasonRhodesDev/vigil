@@ -10,7 +10,7 @@ vigil is **in production on this machine**: it is the greeter (greetd
 runs `/usr/bin/vigil`) and the lockscreen (hypridle's `lock_cmd` and
 `before_sleep_cmd` run `vigil-lock --daemonize`). Both ship as packages
 — COPR `solaris765/vigil` and the `[mason]` pacman repo — built by CI
-from tags. `v0.2.1` is the current release.
+from tags. `v0.2.1` is the current release and what is installed.
 
 Founded 2026-08-03; greeter and lock both went live 2026-08-05.
 
@@ -25,9 +25,9 @@ Founded 2026-08-03; greeter and lock both went live 2026-08-05.
 | State | `/var/lib/vigil/state.toml` | tmpfiles.d, greeter-writable; last user + session |
 | PAM | `/etc/pam.d/vigil-lock` | pass-through hook (`auth include login`) — policy is the operator's |
 
-**Loose end:** `/usr/local/bin/vigil{,-lock}` still exist from the
-hand-install era and **shadow the packaged binaries in PATH**. They
-should be deleted (Mason's call, not done yet).
+The hand-install era is fully retired: the `/usr/local/bin` copies are
+deleted, everything on PATH is packaged, and `dnf update vigil` is the
+upgrade path.
 
 ## The PM loop (Mason's standing direction)
 
