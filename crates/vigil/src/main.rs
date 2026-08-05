@@ -100,6 +100,16 @@ fn resolve(cli: &Cli, config: &Config) -> Resolved {
     }
 }
 
+/// Index of the remembered session, by name; unknown/missing = first.
+fn remembered_index(
+    sessions: &[sessions::SessionEntry],
+    state: Option<&vigil_config::State>,
+) -> usize {
+    state
+        .and_then(|s| sessions.iter().position(|e| e.name == s.session))
+        .unwrap_or(0)
+}
+
 /// One live output: its swapchain and its scene.
 struct Entry {
     id: OutputId,
@@ -151,6 +161,9 @@ struct App {
     auth: AuthMachine,
     sessions: Vec<sessions::SessionEntry>,
     selected_session: usize,
+    remember: bool,
+    state_file: PathBuf,
+    remembered_user: Option<String>,
     theme: Theme,
     platform: VigilPlatform,
     entries: Vec<Entry>,
@@ -266,6 +279,9 @@ impl App {
         let names: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
         window.set_sessions(&names);
         window.set_session_index(self.selected_session);
+        if let Some(user) = &self.remembered_user {
+            window.set_user_name(user);
+        }
         self.snapshot.apply(&mut window);
         let queue = self.queue.clone();
         window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
@@ -393,6 +409,15 @@ impl App {
             }
             if self.auth.is_complete() {
                 self.exit_code = 0;
+                if self.remember
+                    && let Some(user) = self.auth.user()
+                {
+                    vigil_config::State {
+                        user: user.to_owned(),
+                        session: self.sessions[self.selected_session].name.clone(),
+                    }
+                    .store(&self.state_file);
+                }
                 self.signal.stop();
                 return;
             }
@@ -578,8 +603,25 @@ fn run() -> Result<i32, String> {
         }]
     };
 
+    // Kiosk --cmd mode never remembers; otherwise preselect last session and
+    // let an empty username submit the last user.
+    let remember = resolved.cmd.is_empty() && config.sessions.remember;
+    let remembered = remember
+        .then(|| vigil_config::State::load(&config.sessions.state_file))
+        .flatten();
+    let initial_session = remembered_index(&session_list, remembered.as_ref());
+
     let mut auth = AuthMachine::connect(cli.socket.as_deref()).map_err(|e| e.to_string())?;
-    auth.set_session(session_list[0].cmd.clone(), session_list[0].env.clone());
+    auth.set_default_user(
+        remembered
+            .as_ref()
+            .map(|s| s.user.clone())
+            .filter(|u| !u.is_empty()),
+    );
+    auth.set_session(
+        session_list[initial_session].cmd.clone(),
+        session_list[initial_session].env.clone(),
+    );
 
     let mut event_loop: EventLoop<App> =
         EventLoop::try_new().map_err(|e| format!("event loop: {e}"))?;
@@ -591,7 +633,13 @@ fn run() -> Result<i32, String> {
         input,
         auth,
         sessions: session_list,
-        selected_session: 0,
+        selected_session: initial_session,
+        remember,
+        state_file: config.sessions.state_file.clone(),
+        remembered_user: remembered
+            .as_ref()
+            .map(|s| s.user.clone())
+            .filter(|u| !u.is_empty()),
         theme,
         platform,
         entries: Vec::new(),
@@ -682,6 +730,42 @@ fn main() {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn remembered_index_matches_name() {
+        let sessions = vec![
+            sessions::SessionEntry {
+                name: "A".into(),
+                cmd: vec!["x".into()],
+                env: Vec::new(),
+            },
+            sessions::SessionEntry {
+                name: "B".into(),
+                cmd: vec!["x".into()],
+                env: Vec::new(),
+            },
+        ];
+        let state = vigil_config::State {
+            user: String::new(),
+            session: "B".into(),
+        };
+        assert_eq!(remembered_index(&sessions, Some(&state)), 1);
+    }
+
+    #[test]
+    fn remembered_index_unknown_falls_back() {
+        let sessions = vec![sessions::SessionEntry {
+            name: "A".into(),
+            cmd: vec!["x".into()],
+            env: Vec::new(),
+        }];
+        let state = vigil_config::State {
+            user: String::new(),
+            session: "Z".into(),
+        };
+        assert_eq!(remembered_index(&sessions, Some(&state)), 0);
+        assert_eq!(remembered_index(&sessions, None), 0);
+    }
 
     #[test]
     fn cli_overrides_config() {

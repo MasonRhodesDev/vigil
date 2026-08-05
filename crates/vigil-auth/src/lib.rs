@@ -46,6 +46,7 @@ pub struct AuthMachine {
     env: Vec<String>,
     state: State,
     user: Option<String>,
+    default_user: Option<String>,
     /// Whether the user was fixed at startup (kiosk/autologin style). When
     /// false, the machine owns a username stage and Cancel returns to it.
     fixed_user: bool,
@@ -66,6 +67,7 @@ impl AuthMachine {
             env: Vec::new(),
             state: State::Idle,
             user: None,
+            default_user: None,
             fixed_user: false,
         })
     }
@@ -75,6 +77,17 @@ impl AuthMachine {
     pub fn set_session(&mut self, command: Vec<String>, env: Vec<String>) {
         self.command = command;
         self.env = env;
+    }
+
+    /// Username submitted with an empty field falls back to this (the
+    /// remembered last user); with none set, empty re-prompts.
+    pub fn set_default_user(&mut self, user: Option<String>) {
+        self.default_user = user;
+    }
+
+    /// The user of the current conversation, once known.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
     }
 
     /// Whether greetd accepted `start_session` and the greeter may finish.
@@ -131,6 +144,9 @@ impl AuthMachine {
             UiMessage::Respond(username) if self.state == State::AwaitingUser => {
                 let username = username.trim();
                 if username.is_empty() {
+                    if let Some(default) = self.default_user.clone() {
+                        return self.start(&default, ui);
+                    }
                     self.prompt_username(ui);
                     return Ok(());
                 }
@@ -622,6 +638,25 @@ mod tests {
             .handle(UiMessage::Respond("hunter2".into()), &mut ui)
             .unwrap();
         assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn empty_username_submits_default() {
+        let Some(server) = FakeServer::spawn(|stream| {
+            assert_create(request(stream), "alice");
+            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
+        }) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_default_user(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        machine.begin(None, &mut ui).unwrap();
+        machine
+            .handle(UiMessage::Respond("   ".into()), &mut ui)
+            .unwrap();
+        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password:".into(), true)));
+        assert_eq!(machine.user(), Some("alice"));
     }
 
     #[test]

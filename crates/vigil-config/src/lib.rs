@@ -133,6 +133,56 @@ impl Config {
     }
 }
 
+/// Persisted greeter state (`[sessions] state_file`): who logged in last
+/// and which session they picked. Stored by NAME, not index — list order
+/// changes as sessions are installed/removed.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct State {
+    pub user: String,
+    pub session: String,
+}
+
+impl State {
+    /// None on any failure: missing file is silent, anything else logs.
+    pub fn load(path: &Path) -> Option<State> {
+        let source = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                eprintln!("vigil-config: {}: {e}", path.display());
+                return None;
+            }
+        };
+        match toml::from_str(&source) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                eprintln!("vigil-config: {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Best-effort write (tmp + rename): a read-only or absent state dir
+    /// must never break login, so failures log and return.
+    pub fn store(&self, path: &Path) {
+        let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let body = format!(
+            "user = \"{}\"\nsession = \"{}\"\n",
+            escape(&self.user),
+            escape(&self.session)
+        );
+        let tmp = path.with_extension("tmp");
+        let result = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = result {
+            eprintln!(
+                "vigil-config: cannot store state at {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
 fn load_file(path: &Path) -> Option<Config> {
     match std::fs::read_to_string(path) {
         Ok(source) => match parse(&source) {
@@ -246,5 +296,26 @@ fit = "center"
         std::fs::write(&path, "[look]\nclock_format = \"%S\"").unwrap();
         assert_eq!(Config::load_layered(Some(&path)).look.clock_format, "%S");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn state_round_trip_with_escapes() {
+        let tmp =
+            std::env::temp_dir().join(format!("vigil-state-test-{}.toml", std::process::id()));
+        let state = State {
+            user: "al\"ice".into(),
+            session: "Test DE".into(),
+        };
+        state.store(&tmp);
+        assert_eq!(State::load(&tmp), Some(state));
+        std::fs::remove_file(tmp).unwrap();
+    }
+
+    #[test]
+    fn state_load_missing_is_none() {
+        assert_eq!(
+            State::load(Path::new("/nonexistent/vigil-state.toml")),
+            None
+        );
     }
 }
