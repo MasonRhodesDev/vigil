@@ -142,7 +142,9 @@ impl AuthUi for FanUi<'_> {
 
 struct App {
     session: SessionManager,
-    outputs: OutputManager,
+    /// One manager per GPU (outputs can span cards); index == the
+    /// `OutputId` namespace.
+    outputs: Vec<OutputManager>,
     input: InputSystem,
     auth: AuthMachine,
     sessions: Vec<sessions::SessionEntry>,
@@ -171,18 +173,23 @@ impl App {
             SessionEvent::Pause => {
                 self.active = false;
                 self.input.suspend();
-                self.outputs.pause();
+                for gpu in self.outputs.iter_mut() {
+                    gpu.pause();
+                }
             }
             SessionEvent::Activate => {
                 self.active = true;
                 if let Err(e) = self.input.resume() {
                     eprintln!("vigil: {e}");
                 }
-                let _ = self.outputs.activate();
+                for gpu in self.outputs.iter_mut() {
+                    let _ = gpu.activate();
+                }
                 // A render racing the pause can hit DeviceInactive and drop
                 // its entry, and no udev event replays a VT switch — so any
-                // output the manager still knows but we lost gets rebuilt.
-                for id in self.outputs.ids() {
+                // output a manager still knows but we lost gets rebuilt.
+                let known: Vec<OutputId> = self.outputs.iter().flat_map(|gpu| gpu.ids()).collect();
+                for id in known {
                     if !self.entries.iter().any(|e| e.id == id)
                         && let Err(e) = self.add_output(id)
                     {
@@ -200,13 +207,13 @@ impl App {
     }
 
     fn rescan(&mut self) {
-        let events = match self.outputs.scan() {
-            Ok(events) => events,
-            Err(e) => {
-                eprintln!("vigil: hotplug scan failed: {e}");
-                return;
+        let mut events = Vec::new();
+        for gpu in self.outputs.iter_mut() {
+            match gpu.scan() {
+                Ok(batch) => events.extend(batch),
+                Err(e) => eprintln!("vigil: hotplug scan failed: {e}"),
             }
-        };
+        }
         for event in events {
             match event {
                 OutputEvent::Added(id, _) => {
@@ -221,9 +228,18 @@ impl App {
         self.rebuild_row();
     }
 
+    /// The manager owning `id` (its namespace is the vec index).
+    fn gpu_for(&mut self, id: OutputId) -> Result<&mut OutputManager, String> {
+        let index = (id.0 >> 24) as usize;
+        self.outputs
+            .get_mut(index)
+            .ok_or_else(|| format!("no GPU {index} for output {id:?}"))
+    }
+
     fn add_output(&mut self, id: OutputId) -> Result<(), String> {
-        let info = self.outputs.info(id).cloned().ok_or("no info for output")?;
-        let surface = self.outputs.create_surface(id).map_err(|e| e.to_string())?;
+        let gpu = self.gpu_for(id)?;
+        let info = gpu.info(id).cloned().ok_or("no info for output")?;
+        let surface = gpu.create_surface(id).map_err(|e| e.to_string())?;
         let presenter = DumbBufferPresenter::new(surface).map_err(|e| e.to_string())?;
         let component = self.theme.instantiate().map_err(|e| e.to_string())?;
         let adapter = self
@@ -251,8 +267,11 @@ impl App {
         window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
 
         eprintln!(
-            "vigil: output {} {}x{}",
-            info.connector, info.width, info.height
+            "vigil: output {} {}x{} (gpu {})",
+            info.connector,
+            info.width,
+            info.height,
+            id.0 >> 24
         );
         self.entries.push(Entry {
             id,
@@ -499,10 +518,28 @@ fn run() -> Result<i32, String> {
 
     let (session, notifier) = SessionManager::new().map_err(|e| e.to_string())?;
     let seat = session.seat_name();
-    let gpu = vigil_outputs::primary_gpu_path(&seat).map_err(|e| e.to_string())?;
     let mut session = session;
-    let fd = session.open_device(&gpu).map_err(|e| e.to_string())?;
-    let (outputs, _drm_notifier) = OutputManager::new(fd).map_err(|e| e.to_string())?;
+
+    // One manager per GPU on the seat, primary first — outputs can span
+    // cards (found on the founding machine: the dock's DP hangs off the
+    // dGPU while boot_vga drives the panel). A card that fails to open or
+    // init is skipped with a log line, not fatal: a greeter with fewer
+    // monitors beats no greeter.
+    let mut outputs = Vec::new();
+    for path in vigil_outputs::all_gpu_paths(&seat).map_err(|e| e.to_string())? {
+        let namespace = outputs.len() as u32;
+        let manager = session
+            .open_device(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|fd| OutputManager::new(fd, namespace).map_err(|e| e.to_string()));
+        match manager {
+            Ok((manager, _drm_notifier)) => outputs.push(manager),
+            Err(e) => eprintln!("vigil: skipping GPU {}: {e}", path.display()),
+        }
+    }
+    if outputs.is_empty() {
+        return Err("no usable GPU on the seat".into());
+    }
     let udev = vigil_outputs::udev_monitor(&seat).map_err(|e| e.to_string())?;
 
     let platform = VigilPlatform::install().map_err(|e| e.to_string())?;

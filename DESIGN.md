@@ -399,9 +399,14 @@ code; none is scaffolding to be torn out later.
     conversation's fresh prompt (re-raised after it, not flash-cleared).
 - **M2 — product completeness.** Runtime theme loading + validation,
   background fit modes, pointer-follows-panel, connector hotplug,
-  suspend re-modeset, multi-GPU outputs (on-metal finding: DP-1 lives on
-  the second amdgpu and stays dark), session list polish (remember last
-  choice), input completeness (compose, layout config).
+  suspend re-modeset, session list polish (remember last choice), input
+  completeness (compose, layout config).
+  - *Multi-GPU outputs: ✅ done 2026-08-05* (on-metal finding: DP-1
+    lives on the second amdgpu and stayed dark). One `OutputManager`
+    per seat GPU, primary first; `OutputId` namespaced by GPU index
+    (connector handles are only unique per device); unopenable cards
+    are skipped, not fatal. E2E boots two virtio-gpu devices and
+    asserts outputs on both.
 - **M3 — fidelity + integrations.** `GbmGlPresenter`, `status-banner`
   input channel, packaging (PKGBUILD + RPM spec), user/theming docs.
 - **L0–L2 — the lockscreen track** (§12): independent of M2/M3; shares

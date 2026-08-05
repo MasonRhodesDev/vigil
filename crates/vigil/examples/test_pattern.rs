@@ -36,7 +36,7 @@ fn main() {
         .unwrap_or_else(|e| panic!("open {path}: {e}"));
     let fd: OwnedFd = file.into();
 
-    let (mut outputs, _notifier) = OutputManager::new(fd).expect("drm device");
+    let (mut outputs, _notifier) = OutputManager::new(fd, 0).expect("drm device");
     let events = outputs.scan().expect("connector scan");
 
     let mut presenters = Vec::new();

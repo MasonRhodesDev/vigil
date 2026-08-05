@@ -31,6 +31,25 @@ pub fn primary_gpu_path(seat: &str) -> Result<std::path::PathBuf, OutputsError> 
         .ok_or_else(|| OutputsError(format!("no GPU found on seat {seat}")))
 }
 
+/// Every GPU DRM node on the seat, primary (boot_vga) first, the rest in
+/// stable path order. Outputs may span cards (laptop dGPU driving a port),
+/// so the greeter runs one [`OutputManager`] per entry.
+pub fn all_gpu_paths(seat: &str) -> Result<Vec<std::path::PathBuf>, OutputsError> {
+    let primary = smithay::backend::udev::primary_gpu(seat).map_err(err)?;
+    let mut paths = smithay::backend::udev::all_gpus(seat).map_err(err)?;
+    paths.sort();
+    if let Some(primary) = primary
+        && let Some(pos) = paths.iter().position(|p| *p == primary)
+    {
+        let primary = paths.remove(pos);
+        paths.insert(0, primary);
+    }
+    if paths.is_empty() {
+        return Err(OutputsError(format!("no GPU found on seat {seat}")));
+    }
+    Ok(paths)
+}
+
 /// A udev monitor for the seat's DRM subsystem.
 pub fn udev_monitor(seat: &str) -> Result<UdevMonitor, OutputsError> {
     smithay::backend::udev::UdevBackend::new(seat).map_err(err)
@@ -62,14 +81,18 @@ pub struct OutputManager {
     device: DrmDevice,
     scanner: DrmScanner,
     entries: HashMap<OutputId, Entry>,
+    /// Distinguishes this GPU's [`OutputId`]s from other cards' (connector
+    /// handles are only unique per device).
+    namespace: u32,
 }
 
 impl OutputManager {
     /// Take ownership of an opened DRM node (from vigil-session in
     /// production; opened directly in dev harnesses) and prepare it for
-    /// modesetting. Returns the notifier the binary registers for vblank
-    /// events.
-    pub fn new(fd: OwnedFd) -> Result<(Self, DrmDeviceNotifier), OutputsError> {
+    /// modesetting. `namespace` is the GPU's index (0 for a single-GPU
+    /// setup) and is folded into every `OutputId`. Returns the notifier the
+    /// binary registers for vblank events.
+    pub fn new(fd: OwnedFd, namespace: u32) -> Result<(Self, DrmDeviceNotifier), OutputsError> {
         let fd = DrmDeviceFd::new(DeviceFd::from(fd));
         let (device, notifier) = DrmDevice::new(fd, true).map_err(err)?;
         Ok((
@@ -77,9 +100,20 @@ impl OutputManager {
                 device,
                 scanner: DrmScanner::new(),
                 entries: HashMap::new(),
+                namespace,
             },
             notifier,
         ))
+    }
+
+    fn make_id(&self, handle: connector::Handle) -> OutputId {
+        let raw: u32 = handle.into();
+        OutputId(self.namespace << 24 | (raw & 0x00ff_ffff))
+    }
+
+    /// The GPU index this manager was created with (`OutputId` namespace).
+    pub fn namespace(&self) -> u32 {
+        self.namespace
     }
 
     /// Rescan connectors (startup and on udev hotplug). Returns lifecycle
@@ -95,7 +129,7 @@ impl OutputManager {
                     let Some(mode) = preferred_mode(&connector) else {
                         continue;
                     };
-                    let id = OutputId(connector.handle().into());
+                    let id = self.make_id(connector.handle());
                     let (w, h) = mode.size();
                     let info = OutputInfo {
                         connector: connector_name(&connector),
@@ -116,7 +150,7 @@ impl OutputManager {
                     events.push(OutputEvent::Added(id, info));
                 }
                 DrmScanEvent::Disconnected { connector, .. } => {
-                    let id = OutputId(connector.handle().into());
+                    let id = self.make_id(connector.handle());
                     if self.entries.remove(&id).is_some() {
                         events.push(OutputEvent::Removed(id));
                     }

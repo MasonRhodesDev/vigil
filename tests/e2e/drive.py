@@ -11,6 +11,10 @@ the fake-greetd log (asserted by run.sh)."""
 import json, socket, sys, time
 
 qmp_path, outdir = sys.argv[1], sys.argv[2]
+# Total layout width in pixels: the usb-tablet's absolute axes span ALL
+# outputs side by side, so click math needs the full row, not one screen.
+ROW_WIDTH = int(sys.argv[3]) if len(sys.argv) > 3 else 1280
+ROW_HEIGHT = 800
 s = socket.socket(socket.AF_UNIX)
 s.connect(qmp_path)
 f = s.makefile("rw")
@@ -32,8 +36,9 @@ def typestr(text):
         sendkey(k)
         time.sleep(0.15)
 
-def click(x, y, width=1280, height=800):
+def click(x, y, width=None, height=None):
     """Absolute click via the usb-tablet (QMP abs axes are 0..32767)."""
+    width, height = width or ROW_WIDTH, height or ROW_HEIGHT
     ax, ay = int(x / width * 32767), int(y / height * 32767)
     events = [
         {"type": "abs", "data": {"axis": "x", "value": ax}},
