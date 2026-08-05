@@ -14,7 +14,10 @@
 set -uo pipefail
 
 DIR=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=$DIR/target/debug/vigil
+# Release build: debug-profile software rendering at 4K is slow enough to
+# starve the event loop (libinput overflows and drops keystrokes).
+BIN=$DIR/target/release/vigil
+[ -x "$BIN" ] || BIN=$DIR/target/debug/vigil
 SOCK=${XDG_RUNTIME_DIR:-/tmp}/vigil-vt-test.sock
 PASSWORD=${VIGIL_TEST_PASSWORD:-vigil-test}
 LOG=${VIGIL_VT_LOG:-$HOME/.cache/vigil-vt-test}
@@ -29,7 +32,8 @@ if [[ ${CTTY} != tty[0-9]* && ${XDG_SESSION_TYPE:-} != tty && -z ${XDG_VTNR:-} ]
     echo "  (ctty=${CTTY:-?} XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unset} XDG_VTNR=${XDG_VTNR:-unset})" >&2
     echo "  continuing anyway — vigil will fail cleanly if the seat is unavailable" >&2
 fi
-[ -x "$BIN" ] || { echo "build first: cargo build -p vigil" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "build first: cargo build --release -p vigil" >&2; exit 1; }
+echo "vigil-vt: using $BIN"
 
 mkdir -p "$(dirname "$LOG")"
 python3 "$DIR/tests/e2e/fake_greetd.py" "$SOCK" "$PASSWORD" >"$LOG.greetd.log" 2>&1 &

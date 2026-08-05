@@ -45,9 +45,11 @@ impl VigilPlatform {
 
 impl Platform for VigilPlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
-        let adapter = // Full repaint per frame: correct with a double-buffered swapchain we
-        // don't age-track yet; damage-tracked swapchain is a later optimization.
-        MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        // Partial repaints into the window's persistent shadow buffer; each
+        // present then copies the shadow to the (possibly alternating)
+        // output buffer. Software-rendering a full 4K scene per frame is
+        // what made the first on-metal run drop keystrokes.
+        let adapter = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
         self.adapters.borrow_mut().push(adapter.clone());
         Ok(adapter)
     }
@@ -62,6 +64,13 @@ pub struct OutputWindow {
     pointer_x: f64,
     pointer_y: f64,
     cursor_visible: bool,
+    /// Persistent scene buffer (tightly packed XRGB8888). Slint partial-
+    /// repaints into it; presents copy it out. Keeps cursor motion at
+    /// memcpy cost instead of a full software re-render.
+    shadow: Vec<u8>,
+    /// The next present must copy out even if the scene didn't change
+    /// (cursor moved/toggled, or a fresh swapchain buffer needs filling).
+    needs_present: bool,
     adapter: Rc<MinimalSoftwareWindow>,
     component: ComponentInstance,
 }
@@ -117,18 +126,20 @@ impl OutputWindow {
             pointer_x: 0.0,
             pointer_y: 0.0,
             cursor_visible: false,
+            shadow: vec![0u8; width as usize * height as usize * 4],
+            needs_present: true,
             adapter,
             component,
         })
     }
 
     /// Whether this output draws the software cursor (the one under the
-    /// pointer). A change or a pointer move dirties the scene so the cursor
-    /// repaints even when nothing else changed.
+    /// pointer). The cursor is composited at present time, never rendered
+    /// by Slint, so toggling or moving it costs a copy, not a re-render.
     pub fn set_cursor_visible(&mut self, visible: bool) {
         if self.cursor_visible != visible {
             self.cursor_visible = visible;
-            self.adapter.request_redraw();
+            self.needs_present = true;
         }
     }
 
@@ -159,7 +170,7 @@ impl OutputWindow {
                     position: self.pointer_position(),
                 });
                 if self.cursor_visible {
-                    self.adapter.request_redraw();
+                    self.needs_present = true;
                 }
             }
             InputEvent::PointerAbsolute { x, y } => {
@@ -169,7 +180,7 @@ impl OutputWindow {
                     position: self.pointer_position(),
                 });
                 if self.cursor_visible {
-                    self.adapter.request_redraw();
+                    self.needs_present = true;
                 }
             }
             InputEvent::PointerButton { button, pressed } => {
@@ -220,20 +231,39 @@ impl OutputWindow {
             }
             return false;
         }
-        let Ok(pixels) = bytemuck::try_cast_slice_mut::<u8, Xrgb8888>(target.buffer) else {
-            if debug {
-                eprintln!("vigil-ui: buffer not 4-byte aligned");
+        // Slint partial-repaints into the persistent shadow (ReusedBuffer
+        // contract: same buffer, contents preserved between renders).
+        let shadow_stride = self.width as usize;
+        {
+            let shadow_pixels = bytemuck::cast_slice_mut::<u8, Xrgb8888>(&mut self.shadow);
+            if self.adapter.draw_if_needed(|renderer| {
+                renderer.render(shadow_pixels, shadow_stride);
+            }) {
+                self.needs_present = true;
             }
-            return false;
-        };
-        let pixel_stride = target.stride / 4;
-        let drew = self.adapter.draw_if_needed(|renderer| {
-            renderer.render(pixels, pixel_stride);
-        });
-        if drew && self.cursor_visible {
-            self.blit_cursor(pixels, pixel_stride);
         }
-        drew
+        if !self.needs_present {
+            return false;
+        }
+        // Copy out row-wise (the target may be an alternating swapchain
+        // buffer with a wider stride), then composite the cursor on top —
+        // the shadow itself never contains it.
+        let row_bytes = self.width as usize * 4;
+        for y in 0..self.height as usize {
+            target.buffer[y * target.stride..y * target.stride + row_bytes]
+                .copy_from_slice(&self.shadow[y * row_bytes..(y + 1) * row_bytes]);
+        }
+        if self.cursor_visible {
+            let Ok(pixels) = bytemuck::try_cast_slice_mut::<u8, Xrgb8888>(target.buffer) else {
+                if debug {
+                    eprintln!("vigil-ui: buffer not 4-byte aligned");
+                }
+                return true;
+            };
+            self.blit_cursor(pixels, target.stride / 4);
+        }
+        self.needs_present = false;
+        true
     }
 
     /// Overlay the software cursor into the just-rendered frame, scaled to
