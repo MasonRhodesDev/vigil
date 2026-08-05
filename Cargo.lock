@@ -4540,6 +4540,7 @@ dependencies = [
  "image",
  "slint",
  "slint-interpreter",
+ "vigil-config",
  "vigil-core",
 ]
 

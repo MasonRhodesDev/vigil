@@ -78,32 +78,18 @@ fn parse_cli() -> Result<Cli, String> {
 struct Resolved {
     user: Option<String>,
     theme: Option<PathBuf>,
-    background: Option<PathBuf>,
-    bg_mode: BackgroundFit,
     cmd: Vec<String>,
     power_enabled: bool,
     clock_format: String,
 }
 
 fn resolve(cli: &Cli, config: &Config) -> Resolved {
-    let fit = config.look.fit.as_deref().and_then(|s| {
-        let parsed = BackgroundFit::parse(s);
-        if parsed.is_none() {
-            eprintln!("vigil: config: unknown fit `{s}`");
-        }
-        parsed
-    });
     Resolved {
         user: cli
             .user
             .clone()
             .or_else(|| (!config.greeter.user.is_empty()).then(|| config.greeter.user.clone())),
         theme: cli.theme.clone().or_else(|| config.look.theme.clone()),
-        background: cli
-            .background
-            .clone()
-            .or_else(|| config.look.background.clone()),
-        bg_mode: cli.bg_mode.or(fit).unwrap_or_default(),
         cmd: if cli.cmd.is_empty() {
             config.greeter.cmd.clone()
         } else {
@@ -172,8 +158,7 @@ struct App {
     cursor: (f64, f64),
     panel: usize,
     queue: Rc<RefCell<VecDeque<UiMessage>>>,
-    background: Option<PathBuf>,
-    bg_mode: BackgroundFit,
+    looks: vigil_ui::Looks,
     power_enabled: bool,
     clock_format: String,
     caps_lock: bool,
@@ -268,8 +253,9 @@ impl App {
             OutputWindow::new(id, info.width, info.height, info.scale, adapter, component)
                 .map_err(|e| e.to_string())?;
 
-        if let Some(path) = &self.background {
-            match vigil_ui::background(path, self.bg_mode, info.width, info.height) {
+        let (background, fit) = self.looks.for_connector(&info.connector);
+        if let Some(path) = &background {
+            match vigil_ui::background(path, fit, info.width, info.height) {
                 Ok(rgba) => window.set_background(rgba, info.width, info.height),
                 Err(e) => eprintln!("vigil: background: {e}"),
             }
@@ -613,8 +599,11 @@ fn run() -> Result<i32, String> {
         cursor: (0.0, 0.0),
         panel: 0,
         queue: Rc::new(RefCell::new(VecDeque::new())),
-        background: resolved.background.clone(),
-        bg_mode: resolved.bg_mode,
+        looks: vigil_ui::Looks {
+            cli_background: cli.background.clone(),
+            cli_fit: cli.bg_mode,
+            config: config.clone(),
+        },
         power_enabled: resolved.power_enabled,
         clock_format: resolved.clock_format.clone(),
         caps_lock: false,
@@ -712,8 +701,6 @@ mod config_tests {
         .unwrap();
         let resolved = resolve(&cli, &config);
         assert_eq!(resolved.theme, Some(PathBuf::from("/cli.slint")));
-        assert_eq!(resolved.background, Some(PathBuf::from("/cfg.png")));
-        assert_eq!(resolved.bg_mode, BackgroundFit::Tile);
         assert_eq!(resolved.user.as_deref(), Some("kiosk"));
         assert_eq!(resolved.cmd, ["x"]);
     }
@@ -752,7 +739,6 @@ mod config_tests {
         };
         let config = Config::default();
         let resolved = resolve(&cli, &config);
-        assert_eq!(resolved.bg_mode, BackgroundFit::Fill);
         assert!(resolved.power_enabled);
         assert_eq!(resolved.clock_format, "%H:%M");
         assert_eq!(resolved.user, None);

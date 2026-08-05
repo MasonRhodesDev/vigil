@@ -14,7 +14,7 @@ use vigil_core::{
 };
 use vigil_pam::PamAttempt;
 use vigil_theme::Theme;
-use vigil_ui::{OutputWindow, UiSnapshot, VigilPlatform};
+use vigil_ui::{Looks, OutputWindow, UiSnapshot, VigilPlatform};
 use vigil_wayland::{LockOutcome, LockSession};
 
 struct Cli {
@@ -89,8 +89,7 @@ struct Locker {
     entries: Vec<Entry>,
     panel: usize,
     user: String,
-    background: Option<PathBuf>,
-    bg_mode: BackgroundFit,
+    looks: Looks,
     clock_format: String,
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
@@ -142,9 +141,10 @@ impl Grace {
 }
 
 impl Locker {
-    fn new(cli: Cli, clock_format: String, grace_secs: u64) -> Result<Self, String> {
+    fn new(cli: Cli, config: Config, grace_secs: u64) -> Result<Self, String> {
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
+        let clock_format = config.look.clock_format.clone();
         let (auth_tx, auth_rx) = mpsc::channel();
         Ok(Self {
             platform,
@@ -152,8 +152,11 @@ impl Locker {
             entries: Vec::new(),
             panel: 0,
             user: cli.user,
-            background: cli.background,
-            bg_mode: cli.bg_mode.unwrap_or_default(),
+            looks: Looks {
+                cli_background: cli.background.clone(),
+                cli_fit: cli.bg_mode,
+                config,
+            },
             clock_format: clock_format.clone(),
             caps_lock: false,
             queue: Rc::default(),
@@ -271,8 +274,9 @@ impl LockSession for Locker {
             let mut window =
                 OutputWindow::new(id, info.width, info.height, info.scale, adapter, component)
                     .map_err(|e| e.to_string())?;
-            if let Some(path) = &self.background {
-                match vigil_ui::background(path, self.bg_mode, info.width, info.height) {
+            let (background, fit) = self.looks.for_connector(&info.connector);
+            if let Some(path) = &background {
+                match vigil_ui::background(path, fit, info.width, info.height) {
                     Ok(rgba) => window.set_background(rgba, info.width, info.height),
                     Err(e) => eprintln!("vigil-lock: background: {e}"),
                 }
@@ -449,17 +453,8 @@ fn main() {
     }
     let config = Config::load_layered(cli.config.as_deref());
     cli.theme = cli.theme.or(config.look.theme.clone());
-    cli.background = cli.background.or(config.look.background.clone());
-    let fit = config.look.fit.as_deref().and_then(|s| {
-        let parsed = BackgroundFit::parse(s);
-        if parsed.is_none() {
-            eprintln!("vigil-lock: config: unknown fit `{s}`");
-        }
-        parsed
-    });
-    cli.bg_mode = Some(cli.bg_mode.or(fit).unwrap_or_default());
     let grace_secs = cli.grace.unwrap_or(config.lock.grace_secs);
-    let mut locker = match Locker::new(cli, config.look.clock_format, grace_secs) {
+    let mut locker = match Locker::new(cli, config, grace_secs) {
         Ok(locker) => locker,
         Err(e) => {
             eprintln!("vigil-lock: {e}");

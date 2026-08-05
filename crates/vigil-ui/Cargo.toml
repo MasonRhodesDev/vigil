@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 vigil-core.workspace = true
+vigil-config = { workspace = true }
 slint.workspace = true
 slint-interpreter.workspace = true
 image.workspace = true

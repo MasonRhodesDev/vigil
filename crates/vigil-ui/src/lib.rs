@@ -465,6 +465,44 @@ fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
     Some(key.into())
 }
 
+/// Per-output background resolution, one precedence rule per dimension:
+/// CLI > `[output."NAME"]` override > `[look]` > default. An override keys
+/// on the exact connector name; with two GPUs exposing the same name
+/// (e.g. two DP-1s) the override applies to every one of them.
+pub struct Looks {
+    pub cli_background: Option<std::path::PathBuf>,
+    pub cli_fit: Option<BackgroundFit>,
+    pub config: vigil_config::Config,
+}
+
+impl Looks {
+    pub fn for_connector(&self, connector: &str) -> (Option<std::path::PathBuf>, BackgroundFit) {
+        let over = self.config.output.get(connector);
+        let background = self
+            .cli_background
+            .clone()
+            .or_else(|| over.and_then(|o| o.background.clone()))
+            .or_else(|| self.config.look.background.clone());
+        let fit = self
+            .cli_fit
+            .or_else(|| over.and_then(|o| parse_fit(o.fit.as_deref(), connector)))
+            .or_else(|| parse_fit(self.config.look.fit.as_deref(), "look"))
+            .unwrap_or_default();
+        (background, fit)
+    }
+}
+
+/// Parse a config fit string, logging bad values (they fall through to the
+/// next precedence level rather than erroring).
+fn parse_fit(value: Option<&str>, context: &str) -> Option<BackgroundFit> {
+    let value = value?;
+    let parsed = BackgroundFit::parse(value);
+    if parsed.is_none() {
+        eprintln!("vigil-ui: config: unknown fit `{value}` ({context})");
+    }
+    parsed
+}
+
 /// Decode `_path` and produce an RGBA bitmap of exactly `_out_w x _out_h`
 /// per `_fit` (stretch/fill/fit/center/tile). Pure image math (M2 completes
 /// all five modes; M1 ships fill).
@@ -569,6 +607,7 @@ pub fn duration_until_next_timer_update() -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::path::PathBuf;
     use std::pin::pin;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
@@ -580,6 +619,58 @@ mod tests {
     const RED: Rgba<u8> = Rgba([255, 0, 0, 255]);
     const BLUE: Rgba<u8> = Rgba([0, 0, 255, 255]);
     const BLACK: Rgba<u8> = Rgba([0, 0, 0, 255]);
+    const BASE: &str = "[look]\nbackground = \"/global.png\"\nfit = \"tile\"\n[output.\"DP-1\"]\nbackground = \"/side.png\"\nfit = \"center\"";
+
+    fn looks(toml: &str, cli_bg: Option<&str>, cli_fit: Option<BackgroundFit>) -> Looks {
+        Looks {
+            cli_background: cli_bg.map(PathBuf::from),
+            cli_fit,
+            config: vigil_config::parse(toml).unwrap(),
+        }
+    }
+
+    #[test]
+    fn override_beats_look() {
+        assert_eq!(
+            looks(BASE, None, None).for_connector("DP-1"),
+            (Some("/side.png".into()), BackgroundFit::Center)
+        );
+    }
+
+    #[test]
+    fn missing_override_falls_to_look() {
+        assert_eq!(
+            looks(BASE, None, None).for_connector("eDP-2"),
+            (Some("/global.png".into()), BackgroundFit::Tile)
+        );
+    }
+
+    #[test]
+    fn cli_beats_override() {
+        assert_eq!(
+            looks(BASE, Some("/cli.png"), Some(BackgroundFit::Fit)).for_connector("DP-1"),
+            (Some("/cli.png".into()), BackgroundFit::Fit)
+        );
+    }
+
+    #[test]
+    fn bad_override_fit_falls_back_to_look_fit() {
+        let (_, fit) = looks(
+            "[output.\"DP-1\"]\nfit = \"cover\"\n[look]\nfit = \"tile\"",
+            None,
+            None,
+        )
+        .for_connector("DP-1");
+        assert_eq!(fit, BackgroundFit::Tile);
+    }
+
+    #[test]
+    fn no_config_no_cli_defaults() {
+        assert_eq!(
+            looks("", None, None).for_connector("DP-1"),
+            (None, BackgroundFit::Fill)
+        );
+    }
 
     fn stripes() -> DynamicImage {
         DynamicImage::ImageRgba8(RgbaImage::from_fn(
