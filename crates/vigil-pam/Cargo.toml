@@ -2,6 +2,7 @@
 name = "vigil-pam"
 description = "PAM conversation worker behind the AuthUi seam (vigil-lock)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

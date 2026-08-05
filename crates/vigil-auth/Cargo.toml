@@ -2,6 +2,7 @@
 name = "vigil-auth"
 description = "greetd_ipc auth state machine; drives AuthUi"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

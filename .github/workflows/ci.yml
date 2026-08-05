@@ -13,7 +13,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libseat-dev libinput-dev libxkbcommon-dev \
-            libudev-dev libgbm-dev libdrm-dev libfontconfig-dev
+            libudev-dev libgbm-dev libdrm-dev libfontconfig-dev libclang-dev libpam0g-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
@@ -35,7 +35,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libseat-dev libinput-dev libxkbcommon-dev \
-            libudev-dev libgbm-dev libdrm-dev libfontconfig-dev
+            libudev-dev libgbm-dev libdrm-dev libfontconfig-dev libclang-dev libpam0g-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Load vkms

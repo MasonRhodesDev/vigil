@@ -2,6 +2,7 @@
 name = "vigil-core"
 description = "Cross-crate interface surface: trait seams and shared types only"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

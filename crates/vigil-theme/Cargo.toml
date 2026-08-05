@@ -2,6 +2,7 @@
 name = "vigil-theme"
 description = "Theme contract validation, slint-interpreter loader, compiled-in default"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

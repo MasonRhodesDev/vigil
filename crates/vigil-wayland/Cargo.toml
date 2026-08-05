@@ -2,6 +2,7 @@
 name = "vigil-wayland"
 description = "sctk session-lock glue, WlShm presenter, seat input for vigil-lock"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

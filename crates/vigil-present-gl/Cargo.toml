@@ -2,6 +2,7 @@
 name = "vigil-present-gl"
 description = "GbmGlPresenter (M3): FemtoVG over GBM/EGL behind the same Presenter trait"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
