@@ -115,7 +115,15 @@ impl Locker {
             unlocked: false,
             last_clock: (Instant::now(), clock_text()),
             ready_fd: cli.ready_fd,
-            snapshot: UiSnapshot::default(),
+            snapshot: {
+                // Show a usable password prompt from the first frame: with
+                // pam_fprintd in the stack the real prompt only arrives
+                // after fingerprint resolves, and typed responses buffer
+                // until PAM asks — the card must not sit there blank.
+                let mut snapshot = UiSnapshot::default();
+                snapshot.on_prompt("Password", true);
+                snapshot
+            },
         })
     }
 
@@ -129,6 +137,9 @@ impl Locker {
     fn apply_panel(&mut self) {
         for (i, e) in self.entries.iter_mut().enumerate() {
             e.window.set_panel_visible(i == self.panel);
+            // Hyprland does not draw a cursor over lock surfaces a client
+            // that sets no cursor image — the software cursor covers it.
+            e.window.set_cursor_visible(i == self.panel);
         }
     }
 
@@ -219,6 +230,7 @@ impl LockSession for Locker {
             window.set_clock(&self.last_clock.1);
             window.set_caps_lock(self.caps_lock);
             window.set_panel_visible(false);
+            window.set_user_name(&self.user);
             self.snapshot.apply(&mut window);
             let queue = self.queue.clone();
             window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));

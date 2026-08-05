@@ -356,6 +356,14 @@ impl OutputWindow {
         self.set_property("status-banner", Value::String(text.into()));
     }
 
+    /// Optional theme property `user-name` (not in contract v1): set
+    /// best-effort, silently skipped on themes that lack it.
+    pub fn set_user_name(&mut self, name: &str) {
+        let _ = self
+            .component
+            .set_property("user-name", Value::String(name.into()));
+    }
+
     /// Theme contract `sessions`: display names of the launchable sessions.
     pub fn set_sessions(&mut self, names: &[String]) {
         let model: Vec<Value> = names
