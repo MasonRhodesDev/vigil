@@ -12,6 +12,7 @@ repository = "https://github.com/MasonRhodesDev/vigil"
 [workspace.dependencies]
 vigil-core = { path = "crates/vigil-core" }
 vigil-config = { path = "crates/vigil-config" }
+monitor-profiles = { git = "https://github.com/MasonRhodesDev/monitor-profiles", rev = "fa693cb" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 smithay = { version = "0.7.0", default-features = false }

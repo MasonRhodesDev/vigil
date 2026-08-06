@@ -187,6 +187,54 @@ impl OutputManager {
         self.entries.get(&id).map(|e| &e.info)
     }
 
+    /// Every mode the connector reports, as `(width, height, refresh_hz)`.
+    /// The binary picks one for a profile and calls [`Self::set_mode`].
+    pub fn modes(&self, id: OutputId) -> Vec<(u32, u32, u32)> {
+        self.entries
+            .get(&id)
+            .and_then(|e| self.scanner.connectors().get(&e.connector))
+            .map(|conn| {
+                conn.modes()
+                    .iter()
+                    .map(|m| {
+                        let (w, h) = m.size();
+                        (w as u32, h as u32, m.vrefresh())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Choose the mode used by the next [`Self::create_surface`]. Must be one
+    /// of [`Self::modes`]; an unknown mode is refused so a profile typo cannot
+    /// hand DRM a mode the connector never advertised. Updates the cached
+    /// `OutputInfo` so the binary sees the geometry it will actually get.
+    pub fn set_mode(&mut self, id: OutputId, mode: (u32, u32, u32)) -> Result<(), OutputsError> {
+        let connector = self
+            .entries
+            .get(&id)
+            .map(|e| e.connector)
+            .ok_or_else(|| OutputsError(format!("unknown output {id:?}")))?;
+        let found = self
+            .scanner
+            .connectors()
+            .get(&connector)
+            .and_then(|conn| {
+                conn.modes().iter().copied().find(|m| {
+                    let (w, h) = m.size();
+                    (w as u32, h as u32, m.vrefresh()) == mode
+                })
+            })
+            .ok_or_else(|| OutputsError(format!("output {id:?} has no mode {mode:?}")))?;
+        let entry = self.entries.get_mut(&id).expect("checked above");
+        let (w, h) = found.size();
+        entry.mode = found;
+        entry.info.width = w as u32;
+        entry.info.height = h as u32;
+        entry.info.refresh_mhz = found.vrefresh() * 1000;
+        Ok(())
+    }
+
     /// Session paused (VT switch/suspend): stop touching DRM.
     pub fn pause(&mut self) {
         self.device.pause();
@@ -255,8 +303,14 @@ fn read_edid(device: &DrmDevice, handle: connector::Handle) -> Option<Vec<u8>> {
     None
 }
 
+/// PNP ids whose full vendor name libdisplay-info substitutes. Deliberately
+/// tiny: only ids present in this ecosystem's profiles, so a description
+/// built here prefix-matches a selector written against Hyprland. Any other
+/// id passes through verbatim (BNQ and BOE already do).
+const PNP_VENDORS: &[(&str, &str)] = &[("DEL", "Dell Inc."), ("GSM", "LG Electronics")];
+
 /// `(make, model)` from an EDID block: the PNP id packed into bytes 8-9
-/// (three 5-bit letters, big-endian) and the 0xFC descriptor's model name.
+/// (three 5-bit letters, big-endian) and the display description tail.
 /// Every malformed input yields `None`s rather than panicking — this parses
 /// bytes a monitor supplied.
 fn parse_edid(edid: &[u8]) -> (Option<String>, Option<String>) {
@@ -269,14 +323,35 @@ fn parse_edid(edid: &[u8]) -> (Option<String>, Option<String>) {
         (1..=26).contains(&v).then(|| (b'A' + v - 1) as char)
     };
     let make = match (letter(10), letter(5), letter(0)) {
-        (Some(a), Some(b), Some(c)) => Some(format!("{a}{b}{c}")),
+        (Some(a), Some(b), Some(c)) => {
+            let pnp = format!("{a}{b}{c}");
+            let vendor = PNP_VENDORS
+                .iter()
+                .find(|(id, _)| *id == pnp)
+                .map(|(_, name)| *name)
+                .unwrap_or(&pnp);
+            Some(vendor.to_owned())
+        }
         _ => None,
     };
-    // Four 18-byte descriptors start at byte 54; type 0xFC is the model name.
-    let model = (0..4)
+    let mut model = descriptor(edid, 0xfc)
+        .unwrap_or_else(|| format!("0x{:04X}", u16::from_le_bytes([edid[10], edid[11]])));
+    if let Some(serial) = descriptor(edid, 0xff) {
+        model.push(' ');
+        model.push_str(&serial);
+    }
+    (make, Some(model))
+}
+
+/// Text from one of the four 18-byte display descriptors.
+fn descriptor(edid: &[u8], tag: u8) -> Option<String> {
+    if edid.len() < 128 {
+        return None;
+    }
+    (0..4)
         .map(|i| 54 + i * 18)
         .filter(|&at| at + 18 <= edid.len())
-        .find(|&at| edid[at..at + 3] == [0, 0, 0] && edid[at + 3] == 0xfc)
+        .find(|&at| edid[at..at + 3] == [0, 0, 0] && edid[at + 3] == tag)
         .and_then(|at| {
             let text: String = edid[at + 5..at + 18]
                 .iter()
@@ -285,8 +360,7 @@ fn parse_edid(edid: &[u8]) -> (Option<String>, Option<String>) {
                 .collect();
             let text = text.trim().to_owned();
             (!text.is_empty()).then_some(text)
-        });
-    (make, model)
+        })
 }
 
 /// Scale for a panel of `size_mm` showing `width_px`, snapped to the steps
@@ -315,22 +389,51 @@ fn scale_for(width_px: u32, size_mm: Option<(u32, u32)>) -> f32 {
 mod tests {
     use super::*;
 
-    fn edid(make: [u8; 2], name: &str) -> Vec<u8> {
+    fn edid(make: [u8; 2], product: [u8; 2], name: Option<&str>, serial: Option<&str>) -> Vec<u8> {
         let mut block = vec![0; 128];
         block[8..10].copy_from_slice(&make);
-        block[54..59].copy_from_slice(&[0, 0, 0, 0xfc, 0]);
-        block[59..72].fill(b' ');
-        let bytes = name.as_bytes();
-        block[59..59 + bytes.len()].copy_from_slice(bytes);
-        block[59 + bytes.len()] = 0x0a;
+        block[10..12].copy_from_slice(&product);
+        for (slot, (tag, text)) in [(0, (0xfc, name)), (1, (0xff, serial))] {
+            let Some(text) = text else { continue };
+            let at = 54 + slot * 18;
+            block[at..at + 5].copy_from_slice(&[0, 0, 0, tag, 0]);
+            block[at + 5..at + 18].fill(b' ');
+            let bytes = text.as_bytes();
+            block[at + 5..at + 5 + bytes.len()].copy_from_slice(bytes);
+            block[at + 5 + bytes.len()] = 0x0a;
+        }
         block
     }
 
     #[test]
-    fn parses_pnp_and_model() {
+    fn builds_libdisplay_info_description() {
         assert_eq!(
-            parse_edid(&edid([0x10, 0xac], "S2725QC")),
-            (Some("DEL".to_owned()), Some("S2725QC".to_owned()))
+            parse_edid(&edid(
+                [0x10, 0xac],
+                [0, 0],
+                Some("DELL S2725QC"),
+                Some("5DGMS84")
+            )),
+            (
+                Some("Dell Inc.".to_owned()),
+                Some("DELL S2725QC 5DGMS84".to_owned())
+            )
+        );
+    }
+
+    #[test]
+    fn falls_back_to_product_code() {
+        assert_eq!(
+            parse_edid(&edid([0x09, 0xe5], [0xc9, 0x0b], None, None)),
+            (Some("BOE".to_owned()), Some("0x0BC9".to_owned()))
+        );
+    }
+
+    #[test]
+    fn unknown_pnp_passes_through() {
+        assert_eq!(
+            parse_edid(&edid([0x09, 0xd1], [0, 0], Some("BenQ Monitor"), None)),
+            (Some("BNQ".to_owned()), Some("BenQ Monitor".to_owned()))
         );
     }
 
@@ -338,13 +441,6 @@ mod tests {
     fn short_edid_is_none() {
         assert_eq!(parse_edid(&[0u8; 40]), (None, None));
         assert_eq!(parse_edid(&[]), (None, None));
-    }
-
-    #[test]
-    fn missing_model_descriptor_is_none() {
-        let mut block = vec![0; 128];
-        block[8..10].copy_from_slice(&[0x10, 0xac]);
-        assert_eq!(parse_edid(&block), (Some("DEL".to_owned()), None));
     }
 
     #[test]

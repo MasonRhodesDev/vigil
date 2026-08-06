@@ -2397,6 +2397,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "monitor-profiles"
+version = "0.1.0"
+source = "git+https://github.com/MasonRhodesDev/monitor-profiles?rev=fa693cb#fa693cb0af39ea937f4d7fdcd5923d1b460eebd4"
+dependencies = [
+ "serde",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4430,6 +4439,7 @@ version = "0.2.2"
 dependencies = [
  "calloop 0.14.4",
  "image",
+ "monitor-profiles",
  "vigil-auth",
  "vigil-config",
  "vigil-core",

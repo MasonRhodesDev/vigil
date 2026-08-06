@@ -35,6 +35,13 @@
 #remember = true
 #state_file = "/var/lib/vigil/state.toml"
 
+[profiles]
+# Monitor-layout profiles (monitor-profiles format), shared with the
+# session manager so the login screen and the desktop agree on scale,
+# position, and mode. Unset = outputs are laid out left-to-right in the
+# order the kernel reports them.
+#dir = "/etc/monitor-profiles"
+
 [users]
 # Offer the machine's login-capable users as a list (an "Other…" entry
 # always keeps typed names reachable). false = typed names only.

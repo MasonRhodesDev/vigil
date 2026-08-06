@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
+use monitor_profiles::{ConnectedOutput, Profile, ResolvedOutput};
 use vigil_auth::AuthMachine;
 use vigil_config::Config;
 use vigil_core::{
@@ -178,6 +179,8 @@ struct App {
     /// One manager per GPU (outputs can span cards); index == the
     /// `OutputId` namespace.
     outputs: Vec<OutputManager>,
+    profiles: Vec<Profile>,
+    layout: Vec<ResolvedOutput>,
     input: InputSystem,
     auth: AuthMachine,
     sessions: Vec<sessions::SessionEntry>,
@@ -248,6 +251,69 @@ impl App {
         }
     }
 
+    /// Match a profile against the connected outputs and cache its resolved
+    /// geometry. Returns the outputs to skip (profile says disabled).
+    fn resolve_profile(&mut self) -> Vec<OutputId> {
+        self.layout.clear();
+        if self.profiles.is_empty() {
+            return Vec::new();
+        }
+        let mut connected = Vec::new();
+        for gpu in &self.outputs {
+            for id in gpu.ids() {
+                if let Some(info) = gpu.info(id) {
+                    connected.push((
+                        id,
+                        ConnectedOutput {
+                            name: info.connector.clone(),
+                            description: match (&info.make, &info.model) {
+                                (Some(make), Some(model)) => format!("{make} {model}"),
+                                _ => info.connector.clone(),
+                            },
+                        },
+                    ));
+                }
+            }
+        }
+        let signature: Vec<String> = connected
+            .iter()
+            .map(|(_, c)| c.description.clone())
+            .collect();
+        let outputs: Vec<ConnectedOutput> = connected.iter().map(|(_, c)| c.clone()).collect();
+        let Some(profile) = monitor_profiles::select(&signature, &self.profiles) else {
+            eprintln!("vigil: no monitor profile matches {signature:?}");
+            return Vec::new();
+        };
+        let resolved = monitor_profiles::resolve(profile, &outputs);
+        for w in &resolved.warnings {
+            eprintln!("vigil: profile {}: {w}", profile.name);
+        }
+        for u in &resolved.unmatched {
+            eprintln!("vigil: profile {}: no output for {u}", profile.name);
+        }
+        eprintln!("vigil: monitor profile {}", profile.name);
+        let mut disabled = Vec::new();
+        for out in &resolved.outputs {
+            let Some((id, _)) = connected.iter().find(|(_, c)| c.name == out.name) else {
+                continue;
+            };
+            if !out.enabled {
+                disabled.push(*id);
+                continue;
+            }
+            if let Some(mode) = out.mode {
+                let want = (mode.width, mode.height, mode.refresh.round() as u32);
+                if let Some(gpu) = self.outputs.get_mut((id.0 >> 24) as usize)
+                    && let Err(e) = gpu.set_mode(*id, want)
+                {
+                    eprintln!("vigil: profile {}: {e}; using preferred mode", profile.name);
+                }
+            }
+        }
+        self.layout = resolved.outputs;
+        disabled
+    }
+
     fn rescan(&mut self) {
         let mut events = Vec::new();
         for gpu in self.outputs.iter_mut() {
@@ -256,9 +322,14 @@ impl App {
                 Err(e) => eprintln!("vigil: hotplug scan failed: {e}"),
             }
         }
+        let disabled = self.resolve_profile();
         for event in events {
             match event {
                 OutputEvent::Added(id, _) => {
+                    if disabled.contains(&id) {
+                        eprintln!("vigil: output {id:?} disabled by profile");
+                        continue;
+                    }
                     if let Err(e) = self.add_output(id) {
                         eprintln!("vigil: skipping output {id:?}: {e}");
                     }
@@ -288,9 +359,12 @@ impl App {
             .platform
             .claim_last_adapter()
             .ok_or("no window adapter captured for theme instance")?;
-        // CLI has no scale flag, so precedence here is [output."NAME"] over
-        // the EDID-derived default. A non-finite or non-positive value in
-        // config is ignored rather than fatal (config never blocks login).
+        // Precedence: [output."NAME"] > monitor profile > EDID-derived default.
+        let profile_scale = self
+            .layout
+            .iter()
+            .find(|o| o.name == info.connector && o.scale.is_finite() && o.scale > 0.0)
+            .map(|o| o.scale as f32);
         let scale = self
             .looks
             .config
@@ -298,6 +372,7 @@ impl App {
             .get(&info.connector)
             .and_then(|o| o.scale)
             .filter(|s| s.is_finite() && *s > 0.0)
+            .or(profile_scale)
             .unwrap_or(info.scale);
         let mut window = OutputWindow::new(id, info.width, info.height, scale, adapter, component)
             .map_err(|e| e.to_string())?;
@@ -360,12 +435,34 @@ impl App {
     }
 
     fn rebuild_row(&mut self) {
-        let spans: Vec<_> = self
-            .entries
-            .iter()
-            .map(|e| (e.id, e.width, e.height))
-            .collect();
-        self.row.rebuild(&spans);
+        if self.layout.is_empty() {
+            let spans: Vec<_> = self
+                .entries
+                .iter()
+                .map(|e| (e.id, e.width, e.height))
+                .collect();
+            self.row.rebuild_scan_order(&spans);
+        } else {
+            let spans: Vec<_> = self
+                .entries
+                .iter()
+                .map(|e| {
+                    let connector = self
+                        .outputs
+                        .get((e.id.0 >> 24) as usize)
+                        .and_then(|gpu| gpu.info(e.id))
+                        .map(|i| i.connector.clone())
+                        .unwrap_or_default();
+                    let (x, y) = self
+                        .layout
+                        .iter()
+                        .find(|o| o.name == connector)
+                        .map_or((0, 0), |o| o.position);
+                    (e.id, x, y, e.width, e.height)
+                })
+                .collect();
+            self.row.rebuild(&spans);
+        }
         let (cx, cy) = self.row.clamp(self.cursor.0, self.cursor.1);
         self.cursor = (cx, cy);
         self.apply_panel();
@@ -668,6 +765,20 @@ fn run() -> Result<i32, String> {
     let config = Config::load(cli.config.as_deref());
     let resolved = resolve(&cli, &config);
 
+    // Profiles are optional. A missing dir, unreadable files, or no matching
+    // profile all degrade to today's scan-order layout — this is the login
+    // screen; a layout file must never keep someone from logging in.
+    let profiles = match &config.profiles.dir {
+        Some(dir) => {
+            let (profiles, diags) = monitor_profiles::load_dir(dir);
+            for d in diags {
+                eprintln!("vigil: profile {}: {}", d.source, d.message);
+            }
+            profiles
+        }
+        None => Vec::new(),
+    };
+
     let (session, notifier) = SessionManager::new().map_err(|e| e.to_string())?;
     let seat = session.seat_name();
     let mut session = session;
@@ -772,6 +883,8 @@ fn run() -> Result<i32, String> {
     let mut app = App {
         session,
         outputs,
+        profiles,
+        layout: Vec::new(),
         input,
         auth,
         sessions: session_list,

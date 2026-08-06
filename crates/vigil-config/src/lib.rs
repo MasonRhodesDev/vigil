@@ -13,6 +13,7 @@ pub struct Config {
     pub look: Look,
     pub keyboard: Keyboard,
     pub sessions: Sessions,
+    pub profiles: Profiles,
     pub users: Users,
     pub power: Power,
     pub greeter: Greeter,
@@ -68,6 +69,14 @@ impl Default for Sessions {
             default: String::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Profiles {
+    /// Monitor-layout profile directory. Empty = feature off; the greeter
+    /// then lays outputs out exactly as it does today.
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -231,6 +240,7 @@ mod tests {
         assert!(config.power.enabled);
         assert!(config.sessions.remember);
         assert!(config.sessions.default.is_empty());
+        assert!(config.profiles.dir.is_none());
         assert!(config.users.show_list);
         assert_eq!(config.lock.grace_secs, 0);
         assert!(config.greeter.banner_file.is_none());
@@ -261,6 +271,8 @@ dirs = ["/tmp/s"]
 remember = false
 state_file = "/tmp/st.toml"
 default = "Hyprland"
+[profiles]
+dir = "/etc/monitor-profiles"
 [users]
 show_list = false
 [power]
@@ -294,6 +306,10 @@ scale = 1.25
         assert!(!config.sessions.remember);
         assert_eq!(config.sessions.state_file, PathBuf::from("/tmp/st.toml"));
         assert_eq!(config.sessions.default, "Hyprland");
+        assert_eq!(
+            config.profiles.dir,
+            Some(PathBuf::from("/etc/monitor-profiles"))
+        );
         assert!(!config.users.show_list);
         assert!(!config.power.enabled);
         assert_eq!(config.greeter.user, "kiosk");
