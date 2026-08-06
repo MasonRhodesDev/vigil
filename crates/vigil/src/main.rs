@@ -41,6 +41,7 @@ struct Cli {
     socket: Option<String>,
     config: Option<PathBuf>,
     theme: Option<PathBuf>,
+    theme_check: Option<PathBuf>,
     background: Option<PathBuf>,
     bg_mode: Option<BackgroundFit>,
     cmd: Vec<String>,
@@ -53,6 +54,7 @@ fn parse_cli() -> Result<Cli, String> {
         socket: None,
         config: None,
         theme: None,
+        theme_check: None,
         background: None,
         bg_mode: None,
         cmd: Vec::new(),
@@ -64,6 +66,7 @@ fn parse_cli() -> Result<Cli, String> {
             "--socket" => cli.socket = Some(value("--socket")?),
             "--config" => cli.config = Some(PathBuf::from(value("--config")?)),
             "--theme" => cli.theme = Some(PathBuf::from(value("--theme")?)),
+            "--theme-check" => cli.theme_check = Some(PathBuf::from(value("--theme-check")?)),
             "--background" => cli.background = Some(PathBuf::from(value("--background")?)),
             "--bg-mode" => {
                 let v = value("--bg-mode")?;
@@ -587,6 +590,23 @@ fn clock_text(format: &str) -> String {
 
 fn run() -> Result<i32, String> {
     let cli = parse_cli()?;
+
+    // Author/CI tool: validate a theme and exit without touching the seat.
+    if let Some(path) = &cli.theme_check {
+        // The interpreter needs a platform to instantiate the probe component.
+        VigilPlatform::install().map_err(|e| e.to_string())?;
+        return match vigil_theme::check(path) {
+            Ok(()) => {
+                println!("{}: ok", path.display());
+                Ok(0)
+            }
+            Err(e) => {
+                eprintln!("{}: {e}", path.display());
+                Ok(1)
+            }
+        };
+    }
+
     let config = Config::load(cli.config.as_deref());
     let resolved = resolve(&cli, &config);
 
@@ -858,6 +878,7 @@ mod config_tests {
             socket: None,
             config: None,
             theme: Some("/cli.slint".into()),
+            theme_check: None,
             background: None,
             bg_mode: None,
             cmd: Vec::new(),
@@ -880,6 +901,7 @@ mod config_tests {
             socket: None,
             config: None,
             theme: None,
+            theme_check: None,
             background: None,
             bg_mode: None,
             cmd: Vec::new(),
@@ -901,6 +923,7 @@ mod config_tests {
             socket: None,
             config: None,
             theme: None,
+            theme_check: None,
             background: None,
             bg_mode: None,
             cmd: Vec::new(),

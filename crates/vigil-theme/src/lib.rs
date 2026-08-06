@@ -75,8 +75,29 @@ impl Theme {
     }
 }
 
+/// Validate a theme without instantiating a greeter. `Ok(())` means the
+/// theme compiles and satisfies contract v1.
+pub fn check(path: &Path) -> Result<(), ThemeError> {
+    compile_path(path).map(|_| ())
+}
+
+/// A theme is either a `.slint` file or a directory containing
+/// `theme.slint` (with its assets beside it — `@image-url` resolves
+/// relative to the file, so a theme folder is self-contained).
 fn compile_path(path: &Path) -> Result<Theme, ThemeError> {
-    let result = block_on(slint_interpreter::Compiler::default().build_from_path(path));
+    let file = if path.is_dir() {
+        let candidate = path.join("theme.slint");
+        if !candidate.is_file() {
+            return Err(ThemeError::Compile(format!(
+                "{} is a directory with no theme.slint",
+                path.display()
+            )));
+        }
+        candidate
+    } else {
+        path.to_path_buf()
+    };
+    let result = block_on(slint_interpreter::Compiler::default().build_from_path(&file));
     finish_compilation(result)
 }
 
@@ -87,12 +108,24 @@ fn compile_source(source: &str, path: PathBuf) -> Result<Theme, ThemeError> {
 }
 
 fn finish_compilation(result: slint_interpreter::CompilationResult) -> Result<Theme, ThemeError> {
-    let diagnostics = result
-        .diagnostics()
-        .map(|diagnostic| diagnostic.to_string())
-        .collect::<Vec<_>>();
     if result.has_errors() {
-        return Err(ThemeError::Compile(diagnostics.join("\n")));
+        // Lead with the first error: a theme author needs the cause, not a
+        // wall of cascading parse noise. Warnings are not failures.
+        let errors: Vec<String> = result
+            .diagnostics()
+            .filter(|d| d.level() == slint_interpreter::DiagnosticLevel::Error)
+            .map(|d| d.to_string())
+            .collect();
+        let first = errors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "unknown compile error".to_owned());
+        let rest = errors.len().saturating_sub(1);
+        return Err(ThemeError::Compile(if rest > 0 {
+            format!("{first} (+{rest} more)")
+        } else {
+            first
+        }));
     }
 
     let component_name = result
@@ -249,6 +282,39 @@ mod tests {
         init_headless();
         let theme = compile_source(DEFAULT_THEME_SOURCE, PathBuf::from("default.slint")).unwrap();
         theme.instantiate().unwrap();
+    }
+
+    #[test]
+    fn directory_with_theme_slint_loads() {
+        init_headless();
+        let dir = std::env::temp_dir().join(format!("vigil-theme-dir-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("theme.slint"), source(CONTRACT_SURFACE)).unwrap();
+        let theme = Theme::load_or_default(Some(&dir));
+        theme.instantiate().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn directory_without_theme_slint_is_an_error() {
+        let dir =
+            std::env::temp_dir().join(format!("vigil-theme-empty-dir-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let error = check(&dir).unwrap_err();
+        assert!(matches!(error, ThemeError::Compile(message) if message.contains("theme.slint")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn check_accepts_the_default_theme() {
+        init_headless();
+        assert!(
+            check(Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../themes/default/theme.slint"
+            )))
+            .is_ok()
+        );
     }
 
     #[test]
