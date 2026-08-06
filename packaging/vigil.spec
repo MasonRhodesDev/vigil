@@ -14,7 +14,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.1
+Version:        0.2.2
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -83,6 +83,10 @@ install -Dpm0644 themes/default/theme.slint %{buildroot}%{_datadir}/vigil/themes
 %{_datadir}/vigil/
 
 %changelog
+* Thu Aug 06 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.2-1
+- logind integration (SetLockedHint, Lock/Unlock, sleep invalidates
+  grace); user list with Other… fallback; session default policy
+
 * Wed Aug 05 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.1-1
 - Remember last user/session (empty username = one-keypress relogin);
   /etc/pam.d/vigil-lock policy-free pass-through hook
