@@ -1,0 +1,12 @@
+[package]
+name = "vigil-login"
+description = "logind session hints and signals (vigil-lock)"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+zbus.workspace = true

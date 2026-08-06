@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 
 use vigil_config::Config;
 use vigil_core::{
-    AuthEvent, AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputId, OutputInfo, UiMessage,
+    AuthEvent, AuthUi, BackgroundFit, FrameTarget, InputEvent, LoginEvent, OutputId, OutputInfo,
+    UiMessage,
 };
+use vigil_login::LoginSession;
 use vigil_pam::PamAttempt;
 use vigil_theme::Theme;
 use vigil_ui::{Looks, OutputWindow, UiSnapshot, VigilPlatform};
@@ -96,6 +98,9 @@ struct Locker {
     auth_rx: mpsc::Receiver<AuthEvent>,
     auth_tx: mpsc::Sender<AuthEvent>,
     attempt: Option<PamAttempt>,
+    login: Option<LoginSession>,
+    login_rx: mpsc::Receiver<LoginEvent>,
+    login_tx: mpsc::Sender<LoginEvent>,
     unlocked: bool,
     last_clock: (Instant, String),
     ready_fd: Option<i32>,
@@ -140,13 +145,40 @@ impl Grace {
     }
 }
 
+/// What a [`LoginEvent`] means for the locker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginAction {
+    /// Release the screen without authentication.
+    Unlock,
+    Ignore,
+}
+
+/// logind event → locker action. `Unlock` is honored without auth on
+/// purpose: logind only accepts `UnlockSession` from root or the session's
+/// own user, it is the escape hatch every locker implements, and a working
+/// `loginctl unlock-session` is worth having when a locker misbehaves.
+fn handle_login_event(event: LoginEvent, grace: &mut Option<Grace>) -> LoginAction {
+    match event {
+        LoginEvent::Unlock => LoginAction::Unlock,
+        // We ARE the locker; the session is already locked.
+        LoginEvent::Lock => LoginAction::Ignore,
+        LoginEvent::PrepareForSleep(true) => {
+            // A grace window must never survive a suspend (#9 residual).
+            *grace = None;
+            LoginAction::Ignore
+        }
+        LoginEvent::PrepareForSleep(false) => LoginAction::Ignore,
+    }
+}
+
 impl Locker {
     fn new(cli: Cli, config: Config, grace_secs: u64) -> Result<Self, String> {
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
         let clock_format = config.look.clock_format.clone();
         let (auth_tx, auth_rx) = mpsc::channel();
-        Ok(Self {
+        let (login_tx, login_rx) = mpsc::channel();
+        let locker = Self {
             platform,
             theme,
             entries: Vec::new(),
@@ -163,6 +195,9 @@ impl Locker {
             auth_rx,
             auth_tx,
             attempt: None,
+            login: LoginSession::connect(),
+            login_rx,
+            login_tx,
             unlocked: false,
             last_clock: (Instant::now(), clock_text(&clock_format)),
             ready_fd: cli.ready_fd,
@@ -177,7 +212,12 @@ impl Locker {
                 snapshot.on_prompt("Password", true);
                 snapshot
             },
-        })
+        };
+        if let Some(login) = &locker.login {
+            login.spawn_signals(locker.login_tx.clone());
+            login.spawn_sleep_signals(locker.login_tx.clone());
+        }
+        Ok(locker)
     }
 
     fn start_attempt(&mut self) {
@@ -218,7 +258,7 @@ impl Locker {
                     self.each_window(|w| w.show_error(&text));
                 }
                 AuthEvent::Done(Ok(())) => {
-                    self.unlocked = true;
+                    self.unlock_now();
                     return;
                 }
                 AuthEvent::Done(Err(message)) => {
@@ -260,6 +300,22 @@ impl Locker {
                 UiMessage::SelectSession(_) | UiMessage::Power(_) => {}
             }
         }
+    }
+
+    fn pump_login(&mut self) {
+        while let Ok(event) = self.login_rx.try_recv() {
+            if handle_login_event(event, &mut self.grace) == LoginAction::Unlock {
+                self.unlock_now();
+            }
+        }
+    }
+
+    /// Single exit path: clear the logind hint, then release the screen.
+    fn unlock_now(&mut self) {
+        if let Some(login) = &self.login {
+            login.set_locked_hint(false);
+        }
+        self.unlocked = true;
     }
 }
 
@@ -332,7 +388,7 @@ impl LockSession for Locker {
         {
             // Dismissed inside the grace window: unlock and swallow the
             // event so the keystroke never reaches a PAM response.
-            self.unlocked = true;
+            self.unlock_now();
             return;
         }
         if let Some(e) = self.entries.get_mut(self.panel) {
@@ -363,6 +419,9 @@ impl LockSession for Locker {
         if self.grace_secs > 0 {
             self.grace = Some(Grace::new(self.grace_secs));
         }
+        if let Some(login) = &self.login {
+            login.set_locked_hint(true);
+        }
     }
 
     fn tick(&mut self) {
@@ -375,6 +434,7 @@ impl LockSession for Locker {
             self.last_clock = (Instant::now(), text);
         }
         self.pump_auth();
+        self.pump_login();
         self.pump_ui();
     }
 
@@ -545,6 +605,49 @@ mod tests {
 
     #[test]
     fn zero_grace_never_dismisses() {
+        assert!(!Grace::new(0).dismisses(&key(), Instant::now(), SystemTime::now()));
+    }
+
+    #[test]
+    fn unlock_signal_releases_without_auth() {
+        assert_eq!(
+            handle_login_event(LoginEvent::Unlock, &mut None),
+            LoginAction::Unlock
+        );
+    }
+
+    #[test]
+    fn lock_signal_is_a_noop_while_locked() {
+        let mut grace = Some(Grace::new(5));
+        assert_eq!(
+            handle_login_event(LoginEvent::Lock, &mut grace),
+            LoginAction::Ignore
+        );
+        assert!(grace.is_some());
+    }
+
+    #[test]
+    fn sleep_invalidates_grace() {
+        let mut grace = Some(Grace::new(60));
+        assert_eq!(
+            handle_login_event(LoginEvent::PrepareForSleep(true), &mut grace),
+            LoginAction::Ignore
+        );
+        assert!(grace.is_none());
+    }
+
+    #[test]
+    fn resume_leaves_grace_alone() {
+        let mut grace = Some(Grace::new(60));
+        handle_login_event(LoginEvent::PrepareForSleep(false), &mut grace);
+        assert!(grace.is_some());
+    }
+
+    #[test]
+    fn invalidated_grace_never_dismisses() {
+        let mut grace = Some(Grace::new(60));
+        handle_login_event(LoginEvent::PrepareForSleep(true), &mut grace);
+        assert!(grace.is_none());
         assert!(!Grace::new(0).dismisses(&key(), Instant::now(), SystemTime::now()));
     }
 }

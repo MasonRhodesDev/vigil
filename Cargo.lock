@@ -4477,10 +4477,19 @@ version = "0.2.1"
 dependencies = [
  "vigil-config",
  "vigil-core",
+ "vigil-login",
  "vigil-pam",
  "vigil-theme",
  "vigil-ui",
  "vigil-wayland",
+]
+
+[[package]]
+name = "vigil-login"
+version = "0.2.1"
+dependencies = [
+ "vigil-core",
+ "zbus",
 ]
 
 [[package]]

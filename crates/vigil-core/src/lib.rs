@@ -174,6 +174,18 @@ pub enum AuthEvent {
     Done(Result<(), String>),
 }
 
+/// logind session events (org.freedesktop.login1), delivered from
+/// vigil-login's worker thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginEvent {
+    /// `Lock` signal — something asked the session to lock.
+    Lock,
+    /// `Unlock` signal — `loginctl unlock-session`; unlocks WITHOUT auth.
+    Unlock,
+    /// `PrepareForSleep(b)`: true = about to suspend, false = resumed.
+    PrepareForSleep(bool),
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
