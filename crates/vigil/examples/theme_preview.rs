@@ -15,11 +15,22 @@ fn main() {
     let out = args.next().unwrap_or_else(|| "theme-preview.png".into());
     let theme_path = args.next().map(std::path::PathBuf::from);
 
+    // PREVIEW_TRANSFORM=0|1|2|3 renders as a rotated output would scan out:
+    // the scene stays upright and the presented frame is the rotated one.
+    let transform: u8 = std::env::var("PREVIEW_TRANSFORM")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(0);
+
     let platform = VigilPlatform::install().expect("platform");
     let theme = Theme::load_or_default(theme_path.as_deref());
     let component = theme.instantiate().expect("instantiate");
     let adapter = platform.claim_last_adapter().expect("adapter");
-    let mut window = OutputWindow::new(OutputId(1), W, H, 1.0, adapter, component).expect("window");
+    let mut window =
+        OutputWindow::with_transform(OutputId(1), W, H, 1.0, transform, adapter, component)
+            .expect("window");
+    // Panel geometry is what gets scanned out; the scene may be swapped.
+    let (pw, ph) = (W, H);
 
     window.on_ui_message(std::rc::Rc::new(|m| println!("ui-message: {m:?}")));
     window.set_panel_visible(true);
@@ -78,12 +89,12 @@ fn main() {
     });
 
     vigil_ui::advance_timers();
-    let mut buf = vec![0u8; (W * H * 4) as usize];
+    let mut buf = vec![0u8; (pw * ph * 4) as usize];
     let drew = window.render_if_needed(vigil_core::FrameTarget {
         buffer: &mut buf,
-        width: W,
-        height: H,
-        stride: (W * 4) as usize,
+        width: pw,
+        height: ph,
+        stride: (pw * 4) as usize,
     });
     println!("drew: {drew}");
 
@@ -92,6 +103,6 @@ fn main() {
     for px in buf.chunks_exact(4) {
         rgb.extend_from_slice(&[px[2], px[1], px[0]]);
     }
-    image::save_buffer(&out, &rgb, W, H, image::ColorType::Rgb8).expect("png");
+    image::save_buffer(&out, &rgb, pw, ph, image::ColorType::Rgb8).expect("png");
     println!("wrote {out}");
 }

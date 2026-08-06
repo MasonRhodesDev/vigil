@@ -374,13 +374,38 @@ impl App {
             .filter(|s| s.is_finite() && *s > 0.0)
             .or(profile_scale)
             .unwrap_or(info.scale);
-        let mut window = OutputWindow::new(id, info.width, info.height, scale, adapter, component)
-            .map_err(|e| e.to_string())?;
+        // A rotated output renders an upright scene at swapped dimensions;
+        // the presenter still scans out the panel's own geometry.
+        let transform = self
+            .layout
+            .iter()
+            .find(|o| o.name == info.connector)
+            .map_or(0, |o| o.transform);
+        // 4..=7 are the flipped (mirrored) variants. Rotating without the
+        // flip is wrong, but it is legibly wrong and still lets someone log
+        // in, which beats refusing to drive the output at all.
+        if transform > 3 {
+            eprintln!(
+                "vigil: {}: flipped transform {transform} not supported,                  rotating without the flip",
+                info.connector
+            );
+        }
+        let mut window = OutputWindow::with_transform(
+            id,
+            info.width,
+            info.height,
+            scale,
+            transform,
+            adapter,
+            component,
+        )
+        .map_err(|e| e.to_string())?;
+        let (scene_width, scene_height) = window.scene_size();
 
         let (background, fit) = self.looks.for_connector(&info.connector);
         if let Some(path) = &background {
-            match vigil_ui::background(path, fit, info.width, info.height) {
-                Ok(rgba) => window.set_background(rgba, info.width, info.height),
+            match vigil_ui::background(path, fit, scene_width, scene_height) {
+                Ok(rgba) => window.set_background(rgba, scene_width, scene_height),
                 Err(e) => eprintln!("vigil: background: {e}"),
             }
         }
@@ -419,8 +444,10 @@ impl App {
         );
         self.entries.push(Entry {
             id,
-            width: info.width,
-            height: info.height,
+            // Scene dimensions: pointer routing works in the space the user
+            // sees, so a portrait monitor must present as portrait here.
+            width: scene_width,
+            height: scene_height,
             presenter,
             window,
         });
