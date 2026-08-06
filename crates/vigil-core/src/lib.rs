@@ -23,7 +23,11 @@ pub struct OutputInfo {
     pub height: u32,
     /// Vertical refresh in millihertz.
     pub refresh_mhz: u32,
-    /// HiDPI scale factor for the Slint window on this output.
+    /// EDID manufacturer PNP id (e.g. `DEL`), when the monitor reports one.
+    pub make: Option<String>,
+    /// EDID model name (0xFC descriptor), when present.
+    pub model: Option<String>,
+    /// HiDPI scale for this output: derived from EDID physical size, or 1.0.
     pub scale: f32,
 }
 

@@ -144,6 +144,10 @@ impl<S: LockSession> App<S> {
             width: entry.px.0,
             height: entry.px.1,
             refresh_mhz: 0,
+            // wl_output carries make/model, but the lock has no use for
+            // monitor identity: the compositor already told it the scale.
+            make: None,
+            model: None,
             scale: entry.scale120 as f32 / 120.0,
         }
     }

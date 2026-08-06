@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier};
-use smithay::reexports::drm::control::{Mode, ModeTypeFlags, connector, crtc};
+use smithay::reexports::drm::control::{
+    Device as ControlDevice, Mode, ModeTypeFlags, connector, crtc,
+};
 use smithay::utils::DeviceFd;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use vigil_core::{OutputEvent, OutputId, OutputInfo};
@@ -131,12 +133,17 @@ impl OutputManager {
                     };
                     let id = self.make_id(connector.handle());
                     let (w, h) = mode.size();
+                    let (make, model) = read_edid(&self.device, connector.handle())
+                        .map(|edid| parse_edid(&edid))
+                        .unwrap_or((None, None));
                     let info = OutputInfo {
                         connector: connector_name(&connector),
                         width: w as u32,
                         height: h as u32,
                         refresh_mhz: mode.vrefresh() * 1000,
-                        scale: 1.0,
+                        make,
+                        model,
+                        scale: scale_for(w as u32, connector.size()),
                     };
                     self.entries.insert(
                         id,
@@ -232,4 +239,125 @@ fn connector_name(conn: &connector::Info) -> String {
         _ => "Unknown",
     };
     format!("{}-{}", prefix, conn.interface_id())
+}
+
+/// Raw EDID bytes from the connector's `EDID` property blob. `None` for any
+/// failure: a monitor that reports no EDID must still light up.
+fn read_edid(device: &DrmDevice, handle: connector::Handle) -> Option<Vec<u8>> {
+    let props = device.get_properties(handle).ok()?;
+    for (prop, raw) in props.iter() {
+        let info = device.get_property(*prop).ok()?;
+        if info.name().to_str() == Ok("EDID") {
+            let blob = device.get_property_blob(*raw).ok()?;
+            return (!blob.is_empty()).then_some(blob);
+        }
+    }
+    None
+}
+
+/// `(make, model)` from an EDID block: the PNP id packed into bytes 8-9
+/// (three 5-bit letters, big-endian) and the 0xFC descriptor's model name.
+/// Every malformed input yields `None`s rather than panicking — this parses
+/// bytes a monitor supplied.
+fn parse_edid(edid: &[u8]) -> (Option<String>, Option<String>) {
+    if edid.len() < 128 {
+        return (None, None);
+    }
+    let packed = u16::from_be_bytes([edid[8], edid[9]]);
+    let letter = |shift: u16| -> Option<char> {
+        let v = ((packed >> shift) & 0x1f) as u8;
+        (1..=26).contains(&v).then(|| (b'A' + v - 1) as char)
+    };
+    let make = match (letter(10), letter(5), letter(0)) {
+        (Some(a), Some(b), Some(c)) => Some(format!("{a}{b}{c}")),
+        _ => None,
+    };
+    // Four 18-byte descriptors start at byte 54; type 0xFC is the model name.
+    let model = (0..4)
+        .map(|i| 54 + i * 18)
+        .filter(|&at| at + 18 <= edid.len())
+        .find(|&at| edid[at..at + 3] == [0, 0, 0] && edid[at + 3] == 0xfc)
+        .and_then(|at| {
+            let text: String = edid[at + 5..at + 18]
+                .iter()
+                .take_while(|&&b| b != 0x0a)
+                .map(|&b| b as char)
+                .collect();
+            let text = text.trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        });
+    (make, model)
+}
+
+/// Scale for a panel of `size_mm` showing `width_px`, snapped to the steps
+/// compositors actually offer. Bands chosen against real hardware: 1440p at
+/// 27" (109 dpi) stays 1.0, 4K at 27" (163 dpi) and a 16" 2560x1600 panel
+/// (188 dpi) both land on 1.5. No physical size (some monitors report 0)
+/// means no basis to guess: 1.0.
+fn scale_for(width_px: u32, size_mm: Option<(u32, u32)>) -> f32 {
+    let Some((mm_w, _)) = size_mm else {
+        return 1.0;
+    };
+    if mm_w == 0 || width_px == 0 {
+        return 1.0;
+    }
+    let dpi = f64::from(width_px) * 25.4 / f64::from(mm_w);
+    match dpi {
+        d if d < 120.0 => 1.0,
+        d if d < 145.0 => 1.25,
+        d if d < 195.0 => 1.5,
+        d if d < 240.0 => 1.75,
+        _ => 2.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edid(make: [u8; 2], name: &str) -> Vec<u8> {
+        let mut block = vec![0; 128];
+        block[8..10].copy_from_slice(&make);
+        block[54..59].copy_from_slice(&[0, 0, 0, 0xfc, 0]);
+        block[59..72].fill(b' ');
+        let bytes = name.as_bytes();
+        block[59..59 + bytes.len()].copy_from_slice(bytes);
+        block[59 + bytes.len()] = 0x0a;
+        block
+    }
+
+    #[test]
+    fn parses_pnp_and_model() {
+        assert_eq!(
+            parse_edid(&edid([0x10, 0xac], "S2725QC")),
+            (Some("DEL".to_owned()), Some("S2725QC".to_owned()))
+        );
+    }
+
+    #[test]
+    fn short_edid_is_none() {
+        assert_eq!(parse_edid(&[0u8; 40]), (None, None));
+        assert_eq!(parse_edid(&[]), (None, None));
+    }
+
+    #[test]
+    fn missing_model_descriptor_is_none() {
+        let mut block = vec![0; 128];
+        block[8..10].copy_from_slice(&[0x10, 0xac]);
+        assert_eq!(parse_edid(&block), (Some("DEL".to_owned()), None));
+    }
+
+    #[test]
+    fn scale_bands_match_real_hardware() {
+        assert_eq!(scale_for(2560, Some((597, 336))), 1.0);
+        assert_eq!(scale_for(3840, Some((597, 336))), 1.5);
+        assert_eq!(scale_for(2560, Some((345, 215))), 1.5);
+        assert_eq!(scale_for(1920, Some((531, 299))), 1.0);
+    }
+
+    #[test]
+    fn scale_without_physical_size_is_one() {
+        assert_eq!(scale_for(3840, None), 1.0);
+        assert_eq!(scale_for(3840, Some((0, 0))), 1.0);
+    }
 }

@@ -288,9 +288,19 @@ impl App {
             .platform
             .claim_last_adapter()
             .ok_or("no window adapter captured for theme instance")?;
-        let mut window =
-            OutputWindow::new(id, info.width, info.height, info.scale, adapter, component)
-                .map_err(|e| e.to_string())?;
+        // CLI has no scale flag, so precedence here is [output."NAME"] over
+        // the EDID-derived default. A non-finite or non-positive value in
+        // config is ignored rather than fatal (config never blocks login).
+        let scale = self
+            .looks
+            .config
+            .output
+            .get(&info.connector)
+            .and_then(|o| o.scale)
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(info.scale);
+        let mut window = OutputWindow::new(id, info.width, info.height, scale, adapter, component)
+            .map_err(|e| e.to_string())?;
 
         let (background, fit) = self.looks.for_connector(&info.connector);
         if let Some(path) = &background {
@@ -322,11 +332,15 @@ impl App {
         window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
 
         eprintln!(
-            "vigil: output {} {}x{} (gpu {})",
+            "vigil: output {} {}x{} scale {scale} (gpu {}){}",
             info.connector,
             info.width,
             info.height,
-            id.0 >> 24
+            id.0 >> 24,
+            match (&info.make, &info.model) {
+                (Some(make), Some(model)) => format!(" [{make} {model}]"),
+                _ => String::new(),
+            }
         );
         self.entries.push(Entry {
             id,

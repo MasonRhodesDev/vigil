@@ -117,6 +117,7 @@ pub struct Lock {
 pub struct OutputOverride {
     pub background: Option<PathBuf>,
     pub fit: Option<String>,
+    pub scale: Option<f32>,
 }
 
 /// Parse TOML source (exposed for tests).
@@ -273,6 +274,7 @@ grace_secs = 5
 [output."DP-1"]
 background = "/side.png"
 fit = "center"
+scale = 1.25
 "#,
         )
         .unwrap();
@@ -304,6 +306,7 @@ fit = "center"
         let output = &config.output["DP-1"];
         assert_eq!(output.background, Some(PathBuf::from("/side.png")));
         assert_eq!(output.fit.as_deref(), Some("center"));
+        assert_eq!(output.scale, Some(1.25));
     }
 
     #[test]

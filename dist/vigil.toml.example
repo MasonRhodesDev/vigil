@@ -63,3 +63,6 @@
 #[output."DP-1"]
 #background = "/etc/greetd/side.png"
 #fit = "center"
+# HiDPI scale for this output. Default is derived from the monitor's EDID
+# physical size; set this to override.
+#scale = 1.5
