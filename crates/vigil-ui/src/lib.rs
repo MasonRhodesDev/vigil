@@ -327,6 +327,15 @@ impl OutputWindow {
             Value::Void
         });
         debug_assert!(r.is_ok());
+        let s = sink.clone();
+        let _ = self.component.set_callback("user-changed", move |args| {
+            if let Some(Value::Number(index)) = args.first()
+                && *index >= 0.0
+            {
+                s(UiMessage::SelectUser(*index as usize));
+            }
+            Value::Void
+        });
         let r = self.component.set_callback("power-action", move |args| {
             if let Some(Value::String(action)) = args.first() {
                 match action.as_str() {
@@ -379,6 +388,26 @@ impl OutputWindow {
     /// Theme contract `selected-session`.
     pub fn set_session_index(&mut self, index: usize) {
         self.set_property("selected-session", Value::Number(index as f64));
+    }
+
+    /// Optional theme property `users` (contract v2): the selectable user
+    /// names, `Other…` last. Empty on themes that predate the list.
+    pub fn set_users(&mut self, names: &[String]) {
+        let model: Vec<Value> = names
+            .iter()
+            .map(|n| Value::String(n.as_str().into()))
+            .collect();
+        let _ = self.component.set_property(
+            "users",
+            Value::Model(slint::ModelRc::new(slint::VecModel::from(model))),
+        );
+    }
+
+    /// Optional theme property `selected-user` (contract v2).
+    pub fn set_user_index(&mut self, index: usize) {
+        let _ = self
+            .component
+            .set_property("selected-user", Value::Number(index as f64));
     }
 
     fn set_property(&self, name: &str, value: Value) {

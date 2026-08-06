@@ -156,6 +156,7 @@ pub enum UiMessage {
     Respond(String),
     Cancel,
     SelectSession(usize),
+    SelectUser(usize),
     Power(PowerAction),
 }
 

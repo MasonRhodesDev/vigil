@@ -79,8 +79,10 @@ typestr("demo")
 sendkey("ret"); time.sleep(1.5)
 
 # Cycle the session picker: "›" button center at 1280x800 with the default
-# theme (card 400x300 centered; content column 468..812; row y ~372..402).
-click(797, 387)
+# theme. The user cycler (issue #21) sits above the password field, so the
+# session row moved down — verify with the theme_preview example if the
+# card layout changes again.
+click(797, 433)
 cmd("screendump", filename=f"{outdir}/5-picker.ppm")
 
 # Correct password.

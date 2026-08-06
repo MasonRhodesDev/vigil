@@ -177,7 +177,7 @@ impl AuthMachine {
             }
             // Session choice is the binary's product logic (it owns the
             // enumerated list); it never reaches greetd through here.
-            UiMessage::SelectSession(_) => Ok(()),
+            UiMessage::SelectSession(_) | UiMessage::SelectUser(_) => Ok(()),
             UiMessage::Power(_) => Err(AuthError("power actions are not authentication".into())),
         }
     }

@@ -13,6 +13,7 @@ pub struct Config {
     pub look: Look,
     pub keyboard: Keyboard,
     pub sessions: Sessions,
+    pub users: Users,
     pub power: Power,
     pub greeter: Greeter,
     pub lock: Lock,
@@ -55,6 +56,7 @@ pub struct Sessions {
     pub dirs: Vec<String>,
     pub remember: bool,
     pub state_file: PathBuf,
+    pub default: String,
 }
 
 impl Default for Sessions {
@@ -63,7 +65,22 @@ impl Default for Sessions {
             dirs: Vec::new(),
             remember: true,
             state_file: "/var/lib/vigil/state.toml".into(),
+            default: String::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Users {
+    /// Show the machine's users as a list. Set false on multi-tenant or
+    /// privacy-sensitive machines: the greeter then asks for a typed name.
+    pub show_list: bool,
+}
+
+impl Default for Users {
+    fn default() -> Self {
+        Self { show_list: true }
     }
 }
 
@@ -211,6 +228,8 @@ mod tests {
         assert_eq!(config.look.clock_format, "%H:%M");
         assert!(config.power.enabled);
         assert!(config.sessions.remember);
+        assert!(config.sessions.default.is_empty());
+        assert!(config.users.show_list);
         assert_eq!(config.lock.grace_secs, 0);
         assert_eq!(
             config.sessions.state_file,
@@ -238,6 +257,9 @@ rules = "evdev"
 dirs = ["/tmp/s"]
 remember = false
 state_file = "/tmp/st.toml"
+default = "Hyprland"
+[users]
+show_list = false
 [power]
 enabled = false
 [greeter]
@@ -266,6 +288,8 @@ fit = "center"
         assert_eq!(config.sessions.dirs, ["/tmp/s"]);
         assert!(!config.sessions.remember);
         assert_eq!(config.sessions.state_file, PathBuf::from("/tmp/st.toml"));
+        assert_eq!(config.sessions.default, "Hyprland");
+        assert!(!config.users.show_list);
         assert!(!config.power.enabled);
         assert_eq!(config.greeter.user, "kiosk");
         assert_eq!(config.greeter.cmd, ["sway"]);

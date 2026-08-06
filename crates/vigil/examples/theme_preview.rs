@@ -25,6 +25,8 @@ fn main() {
     window.set_panel_visible(true);
     window.set_cursor_visible(true);
     window.set_clock("13:37");
+    window.set_users(&["mason".into(), "Other…".into()]);
+    window.set_user_index(0);
     window.set_sessions(&["Other DE".into(), "Test DE".into()]);
     window.set_session_index(0);
     use vigil_core::AuthUi;

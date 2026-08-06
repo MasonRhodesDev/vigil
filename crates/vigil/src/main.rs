@@ -6,6 +6,7 @@
 
 mod layout;
 mod sessions;
+mod users;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -31,6 +32,9 @@ use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, UiSnapshot, VigilPlatform};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Cycler slot that returns the panel to typing a name.
+const OTHER_USER: &str = "Other…";
 
 struct Cli {
     user: Option<String>,
@@ -100,13 +104,22 @@ fn resolve(cli: &Cli, config: &Config) -> Resolved {
     }
 }
 
-/// Index of the remembered session, by name; unknown/missing = first.
-fn remembered_index(
+/// Session preselected at startup. Precedence: the user's own last
+/// successful session (when it still exists) > the operator's
+/// `[sessions] default` > first. A remembered name that no longer matches
+/// any entry falls through instead of stranding the user (issue #22).
+fn initial_session(
     sessions: &[sessions::SessionEntry],
     state: Option<&vigil_config::State>,
+    configured_default: &str,
 ) -> usize {
     state
         .and_then(|s| sessions.iter().position(|e| e.name == s.session))
+        .or_else(|| {
+            (!configured_default.is_empty())
+                .then(|| sessions.iter().position(|e| e.name == configured_default))
+                .flatten()
+        })
         .unwrap_or(0)
 }
 
@@ -161,6 +174,8 @@ struct App {
     auth: AuthMachine,
     sessions: Vec<sessions::SessionEntry>,
     selected_session: usize,
+    users: Vec<String>,
+    selected_user: usize,
     remember: bool,
     state_file: PathBuf,
     remembered_user: Option<String>,
@@ -279,8 +294,16 @@ impl App {
         let names: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
         window.set_sessions(&names);
         window.set_session_index(self.selected_session);
-        if let Some(user) = &self.remembered_user {
-            window.set_user_name(user);
+        window.set_users(&self.users);
+        window.set_user_index(self.selected_user);
+        match self.users.get(self.selected_user) {
+            Some(name) if name != OTHER_USER => window.set_user_name(name),
+            Some(_) => window.set_user_name(""),
+            None => {
+                if let Some(user) = &self.remembered_user {
+                    window.set_user_name(user);
+                }
+            }
         }
         self.snapshot.apply(&mut window);
         let queue = self.queue.clone();
@@ -396,6 +419,10 @@ impl App {
                 self.select_session(index);
                 continue;
             }
+            if let UiMessage::SelectUser(index) = msg {
+                self.select_user(index);
+                continue;
+            }
             if let UiMessage::Power(action) = msg {
                 self.power(action);
                 continue;
@@ -455,6 +482,22 @@ impl App {
             .set_session(session.cmd.clone(), session.env.clone());
         for e in self.entries.iter_mut() {
             e.window.set_session_index(index);
+        }
+    }
+
+    /// User choice is product logic: it only changes which name an empty
+    /// submit uses — `Other…` clears it so the field is typed into instead.
+    fn select_user(&mut self, index: usize) {
+        let Some(name) = self.users.get(index).cloned() else {
+            return;
+        };
+        self.selected_user = index;
+        let default = (name != OTHER_USER).then(|| name.clone());
+        self.auth.set_default_user(default.clone());
+        let label = default.unwrap_or_default();
+        for e in self.entries.iter_mut() {
+            e.window.set_user_index(index);
+            e.window.set_user_name(&label);
         }
     }
 
@@ -609,15 +652,36 @@ fn run() -> Result<i32, String> {
     let remembered = remember
         .then(|| vigil_config::State::load(&config.sessions.state_file))
         .flatten();
-    let initial_session = remembered_index(&session_list, remembered.as_ref());
+    // A pinned --user/[greeter] user is kiosk mode: no list, no choosing.
+    let user_list = if resolved.user.is_none() && config.users.show_list {
+        let mut list = users::enumerate();
+        if !list.is_empty() {
+            list.push(OTHER_USER.to_owned());
+        }
+        list
+    } else {
+        Vec::new()
+    };
+    let remembered_user = remembered
+        .as_ref()
+        .map(|s| s.user.clone())
+        .filter(|u| !u.is_empty());
+    // Preselect the remembered user when it is still a real account.
+    let selected_user = remembered_user
+        .as_ref()
+        .and_then(|u| user_list.iter().position(|name| name == u))
+        .unwrap_or(0);
+    let initial_session =
+        initial_session(&session_list, remembered.as_ref(), &config.sessions.default);
 
     let mut auth = AuthMachine::connect(cli.socket.as_deref()).map_err(|e| e.to_string())?;
-    auth.set_default_user(
-        remembered
-            .as_ref()
-            .map(|s| s.user.clone())
-            .filter(|u| !u.is_empty()),
-    );
+    // With a list, the selected entry is the default an empty submit uses;
+    // without one, the remembered name still is (G2).
+    auth.set_default_user(match user_list.get(selected_user) {
+        Some(name) if name != OTHER_USER => Some(name.clone()),
+        Some(_) => None,
+        None => remembered_user.clone(),
+    });
     auth.set_session(
         session_list[initial_session].cmd.clone(),
         session_list[initial_session].env.clone(),
@@ -634,12 +698,11 @@ fn run() -> Result<i32, String> {
         auth,
         sessions: session_list,
         selected_session: initial_session,
+        users: user_list,
+        selected_user,
         remember,
         state_file: config.sessions.state_file.clone(),
-        remembered_user: remembered
-            .as_ref()
-            .map(|s| s.user.clone())
-            .filter(|u| !u.is_empty()),
+        remembered_user,
         theme,
         platform,
         entries: Vec::new(),
@@ -732,16 +795,16 @@ mod config_tests {
     use super::*;
 
     #[test]
-    fn remembered_index_matches_name() {
+    fn initial_session_prefers_remembered() {
         let sessions = vec![
             sessions::SessionEntry {
                 name: "A".into(),
-                cmd: vec!["x".into()],
+                cmd: vec!["a".into()],
                 env: Vec::new(),
             },
             sessions::SessionEntry {
                 name: "B".into(),
-                cmd: vec!["x".into()],
+                cmd: vec!["b".into()],
                 env: Vec::new(),
             },
         ];
@@ -749,22 +812,43 @@ mod config_tests {
             user: String::new(),
             session: "B".into(),
         };
-        assert_eq!(remembered_index(&sessions, Some(&state)), 1);
+        assert_eq!(initial_session(&sessions, Some(&state), "A"), 1);
     }
 
     #[test]
-    fn remembered_index_unknown_falls_back() {
-        let sessions = vec![sessions::SessionEntry {
-            name: "A".into(),
-            cmd: vec!["x".into()],
-            env: Vec::new(),
-        }];
+    fn initial_session_uses_configured_default() {
+        let sessions = test_sessions();
+        assert_eq!(initial_session(&sessions, None, "B"), 1);
+    }
+
+    #[test]
+    fn initial_session_ignores_stale_remembered() {
+        let sessions = test_sessions();
         let state = vigil_config::State {
             user: String::new(),
-            session: "Z".into(),
+            session: "Gone".into(),
         };
-        assert_eq!(remembered_index(&sessions, Some(&state)), 0);
-        assert_eq!(remembered_index(&sessions, None), 0);
+        assert_eq!(initial_session(&sessions, Some(&state), "B"), 1);
+    }
+
+    #[test]
+    fn initial_session_falls_back_to_first() {
+        assert_eq!(initial_session(&test_sessions(), None, ""), 0);
+    }
+
+    fn test_sessions() -> Vec<sessions::SessionEntry> {
+        vec![
+            sessions::SessionEntry {
+                name: "A".into(),
+                cmd: vec!["a".into()],
+                env: Vec::new(),
+            },
+            sessions::SessionEntry {
+                name: "B".into(),
+                cmd: vec!["b".into()],
+                env: Vec::new(),
+            },
+        ]
     }
 
     #[test]

@@ -297,7 +297,9 @@ impl Locker {
                 }
                 // A locker has no session picker; power actions are policy
                 // for L2.
-                UiMessage::SelectSession(_) | UiMessage::Power(_) => {}
+                // A locker has no session or user picker; power actions are
+                // policy for L2.
+                UiMessage::SelectSession(_) | UiMessage::SelectUser(_) | UiMessage::Power(_) => {}
             }
         }
     }

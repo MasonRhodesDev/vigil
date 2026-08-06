@@ -27,10 +27,18 @@
 # Extra session directories; empty = /usr/share/wayland-sessions +
 # /usr/share/xsessions. A directory whose basename is `xsessions` lists as X11.
 #dirs = []
+# Session preselected on a machine with no remembered choice (exact Name=
+# from the .desktop entry). Your own last successful session still wins.
+#default = "Hyprland (uwsm-managed)"
 # Preselect the last successful user/session (needs a writable state_file;
 # the package ships tmpfiles.d for /var/lib/vigil).
 #remember = true
 #state_file = "/var/lib/vigil/state.toml"
+
+[users]
+# Offer the machine's login-capable users as a list (an "Other…" entry
+# always keeps typed names reachable). false = typed names only.
+#show_list = true
 
 [power]
 # false = the greeter's Restart/Shut Down buttons log instead of acting.
