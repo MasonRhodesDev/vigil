@@ -15,6 +15,7 @@ license=('GPL-3.0-only')
 depends=('greetd' 'seatd' 'libinput' 'libxkbcommon' 'systemd-libs' 'libdrm' 'mesa' 'pam' 'fontconfig')
 makedepends=('cargo' 'clang' 'systemd')
 checkdepends=('ttf-dejavu')
+install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::https://github.com/MasonRhodesDev/vigil/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP') # pin on release: updpkgsums
 
@@ -47,6 +48,9 @@ package() {
   install -Dm644 dist/vigil-lock.pam "$pkgdir/etc/pam.d/vigil-lock"
   install -Dm644 dist/vigil.toml.example "$pkgdir/usr/share/vigil/vigil.toml.example"
   install -Dm644 themes/default/theme.slint "$pkgdir/usr/share/vigil/themes/default.slint"
+
+  # Shared monitor-profile directory (see vigil.install for the group).
+  install -dm2775 "$pkgdir/etc/monitor-profiles"
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"

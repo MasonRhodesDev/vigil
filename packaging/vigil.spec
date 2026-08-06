@@ -37,6 +37,8 @@ BuildRequires:  clang-devel
 BuildRequires:  fontconfig-devel
 # The greeter runs as greetd's `greeter` user on greetd's socket.
 Requires:       greetd
+# groupadd in %pre for the shared monitor-profiles group.
+Requires(pre):  shadow-utils
 
 %description
 vigil is a multi-monitor, themeable greetd greeter that renders directly on
@@ -64,11 +66,21 @@ install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
 install -Dpm0644 dist/vigil-lock.pam %{buildroot}%{_sysconfdir}/pam.d/vigil-lock
 install -Dpm0644 dist/vigil.toml.example %{buildroot}%{_datadir}/vigil/vigil.toml.example
 install -Dpm0644 themes/default/theme.slint %{buildroot}%{_datadir}/vigil/themes/default.slint
+install -d -m2775 %{buildroot}%{_sysconfdir}/monitor-profiles
 
 %if %{with check}
 %check
 %cargo_test
 %endif
+
+%pre
+# Shared monitor-profile group. The greeter reads layouts from
+# /etc/monitor-profiles so the login screen arranges monitors the way the
+# session will; the directory is group-writable so a desktop user can edit
+# them without root, with no username baked in. hyprstate creates the same
+# group and co-owns the directory with identical attributes -- either package
+# may be installed alone.
+getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 
 # /var/lib/vigil itself comes from the tmpfiles.d snippet via systemd's file
 # triggers (no scriptlet needed on current Fedora).
@@ -81,6 +93,7 @@ install -Dpm0644 themes/default/theme.slint %{buildroot}%{_datadir}/vigil/themes
 %{_tmpfilesdir}/vigil.conf
 %config(noreplace) %{_sysconfdir}/pam.d/vigil-lock
 %{_datadir}/vigil/
+%dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
 * Thu Aug 06 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.2-1

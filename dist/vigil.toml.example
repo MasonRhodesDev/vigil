@@ -38,8 +38,15 @@
 [profiles]
 # Monitor-layout profiles (monitor-profiles format), shared with the
 # session manager so the login screen and the desktop agree on scale,
-# position, and mode. Unset = outputs are laid out left-to-right in the
-# order the kernel reports them.
+# position, and mode. Defaults to the packaged directory below, which the
+# package creates as 2775 root:monitor-profiles -- add yourself to that
+# group to edit layouts without root:
+#
+#     sudo gpasswd -a "$USER" monitor-profiles
+#
+# An absent or empty directory is not an error: outputs are then laid out
+# left-to-right in the order the kernel reports them. Set dir = "" to force
+# that off even when profiles are installed.
 #dir = "/etc/monitor-profiles"
 
 [users]

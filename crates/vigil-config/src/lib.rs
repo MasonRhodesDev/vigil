@@ -71,12 +71,23 @@ impl Default for Sessions {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Profiles {
-    /// Monitor-layout profile directory. Empty = feature off; the greeter
-    /// then lays outputs out exactly as it does today.
+    /// Monitor-layout profile directory, shared with the session manager so
+    /// the login screen and the desktop agree on scale, position and mode.
+    /// Defaults to the packaged directory; an absent directory is not an
+    /// error and simply means outputs are laid out in DRM scan order, as
+    /// they were before profiles existed. Set to "" to force that off.
     pub dir: Option<PathBuf>,
+}
+
+impl Default for Profiles {
+    fn default() -> Self {
+        Self {
+            dir: Some(PathBuf::from("/etc/monitor-profiles")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -240,7 +251,11 @@ mod tests {
         assert!(config.power.enabled);
         assert!(config.sessions.remember);
         assert!(config.sessions.default.is_empty());
-        assert!(config.profiles.dir.is_none());
+        // Defaults to the packaged shared directory; absent = feature off.
+        assert_eq!(
+            config.profiles.dir,
+            Some(PathBuf::from("/etc/monitor-profiles"))
+        );
         assert!(config.users.show_list);
         assert_eq!(config.lock.grace_secs, 0);
         assert!(config.greeter.banner_file.is_none());

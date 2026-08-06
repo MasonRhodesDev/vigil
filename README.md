@@ -64,6 +64,32 @@ greetd — it reads its config once at startup), and hypridle/your lock
 keybind at `vigil-lock`. An example `vigil.toml` ships at
 `/usr/share/vigil/vigil.toml.example`.
 
+## Monitor layout
+
+A greeter with no compositor has no layout to inherit: without help it lights
+outputs up in DRM scan order at scale 1.0, which on a HiDPI desk means a login
+card the size of a postage stamp on a monitor that may not even be the one you
+are looking at.
+
+vigil reads monitor layouts from `/etc/monitor-profiles/` — neutral TOML in the
+[monitor-profiles](https://github.com/MasonRhodesDev/monitor-profiles) format,
+the same directory the session manager
+([hyprstate](https://github.com/MasonRhodesDev/hyprstate)) reads. One layout
+definition, applied on both sides of login, so the screen you type your
+password into is the screen your desktop appears on.
+
+The package creates the directory as `2775 root:monitor-profiles` so layouts
+are editable by group rather than by root:
+
+```sh
+sudo gpasswd -a "$USER" monitor-profiles   # re-login for it to take effect
+```
+
+No profiles installed is a supported state, not an error: vigil falls back to
+scan order with a DPI-derived scale from the monitor's EDID. A profile that is
+unreadable, unmatched, or nonsensical degrades the same way — a layout file
+must never be what keeps someone from logging in.
+
 ## License
 
 [GPL-3.0](LICENSE). Slint is used under its GPLv3 license option — see
