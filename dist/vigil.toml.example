@@ -49,6 +49,9 @@
 #user = ""
 # Non-empty cmd = fixed session command; hides the session picker.
 #cmd = []
+# A host integration (e.g. an approval daemon) writes a one-line message
+# here and the greeter displays it; empty file or unset = no banner.
+#banner_file = "/run/vigil/banner"
 
 [lock]
 # Seconds after locking during which a key/click unlocks without auth

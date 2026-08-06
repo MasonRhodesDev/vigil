@@ -101,6 +101,7 @@ impl Default for Power {
 pub struct Greeter {
     pub user: String,
     pub cmd: Vec<String>,
+    pub banner_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -231,6 +232,7 @@ mod tests {
         assert!(config.sessions.default.is_empty());
         assert!(config.users.show_list);
         assert_eq!(config.lock.grace_secs, 0);
+        assert!(config.greeter.banner_file.is_none());
         assert_eq!(
             config.sessions.state_file,
             PathBuf::from("/var/lib/vigil/state.toml")
@@ -265,6 +267,7 @@ enabled = false
 [greeter]
 user = "kiosk"
 cmd = ["sway"]
+banner_file = "/run/vigil/banner"
 [lock]
 grace_secs = 5
 [output."DP-1"]
@@ -293,6 +296,10 @@ fit = "center"
         assert!(!config.power.enabled);
         assert_eq!(config.greeter.user, "kiosk");
         assert_eq!(config.greeter.cmd, ["sway"]);
+        assert_eq!(
+            config.greeter.banner_file,
+            Some(PathBuf::from("/run/vigil/banner"))
+        );
         assert_eq!(config.lock.grace_secs, 5);
         let output = &config.output["DP-1"];
         assert_eq!(output.background, Some(PathBuf::from("/side.png")));

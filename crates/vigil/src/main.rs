@@ -32,6 +32,11 @@ use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, UiSnapshot, VigilPlatform};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// How often the banner file is re-read. Host integrations update it at
+/// human timescale; a 1s poll costs one small read and needs no watcher.
+const BANNER_POLL: Duration = Duration::from_secs(1);
+/// Cap so a runaway file cannot break the theme's layout.
+const BANNER_MAX: usize = 200;
 
 /// Cycler slot that returns the panel to typing a name.
 const OTHER_USER: &str = "Other…";
@@ -192,6 +197,9 @@ struct App {
     looks: vigil_ui::Looks,
     power_enabled: bool,
     clock_format: String,
+    banner_file: Option<PathBuf>,
+    banner: String,
+    last_banner: Instant,
     caps_lock: bool,
     last_clock: (Instant, String),
     snapshot: UiSnapshot,
@@ -293,6 +301,7 @@ impl App {
         }
         window.set_clock(&self.last_clock.1);
         window.set_caps_lock(self.caps_lock);
+        window.set_status_banner(&self.banner);
         window.set_panel_visible(false);
         let names: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
         window.set_sessions(&names);
@@ -526,8 +535,30 @@ impl App {
             }
             self.last_clock = (Instant::now(), text);
         }
+        if self.last_banner.elapsed() >= BANNER_POLL {
+            self.last_banner = Instant::now();
+            self.refresh_banner();
+        }
         self.pump_messages();
         self.render();
+    }
+
+    /// Re-read the banner file and push any change to every output. A
+    /// missing or unreadable file means no banner: a host-integration
+    /// channel must never be able to break the login screen.
+    fn refresh_banner(&mut self) {
+        let Some(path) = &self.banner_file else {
+            return;
+        };
+        let text = std::fs::read_to_string(path)
+            .map(|raw| banner_text(&raw))
+            .unwrap_or_default();
+        if text != self.banner {
+            self.banner = text;
+            for e in self.entries.iter_mut() {
+                e.window.set_status_banner(&self.banner);
+            }
+        }
     }
 
     fn render(&mut self) {
@@ -574,6 +605,19 @@ impl App {
             self.panel = 0;
         }
     }
+}
+
+/// Normalize banner-file contents into one display line: non-whitespace
+/// control characters are dropped (an escape sequence must not reach the
+/// scene), whitespace runs — newlines included — collapse to single
+/// spaces, and the result is capped.
+fn banner_text(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() || c.is_whitespace())
+        .collect();
+    let line = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    line.chars().take(BANNER_MAX).collect()
 }
 
 /// HH:MM via `date`; std has no local-time formatting and a chrono dependency
@@ -737,6 +781,9 @@ fn run() -> Result<i32, String> {
         },
         power_enabled: resolved.power_enabled,
         clock_format: resolved.clock_format.clone(),
+        banner_file: config.greeter.banner_file.clone(),
+        banner: String::new(),
+        last_banner: Instant::now(),
         caps_lock: false,
         last_clock: (Instant::now(), clock_text(&resolved.clock_format)),
         snapshot: UiSnapshot::default(),
@@ -746,6 +793,7 @@ fn run() -> Result<i32, String> {
     };
 
     app.rescan();
+    app.refresh_banner();
     {
         let mut fan = FanUi {
             entries: &mut app.entries,
@@ -813,6 +861,29 @@ fn main() {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn banner_text_collapses_to_one_line() {
+        assert_eq!(
+            banner_text("  Approval sent\nto your phone  "),
+            "Approval sent to your phone"
+        );
+    }
+
+    #[test]
+    fn banner_text_drops_escapes() {
+        assert_eq!(banner_text("bell\u{7}here"), "bellhere");
+    }
+
+    #[test]
+    fn banner_text_caps_length() {
+        assert_eq!(banner_text(&"x".repeat(500)).chars().count(), 200);
+    }
+
+    #[test]
+    fn banner_text_blank_is_empty() {
+        assert_eq!(banner_text("   \n\t "), "");
+    }
 
     #[test]
     fn initial_session_prefers_remembered() {
