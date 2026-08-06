@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use vigil_config::Config;
 use vigil_core::{
-    AuthEvent, AuthUi, BackgroundFit, FrameTarget, InputEvent, LoginEvent, OutputId, OutputInfo,
-    UiMessage,
+    AppearanceEvent, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget, InputEvent,
+    LoginEvent, OutputId, OutputInfo, UiMessage,
 };
-use vigil_login::LoginSession;
+use vigil_login::{AppearanceWatcher, LoginSession};
 use vigil_pam::PamAttempt;
 use vigil_theme::Theme;
 use vigil_ui::{Looks, OutputWindow, UiSnapshot, VigilPlatform};
@@ -101,6 +101,11 @@ struct Locker {
     login: Option<LoginSession>,
     login_rx: mpsc::Receiver<LoginEvent>,
     login_tx: mpsc::Sender<LoginEvent>,
+    appearance: Option<AppearanceWatcher>,
+    appearance_rx: mpsc::Receiver<AppearanceEvent>,
+    appearance_tx: mpsc::Sender<AppearanceEvent>,
+    scheme: ColorScheme,
+    accent: Option<(f32, f32, f32)>,
     unlocked: bool,
     last_clock: (Instant, String),
     ready_fd: Option<i32>,
@@ -178,6 +183,7 @@ impl Locker {
         let clock_format = config.look.clock_format.clone();
         let (auth_tx, auth_rx) = mpsc::channel();
         let (login_tx, login_rx) = mpsc::channel();
+        let (appearance_tx, appearance_rx) = mpsc::channel();
         let locker = Self {
             platform,
             theme,
@@ -198,6 +204,11 @@ impl Locker {
             login: LoginSession::connect(),
             login_rx,
             login_tx,
+            appearance: AppearanceWatcher::connect(),
+            appearance_rx,
+            appearance_tx,
+            scheme: ColorScheme::default(),
+            accent: None,
             unlocked: false,
             last_clock: (Instant::now(), clock_text(&clock_format)),
             ready_fd: cli.ready_fd,
@@ -216,6 +227,10 @@ impl Locker {
         if let Some(login) = &locker.login {
             login.spawn_signals(locker.login_tx.clone());
             login.spawn_sleep_signals(locker.login_tx.clone());
+        }
+        if let Some(appearance) = &locker.appearance {
+            appearance.read_initial(&locker.appearance_tx);
+            appearance.spawn_signals(locker.appearance_tx.clone());
         }
         Ok(locker)
     }
@@ -312,6 +327,27 @@ impl Locker {
         }
     }
 
+    /// Portal appearance → theme properties, cached so scenes rebuilt later
+    /// (resume, hotplug, resize) come up with the same look.
+    fn pump_appearance(&mut self) {
+        while let Ok(event) = self.appearance_rx.try_recv() {
+            match event {
+                AppearanceEvent::Scheme(scheme) => {
+                    self.scheme = scheme;
+                    let text = scheme.as_theme_str();
+                    self.each_window(|w| w.set_color_scheme(text));
+                }
+                AppearanceEvent::Accent(accent) => {
+                    self.accent = accent;
+                    // Unset leaves the theme's own default binding intact.
+                    if let Some(rgb) = accent {
+                        self.each_window(|w| w.set_accent_color(rgb));
+                    }
+                }
+            }
+        }
+    }
+
     /// Single exit path: clear the logind hint, then release the screen.
     fn unlock_now(&mut self) {
         if let Some(login) = &self.login {
@@ -343,6 +379,10 @@ impl LockSession for Locker {
             window.set_caps_lock(self.caps_lock);
             window.set_panel_visible(false);
             window.set_user_name(&self.user);
+            window.set_color_scheme(self.scheme.as_theme_str());
+            if let Some(rgb) = self.accent {
+                window.set_accent_color(rgb);
+            }
             self.snapshot.apply(&mut window);
             let queue = self.queue.clone();
             window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
@@ -437,6 +477,7 @@ impl LockSession for Locker {
         }
         self.pump_auth();
         self.pump_login();
+        self.pump_appearance();
         self.pump_ui();
     }
 

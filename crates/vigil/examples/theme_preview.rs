@@ -25,6 +25,10 @@ fn main() {
     window.set_panel_visible(true);
     window.set_cursor_visible(true);
     window.set_clock("13:37");
+    if std::env::var_os("PREVIEW_LIGHT").is_some() {
+        window.set_color_scheme("light");
+        window.set_accent_color((0.29, 0.44, 0.65));
+    }
     window.set_users(&["mason".into(), "Other…".into()]);
     window.set_user_index(0);
     window.set_sessions(&["Other DE".into(), "Test DE".into()]);

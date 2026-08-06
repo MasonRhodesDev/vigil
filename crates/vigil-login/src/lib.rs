@@ -1,9 +1,9 @@
 //! logind glue for vigil-lock (DESIGN.md §12): SetLockedHint, and Lock/Unlock/PrepareForSleep signals on a worker thread (the vigil-pam pattern — the event loop is calloop-driven and must never block on D-Bus). Transport only, no policy. D-Bus being unavailable must never affect locking: connect() returns None and every call becomes a no-op.
 
 use std::sync::mpsc::Sender;
-use vigil_core::LoginEvent;
+use vigil_core::{AppearanceEvent, ColorScheme, LoginEvent, accent_from_portal};
 use zbus::blocking::{Connection, MessageIterator, Proxy};
-use zbus::zvariant::OwnedObjectPath;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 const DEST: &str = "org.freedesktop.login1";
 const MANAGER_PATH: &str = "/org/freedesktop/login1";
@@ -13,6 +13,10 @@ const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
 /// in the user manager's scope (hypridle spawns us there, so GetSessionByPID
 /// fails), to the user's display session. Verified on the reference machine.
 const SESSION_AUTO: &str = "/org/freedesktop/login1/session/auto";
+const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+const PORTAL_IFACE: &str = "org.freedesktop.portal.Settings";
+const APPEARANCE_NS: &str = "org.freedesktop.appearance";
 
 pub struct LoginSession {
     conn: Connection,
@@ -117,6 +121,96 @@ impl LoginSession {
                     continue;
                 };
                 if tx.send(LoginEvent::PrepareForSleep(sleeping)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+/// Settings-portal reader for `org.freedesktop.appearance` (issues #15/#16).
+/// Session bus, unlike [`LoginSession`]. The portal being absent is normal —
+/// there is none at the greeter, and a bare session may not run one — so
+/// every failure logs once and leaves the theme on its own defaults.
+pub struct AppearanceWatcher {
+    conn: Connection,
+}
+
+/// The portal returns `v`; some backends nest one more variant. Unwrap at
+/// most one level so both shapes deserialize.
+fn portal_inner(value: OwnedValue) -> OwnedValue {
+    match value.downcast_ref::<zbus::zvariant::Value>() {
+        Ok(inner) => OwnedValue::try_from(inner).unwrap_or(value),
+        Err(_) => value,
+    }
+}
+
+impl AppearanceWatcher {
+    pub fn connect() -> Option<Self> {
+        match Connection::session() {
+            Ok(conn) => Some(Self { conn }),
+            Err(e) => {
+                eprintln!("vigil-lock: settings portal unavailable ({e}); theme defaults kept");
+                None
+            }
+        }
+    }
+
+    /// Read both keys once and send them. Missing keys are silent: the
+    /// portal answers with an error for keys its backend does not provide.
+    pub fn read_initial(&self, tx: &Sender<AppearanceEvent>) {
+        let Ok(proxy) = Proxy::new(&self.conn, PORTAL_DEST, PORTAL_PATH, PORTAL_IFACE) else {
+            return;
+        };
+        if let Ok(value) =
+            proxy.call::<_, _, OwnedValue>("ReadOne", &(APPEARANCE_NS, "color-scheme"))
+            && let Ok(raw) = u32::try_from(portal_inner(value))
+        {
+            let _ = tx.send(AppearanceEvent::Scheme(ColorScheme::from_portal(raw)));
+        }
+        if let Ok(value) =
+            proxy.call::<_, _, OwnedValue>("ReadOne", &(APPEARANCE_NS, "accent-color"))
+            && let Ok(rgb) = <(f64, f64, f64)>::try_from(portal_inner(value))
+        {
+            let _ = tx.send(AppearanceEvent::Accent(accent_from_portal(rgb)));
+        }
+    }
+
+    /// Watch `SettingChanged` so `lmtt switch` retints a running lock.
+    pub fn spawn_signals(&self, tx: Sender<AppearanceEvent>) {
+        let conn = self.conn.clone();
+        std::thread::spawn(move || {
+            let rule = zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender(PORTAL_DEST)
+                .and_then(|b| b.interface(PORTAL_IFACE))
+                .and_then(|b| b.member("SettingChanged"))
+                .map(|b| b.build());
+            let Ok(rule) = rule else { return };
+            let Ok(iter) = MessageIterator::for_match_rule(rule, &conn, Some(8)) else {
+                return;
+            };
+            for message in iter.flatten() {
+                let Ok((namespace, key, value)) =
+                    message.body().deserialize::<(String, String, OwnedValue)>()
+                else {
+                    continue;
+                };
+                if namespace != APPEARANCE_NS {
+                    continue;
+                }
+                let event = match key.as_str() {
+                    "color-scheme" => u32::try_from(portal_inner(value))
+                        .ok()
+                        .map(|raw| AppearanceEvent::Scheme(ColorScheme::from_portal(raw))),
+                    "accent-color" => <(f64, f64, f64)>::try_from(portal_inner(value))
+                        .ok()
+                        .map(|rgb| AppearanceEvent::Accent(accent_from_portal(rgb))),
+                    _ => None,
+                };
+                if let Some(event) = event
+                    && tx.send(event).is_err()
+                {
                     return;
                 }
             }

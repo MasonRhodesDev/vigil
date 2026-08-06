@@ -15,7 +15,9 @@ use slint::platform::software_renderer::{
 use slint::platform::{
     Key, Platform, PlatformError, PointerEventButton, WindowAdapter, WindowEvent,
 };
-use slint::{ComponentHandle, Image, LogicalPosition, PhysicalSize, Rgba8Pixel, SharedPixelBuffer};
+use slint::{
+    Color, ComponentHandle, Image, LogicalPosition, PhysicalSize, Rgba8Pixel, SharedPixelBuffer,
+};
 use slint_interpreter::{ComponentInstance, Value};
 use vigil_core::{
     AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputId, PowerAction, UiMessage,
@@ -408,6 +410,22 @@ impl OutputWindow {
         let _ = self
             .component
             .set_property("selected-user", Value::Number(index as f64));
+    }
+
+    /// Optional theme property `color-scheme` ("dark" | "light" | "").
+    pub fn set_color_scheme(&mut self, scheme: &str) {
+        let _ = self
+            .component
+            .set_property("color-scheme", Value::String(scheme.into()));
+    }
+
+    /// Optional theme property `accent-color`. Portal sRGB is already
+    /// [0,1] floats, which is exactly what `from_rgb_f32` wants.
+    pub fn set_accent_color(&mut self, rgb: (f32, f32, f32)) {
+        let _ = self.component.set_property(
+            "accent-color",
+            Color::from_rgb_f32(rgb.0, rgb.1, rgb.2).into(),
+        );
     }
 
     fn set_property(&self, name: &str, value: Value) {

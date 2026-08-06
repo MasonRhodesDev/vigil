@@ -187,6 +187,52 @@ pub enum LoginEvent {
     PrepareForSleep(bool),
 }
 
+/// Desktop appearance preference (`org.freedesktop.appearance` color-scheme).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorScheme {
+    #[default]
+    NoPreference,
+    Dark,
+    Light,
+}
+
+impl ColorScheme {
+    /// Portal values: 1 = prefer dark, 2 = prefer light; the spec says
+    /// unknown values are treated as 0 (no preference).
+    pub fn from_portal(value: u32) -> Self {
+        match value {
+            1 => Self::Dark,
+            2 => Self::Light,
+            _ => Self::NoPreference,
+        }
+    }
+
+    /// Theme contract string; "" means the theme picks for itself.
+    pub fn as_theme_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::NoPreference => "",
+        }
+    }
+}
+
+/// Portal `accent-color` is sRGB in [0,1]; the spec says out-of-range means
+/// "unset", and a non-finite component is equally unusable.
+pub fn accent_from_portal(rgb: (f64, f64, f64)) -> Option<(f32, f32, f32)> {
+    let ok = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
+    (ok(rgb.0) && ok(rgb.1) && ok(rgb.2)).then_some((rgb.0 as f32, rgb.1 as f32, rgb.2 as f32))
+}
+
+/// Appearance changes from the settings portal, one per key (mirrors
+/// `SettingChanged`), delivered from vigil-login's worker thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AppearanceEvent {
+    Scheme(ColorScheme),
+    /// `None` = unset; the theme keeps its own default accent.
+    Accent(Option<(f32, f32, f32)>),
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -243,5 +289,36 @@ mod tests {
             assert_eq!(BackgroundFit::parse(s), Some(v));
         }
         assert_eq!(BackgroundFit::parse("cover"), None);
+    }
+
+    #[test]
+    fn color_scheme_from_portal_maps_spec_values() {
+        assert_eq!(ColorScheme::from_portal(1), ColorScheme::Dark);
+        assert_eq!(ColorScheme::from_portal(2), ColorScheme::Light);
+        assert_eq!(ColorScheme::from_portal(0), ColorScheme::NoPreference);
+        assert_eq!(ColorScheme::from_portal(7), ColorScheme::NoPreference);
+    }
+
+    #[test]
+    fn color_scheme_theme_strings() {
+        assert_eq!(ColorScheme::Dark.as_theme_str(), "dark");
+        assert_eq!(ColorScheme::Light.as_theme_str(), "light");
+        assert_eq!(ColorScheme::NoPreference.as_theme_str(), "");
+    }
+
+    #[test]
+    fn accent_in_range_converts() {
+        assert_eq!(accent_from_portal((0.0, 0.5, 1.0)), Some((0.0, 0.5, 1.0)));
+    }
+
+    #[test]
+    fn accent_out_of_range_is_unset() {
+        assert_eq!(accent_from_portal((1.5, 0.0, 0.0)), None);
+        assert_eq!(accent_from_portal((-0.1, 0.0, 0.0)), None);
+    }
+
+    #[test]
+    fn accent_non_finite_is_unset() {
+        assert_eq!(accent_from_portal((f64::NAN, 0.0, 0.0)), None);
     }
 }
