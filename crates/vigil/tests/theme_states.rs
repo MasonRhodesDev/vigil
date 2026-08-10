@@ -165,3 +165,42 @@ fn default_theme_state_matrix() {
         "card region must be background-only when panel-hidden"
     );
 }
+
+/// Moving the pointer must dirty the frame.
+///
+/// The software cursor is composited at present time and never touches the
+/// Slint scene, so nothing else marks the frame dirty when only the pointer
+/// moved. Lose that and the cursor stops tracking -- it jumps once a second
+/// when the clock happens to redraw. No other test moves the pointer, so
+/// this is the only thing standing between that regression and metal.
+#[test]
+fn pointer_motion_alone_dirties_the_frame() {
+    let platform = VigilPlatform::install().expect("platform");
+    let theme = Theme::load_or_default(None);
+    let component = theme.instantiate().expect("instantiate");
+    let adapter = platform.claim_last_adapter().expect("adapter");
+    let window = OutputWindow::new(OutputId(2), W, H, 1.0, adapter, component).expect("window");
+    let mut scene = Scene {
+        window,
+        buf: vec![0u8; (W * H * 4) as usize],
+    };
+
+    scene.window.set_panel_visible(true);
+    scene.window.set_cursor_visible(true);
+    assert!(scene.render(), "first frame draws");
+    // Settle: with nothing changing, a present is not needed.
+    scene.render();
+    assert!(
+        !scene.render(),
+        "an unchanged scene must not keep presenting"
+    );
+
+    scene.window.dispatch(vigil_core::InputEvent::PointerAbsolute {
+        x: 0.5,
+        y: 0.5,
+    });
+    assert!(
+        scene.render(),
+        "pointer motion must dirty the frame, or the cursor stops tracking"
+    );
+}
