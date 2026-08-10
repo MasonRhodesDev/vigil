@@ -4547,6 +4547,7 @@ version = "0.2.2"
 name = "vigil-gl"
 version = "0.2.2"
 dependencies = [
+ "drm",
  "gbm",
  "image",
  "slint",

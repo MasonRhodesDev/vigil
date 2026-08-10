@@ -46,8 +46,8 @@ use slint::platform::femtovg_renderer::{FemtoVGRenderer, OpenGLInterface};
 use slint::platform::{Renderer, WindowAdapter};
 use slint::{PhysicalSize, Window};
 use smithay::backend::allocator::gbm::GbmDevice;
-use smithay::backend::egl::context::{GlAttributes, PixelFormatRequirements};
 use smithay::backend::egl::display::EGLDisplayHandle;
+use smithay::backend::egl::display::PixelFormat;
 use smithay::backend::egl::native::EGLNativeSurface;
 use smithay::backend::egl::{EGLContext, EGLDisplay, EGLSurface, ffi, get_proc_address};
 
@@ -83,35 +83,27 @@ impl GlContext {
             .write(true)
             .open(path)
             .map_err(|e| GlError(format!("open {}: {e}", path.display())))?;
-        let device = GbmDevice::new(Arc::new(OwnedFd::from(file)))
-            .map_err(|e| GlError(format!("gbm device: {e}")))?;
+        Self::from_fd(Arc::new(OwnedFd::from(file)))
+    }
+
+    /// Build a context on an already-open node.
+    ///
+    /// Scanout needs this: DRM master is granted per *open file description*,
+    /// so the modesetting device and the GBM device have to share one --
+    /// duplicated, not opened a second time. A second `open` of the same card
+    /// is a different description and does not get master.
+    pub fn from_fd(fd: Arc<OwnedFd>) -> Result<Self, GlError> {
+        let device = GbmDevice::new(fd).map_err(|e| GlError(format!("gbm device: {e}")))?;
         // SAFETY: the display keeps its own reference to the device's fd.
         let display =
             unsafe { EGLDisplay::new(device.clone()) }.map_err(|e| GlError(format!("egl: {e}")))?;
-        // `EGLContext::new` builds a *configless* context, whose config_id is
-        // EGL_NO_CONFIG -- there is then nothing to query for a native visual
-        // and nothing for a window surface to match. A window surface needs a
-        // real config, so ask for one: 24-bit colour and no alpha, matching
-        // the XRGB the scanout path wants.
-        let context = EGLContext::new_with_config(
-            &display,
-            GlAttributes {
-                version: (2, 0),
-                profile: None,
-                debug: cfg!(debug_assertions),
-                vsync: false,
-            },
-            PixelFormatRequirements {
-                hardware_accelerated: None,
-                color_bits: Some(24),
-                float_color_buffer: false,
-                alpha_bits: Some(0),
-                depth_bits: None,
-                stencil_bits: None,
-                multisampling: None,
-            },
-        )
-        .map_err(|e| GlError(format!("egl context: {e}")))?;
+        // A *configless* context (EGL_KHR_no_config_context), so the surface
+        // picks its own config below. Letting smithay choose one here does
+        // not work: its requirements are minimums, so "at least 24-bit
+        // colour" happily selects a 10-bit-per-channel XR30 config, and
+        // virtio-gpu refuses to scan that out -- AddFB2 fails with ENOENT.
+        let context =
+            EGLContext::new(&display).map_err(|e| GlError(format!("egl context: {e}")))?;
         Ok(Self {
             context,
             display,
@@ -127,30 +119,56 @@ impl GlContext {
         unsafe { self.context.make_current() }.map_err(|e| GlError(format!("make current: {e}")))
     }
 
-    /// The fourcc this context's EGL config expects a native window to be.
+    /// An EGL config whose native visual is exactly `fourcc`.
     ///
-    /// Reading it and *then* creating the GBM surface to match is what keeps
-    /// the two in agreement. Choosing a format first and hoping the config
-    /// matches is the classic way to earn `EGL_BAD_MATCH` from
-    /// `eglCreateWindowSurface`: the first config offered is typically
-    /// ARGB8888 against an XRGB8888 surface.
-    pub fn native_visual_fourcc(&self) -> Result<u32, GlError> {
+    /// The config and the GBM surface must agree on format or
+    /// `eglCreateWindowSurface` returns `EGL_BAD_MATCH`, and the format also
+    /// has to be one the display hardware will scan out. Both constraints
+    /// point at the same answer: ask for the format by name rather than
+    /// describing it in bit counts and taking what turns up.
+    fn config_for(&self, fourcc: u32) -> Result<ffi::egl::types::EGLConfig, GlError> {
         let handle = self.display.get_display_handle();
-        let mut id: ffi::egl::types::EGLint = 0;
-        // SAFETY: a valid display handle and the config this context was
-        // created with; NATIVE_VISUAL_ID is defined for every config.
+        let attrs = [
+            ffi::egl::SURFACE_TYPE as ffi::egl::types::EGLint,
+            ffi::egl::WINDOW_BIT as ffi::egl::types::EGLint,
+            ffi::egl::RENDERABLE_TYPE as ffi::egl::types::EGLint,
+            ffi::egl::OPENGL_ES2_BIT as ffi::egl::types::EGLint,
+            ffi::egl::NONE as ffi::egl::types::EGLint,
+        ];
+        let mut configs = [std::ptr::null(); 64];
+        let mut found: ffi::egl::types::EGLint = 0;
+        // SAFETY: a valid display, a NONE-terminated attribute list, and a
+        // buffer matching the count we pass.
         let ok = unsafe {
-            ffi::egl::GetConfigAttrib(
+            ffi::egl::ChooseConfig(
                 handle.handle,
-                self.context.config_id(),
-                ffi::egl::NATIVE_VISUAL_ID as ffi::egl::types::EGLint,
-                &mut id,
+                attrs.as_ptr(),
+                configs.as_mut_ptr() as *mut _,
+                configs.len() as ffi::egl::types::EGLint,
+                &mut found,
             )
         };
-        if ok == 0 {
-            return Err(GlError("could not read EGL_NATIVE_VISUAL_ID".into()));
+        if ok == 0 || found == 0 {
+            return Err(GlError("no window-capable EGL configs".into()));
         }
-        Ok(id as u32)
+        for config in configs.iter().take(found as usize) {
+            let mut id: ffi::egl::types::EGLint = 0;
+            // SAFETY: a config just returned by ChooseConfig on this display.
+            let ok = unsafe {
+                ffi::egl::GetConfigAttrib(
+                    handle.handle,
+                    *config,
+                    ffi::egl::NATIVE_VISUAL_ID as ffi::egl::types::EGLint,
+                    &mut id,
+                )
+            };
+            if ok != 0 && id as u32 == fourcc {
+                return Ok(*config);
+            }
+        }
+        Err(GlError(format!(
+            "no EGL config with native visual {fourcc:#x} (of {found})"
+        )))
     }
 }
 
@@ -217,10 +235,34 @@ pub struct GlSurface {
 }
 
 impl GlSurface {
+    /// Scanout formats in preference order. XRGB8888 first: it is what every
+    /// display pipeline handles, whereas the 10-bit variants are accepted by
+    /// EGL and then rejected by `AddFB2` on hardware that cannot scan them
+    /// out (virtio-gpu fails with ENOENT).
+    const FORMATS: &'static [(u32, gbm::Format)] = &[
+        (0x3432_5258, gbm::Format::Xrgb8888),
+        (0x3330_3358, gbm::Format::Xrgb2101010),
+    ];
+
     pub fn new(context: Rc<GlContext>, width: u32, height: u32) -> Result<Self, GlError> {
-        let fourcc = context.native_visual_fourcc()?;
-        let format = gbm::Format::try_from(fourcc)
-            .map_err(|_| GlError(format!("unknown native visual fourcc {fourcc:#x}")))?;
+        let mut last = GlError("no candidate formats".into());
+        for (fourcc, format) in Self::FORMATS {
+            match Self::with_format(&context, width, height, *fourcc, *format) {
+                Ok(surface) => return Ok(surface),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    fn with_format(
+        context: &Rc<GlContext>,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        format: gbm::Format,
+    ) -> Result<Self, GlError> {
+        let config = context.config_for(fourcc)?;
         let gbm_surface = context
             .device
             .create_surface::<()>(
@@ -231,20 +273,24 @@ impl GlSurface {
             )
             .map_err(|e| GlError(format!("gbm surface: {e}")))?;
         let window = GbmWindow(Arc::new(gbm_surface));
-        let pixel_format = context
-            .context
-            .pixel_format()
-            .ok_or_else(|| GlError("context has no pixel format".into()))?;
-        // SAFETY: the config comes from this very context.
-        let surface = unsafe {
-            EGLSurface::new(
-                &context.display,
-                pixel_format,
-                context.context.config_id(),
-                window.clone(),
-            )
-        }
-        .map_err(|e| GlError(format!("egl window surface: {e}")))?;
+        // The context is configless, so it carries no pixel format of its
+        // own; describe the one the chosen config actually is.
+        let pixel_format = PixelFormat {
+            hardware_accelerated: true,
+            color_bits: 24,
+            alpha_bits: 0,
+            depth_bits: 0,
+            stencil_bits: 0,
+            stereoscopy: false,
+            multisampling: None,
+            srgb: false,
+        };
+        // SAFETY: `config` came from this display's own ChooseConfig, and the
+        // GBM surface was created with the format that config names.
+        let surface =
+            unsafe { EGLSurface::new(&context.display, pixel_format, config, window.clone()) }
+                .map_err(|e| GlError(format!("egl window surface: {e}")))?;
+        let context = context.clone();
         Ok(Self {
             context,
             surface,

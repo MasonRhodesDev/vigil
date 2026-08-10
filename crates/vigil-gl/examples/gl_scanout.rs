@@ -40,12 +40,6 @@ fn main() {
     let node = std::env::var("VIGIL_GL_NODE").unwrap_or_else(|_| "/dev/dri/card0".into());
 
     let context = Rc::new(GlContext::open(std::path::Path::new(&node)).expect("gl context"));
-    let fourcc = context.native_visual_fourcc().expect("native visual");
-    println!(
-        "egl config native visual: {:?} ({fourcc:#x})",
-        std::str::from_utf8(&fourcc.to_le_bytes()).unwrap_or("?")
-    );
-
     let surface = GlSurface::new(context, W, H).expect("gbm window surface");
     println!("egl window surface over gbm: ok");
     let gbm = surface.window();

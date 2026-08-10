@@ -22,3 +22,5 @@ gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 [dev-dependencies]
 image.workspace = true
 slint-interpreter.workspace = true
+# Same drm the smithay backend uses; the modeset example drives a CRTC.
+drm = "0.14"
