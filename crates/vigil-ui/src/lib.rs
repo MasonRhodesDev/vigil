@@ -22,6 +22,7 @@ use slint_interpreter::{ComponentInstance, Value};
 use vigil_core::{
     AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputId, PowerAction, UiMessage,
 };
+use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 
 /// The custom Slint platform. Window adapters are created one at a time and
 /// captured per output (M0b's adapter-capture pattern).
@@ -60,22 +61,26 @@ impl Platform for VigilPlatform {
 /// One output's scene: Slint window + theme instance + per-output state.
 pub struct OutputWindow {
     _id: OutputId,
+    /// How this scene becomes pixels. Everything above is what the scene
+    /// *is*, and is identical whichever renderer draws it.
+    backend: Box<dyn RenderBackend>,
     /// Scene dimensions: what Slint renders and what every coordinate in
     /// this type is expressed in. For a rotated output these are the
     /// *rotated* dimensions, so the whole UI, pointer and cursor stay in one
     /// upright coordinate space and only the final copy-out knows better.
     width: u32,
     height: u32,
-    /// Panel dimensions: what the scanout buffer actually is. Equal to the
-    /// scene dimensions unless the output is rotated a quarter turn.
-    panel_width: u32,
-    panel_height: u32,
-    /// wl_output/Hyprland transform: 0, 1, 2, 3 = 0, 90, 180, 270 degrees.
-    transform: u8,
     scale: f32,
     pointer_x: f64,
     pointer_y: f64,
     cursor_visible: bool,
+    component: ComponentInstance,
+}
+
+/// The software baseline: Slint's `SoftwareRenderer` into a persistent
+/// shadow buffer, copied out (rotating if the output is transformed) with
+/// the cursor composited on top.
+pub struct SoftwareBackend {
     /// Persistent scene buffer (tightly packed XRGB8888). Slint partial-
     /// repaints into it; presents copy it out. Keeps cursor motion at
     /// memcpy cost instead of a full software re-render.
@@ -84,7 +89,11 @@ pub struct OutputWindow {
     /// (cursor moved/toggled, or a fresh swapchain buffer needs filling).
     needs_present: bool,
     adapter: Rc<MinimalSoftwareWindow>,
-    component: ComponentInstance,
+    /// Panel (scanout) dimensions; differ from the scene on a quarter turn.
+    panel_width: u32,
+    panel_height: u32,
+    /// wl_output/Hyprland transform: 0, 1, 2, 3 = 0, 90, 180, 270 degrees.
+    transform: u8,
 }
 
 /// The software cursor (DESIGN.md §3: scene element, no cursor plane).
@@ -164,22 +173,26 @@ impl OutputWindow {
             .dispatch_event(WindowEvent::ScaleFactorChanged {
                 scale_factor: scale,
             });
+        // Size before show: the first layout happens on show, and a wrong
+        // size there means a first frame laid out for the wrong output.
         adapter.set_size(PhysicalSize::new(width, height));
         component.show()?;
         Ok(Self {
             _id: id,
+            backend: Box::new(SoftwareBackend {
+                shadow: vec![0u8; width as usize * height as usize * 4],
+                needs_present: true,
+                adapter,
+                panel_width,
+                panel_height,
+                transform,
+            }),
             width,
             height,
-            panel_width,
-            panel_height,
-            transform,
             scale,
             pointer_x: 0.0,
             pointer_y: 0.0,
             cursor_visible: false,
-            shadow: vec![0u8; width as usize * height as usize * 4],
-            needs_present: true,
-            adapter,
             component,
         })
     }
@@ -191,13 +204,13 @@ impl OutputWindow {
     /// After a resume the scanout buffers hold whatever survived suspend, so
     /// there is nothing to be gained by trusting them.
     pub fn request_present(&mut self) {
-        self.needs_present = true;
+        self.backend.request_present();
     }
 
     pub fn set_cursor_visible(&mut self, visible: bool) {
         if self.cursor_visible != visible {
             self.cursor_visible = visible;
-            self.needs_present = true;
+            self.backend.request_present();
         }
     }
 
@@ -228,7 +241,7 @@ impl OutputWindow {
                     position: self.pointer_position(),
                 });
                 if self.cursor_visible {
-                    self.needs_present = true;
+                    self.backend.request_present();
                 }
             }
             InputEvent::PointerAbsolute { x, y } => {
@@ -238,7 +251,7 @@ impl OutputWindow {
                     position: self.pointer_position(),
                 });
                 if self.cursor_visible {
-                    self.needs_present = true;
+                    self.backend.request_present();
                 }
             }
             InputEvent::PointerButton { button, pressed } => {
@@ -268,89 +281,6 @@ impl OutputWindow {
         }
     }
 
-    /// Render into the target if dirty; returns whether pixels changed.
-    pub fn render_if_needed(&mut self, target: FrameTarget<'_>) -> bool {
-        let debug = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
-        if target.width != self.panel_width
-            || target.height != self.panel_height
-            || !target.stride.is_multiple_of(4)
-            || target.buffer.len() < target.stride.saturating_mul(target.height as usize)
-        {
-            if debug {
-                eprintln!(
-                    "vigil-ui: target mismatch: got {}x{} stride {} len {}, want {}x{}",
-                    target.width,
-                    target.height,
-                    target.stride,
-                    target.buffer.len(),
-                    self.width,
-                    self.height
-                );
-            }
-            return false;
-        }
-        // Slint partial-repaints into the persistent shadow (ReusedBuffer
-        // contract: same buffer, contents preserved between renders).
-        let shadow_stride = self.width as usize;
-        {
-            let shadow_pixels = bytemuck::cast_slice_mut::<u8, Xrgb8888>(&mut self.shadow);
-            if self.adapter.draw_if_needed(|renderer| {
-                renderer.render(shadow_pixels, shadow_stride);
-            }) {
-                self.needs_present = true;
-            }
-        }
-        if !self.needs_present {
-            return false;
-        }
-        // Copy out (the target may be an alternating swapchain buffer with a
-        // wider stride), then composite the cursor on top — the shadow itself
-        // never contains it.
-        if self.transform == 0 {
-            let row_bytes = self.width as usize * 4;
-            for y in 0..self.height as usize {
-                target.buffer[y * target.stride..y * target.stride + row_bytes]
-                    .copy_from_slice(&self.shadow[y * row_bytes..(y + 1) * row_bytes]);
-            }
-        } else {
-            let Ok(pixels) = bytemuck::try_cast_slice_mut::<u8, Xrgb8888>(target.buffer) else {
-                if debug {
-                    eprintln!("vigil-ui: buffer not 4-byte aligned");
-                }
-                return true;
-            };
-            self.rotate_out(pixels, target.stride / 4);
-        }
-        if self.cursor_visible {
-            let Ok(pixels) = bytemuck::try_cast_slice_mut::<u8, Xrgb8888>(target.buffer) else {
-                if debug {
-                    eprintln!("vigil-ui: buffer not 4-byte aligned");
-                }
-                return true;
-            };
-            self.blit_cursor(pixels, target.stride / 4);
-        }
-        self.needs_present = false;
-        true
-    }
-
-    /// Scene pixel -> panel pixel for this output's transform.
-    ///
-    /// Convention (wl_output / Hyprland): the transform names how the panel
-    /// is mounted, so the content is rotated the opposite way to come out
-    /// upright. `1` (90) therefore rotates the scene a quarter turn
-    /// *clockwise* into the panel, `3` (270) counter-clockwise.
-    #[inline]
-    fn to_panel(&self, sx: usize, sy: usize) -> (usize, usize) {
-        scene_to_panel(
-            self.transform,
-            self.width as usize,
-            self.height as usize,
-            sx,
-            sy,
-        )
-    }
-
     /// Scene dimensions — what the theme is laid out in, and what pointer
     /// coordinates and backgrounds for this output must be sized to. Differs
     /// from the panel's scanout size on a quarter-turn transform.
@@ -358,67 +288,20 @@ impl OutputWindow {
         (self.width, self.height)
     }
 
-    /// Rotate the shadow into the scanout buffer.
-    ///
-    /// Tiled rather than scanline: a quarter turn writes down a column for
-    /// every row it reads, so the naive loop misses cache on nearly every
-    /// pixel. On a 4K panel that is 8.3M scattered writes per present, and
-    /// per-frame work on that scale is precisely what starved the event loop
-    /// and dropped keystrokes once already (see the shadow buffer above).
-    ///
-    /// Measured on the reference machine, rotating a 2160x3840 scene into a
-    /// 3840x2160 panel: naive 15.8 ms/frame, tiled 7.5 ms. For scale, the
-    /// unrotated row memcpy is 2.2 ms. A tile of 16 pixels is one 64-byte
-    /// cache line of XRGB8888 and measured fastest; 8 and 32 both lose ~1 ms.
-    fn rotate_out(&self, target: &mut [Xrgb8888], target_stride: usize) {
-        const TILE: usize = 16;
-        let (sw, sh) = (self.width as usize, self.height as usize);
-        let shadow = bytemuck::cast_slice::<u8, Xrgb8888>(&self.shadow);
-        for tile_y in (0..sh).step_by(TILE) {
-            let y_end = (tile_y + TILE).min(sh);
-            for tile_x in (0..sw).step_by(TILE) {
-                let x_end = (tile_x + TILE).min(sw);
-                for sy in tile_y..y_end {
-                    let row = &shadow[sy * sw + tile_x..sy * sw + x_end];
-                    for (sx, pixel) in (tile_x..x_end).zip(row) {
-                        let (px, py) = self.to_panel(sx, sy);
-                        target[py * target_stride + px] = *pixel;
-                    }
-                }
-            }
+    /// A description of the scene for the backend to draw.
+    fn view(&self) -> SceneView {
+        SceneView {
+            scene_size: (self.width, self.height),
+            scale: self.scale,
+            pointer: (self.pointer_x, self.pointer_y),
+            cursor_visible: self.cursor_visible,
         }
     }
 
-    /// Overlay the software cursor into the just-rendered frame, scaled to
-    /// the output's HiDPI factor (nearest neighbor — it is a pointer).
-    fn blit_cursor(&self, pixels: &mut [Xrgb8888], pixel_stride: usize) {
-        let scale = f64::from(self.scale.max(1.0));
-        let out_w = (CURSOR[0].len() as f64 * scale) as usize;
-        let out_h = (CURSOR.len() as f64 * scale) as usize;
-        let (base_x, base_y) = (self.pointer_x as usize, self.pointer_y as usize);
-        for oy in 0..out_h {
-            let py = base_y + oy;
-            if py >= self.height as usize {
-                break;
-            }
-            let row = CURSOR[((oy as f64 / scale) as usize).min(CURSOR.len() - 1)];
-            for ox in 0..out_w {
-                let px = base_x + ox;
-                if px >= self.width as usize {
-                    break;
-                }
-                // The cursor is composited after the rotation, so its scene
-                // coordinates have to make the same trip the frame just did
-                // — otherwise the pointer sits at right angles to the UI it
-                // is pointing at.
-                let (tx, ty) = self.to_panel(px, py);
-                match row[((ox as f64 / scale) as usize).min(row.len() - 1)] {
-                    b'X' => pixels[ty * pixel_stride + tx] = Xrgb8888(0),
-                    b'#' => pixels[ty * pixel_stride + tx] = Xrgb8888(0x00ff_ffff),
-                    _ => {}
-                }
-            }
-        }
+    /// Render into the target if dirty; returns whether pixels changed.
+    pub fn render_if_needed(&mut self, target: FrameTarget<'_>) -> bool {
+        let view = self.view();
+        self.backend.render(&view, CoreCanvas::Cpu(target))
     }
 
     fn pointer_position(&self) -> LogicalPosition {
@@ -775,6 +658,158 @@ pub fn advance_timers() {
 /// Return the maximum duration the event loop may sleep before the next Slint timer.
 pub fn duration_until_next_timer_update() -> Option<Duration> {
     slint::platform::duration_until_next_timer_update()
+}
+
+impl RenderBackend for SoftwareBackend {
+    fn request_present(&mut self) {
+        self.needs_present = true;
+    }
+
+    fn render(&mut self, view: &SceneView, canvas: CoreCanvas<'_>) -> bool {
+        let CoreCanvas::Cpu(target) = canvas else {
+            eprintln!("vigil-ui: software backend given a GL canvas");
+            return false;
+        };
+        let (scene_w, scene_h) = view.scene_size;
+        let debug = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
+        if target.width != self.panel_width
+            || target.height != self.panel_height
+            || !target.stride.is_multiple_of(4)
+            || target.buffer.len() < target.stride.saturating_mul(target.height as usize)
+        {
+            if debug {
+                eprintln!(
+                    "vigil-ui: target mismatch: got {}x{} stride {} len {}, want {}x{}",
+                    target.width,
+                    target.height,
+                    target.stride,
+                    target.buffer.len(),
+                    scene_w,
+                    scene_h
+                );
+            }
+            return false;
+        }
+        // Slint partial-repaints into the persistent shadow (ReusedBuffer
+        // contract: same buffer, contents preserved between renders).
+        let shadow_stride = scene_w as usize;
+        {
+            let shadow_pixels = bytemuck::cast_slice_mut::<u8, Xrgb8888>(&mut self.shadow);
+            if self.adapter.draw_if_needed(|renderer| {
+                renderer.render(shadow_pixels, shadow_stride);
+            }) {
+                self.needs_present = true;
+            }
+        }
+        if !self.needs_present {
+            return false;
+        }
+        // Copy out (the target may be an alternating swapchain buffer with a
+        // wider stride), then composite the cursor on top — the shadow itself
+        // never contains it.
+        if self.transform == 0 {
+            let row_bytes = scene_w as usize * 4;
+            for y in 0..scene_h as usize {
+                target.buffer[y * target.stride..y * target.stride + row_bytes]
+                    .copy_from_slice(&self.shadow[y * row_bytes..(y + 1) * row_bytes]);
+            }
+        } else {
+            let Ok(pixels) = bytemuck::try_cast_slice_mut::<u8, Xrgb8888>(target.buffer) else {
+                if debug {
+                    eprintln!("vigil-ui: buffer not 4-byte aligned");
+                }
+                return true;
+            };
+            self.rotate_out(view.scene_size, pixels, target.stride / 4);
+        }
+        if view.cursor_visible {
+            let Ok(pixels) = bytemuck::try_cast_slice_mut::<u8, Xrgb8888>(target.buffer) else {
+                if debug {
+                    eprintln!("vigil-ui: buffer not 4-byte aligned");
+                }
+                return true;
+            };
+            self.blit_cursor(view, pixels, target.stride / 4);
+        }
+        self.needs_present = false;
+        true
+    }
+}
+
+impl SoftwareBackend {
+    /// Scene pixel -> panel pixel for this output's transform.
+    ///
+    /// Convention (wl_output / Hyprland): the transform names how the panel
+    /// is mounted, so the content is rotated the opposite way to come out
+    /// upright. `1` (90) therefore rotates the scene a quarter turn
+    /// *clockwise* into the panel, `3` (270) counter-clockwise.
+    #[inline]
+    fn to_panel(&self, scene: (u32, u32), sx: usize, sy: usize) -> (usize, usize) {
+        scene_to_panel(self.transform, scene.0 as usize, scene.1 as usize, sx, sy)
+    }
+
+    /// Rotate the shadow into the scanout buffer.
+    ///
+    /// Tiled rather than scanline: a quarter turn writes down a column for
+    /// every row it reads, so the naive loop misses cache on nearly every
+    /// pixel. On a 4K panel that is 8.3M scattered writes per present, and
+    /// per-frame work on that scale is precisely what starved the event loop
+    /// and dropped keystrokes once already (see the shadow buffer above).
+    ///
+    /// Measured on the reference machine, rotating a 2160x3840 scene into a
+    /// 3840x2160 panel: naive 15.8 ms/frame, tiled 7.5 ms. For scale, the
+    /// unrotated row memcpy is 2.2 ms. A tile of 16 pixels is one 64-byte
+    /// cache line of XRGB8888 and measured fastest; 8 and 32 both lose ~1 ms.
+    fn rotate_out(&self, scene: (u32, u32), target: &mut [Xrgb8888], target_stride: usize) {
+        const TILE: usize = 16;
+        let (sw, sh) = (scene.0 as usize, scene.1 as usize);
+        let shadow = bytemuck::cast_slice::<u8, Xrgb8888>(&self.shadow);
+        for tile_y in (0..sh).step_by(TILE) {
+            let y_end = (tile_y + TILE).min(sh);
+            for tile_x in (0..sw).step_by(TILE) {
+                let x_end = (tile_x + TILE).min(sw);
+                for sy in tile_y..y_end {
+                    let row = &shadow[sy * sw + tile_x..sy * sw + x_end];
+                    for (sx, pixel) in (tile_x..x_end).zip(row) {
+                        let (px, py) = self.to_panel(scene, sx, sy);
+                        target[py * target_stride + px] = *pixel;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Overlay the software cursor into the just-rendered frame, scaled to
+    /// the output's HiDPI factor (nearest neighbor — it is a pointer).
+    fn blit_cursor(&self, view: &SceneView, pixels: &mut [Xrgb8888], pixel_stride: usize) {
+        let scale = f64::from(view.scale.max(1.0));
+        let out_w = (CURSOR[0].len() as f64 * scale) as usize;
+        let out_h = (CURSOR.len() as f64 * scale) as usize;
+        let (base_x, base_y) = (view.pointer.0 as usize, view.pointer.1 as usize);
+        for oy in 0..out_h {
+            let py = base_y + oy;
+            if py >= view.scene_size.1 as usize {
+                break;
+            }
+            let row = CURSOR[((oy as f64 / scale) as usize).min(CURSOR.len() - 1)];
+            for ox in 0..out_w {
+                let px = base_x + ox;
+                if px >= view.scene_size.0 as usize {
+                    break;
+                }
+                // The cursor is composited after the rotation, so its scene
+                // coordinates have to make the same trip the frame just did
+                // — otherwise the pointer sits at right angles to the UI it
+                // is pointing at.
+                let (tx, ty) = self.to_panel(view.scene_size, px, py);
+                match row[((ox as f64 / scale) as usize).min(row.len() - 1)] {
+                    b'X' => pixels[ty * pixel_stride + tx] = Xrgb8888(0),
+                    b'#' => pixels[ty * pixel_stride + tx] = Xrgb8888(0x00ff_ffff),
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

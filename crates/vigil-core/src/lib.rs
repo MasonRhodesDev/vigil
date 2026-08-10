@@ -74,6 +74,31 @@ impl std::error::Error for PresentError {}
 
 /// How a rendered frame reaches an output. Implemented by vigil-present-dumb
 /// (software, permanent baseline) and vigil-present-gl (GL, M3).
+/// What a render backend needs to know about the scene it is drawing.
+///
+/// Deliberately toolkit-free so the trait below can live here, next to
+/// `Presenter`, without dragging the UI toolkit into this crate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneView {
+    /// Logical scene size -- already rotated if the output is transformed.
+    pub scene_size: (u32, u32),
+    pub scale: f32,
+    pub pointer: (f64, f64),
+    pub cursor_visible: bool,
+}
+
+/// Turns a scene into pixels. The half of rendering that differs between the
+/// software baseline and GL; everything about *what* the scene contains is
+/// shared and lives with the window.
+pub trait RenderBackend {
+    /// Draw the scene into this frame's canvas. Returns whether anything was
+    /// drawn -- a frame that draws nothing is not presented.
+    fn render(&mut self, view: &SceneView, canvas: Canvas<'_>) -> bool;
+
+    /// Force the next frame to present even if the scene is unchanged.
+    fn request_present(&mut self);
+}
+
 /// What a presenter hands the renderer for one frame.
 ///
 /// The two rendering paths differ in what "draw here" even means: the

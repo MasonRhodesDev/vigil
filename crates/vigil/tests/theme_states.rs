@@ -195,10 +195,9 @@ fn pointer_motion_alone_dirties_the_frame() {
         "an unchanged scene must not keep presenting"
     );
 
-    scene.window.dispatch(vigil_core::InputEvent::PointerAbsolute {
-        x: 0.5,
-        y: 0.5,
-    });
+    scene
+        .window
+        .dispatch(vigil_core::InputEvent::PointerAbsolute { x: 0.5, y: 0.5 });
     assert!(
         scene.render(),
         "pointer motion must dirty the frame, or the cursor stops tracking"
