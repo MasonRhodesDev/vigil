@@ -405,10 +405,19 @@ impl App {
         &mut self,
         id: OutputId,
         scale: f32,
+        transform: u8,
         surface_slot: &mut Option<vigil_outputs::DrmSurface>,
         device_fd: vigil_outputs::DrmDeviceFd,
     ) -> Result<(OutputWindow, Box<dyn Presenter>), String> {
         use std::sync::Arc;
+        // The GL path rotates via the DRM plane, which is not wired up yet,
+        // so a rotated output would scan out sideways. Software already
+        // rotates correctly -- let it, rather than render this one wrong.
+        if transform != 0 {
+            return Err(format!(
+                "transform {transform} not supported on the GL path"
+            ));
+        }
         let surface = surface_slot.take().ok_or("no DRM surface")?;
         // Duplicate the device's own descriptor: DRM master rides on the
         // open file description, so re-opening the node would not be master.
@@ -458,6 +467,7 @@ impl App {
         &mut self,
         _id: OutputId,
         _scale: f32,
+        _transform: u8,
         _surface_slot: &mut Option<vigil_outputs::DrmSurface>,
         _device_fd: vigil_outputs::DrmDeviceFd,
     ) -> Result<(OutputWindow, Box<dyn Presenter>), String> {
@@ -505,7 +515,7 @@ impl App {
         // a GL failure degrades to software with a log line, per output.
         let mut surface_slot = Some(surface);
         let gl = if want_gl {
-            match self.gl_output(id, scale, &mut surface_slot, device_fd) {
+            match self.gl_output(id, scale, transform, &mut surface_slot, device_fd) {
                 Ok(built) => Some(built),
                 Err(e) => {
                     eprintln!(
@@ -520,7 +530,10 @@ impl App {
         };
 
         let (mut window, presenter) = match gl {
-            Some(built) => built,
+            Some(built) => {
+                eprintln!("vigil: {}: rendering with GL", info.connector);
+                built
+            }
             None => {
                 let surface = surface_slot
                     .take()

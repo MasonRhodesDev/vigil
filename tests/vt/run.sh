@@ -46,8 +46,12 @@ echo "vigil-vt: starting (auto-kill after ${LIMIT}s; password: $PASSWORD)"
 # with the mouse, and use Ctrl+Alt+Fn to switch VTs at any time. Power
 # buttons are inhibited — this is a test, not a real login.
 export VIGIL_POWER_INHIBIT=1
+# $VIGIL_VT_CONFIG picks a non-default config -- how the GL renderer is
+# selected, so the same on-metal flow can be driven on either path.
+CONFIG_ARGS=()
+[ -n "${VIGIL_VT_CONFIG:-}" ] && CONFIG_ARGS=(--config "$VIGIL_VT_CONFIG")
 timeout --foreground "$LIMIT" \
-    "$BIN" --socket "$SOCK" >"$LOG.log" 2>&1
+    "$BIN" --socket "$SOCK" "${CONFIG_ARGS[@]}" >"$LOG.log" 2>&1
 RC=$?
 
 echo "vigil-vt: vigil exited $RC (124 = timeout kill)"
@@ -55,6 +59,8 @@ echo "--- vigil ---"
 tail -n 20 "$LOG.log"
 echo "--- fake greetd ---"
 tail -n 10 "$LOG.greetd.log"
+echo "--- renderer ---"
+grep -E "rendering with GL|GL unavailable" "$LOG.log" || echo "software (no GL lines)"
 if [ "$RC" -eq 0 ] && grep -q START_SESSION "$LOG.greetd.log"; then
     echo "vigil-vt: PASS — full login completed on metal"
 else
