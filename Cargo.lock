@@ -986,6 +986,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "femtovg"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f43d05da42e81724c16d34a150fb7fda53d3f786e5a94673ee526ff8602f0f6a"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytemuck",
+ "fnv",
+ "glow",
+ "imgref",
+ "itertools 0.14.0",
+ "log",
+ "rgb",
+ "slotmap",
+ "swash",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "field-offset"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1037,6 +1057,12 @@ name = "float-cmp"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
+
+[[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foldhash"
@@ -1365,6 +1391,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "glutin-winit"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85edca7075f8fc728f28cb8fbb111a96c3b89e930574369e3e9c27eb75d3788f"
+dependencies = [
+ "cfg_aliases",
+ "glutin",
+ "raw-window-handle",
+ "winit",
+]
+
+[[package]]
 name = "glutin_egl_sys"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1478,12 +1516,16 @@ dependencies = [
  "calloop 0.14.4",
  "cfg_aliases",
  "drm",
+ "gbm",
+ "glutin",
  "i-slint-common",
  "i-slint-core",
+ "i-slint-renderer-femtovg",
  "i-slint-renderer-software",
  "input 0.10.0",
  "memmap2",
  "nix",
+ "raw-window-handle",
  "xkbcommon 0.9.0",
 ]
 
@@ -1515,6 +1557,7 @@ dependencies = [
  "i-slint-common",
  "i-slint-core",
  "i-slint-core-macros",
+ "i-slint-renderer-femtovg",
 ]
 
 [[package]]
@@ -1543,9 +1586,12 @@ dependencies = [
  "copypasta",
  "derive_more",
  "futures",
+ "glutin",
+ "glutin-winit",
  "i-slint-common",
  "i-slint-core",
  "i-slint-core-macros",
+ "i-slint-renderer-femtovg",
  "i-slint-renderer-skia",
  "i-slint-renderer-software",
  "imgref",
@@ -1676,6 +1722,28 @@ dependencies = [
  "quote",
  "serde_json",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "i-slint-renderer-femtovg"
+version = "1.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78d0d99a18d66738b684758fe8460743a0aa0f64a96e05940942231a340085b1"
+dependencies = [
+ "cfg-if",
+ "const-field-offset",
+ "derive_more",
+ "femtovg",
+ "glow",
+ "i-slint-common",
+ "i-slint-core",
+ "i-slint-core-macros",
+ "imgref",
+ "lyon_path",
+ "pin-weak",
+ "rgb",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
@@ -3711,6 +3779,7 @@ dependencies = [
  "i-slint-common",
  "i-slint-core",
  "i-slint-core-macros",
+ "i-slint-renderer-femtovg",
  "i-slint-renderer-software",
  "num-traits",
  "once_cell",
@@ -3789,9 +3858,11 @@ dependencies = [
  "drm-fourcc",
  "errno",
  "gbm",
+ "gl_generator",
  "indexmap",
  "input 0.9.1",
  "libc",
+ "libloading",
  "libseat",
  "pkg-config",
  "profiling",
@@ -4471,6 +4542,17 @@ dependencies = [
 [[package]]
 name = "vigil-core"
 version = "0.2.2"
+
+[[package]]
+name = "vigil-gl"
+version = "0.2.2"
+dependencies = [
+ "image",
+ "slint",
+ "slint-interpreter",
+ "smithay",
+ "vigil-core",
+]
 
 [[package]]
 name = "vigil-input"

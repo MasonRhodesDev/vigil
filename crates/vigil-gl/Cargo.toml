@@ -1,0 +1,21 @@
+[package]
+name = "vigil-gl"
+description = "EGL/GBM context and Slint OpenGLInterface for the GL rendering path (DESIGN.md §7)"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+# Not the workspace slint entry: enabling renderer-femtovg there would unify
+# the feature onto every crate in the graph, and the shipped greeter is
+# deliberately software-only (DESIGN.md §7 -- GL is fidelity on top, never
+# the baseline).
+slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "renderer-femtovg"] }
+smithay = { workspace = true, features = ["backend_egl", "backend_gbm", "backend_drm"] }
+
+[dev-dependencies]
+image.workspace = true
+slint-interpreter.workspace = true
