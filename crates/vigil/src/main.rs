@@ -873,20 +873,17 @@ impl App {
             } = entry;
             let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
             match presenter.with_frame(&mut |canvas| {
-                // The greeter is built on the software presenter; a GL canvas
-                // can only arrive from a presenter it was not given.
-                let Canvas::Cpu(target) = canvas else {
-                    eprintln!("vigil: unexpected GL canvas from the software presenter");
-                    return false;
+                // Either canvas: the window knows which backend it has, and
+                // the presenter hands out the matching kind.
+                let Canvas::Cpu(mut target) = canvas else {
+                    return window.render(canvas);
                 };
-                let (mid, row_len, stride) = (
+                let (mid, row_len) = (
                     target.stride * (target.height as usize / 2),
                     target.width as usize * 4,
-                    target.stride,
                 );
-                let _ = stride;
                 let drew = window.render_if_needed(FrameTarget {
-                    buffer: target.buffer,
+                    buffer: &mut target.buffer[..],
                     width: target.width,
                     height: target.height,
                     stride: target.stride,
