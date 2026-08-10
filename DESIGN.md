@@ -324,6 +324,20 @@ Alternatives rejected:
   the `Presenter` trait, using the already-proven `OpenGLInterface`
   approach — but it is fidelity on top, never the baseline.
 
+  Two of those objections did not survive contact (2026-08-10, #17).
+  **Dependency weight**: enabling `renderer-femtovg` adds six crates over
+  the software renderer, because the software path already pulls most of
+  the tree. **GPU-dependent CI**: not required. `tests/gpu/run.sh` boots a
+  virtme-ng guest where a plain `virtio-gpu` device plus Mesa's
+  `kms_swrast`/llvmpipe gives real GL over a real GBM surface with no host
+  GPU — verified rendering into a locked front buffer, the object that
+  becomes a DRM framebuffer. `--accel` swaps in `virtio-gpu-gl` and
+  virglrenderer for the host GPU when fidelity or speed is the question.
+
+  What remains true, and is now the actual reason software stays the
+  baseline: GL puts Mesa, EGL and GBM in the login path, where the software
+  renderer has no such surface to break.
+
 ## 8. Testing strategy
 
 Designed in from M1, not retrofitted:
