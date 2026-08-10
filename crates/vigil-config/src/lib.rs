@@ -14,6 +14,7 @@ pub struct Config {
     pub keyboard: Keyboard,
     pub sessions: Sessions,
     pub profiles: Profiles,
+    pub render: Render,
     pub users: Users,
     pub power: Power,
     pub greeter: Greeter,
@@ -69,6 +70,20 @@ impl Default for Sessions {
             default: String::new(),
         }
     }
+}
+
+/// Which renderer draws the greeter.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Render {
+    /// "software" (default) or "gl".
+    ///
+    /// Software is the zero-GPU baseline and what every machine can run;
+    /// "gl" is fidelity headroom and requires a build with the `gl` feature.
+    /// Anything unrecognised, unavailable, or that fails to initialise falls
+    /// back to software -- a rendering preference must never be why someone
+    /// cannot log in.
+    pub backend: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

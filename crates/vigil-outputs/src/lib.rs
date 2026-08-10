@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 
-use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier};
+use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier};
 use smithay::reexports::drm::control::{
     Device as ControlDevice, Mode, ModeTypeFlags, connector, crtc,
 };
@@ -19,7 +19,7 @@ use vigil_core::{OutputEvent, OutputId, OutputInfo};
 
 /// Re-exported opaquely so the binary can hand surfaces to a presenter
 /// without naming smithay itself.
-pub use smithay::backend::drm::DrmSurface;
+pub use smithay::backend::drm::{DrmDeviceFd, DrmSurface};
 
 /// Opaque udev monitor: a calloop event source firing on GPU/connector
 /// changes. The binary registers it and calls [`OutputManager::scan`] on any
@@ -251,6 +251,16 @@ impl OutputManager {
             .keys()
             .map(|id| OutputEvent::NeedsRedraw(*id))
             .collect()
+    }
+
+    /// The DRM device this manager owns.
+    ///
+    /// A GL presenter allocates its buffers on the same device and creates
+    /// framebuffers against it. Cloning shares the open file description,
+    /// which is what DRM master rides on -- opening the node again would not
+    /// be master.
+    pub fn device_fd(&self) -> smithay::backend::drm::DrmDeviceFd {
+        self.device.device_fd().clone()
     }
 
     /// Live output ids.

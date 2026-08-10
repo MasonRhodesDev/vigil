@@ -62,6 +62,15 @@ impl VigilPlatform {
     pub fn clear_adapter_override(&self) {
         *self.next.borrow_mut() = None;
     }
+
+    /// How many software adapters have been created and not yet claimed.
+    ///
+    /// Compare across an instantiation to tell whether it got the override:
+    /// the absolute count is not a signal, because earlier outputs leave
+    /// adapters behind.
+    pub fn adapters_created(&self) -> usize {
+        self.adapters.borrow().len()
+    }
 }
 
 impl Platform for VigilPlatform {

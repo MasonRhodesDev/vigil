@@ -19,7 +19,14 @@ vigil-auth = { path = "../vigil-auth" }
 vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }
 vigil-login = { path = "../vigil-login" }
+# The GL path is opt-in at build time as well as at runtime: DESIGN.md §7
+# keeps Mesa, EGL and GBM out of the default login path.
+vigil-gl = { path = "../vigil-gl", optional = true }
+vigil-present-gl = { path = "../vigil-present-gl", optional = true }
 calloop.workspace = true
 
 [dev-dependencies]
 image.workspace = true
+
+[features]
+gl = ["dep:vigil-gl", "dep:vigil-present-gl"]

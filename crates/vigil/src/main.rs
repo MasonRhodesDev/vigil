@@ -142,7 +142,7 @@ struct Entry {
     id: OutputId,
     width: u32,
     height: u32,
-    presenter: DumbBufferPresenter,
+    presenter: Box<dyn Presenter>,
     window: OutputWindow,
     /// Consecutive failed presents, for throttling the log. Reset on success.
     present_failures: u32,
@@ -396,16 +396,80 @@ impl App {
             .ok_or_else(|| format!("no GPU {index} for output {id:?}"))
     }
 
+    /// Build a GL window and presenter for one output.
+    ///
+    /// Absent the `gl` feature this always fails, so a config asking for GL
+    /// on a software build says so once per output and carries on.
+    #[cfg(feature = "gl")]
+    fn gl_output(
+        &mut self,
+        id: OutputId,
+        scale: f32,
+        surface_slot: &mut Option<vigil_outputs::DrmSurface>,
+        device_fd: vigil_outputs::DrmDeviceFd,
+    ) -> Result<(OutputWindow, Box<dyn Presenter>), String> {
+        use std::sync::Arc;
+        let surface = surface_slot.take().ok_or("no DRM surface")?;
+        // Duplicate the device's own descriptor: DRM master rides on the
+        // open file description, so re-opening the node would not be master.
+        let fd = Arc::new(
+            std::os::fd::AsFd::as_fd(&device_fd)
+                .try_clone_to_owned()
+                .map_err(|e| format!("dup drm fd: {e}"))?,
+        );
+        let context = Rc::new(vigil_gl::GlContext::from_fd(fd).map_err(|e| e.to_string())?);
+        let (presenter, gl_surface) =
+            vigil_present_gl::GbmPresenter::new(surface, device_fd, context)
+                .map_err(|e| e.to_string())?;
+        let (w, h) = presenter.size();
+        let gl_window =
+            vigil_gl::GlWindow::with_surface(gl_surface, vigil_gl::PhysicalSizeExport::new(w, h))
+                .map_err(|e| e.to_string())?;
+        gl_window.set_size(vigil_gl::PhysicalSizeExport::new(w, h));
+
+        // One instantiation asks for an adapter more than once, so the
+        // override is held across it and cleared after.
+        // Count across the instantiation rather than checking for any
+        // unclaimed adapter: earlier outputs leave their own behind, and a
+        // leftover is not evidence about this one.
+        let before = self.platform.adapters_created();
+        self.platform.use_next_adapter(gl_window.clone());
+        let component = self.theme.instantiate();
+        self.platform.clear_adapter_override();
+        let component = component.map_err(|e| e.to_string())?;
+        if self.platform.adapters_created() > before {
+            return Err("theme bound to a software adapter".into());
+        }
+
+        let window = OutputWindow::with_backend(
+            id,
+            w,
+            h,
+            scale,
+            component,
+            Box::new(vigil_gl::GlBackend::new(gl_window)),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((window, Box::new(presenter)))
+    }
+
+    #[cfg(not(feature = "gl"))]
+    fn gl_output(
+        &mut self,
+        _id: OutputId,
+        _scale: f32,
+        _surface_slot: &mut Option<vigil_outputs::DrmSurface>,
+        _device_fd: vigil_outputs::DrmDeviceFd,
+    ) -> Result<(OutputWindow, Box<dyn Presenter>), String> {
+        Err("built without the gl feature".into())
+    }
+
     fn add_output(&mut self, id: OutputId) -> Result<(), String> {
         let gpu = self.gpu_for(id)?;
         let info = gpu.info(id).cloned().ok_or("no info for output")?;
         let surface = gpu.create_surface(id).map_err(|e| e.to_string())?;
-        let presenter = DumbBufferPresenter::new(surface).map_err(|e| e.to_string())?;
-        let component = self.theme.instantiate().map_err(|e| e.to_string())?;
-        let adapter = self
-            .platform
-            .claim_last_adapter()
-            .ok_or("no window adapter captured for theme instance")?;
+        let device_fd = gpu.device_fd();
+        let want_gl = self.looks.config.render.backend.eq_ignore_ascii_case("gl");
         // Precedence: [output."NAME"] > monitor profile > EDID-derived default.
         let profile_scale = self
             .layout
@@ -437,16 +501,50 @@ impl App {
                 info.connector
             );
         }
-        let mut window = OutputWindow::with_transform(
-            id,
-            info.width,
-            info.height,
-            scale,
-            transform,
-            adapter,
-            component,
-        )
-        .map_err(|e| e.to_string())?;
+        // A rendering preference must never be why someone cannot log in, so
+        // a GL failure degrades to software with a log line, per output.
+        let mut surface_slot = Some(surface);
+        let gl = if want_gl {
+            match self.gl_output(id, scale, &mut surface_slot, device_fd) {
+                Ok(built) => Some(built),
+                Err(e) => {
+                    eprintln!(
+                        "vigil: {}: GL unavailable ({e}); using software",
+                        info.connector
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let (mut window, presenter) = match gl {
+            Some(built) => built,
+            None => {
+                let surface = surface_slot
+                    .take()
+                    .ok_or("DRM surface consumed by a failed GL attempt")?;
+                let presenter: Box<dyn Presenter> =
+                    Box::new(DumbBufferPresenter::new(surface).map_err(|e| e.to_string())?);
+                let component = self.theme.instantiate().map_err(|e| e.to_string())?;
+                let adapter = self
+                    .platform
+                    .claim_last_adapter()
+                    .ok_or("no window adapter captured for theme instance")?;
+                let window = OutputWindow::with_transform(
+                    id,
+                    info.width,
+                    info.height,
+                    scale,
+                    transform,
+                    adapter,
+                    component,
+                )
+                .map_err(|e| e.to_string())?;
+                (window, presenter)
+            }
+        };
         let (scene_width, scene_height) = window.scene_size();
 
         let (background, fit) = self.looks.for_connector(&info.connector);

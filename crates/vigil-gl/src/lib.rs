@@ -45,6 +45,9 @@ use gbm::AsRaw;
 use slint::platform::femtovg_renderer::{FemtoVGRenderer, OpenGLInterface};
 use slint::platform::{Renderer, WindowAdapter};
 use slint::{PhysicalSize, Window};
+
+/// Re-exported so consumers can size a window without depending on slint.
+pub use slint::PhysicalSize as PhysicalSizeExport;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::egl::display::EGLDisplayHandle;
 use smithay::backend::egl::display::PixelFormat;

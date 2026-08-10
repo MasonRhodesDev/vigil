@@ -28,5 +28,11 @@ fi
 # list). "Other DE" sorts first, so the driver cycling once should land on
 # "Test DE" -> /bin/true; without cycling, start cmd is /bin/false, which the
 # fake greetd still accepts (it only logs) — run.sh asserts the logged cmd.
-"$REPO/target/debug/vigil" --socket /tmp/greetd.sock 2>>"$LOG"
+# $VIGIL_E2E_CONFIG lets a run pick a non-default config -- the GL path is
+# selected that way, so the same flow can be driven on either renderer.
+if [ -n "${VIGIL_E2E_CONFIG:-}" ]; then
+    "$REPO/target/debug/vigil" --socket /tmp/greetd.sock --config "$VIGIL_E2E_CONFIG" 2>>"$LOG"
+else
+    "$REPO/target/debug/vigil" --socket /tmp/greetd.sock 2>>"$LOG"
+fi
 echo "VIGIL-EXIT:$?" | tee -a "$LOG"

@@ -35,6 +35,19 @@
 #remember = true
 #state_file = "/var/lib/vigil/state.toml"
 
+[render]
+# Which renderer draws the greeter: "software" (default) or "gl".
+#
+# Software is the zero-GPU baseline -- no Mesa, EGL or GBM in the login
+# path, which is why it is the default. "gl" renders through FemtoVG on the
+# GPU and needs a build with the `gl` feature; it buys fidelity headroom
+# (gradients, effects) rather than speed.
+#
+# Anything unrecognised, a build without the feature, or a GPU that fails to
+# initialise falls back to software per output, with a line in the log. A
+# rendering preference must never be why someone cannot log in.
+#backend = "software"
+
 [profiles]
 # Monitor-layout profiles (monitor-profiles format), shared with the
 # session manager so the login screen and the desktop agree on scale,
