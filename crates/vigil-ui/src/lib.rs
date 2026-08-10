@@ -187,6 +187,13 @@ impl OutputWindow {
     /// Whether this output draws the software cursor (the one under the
     /// pointer). The cursor is composited at present time, never rendered
     /// by Slint, so toggling or moving it costs a copy, not a re-render.
+    /// Force the next present to copy out even if the scene is unchanged.
+    /// After a resume the scanout buffers hold whatever survived suspend, so
+    /// there is nothing to be gained by trusting them.
+    pub fn request_present(&mut self) {
+        self.needs_present = true;
+    }
+
     pub fn set_cursor_visible(&mut self, visible: bool) {
         if self.cursor_visible != visible {
             self.cursor_visible = visible;

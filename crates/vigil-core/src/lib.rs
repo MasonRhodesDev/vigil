@@ -86,6 +86,16 @@ pub trait Presenter {
         &mut self,
         draw: &mut dyn FnMut(FrameTarget<'_>) -> bool,
     ) -> Result<bool, PresentError>;
+
+    /// Drop any assumption that the CRTC still holds our configuration, so
+    /// the next frame does a full modeset instead of a page flip.
+    ///
+    /// Required after the kernel may have lost display state under us —
+    /// system resume, or reclaiming the device after a VT switch. Flipping
+    /// onto a CRTC that no longer has our mode either fails or scans out
+    /// nothing, and the greeter has no way to notice it is showing a black
+    /// screen.
+    fn invalidate(&mut self);
 }
 
 // ---------------------------------------------------------------------------

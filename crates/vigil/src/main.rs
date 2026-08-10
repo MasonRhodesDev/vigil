@@ -22,10 +22,11 @@ use monitor_profiles::{ConnectedOutput, Profile, ResolvedOutput};
 use vigil_auth::AuthMachine;
 use vigil_config::Config;
 use vigil_core::{
-    AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputEvent, OutputId, PowerAction,
+    AuthUi, BackgroundFit, FrameTarget, InputEvent, LoginEvent, OutputEvent, OutputId, PowerAction,
     PresentError, Presenter, SessionEvent, UiMessage,
 };
 use vigil_input::InputSystem;
+use vigil_login::LoginSession;
 use vigil_outputs::OutputManager;
 use vigil_present_dumb::DumbBufferPresenter;
 use vigil_session::SessionManager;
@@ -40,6 +41,10 @@ const BANNER_POLL: Duration = Duration::from_secs(1);
 const BANNER_MAX: usize = 200;
 
 /// Cycler slot that returns the panel to typing a name.
+/// Present failures are retried every frame; log one in this many so a stuck
+/// output leaves a trail without flooding the journal.
+const PRESENT_LOG_EVERY: u32 = 60;
+
 const OTHER_USER: &str = "Other…";
 
 struct Cli {
@@ -139,6 +144,8 @@ struct Entry {
     height: u32,
     presenter: DumbBufferPresenter,
     window: OutputWindow,
+    /// Consecutive failed presents, for throttling the log. Reset on success.
+    present_failures: u32,
 }
 
 /// Fan-out AuthUi: every monitor mirrors the auth state.
@@ -208,6 +215,10 @@ struct App {
     snapshot: UiSnapshot,
     /// False while VT-switched away: DRM is paused, rendering must stop.
     active: bool,
+    /// logind sleep signals. Suspend never revokes DRM master, so no session
+    /// event fires across it and this is the greeter's only notice that the
+    /// kernel may have dropped its display state.
+    login_rx: std::sync::mpsc::Receiver<LoginEvent>,
     signal: LoopSignal,
     exit_code: i32,
 }
@@ -242,13 +253,49 @@ impl App {
                     }
                 }
                 self.rebuild_row();
-                // Presenters re-commit on the next drawn frame; force one.
+                // Reclaiming the device does not restore our CRTC state, so
+                // the presenters must be told to modeset rather than flip.
                 for e in self.entries.iter_mut() {
+                    e.presenter.invalidate();
+                    e.window.request_present();
                     e.window.set_panel_visible(false);
                 }
                 self.apply_panel();
             }
         }
+    }
+
+    /// Drain logind's sleep signals.
+    fn pump_login(&mut self) {
+        while let Ok(event) = self.login_rx.try_recv() {
+            match event {
+                LoginEvent::PrepareForSleep(true) => {}
+                LoginEvent::PrepareForSleep(false) => self.on_resume(),
+                // The greeter has no session to lock or unlock.
+                LoginEvent::Lock | LoginEvent::Unlock => {}
+            }
+        }
+    }
+
+    /// Rebuild the scanout state after a system resume.
+    ///
+    /// Nothing pauses the greeter across suspend — logind revokes DRM master
+    /// on a VT switch, not on sleep — so the presenters still believe their
+    /// CRTCs hold the mode they set before the machine went down. Flipping
+    /// onto that either fails or scans out nothing, and a greeter showing a
+    /// black screen has no way to notice. Force a full modeset and a present
+    /// that does not trust the surviving buffer contents.
+    fn on_resume(&mut self) {
+        for entry in self.entries.iter_mut() {
+            entry.presenter.invalidate();
+            entry.window.request_present();
+        }
+        // The clock is now wrong by however long the machine slept.
+        let text = clock_text(&self.clock_format);
+        for entry in self.entries.iter_mut() {
+            entry.window.set_clock(&text);
+        }
+        self.last_clock = (Instant::now(), text);
     }
 
     /// Match a profile against the connected outputs and cache its resolved
@@ -448,6 +495,7 @@ impl App {
             // sees, so a portrait monitor must present as portrait here.
             width: scene_width,
             height: scene_height,
+            present_failures: 0,
             presenter,
             window,
         });
@@ -677,6 +725,7 @@ impl App {
             self.last_banner = Instant::now();
             self.refresh_banner();
         }
+        self.pump_login();
         self.pump_messages();
         self.render();
     }
@@ -706,7 +755,10 @@ impl App {
         let mut dead = Vec::new();
         for (i, entry) in self.entries.iter_mut().enumerate() {
             let Entry {
-                presenter, window, ..
+                presenter,
+                window,
+                present_failures,
+                ..
             } = entry;
             let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
             match presenter.with_frame(&mut |target| {
@@ -729,9 +781,23 @@ impl App {
                 }
                 drew
             }) {
-                Ok(_) => {}
+                Ok(_) => *present_failures = 0,
                 Err(PresentError::DeviceLost) => dead.push(i),
-                Err(e) => eprintln!("vigil: present: {e}"),
+                Err(e) => {
+                    // The frame was drawn and the scene's dirty flag consumed,
+                    // but nothing reached the CRTC. Without re-arming, a single
+                    // failure — most likely just after a resume, when the
+                    // device may not be fully back — leaves the greeter black
+                    // until something else happens to change the scene.
+                    presenter.invalidate();
+                    window.request_present();
+                    // A persistent failure retries every frame; do not narrate
+                    // it every frame.
+                    if *present_failures % PRESENT_LOG_EVERY == 0 {
+                        eprintln!("vigil: present: {e} (retrying)");
+                    }
+                    *present_failures = present_failures.saturating_add(1);
+                }
             }
         }
         for i in dead.into_iter().rev() {
@@ -907,6 +973,16 @@ fn run() -> Result<i32, String> {
         EventLoop::try_new().map_err(|e| format!("event loop: {e}"))?;
     let handle = event_loop.handle();
 
+    // Sleep signals on a worker thread (the vigil-pam pattern: the event loop
+    // is calloop-driven and must never block on D-Bus). logind being absent
+    // is survivable — the greeter then behaves exactly as it did before, so
+    // this must never be fatal.
+    let (login_tx, login_rx) = std::sync::mpsc::channel();
+    let login = LoginSession::connect_for("vigil");
+    if let Some(login) = &login {
+        login.spawn_sleep_signals(login_tx);
+    }
+
     let mut app = App {
         session,
         outputs,
@@ -942,6 +1018,7 @@ fn run() -> Result<i32, String> {
         last_clock: (Instant::now(), clock_text(&resolved.clock_format)),
         snapshot: UiSnapshot::default(),
         active: true,
+        login_rx,
         signal: event_loop.get_signal(),
         exit_code: 1,
     };

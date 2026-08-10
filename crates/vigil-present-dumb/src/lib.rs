@@ -89,6 +89,10 @@ impl Presenter for DumbBufferPresenter {
         (self.width, self.height)
     }
 
+    fn invalidate(&mut self) {
+        self.modeset_done = false;
+    }
+
     fn with_frame(
         &mut self,
         draw: &mut dyn FnMut(FrameTarget<'_>) -> bool,

@@ -27,10 +27,17 @@ impl LoginSession {
     /// Connect and resolve our session's real object path. `None` (logged
     /// once) if anything fails — the locker then runs exactly as before.
     pub fn connect() -> Option<Self> {
+        Self::connect_for("vigil-lock")
+    }
+
+    /// As [`connect`](Self::connect), naming the caller in the failure log —
+    /// the greeter wants the sleep signals too, and "vigil-lock" in the
+    /// greeter's journal is a lie that costs someone an hour.
+    pub fn connect_for(component: &str) -> Option<Self> {
         match Self::try_connect() {
             Ok(session) => Some(session),
             Err(e) => {
-                eprintln!("vigil-lock: logind unavailable ({e}); no lock hint or signals");
+                eprintln!("{component}: logind unavailable ({e}); no logind hints or signals");
                 None
             }
         }

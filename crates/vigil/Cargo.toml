@@ -18,6 +18,7 @@ vigil-input = { path = "../vigil-input" }
 vigil-auth = { path = "../vigil-auth" }
 vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }
+vigil-login = { path = "../vigil-login" }
 calloop.workspace = true
 
 [dev-dependencies]

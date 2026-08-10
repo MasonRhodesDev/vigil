@@ -4444,6 +4444,7 @@ dependencies = [
  "vigil-config",
  "vigil-core",
  "vigil-input",
+ "vigil-login",
  "vigil-outputs",
  "vigil-present-dumb",
  "vigil-session",
