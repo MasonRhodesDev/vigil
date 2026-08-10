@@ -22,8 +22,8 @@ use monitor_profiles::{ConnectedOutput, Profile, ResolvedOutput};
 use vigil_auth::AuthMachine;
 use vigil_config::Config;
 use vigil_core::{
-    AuthUi, BackgroundFit, FrameTarget, InputEvent, LoginEvent, OutputEvent, OutputId, PowerAction,
-    PresentError, Presenter, SessionEvent, UiMessage,
+    AuthUi, BackgroundFit, Canvas, FrameTarget, InputEvent, LoginEvent, OutputEvent, OutputId,
+    PowerAction, PresentError, Presenter, SessionEvent, UiMessage,
 };
 use vigil_input::InputSystem;
 use vigil_login::LoginSession;
@@ -761,7 +761,13 @@ impl App {
                 ..
             } = entry;
             let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
-            match presenter.with_frame(&mut |target| {
+            match presenter.with_frame(&mut |canvas| {
+                // The greeter is built on the software presenter; a GL canvas
+                // can only arrive from a presenter it was not given.
+                let Canvas::Cpu(target) = canvas else {
+                    eprintln!("vigil: unexpected GL canvas from the software presenter");
+                    return false;
+                };
                 let (mid, row_len, stride) = (
                     target.stride * (target.height as usize / 2),
                     target.width as usize * 4,

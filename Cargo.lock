@@ -4613,6 +4613,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vigil-present-gbm"
+version = "0.2.2"
+dependencies = [
+ "gbm",
+ "slint",
+ "slint-interpreter",
+ "smithay",
+ "vigil-core",
+ "vigil-gl",
+]
+
+[[package]]
 name = "vigil-present-gl"
 version = "0.2.2"
 dependencies = [

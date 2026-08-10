@@ -54,7 +54,10 @@ fn main() {
 
     // Frame 1: gradient (modeset commit).
     for p in presenters.iter_mut() {
-        p.with_frame(&mut |t| {
+        p.with_frame(&mut |canvas| {
+            let vigil_core::Canvas::Cpu(t) = canvas else {
+                panic!("dumb presenter handed a GL canvas");
+            };
             gradient(t, 0);
             true
         })
@@ -68,7 +71,10 @@ fn main() {
 
     // Frame 2: shifted gradient (page flip).
     for p in presenters.iter_mut() {
-        p.with_frame(&mut |t| {
+        p.with_frame(&mut |canvas| {
+            let vigil_core::Canvas::Cpu(t) = canvas else {
+                panic!("dumb presenter handed a GL canvas");
+            };
             gradient(t, 128);
             true
         })

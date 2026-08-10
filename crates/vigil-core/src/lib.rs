@@ -74,6 +74,29 @@ impl std::error::Error for PresentError {}
 
 /// How a rendered frame reaches an output. Implemented by vigil-present-dumb
 /// (software, permanent baseline) and vigil-present-gl (GL, M3).
+/// What a presenter hands the renderer for one frame.
+///
+/// The two rendering paths differ in what "draw here" even means: the
+/// software renderer fills a byte buffer, while GL issues commands against a
+/// bound framebuffer and never sees pixels at all. This is that difference,
+/// and the only place the rest of the code has to know about it.
+pub enum Canvas<'a> {
+    /// A CPU buffer to fill (the software baseline).
+    Cpu(FrameTarget<'a>),
+    /// The GL context is current and its default framebuffer is bound. The
+    /// renderer issues GL calls; the presenter swaps and scans out.
+    Gl { width: u32, height: u32 },
+}
+
+impl Canvas<'_> {
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Canvas::Cpu(target) => (target.width, target.height),
+            Canvas::Gl { width, height } => (*width, *height),
+        }
+    }
+}
+
 pub trait Presenter {
     fn size(&self) -> (u32, u32);
 
@@ -84,7 +107,7 @@ pub trait Presenter {
     /// Flip completion is reported via the event loop, not by blocking here.
     fn with_frame(
         &mut self,
-        draw: &mut dyn FnMut(FrameTarget<'_>) -> bool,
+        draw: &mut dyn FnMut(Canvas<'_>) -> bool,
     ) -> Result<bool, PresentError>;
 
     /// Drop any assumption that the CRTC still holds our configuration, so

@@ -8,7 +8,7 @@ use smithay::reexports::drm::buffer::{Buffer as _, DrmFourcc};
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
 use smithay::reexports::drm::control::{Device as ControlDevice, framebuffer};
 use smithay::utils::{Rectangle, Transform};
-use vigil_core::{FrameTarget, PresentError, Presenter};
+use vigil_core::{Canvas, FrameTarget, PresentError, Presenter};
 
 const BPP: u32 = 32;
 const DEPTH: u32 = 24;
@@ -95,7 +95,7 @@ impl Presenter for DumbBufferPresenter {
 
     fn with_frame(
         &mut self,
-        draw: &mut dyn FnMut(FrameTarget<'_>) -> bool,
+        draw: &mut dyn FnMut(Canvas<'_>) -> bool,
     ) -> Result<bool, PresentError> {
         let slot = &mut self.slots[self.back];
 
@@ -105,12 +105,12 @@ impl Presenter for DumbBufferPresenter {
                 .surface
                 .map_dumb_buffer(&mut slot.buffer)
                 .map_err(backend)?;
-            draw(FrameTarget {
+            draw(Canvas::Cpu(FrameTarget {
                 buffer: mapping.as_mut(),
                 width: self.width,
                 height: self.height,
                 stride,
-            })
+            }))
         };
         if !drew {
             return Ok(false);
