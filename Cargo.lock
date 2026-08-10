@@ -4613,7 +4613,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vigil-present-gbm"
+name = "vigil-present-gl"
 version = "0.2.2"
 dependencies = [
  "gbm",
@@ -4622,13 +4622,8 @@ dependencies = [
  "smithay",
  "vigil-core",
  "vigil-gl",
-]
-
-[[package]]
-name = "vigil-present-gl"
-version = "0.2.2"
-dependencies = [
- "vigil-core",
+ "vigil-theme",
+ "vigil-ui",
 ]
 
 [[package]]

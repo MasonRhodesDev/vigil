@@ -389,6 +389,10 @@ pub struct GlWindow {
     window: Window,
     renderer: FemtoVGRenderer,
     size: std::cell::Cell<PhysicalSize>,
+    /// Set by Slint when the scene needs drawing again. Without consulting
+    /// it a GL greeter would redraw and flip forever on an idle login
+    /// screen; the software path gets the same signal from `draw_if_needed`.
+    needs_redraw: std::cell::Cell<bool>,
     /// Present when rendering on-screen; absent for a context-only window,
     /// which can compile and instantiate a scene but not produce pixels.
     gbm: Option<GbmWindow>,
@@ -427,6 +431,8 @@ impl GlWindow {
             window: Window::new(weak.clone()),
             renderer,
             size: std::cell::Cell::new(size),
+            // Draw the first frame unconditionally.
+            needs_redraw: std::cell::Cell::new(true),
             gbm,
         }))
     }
@@ -437,6 +443,12 @@ impl GlWindow {
         self.renderer
             .render()
             .map_err(|e| GlError(format!("render: {e}")))
+    }
+
+    /// Whether Slint has asked for a redraw since this was last called.
+    /// Reading it clears it.
+    pub fn take_needs_redraw(&self) -> bool {
+        self.needs_redraw.replace(false)
     }
 
     /// The GBM surface, when this window renders on-screen.
@@ -464,5 +476,73 @@ impl WindowAdapter for GlWindow {
 
     fn renderer(&self) -> &dyn Renderer {
         &self.renderer
+    }
+
+    fn request_redraw(&self) {
+        self.needs_redraw.set(true);
+    }
+}
+
+/// A [`RenderBackend`](vigil_core::RenderBackend) drawing through GL.
+///
+/// The counterpart to vigil-ui's software backend: same scene, same trait,
+/// different way of turning it into pixels. The scene itself -- every
+/// property, the pointer, the auth state -- is shared code neither backend
+/// knows about.
+pub struct GlBackend {
+    window: Rc<GlWindow>,
+    /// What the scene looked like when it was last presented. GL has no
+    /// equivalent of the software path's partial-repaint bookkeeping, so
+    /// without this an idle login screen would render and flip forever.
+    last: Option<vigil_core::SceneView>,
+    force: bool,
+}
+
+impl GlBackend {
+    pub fn new(window: Rc<GlWindow>) -> Self {
+        Self {
+            window,
+            last: None,
+            force: true,
+        }
+    }
+
+    /// The GBM surface being rendered into, for the presenter to scan out.
+    pub fn gbm(&self) -> Option<&GbmWindow> {
+        self.window.gbm()
+    }
+}
+
+impl vigil_core::RenderBackend for GlBackend {
+    fn request_present(&mut self) {
+        self.force = true;
+    }
+
+    fn render(&mut self, view: &vigil_core::SceneView, canvas: vigil_core::Canvas<'_>) -> bool {
+        if !matches!(canvas, vigil_core::Canvas::Gl { .. }) {
+            eprintln!("vigil-gl: GL backend given a CPU canvas");
+            return false;
+        }
+        // Slint's own redraw request fires once for a custom adapter and
+        // never re-arms, so it cannot be the only signal; the view's revision
+        // is what actually tracks scene changes. Both are honoured.
+        let scene_dirty = self.window.take_needs_redraw();
+        if std::env::var_os("VIGIL_DEBUG_FRAMES").is_some() {
+            eprintln!(
+                "vigil-gl: dirty={scene_dirty} force={} view_changed={}",
+                self.force,
+                self.last.as_ref() != Some(view)
+            );
+        }
+        if !self.force && !scene_dirty && self.last.as_ref() == Some(view) {
+            return false;
+        }
+        if let Err(e) = self.window.render() {
+            eprintln!("vigil-gl: render: {e}");
+            return false;
+        }
+        self.last = Some(*view);
+        self.force = false;
+        true
     }
 }

@@ -9,3 +9,12 @@ repository.workspace = true
 
 [dependencies]
 vigil-core.workspace = true
+vigil-gl = { path = "../vigil-gl" }
+smithay = { workspace = true, features = ["backend_drm", "backend_gbm", "backend_egl"] }
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
+
+[dev-dependencies]
+vigil-ui = { path = "../vigil-ui" }
+vigil-theme = { path = "../vigil-theme" }
+slint = { workspace = true }
+slint-interpreter.workspace = true

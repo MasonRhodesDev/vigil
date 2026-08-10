@@ -5,7 +5,7 @@
 //! frames -- a bug a one-frame demo cannot see. This drives enough frames
 //! that a leak has to surface.
 //!
-//!   cargo build -p vigil-present-gbm --example gl_frames
+//!   cargo build -p vigil-present-gl --example gl_frames
 //!   tests/gpu/run.sh --screenshot /tmp/frames.ppm -- target/debug/examples/gl_frames
 //!   tests/gpu/run.sh --accel -- target/debug/examples/gl_frames
 
@@ -21,7 +21,7 @@ use smithay::backend::drm::{DrmDevice, DrmDeviceFd};
 use smithay::utils::DeviceFd;
 use vigil_core::{Canvas, Presenter};
 use vigil_gl::{GlContext, GlWindow};
-use vigil_present_gbm::GbmPresenter;
+use vigil_present_gl::GbmPresenter;
 
 use smithay::reexports::drm::control::Device as ControlDevice;
 

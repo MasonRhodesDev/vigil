@@ -85,6 +85,9 @@ pub struct SceneView {
     pub scale: f32,
     pub pointer: (f64, f64),
     pub cursor_visible: bool,
+    /// Bumped on every scene mutation. A backend with no repaint bookkeeping
+    /// of its own compares this to decide whether a frame is worth drawing.
+    pub revision: u64,
 }
 
 /// Turns a scene into pixels. The half of rendering that differs between the

@@ -29,6 +29,13 @@ use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 #[derive(Clone, Default)]
 pub struct VigilPlatform {
     adapters: Rc<RefCell<Vec<Rc<MinimalSoftwareWindow>>>>,
+    /// Adapter to vend for the next instantiation instead of a software one.
+    ///
+    /// A component is bound to whatever adapter existed when it was created,
+    /// so a GL scene has to be built against its own GL window -- which only
+    /// exists after that output's surface does. The binary sets this, then
+    /// instantiates.
+    next: Rc<RefCell<Option<Rc<dyn WindowAdapter>>>>,
 }
 
 impl VigilPlatform {
@@ -44,10 +51,31 @@ impl VigilPlatform {
     pub fn claim_last_adapter(&self) -> Option<Rc<MinimalSoftwareWindow>> {
         self.adapters.borrow_mut().pop()
     }
+
+    /// Vend `adapter` for components instantiated from now until
+    /// [`Self::clear_adapter_override`]. Wrap exactly one instantiation.
+    pub fn use_next_adapter(&self, adapter: Rc<dyn WindowAdapter>) {
+        *self.next.borrow_mut() = Some(adapter);
+    }
+
+    /// Go back to vending software adapters.
+    pub fn clear_adapter_override(&self) {
+        *self.next.borrow_mut() = None;
+    }
 }
 
 impl Platform for VigilPlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+        // A one-shot override: taken, so the next instantiation goes back to
+        // the software default rather than silently reusing this adapter.
+        // Sticky, not one-shot: instantiating one component asks for an
+        // adapter more than once, and handing out the override only the first
+        // time leaves the component bound to a software window that the GL
+        // renderer then draws nothing into -- a black screen with every log
+        // line reporting success.
+        if let Some(adapter) = self.next.borrow().clone() {
+            return Ok(adapter);
+        }
         // Partial repaints into the window's persistent shadow buffer; each
         // present then copies the shadow to the (possibly alternating)
         // output buffer. Software-rendering a full 4K scene per frame is
@@ -74,6 +102,12 @@ pub struct OutputWindow {
     pointer_x: f64,
     pointer_y: f64,
     cursor_visible: bool,
+    /// Bumped whenever the scene changes. Slint's own redraw request fires
+    /// once for a custom adapter and never re-arms, so a backend that has no
+    /// partial-repaint bookkeeping of its own (GL) needs a signal it can
+    /// trust. Every mutation funnels through `set_property`, so one counter
+    /// there covers the lot.
+    revision: std::cell::Cell<u64>,
     component: ComponentInstance,
 }
 
@@ -149,6 +183,40 @@ impl OutputWindow {
         Self::with_transform(id, width, height, scale, 0, adapter, component)
     }
 
+    /// Bind a component to a backend built elsewhere -- the GL path, which
+    /// this crate cannot name without depending on it.
+    ///
+    /// `width`/`height` are *scene* dimensions here: a caller with its own
+    /// adapter has already sized it, so there is nothing left to swap.
+    pub fn with_backend(
+        id: OutputId,
+        width: u32,
+        height: u32,
+        scale: f32,
+        component: ComponentInstance,
+        backend: Box<dyn RenderBackend>,
+    ) -> Result<Self, PlatformError> {
+        let scale = scale.max(f32::EPSILON);
+        component
+            .window()
+            .dispatch_event(WindowEvent::ScaleFactorChanged {
+                scale_factor: scale,
+            });
+        component.show()?;
+        Ok(Self {
+            _id: id,
+            backend,
+            width,
+            height,
+            scale,
+            pointer_x: 0.0,
+            pointer_y: 0.0,
+            cursor_visible: false,
+            revision: std::cell::Cell::new(0),
+            component,
+        })
+    }
+
     /// `width`/`height` are the panel's scanout dimensions; a quarter-turn
     /// transform swaps them to get the scene the theme is laid out in.
     pub fn with_transform(
@@ -193,6 +261,7 @@ impl OutputWindow {
             pointer_x: 0.0,
             pointer_y: 0.0,
             cursor_visible: false,
+            revision: std::cell::Cell::new(0),
             component,
         })
     }
@@ -230,6 +299,8 @@ impl OutputWindow {
 
     /// Route a normalized input event into this window.
     pub fn dispatch(&mut self, event: InputEvent) {
+        // Input can change what the scene shows (typed text, focus, hover).
+        self.touch();
         let window = self.component.window();
         match event {
             InputEvent::PointerMotion { dx, dy } => {
@@ -295,13 +366,20 @@ impl OutputWindow {
             scale: self.scale,
             pointer: (self.pointer_x, self.pointer_y),
             cursor_visible: self.cursor_visible,
+            revision: self.revision.get(),
         }
     }
 
-    /// Render into the target if dirty; returns whether pixels changed.
-    pub fn render_if_needed(&mut self, target: FrameTarget<'_>) -> bool {
+    /// Draw into whatever canvas the presenter handed out; returns whether
+    /// anything was drawn. The one render entry point both paths share.
+    pub fn render(&mut self, canvas: CoreCanvas<'_>) -> bool {
         let view = self.view();
-        self.backend.render(&view, CoreCanvas::Cpu(target))
+        self.backend.render(&view, canvas)
+    }
+
+    /// Render into a CPU target if dirty; returns whether pixels changed.
+    pub fn render_if_needed(&mut self, target: FrameTarget<'_>) -> bool {
+        self.render(CoreCanvas::Cpu(target))
     }
 
     fn pointer_position(&self) -> LogicalPosition {
@@ -379,9 +457,7 @@ impl OutputWindow {
     /// Optional theme property `user-name` (not in contract v1): set
     /// best-effort, silently skipped on themes that lack it.
     pub fn set_user_name(&mut self, name: &str) {
-        let _ = self
-            .component
-            .set_property("user-name", Value::String(name.into()));
+        self.set_optional_property("user-name", Value::String(name.into()));
     }
 
     /// Theme contract `sessions`: display names of the launchable sessions.
@@ -408,7 +484,7 @@ impl OutputWindow {
             .iter()
             .map(|n| Value::String(n.as_str().into()))
             .collect();
-        let _ = self.component.set_property(
+        self.set_optional_property(
             "users",
             Value::Model(slint::ModelRc::new(slint::VecModel::from(model))),
         );
@@ -416,22 +492,18 @@ impl OutputWindow {
 
     /// Optional theme property `selected-user` (contract v2).
     pub fn set_user_index(&mut self, index: usize) {
-        let _ = self
-            .component
-            .set_property("selected-user", Value::Number(index as f64));
+        self.set_optional_property("selected-user", Value::Number(index as f64));
     }
 
     /// Optional theme property `color-scheme` ("dark" | "light" | "").
     pub fn set_color_scheme(&mut self, scheme: &str) {
-        let _ = self
-            .component
-            .set_property("color-scheme", Value::String(scheme.into()));
+        self.set_optional_property("color-scheme", Value::String(scheme.into()));
     }
 
     /// Optional theme property `accent-color`. Portal sRGB is already
     /// [0,1] floats, which is exactly what `from_rgb_f32` wants.
     pub fn set_accent_color(&mut self, rgb: (f32, f32, f32)) {
-        let _ = self.component.set_property(
+        self.set_optional_property(
             "accent-color",
             Color::from_rgb_f32(rgb.0, rgb.1, rgb.2).into(),
         );
@@ -440,6 +512,19 @@ impl OutputWindow {
     fn set_property(&self, name: &str, value: Value) {
         let result = self.component.set_property(name, value);
         debug_assert!(result.is_ok());
+        self.touch();
+    }
+
+    /// As [`Self::set_property`] but for optional contract properties a theme
+    /// may legitimately not declare.
+    fn set_optional_property(&self, name: &str, value: Value) {
+        let _ = self.component.set_property(name, value);
+        self.touch();
+    }
+
+    /// Mark the scene changed.
+    fn touch(&self) {
+        self.revision.set(self.revision.get().wrapping_add(1));
     }
 }
 
