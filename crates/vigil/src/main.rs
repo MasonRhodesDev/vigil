@@ -875,7 +875,7 @@ impl App {
             match presenter.with_frame(&mut |canvas| {
                 // Either canvas: the window knows which backend it has, and
                 // the presenter hands out the matching kind.
-                let Canvas::Cpu(mut target) = canvas else {
+                let Canvas::Cpu(target) = canvas else {
                     return window.render(canvas);
                 };
                 let (mid, row_len) = (
