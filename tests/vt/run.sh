@@ -16,7 +16,9 @@ set -uo pipefail
 DIR=$(cd "$(dirname "$0")/../.." && pwd)
 # Release build: debug-profile software rendering at 4K is slow enough to
 # starve the event loop (libinput overflows and drops keystrokes).
-BIN=$DIR/target/release/vigil
+# $VIGIL_VT_BIN pre-flights an *installed* greeter -- the exact binary greetd
+# will run -- rather than the repo build.
+BIN=${VIGIL_VT_BIN:-$DIR/target/release/vigil}
 [ -x "$BIN" ] || BIN=$DIR/target/debug/vigil
 SOCK=${XDG_RUNTIME_DIR:-/tmp}/vigil-vt-test.sock
 PASSWORD=${VIGIL_TEST_PASSWORD:-vigil-test}

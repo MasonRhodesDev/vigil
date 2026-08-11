@@ -986,6 +986,15 @@ fn run() -> Result<i32, String> {
         None => Vec::new(),
     };
 
+    eprintln!(
+        "vigil: renderer requested: {} (per-output result logged below)",
+        if config.render.backend.is_empty() {
+            "software"
+        } else {
+            &config.render.backend
+        }
+    );
+
     let (session, notifier) = SessionManager::new().map_err(|e| e.to_string())?;
     let seat = session.seat_name();
     let mut session = session;
