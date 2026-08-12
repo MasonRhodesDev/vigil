@@ -1,4 +1,4 @@
-# vigil — session handoff (2026-08-05)
+# vigil — session handoff (2026-08-12)
 
 Working notes for whoever picks this up next. Authoritative sources:
 [DESIGN.md](DESIGN.md) for architecture, GitHub issues for the backlog.
@@ -57,21 +57,26 @@ What makes it work:
   detectors — codex's gate runs (long dep compiles in its own process
   group) look identical to a wedge and false-alarm constantly.
 
-## Open issues (8)
+## Open issues (7)
 
 Umbrella: **#20**. Nothing is blocked on anything else anymore.
 
+- **#25 GL software cursor** — blocks GL becoming a deployable default;
+  DRM cursor plane preferred, measured against post-render composite.
+- **#26 GL rotation**, **#27 multi-GPU GL** — need on-metal testing
+  with the dock (plane `rotation` property; virtio-gpu can't prove it).
+- **#29 deployment drift** — needs Mason's call: should game mode's
+  greeter match the desktop one or stay pinned to the packaged RPM?
 - **#6 hotplug at the greeter**, **#7 suspend/resume at the greeter** —
   validation work; needs harness design (the dock's DP-1 is on the
   second GPU, which makes it the interesting case).
 - **#10 login1 integration** — Lock/Unlock signals + `SetLockedHint`;
   also carries a documented residual from #9: invalidate an active
   grace window on `PrepareForSleep(true)`.
-- **#14 → #15 → #16 theme track** — runtime theme polish, then the
-  styled lmtt theme (visual parity with the retired hyprlock look —
-  the thing Mason sees every morning), then light/dark via `lmtt
-  switch`.
-- **#17 GL presenter**, **#18 status-banner channel** — M3 fidelity.
+
+Closed since 08-05: #14/#15/#16 (theme track), #17 (GL presenter),
+#18 (banner), #19 (vendor), #21–#24 (greeter spec + EDID/transform),
+#28 (e2e frame assertions).
 
 ## Landmines (learned the hard way, all real)
 
@@ -104,6 +109,22 @@ Umbrella: **#20**. Nothing is blocked on anything else anymore.
 - hypr-DE files use `@DATADIR@`/`@BINDIR@`/`@LIBEXECDIR@` templating —
   substitute **all** placeholders (`packaging/substitute.sh` semantics)
   or you silently break unrelated keybinds.
+
+## Session notes (2026-08-12, Arch reference machine)
+
+- **codex auth is broken** (`refresh token was already used`); `codex
+  exec` dies instantly. Mason must re-run `codex login`. Until then,
+  implement directly.
+- e2e on Arch needs `virtme-ng` and `qemu-hw-display-virtio-gpu-pci`
+  (both in extra, now installed) — Fedora's qemu bundles the device,
+  Arch splits it. rustc had to move to 1.97 for the slint 1.17 lockfile.
+- **QEMU's console shows stale fbcon for ~10s** after vigil starts
+  presenting (both cards; even VT switches don't show). Not a vigil bug
+  — 23 successful draws/flips logged during the freeze. drive.py now
+  waits for first paint before driving; don't chase the black frames.
+- The e2e guest inherits the HOST's installed theme (shared read-only
+  rootfs) — Mason's lmtt wallpaper theme, not the repo default. Frame
+  assertions must stay theme-agnostic (check_frames.py explains).
 
 ## Testing
 
