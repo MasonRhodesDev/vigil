@@ -53,6 +53,40 @@ def click(x, y, width=None, height=None):
 
 cmd("qmp_capabilities")
 
+def load_ppm(path):
+    """Binary P6 only. Returns (width, height, rgb_bytes)."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    magic, dims, _maxval, px = data.split(b"\n", 3)
+    if magic != b"P6":
+        sys.exit(f"{path}: not a binary P6 ppm")
+    w, h = map(int, dims.split())
+    return w, h, px
+
+def distinct_colors(img, step=8):
+    w, h, px = img
+    seen = set()
+    for y in range(0, h, step):
+        row = y * w
+        for x in range(0, w, step):
+            i = (row + x) * 3
+            seen.add(px[i:i + 3])
+    return len(seen)
+
+# The VM's console shows stale fbcon (a black frame, <=2 distinct colours)
+# for ~10s after vigil starts presenting. Driving before the greeter is
+# actually on screen would capture frames that say nothing about it — and a
+# renderer that never paints anything must fail here, not "pass" blind.
+FIRST_PAINT_TIMEOUT = 90
+t0 = time.time()
+while True:
+    cmd("screendump", filename=f"{outdir}/0-first-paint.ppm")
+    if distinct_colors(load_ppm(f"{outdir}/0-first-paint.ppm")) >= 8:
+        break
+    if time.time() - t0 > FIRST_PAINT_TIMEOUT:
+        sys.exit(f"greeter never appeared on screen after {FIRST_PAINT_TIMEOUT}s")
+    time.sleep(1)
+
 # Username stage.
 cmd("screendump", filename=f"{outdir}/1-username.ppm")
 typestr("demo")

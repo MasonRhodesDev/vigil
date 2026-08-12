@@ -43,4 +43,8 @@ grep -q "VIGIL-EXIT:0" "$WORK/vigil.log" || { echo "E2E FAIL: no clean exit ($WO
     echo "E2E FAIL: expected outputs on both GPUs ($WORK)"; exit 1; }
 grep -q "START_SESSION cmd=\['/bin/true'\]" "$WORK/vigil.log" || {
     echo "E2E FAIL: picked session was not started ($WORK)"; exit 1; }
+# A renderer that produces black frames must not pass (issue #28): the
+# flow above is driven blind over QMP and proves nothing about pixels.
+python3 "$REPO/tests/e2e/check_frames.py" "$WORK" || {
+    echo "E2E FAIL: frame assertions ($WORK)"; exit 1; }
 echo "E2E PASS ($WORK)"
