@@ -57,14 +57,15 @@ What makes it work:
   detectors — codex's gate runs (long dep compiles in its own process
   group) look identical to a wedge and false-alarm constantly.
 
-## Open issues (7)
+## Open issues (6)
 
 Umbrella: **#20**. Nothing is blocked on anything else anymore.
 
-- **#25 GL software cursor** — blocks GL becoming a deployable default;
-  DRM cursor plane preferred, measured against post-render composite.
 - **#26 GL rotation**, **#27 multi-GPU GL** — need on-metal testing
   with the dock (plane `rotation` property; virtio-gpu can't prove it).
+  #27's metal session should also eyeball the #25 cursor arrow — QEMU
+  keeps the cursor plane out of screendump, so it is verified by
+  commit success + log only.
 - **#29 deployment drift** — needs Mason's call: should game mode's
   greeter match the desktop one or stay pinned to the packaged RPM?
 - **#6 hotplug at the greeter**, **#7 suspend/resume at the greeter** —
@@ -76,7 +77,8 @@ Umbrella: **#20**. Nothing is blocked on anything else anymore.
 
 Closed since 08-05: #14/#15/#16 (theme track), #17 (GL presenter),
 #18 (banner), #19 (vendor), #21–#24 (greeter spec + EDID/transform),
-#28 (e2e frame assertions).
+#28 (e2e frame assertions), #25 (GL cursor on a DRM cursor plane —
+atomic-then-hotspot cap order matters; see plane_probe.rs).
 
 ## Landmines (learned the hard way, all real)
 
