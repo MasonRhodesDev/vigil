@@ -36,6 +36,23 @@ fn backend(e: impl std::fmt::Display) -> PresentError {
     PresentError::Backend(e.to_string())
 }
 
+/// A device that vanished (ENODEV) is as gone as one that got paused:
+/// surprise removal — a dock GPU unplugged at the greeter (#6) — must drop
+/// the output, not retry the present forever.
+fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
+    use smithay::backend::drm::DrmError;
+    use smithay::reexports::rustix;
+    match e {
+        DrmError::DeviceInactive => PresentError::DeviceLost,
+        DrmError::Access(ref a)
+            if rustix::io::Errno::from_io_error(&a.source) == Some(rustix::io::Errno::NODEV) =>
+        {
+            PresentError::DeviceLost
+        }
+        e => backend(e),
+    }
+}
+
 /// One frame's worth of scanout state: the buffer and the framebuffer made
 /// from it. The framebuffer must outlive the flip, and the buffer must
 /// outlive the framebuffer, so they travel together.
@@ -277,10 +294,7 @@ impl Presenter for GbmPresenter {
             }
             let mut states = vec![self.plane_state(*current.fb.as_ref())];
             states.extend(self.cursor_state());
-            self.surface.page_flip(states, true).map_err(|e| match e {
-                smithay::backend::drm::DrmError::DeviceInactive => PresentError::DeviceLost,
-                e => backend(e),
-            })?;
+            self.surface.page_flip(states, true).map_err(present_error)?;
             if let Some(cursor) = self.cursor.as_mut() {
                 cursor.dirty = false;
             }
@@ -304,10 +318,7 @@ impl Presenter for GbmPresenter {
         } else {
             self.surface.commit(states, true)
         };
-        result.map_err(|e| match e {
-            smithay::backend::drm::DrmError::DeviceInactive => PresentError::DeviceLost,
-            e => backend(e),
-        })?;
+        result.map_err(present_error)?;
         self.modeset_done = true;
         if let Some(cursor) = self.cursor.as_mut() {
             cursor.dirty = false;

@@ -188,7 +188,9 @@ struct App {
     session: SessionManager,
     /// One manager per GPU (outputs can span cards); index == the
     /// `OutputId` namespace.
-    outputs: Vec<OutputManager>,
+    /// One manager per GPU; the index IS the `OutputId` namespace, so a
+    /// card that vanishes at runtime is tombstoned (`None`), never removed.
+    outputs: Vec<Option<OutputManager>>,
     profiles: Vec<Profile>,
     layout: Vec<ResolvedOutput>,
     input: InputSystem,
@@ -232,7 +234,7 @@ impl App {
             SessionEvent::Pause => {
                 self.active = false;
                 self.input.suspend();
-                for gpu in self.outputs.iter_mut() {
+                for gpu in self.outputs.iter_mut().flatten() {
                     gpu.pause();
                 }
             }
@@ -241,13 +243,14 @@ impl App {
                 if let Err(e) = self.input.resume() {
                     eprintln!("vigil: {e}");
                 }
-                for gpu in self.outputs.iter_mut() {
+                for gpu in self.outputs.iter_mut().flatten() {
                     let _ = gpu.activate();
                 }
                 // A render racing the pause can hit DeviceInactive and drop
                 // its entry, and no udev event replays a VT switch — so any
                 // output a manager still knows but we lost gets rebuilt.
-                let known: Vec<OutputId> = self.outputs.iter().flat_map(|gpu| gpu.ids()).collect();
+                let known: Vec<OutputId> =
+                    self.outputs.iter().flatten().flat_map(|gpu| gpu.ids()).collect();
                 for id in known {
                     if !self.entries.iter().any(|e| e.id == id)
                         && let Err(e) = self.add_output(id)
@@ -309,7 +312,7 @@ impl App {
             return Vec::new();
         }
         let mut connected = Vec::new();
-        for gpu in &self.outputs {
+        for gpu in self.outputs.iter().flatten() {
             for id in gpu.ids() {
                 if let Some(info) = gpu.info(id) {
                     connected.push((
@@ -353,7 +356,7 @@ impl App {
             }
             if let Some(mode) = out.mode {
                 let want = (mode.width, mode.height, mode.refresh.round() as u32);
-                if let Some(gpu) = self.outputs.get_mut((id.0 >> 24) as usize)
+                if let Some(gpu) = self.outputs.get_mut((id.0 >> 24) as usize).and_then(Option::as_mut)
                     && let Err(e) = gpu.set_mode(*id, want)
                 {
                     eprintln!("vigil: profile {}: {e}; using preferred mode", profile.name);
@@ -366,10 +369,28 @@ impl App {
 
     fn rescan(&mut self) {
         let mut events = Vec::new();
-        for gpu in self.outputs.iter_mut() {
+        for slot in self.outputs.iter_mut() {
+            let Some(gpu) = slot else { continue };
             match gpu.scan() {
                 Ok(batch) => events.extend(batch),
-                Err(e) => eprintln!("vigil: hotplug scan failed: {e}"),
+                Err(e) if gpu.alive() => eprintln!("vigil: hotplug scan failed: {e}"),
+                Err(_) => {
+                    // The whole card is gone (a dock GPU unplugged at the
+                    // greeter, #6). Tombstone the manager — the namespace is
+                    // the vec index, so it can never be removed — and retire
+                    // its outputs; a re-plugged card comes back as a device
+                    // this process has no manager for and stays ignored
+                    // until the next greeter start.
+                    let ns = gpu.namespace();
+                    eprintln!("vigil: gpu {ns} vanished; dropping its outputs");
+                    events.extend(
+                        self.entries
+                            .iter()
+                            .filter(|e| e.id.0 >> 24 == ns)
+                            .map(|e| OutputEvent::Removed(e.id)),
+                    );
+                    *slot = None;
+                }
             }
         }
         let disabled = self.resolve_profile();
@@ -396,6 +417,7 @@ impl App {
         let index = (id.0 >> 24) as usize;
         self.outputs
             .get_mut(index)
+            .and_then(Option::as_mut)
             .ok_or_else(|| format!("no GPU {index} for output {id:?}"))
     }
 
@@ -666,6 +688,7 @@ impl App {
                     let connector = self
                         .outputs
                         .get((e.id.0 >> 24) as usize)
+                        .and_then(Option::as_ref)
                         .and_then(|gpu| gpu.info(e.id))
                         .map(|i| i.connector.clone())
                         .unwrap_or_default();
@@ -1053,7 +1076,7 @@ fn run() -> Result<i32, String> {
             .map_err(|e| e.to_string())
             .and_then(|fd| OutputManager::new(fd, namespace).map_err(|e| e.to_string()));
         match manager {
-            Ok((manager, _drm_notifier)) => outputs.push(manager),
+            Ok((manager, _drm_notifier)) => outputs.push(Some(manager)),
             Err(e) => eprintln!("vigil: skipping GPU {}: {e}", path.display()),
         }
     }

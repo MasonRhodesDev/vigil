@@ -39,6 +39,35 @@ fn backend(e: impl std::fmt::Display) -> PresentError {
     PresentError::Backend(e.to_string())
 }
 
+/// A device that vanished (ENODEV) is as gone as one that got paused:
+/// surprise removal — a dock GPU unplugged at the greeter (#6) — must drop
+/// the output, not retry the present forever.
+fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
+    use smithay::backend::drm::DrmError;
+    use smithay::reexports::rustix;
+    match e {
+        DrmError::DeviceInactive => PresentError::DeviceLost,
+        DrmError::Access(ref a)
+            if rustix::io::Errno::from_io_error(&a.source) == Some(rustix::io::Errno::NODEV) =>
+        {
+            PresentError::DeviceLost
+        }
+        e => backend(e),
+    }
+}
+
+/// [`present_error`] for the raw drm-rs calls (`map_dumb_buffer`), which
+/// fail with a plain io error — on a vanished device, before any commit is
+/// even attempted.
+fn io_present_error(e: std::io::Error) -> PresentError {
+    use smithay::reexports::rustix;
+    if rustix::io::Errno::from_io_error(&e) == Some(rustix::io::Errno::NODEV) {
+        PresentError::DeviceLost
+    } else {
+        backend(e)
+    }
+}
+
 impl DumbBufferPresenter {
     /// Allocate the swapchain for the surface's pending mode and take
     /// ownership of the surface.
@@ -104,7 +133,7 @@ impl Presenter for DumbBufferPresenter {
             let mut mapping = self
                 .surface
                 .map_dumb_buffer(&mut slot.buffer)
-                .map_err(backend)?;
+                .map_err(io_present_error)?;
             draw(Canvas::Cpu(FrameTarget {
                 buffer: mapping.as_mut(),
                 width: self.width,
@@ -123,10 +152,7 @@ impl Presenter for DumbBufferPresenter {
         } else {
             self.surface.commit([state], false)
         };
-        result.map_err(|e| match e {
-            smithay::backend::drm::DrmError::DeviceInactive => PresentError::DeviceLost,
-            e => backend(e),
-        })?;
+        result.map_err(present_error)?;
 
         self.modeset_done = true;
         self.back ^= 1;

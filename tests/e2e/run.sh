@@ -33,7 +33,13 @@ grep -q "vigil: output" "$WORK/vigil.log" 2>/dev/null || { echo "vigil never cam
 sleep 2
 # Two virtio-gpu devices -> two DRM cards -> the tablet's absolute axes
 # span both outputs side by side (2560 global width).
-python3 "$REPO/tests/e2e/drive.py" "$QMP" "$WORK" 2560
+# A driver failure (e.g. the first-paint timeout) must kill the VM, or the
+# orphaned guest holds this script's pipes open forever.
+python3 "$REPO/tests/e2e/drive.py" "$QMP" "$WORK" 2560 || {
+    echo "E2E FAIL: driver error ($WORK)"
+    kill "$VM" 2>/dev/null; wait "$VM" 2>/dev/null || true
+    exit 1
+}
 wait $VM || true
 # Full-spec pass: clean exit, both GPUs' outputs lit, AND the session
 # picked by mouse (Test DE -> /bin/true, not the default-sorted Other DE ->

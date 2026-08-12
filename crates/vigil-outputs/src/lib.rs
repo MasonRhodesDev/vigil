@@ -290,6 +290,16 @@ impl OutputManager {
         self.device.is_atomic()
     }
 
+    /// Whether the kernel still backs this device. False after a surprise
+    /// removal (dock GPU unplugged): every ioctl on the fd is ENODEV from
+    /// then on, and the manager is only good for dropping.
+    pub fn alive(&self) -> bool {
+        use std::os::fd::AsFd;
+        RawDrm(self.device.device_fd().as_fd())
+            .get_driver_capability(smithay::reexports::drm::DriverCapability::DumbBuffer)
+            .is_ok()
+    }
+
     /// Live output ids.
     pub fn ids(&self) -> Vec<OutputId> {
         self.entries.keys().copied().collect()
