@@ -144,6 +144,9 @@ struct Entry {
     height: u32,
     presenter: Box<dyn Presenter>,
     window: OutputWindow,
+    /// The presenter shows the pointer on a cursor plane; the scene must
+    /// not composite one.
+    hw_cursor: bool,
     /// Consecutive failed presents, for throttling the log. Reset on success.
     present_failures: u32,
 }
@@ -406,6 +409,7 @@ impl App {
         id: OutputId,
         scale: f32,
         transform: u8,
+        atomic: bool,
         surface_slot: &mut Option<vigil_outputs::DrmSurface>,
         device_fd: vigil_outputs::DrmDeviceFd,
     ) -> Result<(OutputWindow, Box<dyn Presenter>), String> {
@@ -418,6 +422,20 @@ impl App {
                 "transform {transform} not supported on the GL path"
             ));
         }
+        // The cursor rides a DRM cursor plane, which needs atomic
+        // commits — smithay's legacy path drives only the primary plane.
+        if !atomic {
+            return Err("legacy modesetting has no cursor plane".into());
+        }
+        // No plane, no GL: a mouse-driven greeter without a pointer is not
+        // deployable (#25), and software composites a perfectly good one.
+        // Probed BEFORE the surface is consumed so the fallback can have it.
+        if !surface_slot
+            .as_ref()
+            .is_some_and(vigil_present_gl::GbmPresenter::probe_cursor)
+        {
+            return Err("no ARGB8888 cursor plane".into());
+        }
         let surface = surface_slot.take().ok_or("no DRM surface")?;
         // Duplicate the device's own descriptor: DRM master rides on the
         // open file description, so re-opening the node would not be master.
@@ -428,8 +446,13 @@ impl App {
         );
         let context = Rc::new(vigil_gl::GlContext::from_fd(fd).map_err(|e| e.to_string())?);
         let (presenter, gl_surface) =
-            vigil_present_gl::GbmPresenter::new(surface, device_fd, context)
+            vigil_present_gl::GbmPresenter::new(surface, device_fd, context, scale)
                 .map_err(|e| e.to_string())?;
+        // The probe above said yes, so construction claiming the plane is
+        // the invariant this asserts, not a fallback path.
+        if !presenter.has_cursor() {
+            return Err("cursor plane vanished between probe and claim".into());
+        }
         let (w, h) = presenter.size();
         let gl_window =
             vigil_gl::GlWindow::with_surface(gl_surface, vigil_gl::PhysicalSizeExport::new(w, h))
@@ -468,6 +491,7 @@ impl App {
         _id: OutputId,
         _scale: f32,
         _transform: u8,
+        _atomic: bool,
         _surface_slot: &mut Option<vigil_outputs::DrmSurface>,
         _device_fd: vigil_outputs::DrmDeviceFd,
     ) -> Result<(OutputWindow, Box<dyn Presenter>), String> {
@@ -479,6 +503,7 @@ impl App {
         let info = gpu.info(id).cloned().ok_or("no info for output")?;
         let surface = gpu.create_surface(id).map_err(|e| e.to_string())?;
         let device_fd = gpu.device_fd();
+        let atomic = gpu.is_atomic();
         let want_gl = self.looks.config.render.backend.eq_ignore_ascii_case("gl");
         // Precedence: [output."NAME"] > monitor profile > EDID-derived default.
         let profile_scale = self
@@ -515,7 +540,7 @@ impl App {
         // a GL failure degrades to software with a log line, per output.
         let mut surface_slot = Some(surface);
         let gl = if want_gl {
-            match self.gl_output(id, scale, transform, &mut surface_slot, device_fd) {
+            match self.gl_output(id, scale, transform, atomic, &mut surface_slot, device_fd) {
                 Ok(built) => Some(built),
                 Err(e) => {
                     eprintln!(
@@ -528,10 +553,14 @@ impl App {
         } else {
             None
         };
+        let hw_cursor = gl.is_some();
 
         let (mut window, presenter) = match gl {
             Some(built) => {
-                eprintln!("vigil: {}: rendering with GL", info.connector);
+                eprintln!(
+                    "vigil: {}: rendering with GL (hardware cursor)",
+                    info.connector
+                );
                 built
             }
             None => {
@@ -606,6 +635,7 @@ impl App {
             // sees, so a portrait monitor must present as portrait here.
             width: scene_width,
             height: scene_height,
+            hw_cursor,
             present_failures: 0,
             presenter,
             window,
@@ -656,9 +686,17 @@ impl App {
 
     fn apply_panel(&mut self) {
         for (i, e) in self.entries.iter_mut().enumerate() {
-            e.window.set_panel_visible(i == self.panel);
+            let on_panel = i == self.panel;
+            e.window.set_panel_visible(on_panel);
             // The panel output is by construction the one under the pointer.
-            e.window.set_cursor_visible(i == self.panel);
+            if e.hw_cursor {
+                let (px, py) = e.window.pointer();
+                e.presenter
+                    .set_cursor(on_panel.then_some((px as i32, py as i32)));
+                e.window.set_cursor_visible(false);
+            } else {
+                e.window.set_cursor_visible(on_panel);
+            }
         }
     }
 
@@ -717,6 +755,9 @@ impl App {
         if let Some(e) = self.entries.get_mut(idx) {
             e.window
                 .dispatch(InputEvent::PointerAbsolute { x: lx, y: ly });
+            if e.hw_cursor {
+                e.presenter.set_cursor(Some((lx as i32, ly as i32)));
+            }
         }
     }
 

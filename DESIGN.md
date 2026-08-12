@@ -112,7 +112,9 @@ calloop event loop
 └─ Slint custom Platform ── one full-output Window per output
    ├─ per-output background image: stretch/fill/fit/center/tile (`image` crate)
    ├─ login panel migrates to the pointer's output (per-window `panel-visible`)
-   ├─ software cursor as a scene element (no cursor plane required)
+   ├─ cursor: software path composites it at present time; the GL path
+   │  puts it on a DRM cursor plane and requires one, falling back to
+   │  software rendering without it (#25)
    └─ slint-interpreter runtime themes + compiled-in default (same contract)
 ```
 

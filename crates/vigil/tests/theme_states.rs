@@ -203,3 +203,32 @@ fn pointer_motion_alone_dirties_the_frame() {
         "pointer motion must dirty the frame, or the cursor stops tracking"
     );
 }
+
+/// The inverse property: an output whose cursor is NOT composited into the
+/// scene (hardware cursor, or simply not the panel output) must not present
+/// for pointer motion alone — that is the entire point of a cursor plane.
+#[test]
+fn pointer_motion_without_scene_cursor_does_not_present() {
+    let platform = VigilPlatform::install().expect("platform");
+    let theme = Theme::load_or_default(None);
+    let component = theme.instantiate().expect("instantiate");
+    let adapter = platform.claim_last_adapter().expect("adapter");
+    let window = OutputWindow::new(OutputId(3), W, H, 1.0, adapter, component).expect("window");
+    let mut scene = Scene {
+        window,
+        buf: vec![0u8; (W * H * 4) as usize],
+    };
+
+    scene.window.set_panel_visible(true);
+    scene.window.set_cursor_visible(false);
+    assert!(scene.render(), "first frame draws");
+    scene.render();
+    assert!(!scene.render(), "an unchanged scene must not keep presenting");
+    scene
+        .window
+        .dispatch(vigil_core::InputEvent::PointerAbsolute { x: 0.5, y: 0.5 });
+    assert!(
+        !scene.render(),
+        "motion with no scene cursor must not force a present"
+    );
+}

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 
 use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier};
+use smithay::reexports::drm::{ClientCapability, Device as _};
 use smithay::reexports::drm::control::{
     Device as ControlDevice, Mode, ModeTypeFlags, connector, crtc,
 };
@@ -95,6 +96,26 @@ impl OutputManager {
     /// setup) and is folded into every `OutputId`. Returns the notifier the
     /// binary registers for vblank events.
     pub fn new(fd: OwnedFd, namespace: u32) -> Result<(Self, DrmDeviceNotifier), OutputsError> {
+        // Virtualized drivers (virtio-gpu, vmwgfx) hide their cursor plane
+        // from atomic clients unless the client declares it will supply
+        // cursor hotspots (DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, kernel
+        // 6.8+). Declare before smithay enumerates planes. Our hotspot is
+        // the arrow tip at (0, 0) — the property's default — so declaring
+        // costs nothing. Both best-effort: legacy-only devices refuse the
+        // atomic cap, older kernels the hotspot cap, and either way the
+        // plane is simply absent, which the GL policy already handles.
+        //
+        // Order matters: the kernel refuses the hotspot declaration with
+        // EINVAL unless the client is ALREADY atomic (verified with
+        // examples/plane_probe.rs in the GPU harness — hotspot-then-atomic
+        // leaves virtio-gpu's cursor plane hidden). Setting atomic here is
+        // idempotent with smithay doing it again inside DrmDevice::new.
+        {
+            use std::os::fd::AsFd;
+            let raw = RawDrm(fd.as_fd());
+            let _ = raw.set_client_capability(ClientCapability::Atomic, true);
+            let _ = raw.set_client_capability(ClientCapability::CursorPlaneHotspot, true);
+        }
         let fd = DrmDeviceFd::new(DeviceFd::from(fd));
         let (device, notifier) = DrmDevice::new(fd, true).map_err(err)?;
         Ok((
@@ -263,11 +284,28 @@ impl OutputManager {
         self.device.device_fd().clone()
     }
 
+    /// Whether the device does atomic modesetting (the cursor plane path
+    /// needs it; smithay's legacy fallback drives only the primary plane).
+    pub fn is_atomic(&self) -> bool {
+        self.device.is_atomic()
+    }
+
     /// Live output ids.
     pub fn ids(&self) -> Vec<OutputId> {
         self.entries.keys().copied().collect()
     }
 }
+
+/// Minimal DRM handle for setting client caps before smithay owns the fd.
+struct RawDrm<'a>(std::os::fd::BorrowedFd<'a>);
+
+impl std::os::fd::AsFd for RawDrm<'_> {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0
+    }
+}
+
+impl smithay::reexports::drm::Device for RawDrm<'_> {}
 
 /// The connector's preferred mode, falling back to its first (largest) mode.
 fn preferred_mode(conn: &connector::Info) -> Option<Mode> {

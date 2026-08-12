@@ -52,6 +52,54 @@ pub struct FrameTarget<'a> {
     pub stride: usize,
 }
 
+/// The pointer bitmap, shared by every path that draws one: `X` outline,
+/// `#` fill, `.` transparent; scaled by the output's HiDPI factor when
+/// rasterized. The hotspot is the arrow tip at (0, 0).
+pub const CURSOR: &[&[u8]] = &[
+    b"X...........",
+    b"XX..........",
+    b"X#X.........",
+    b"X##X........",
+    b"X###X.......",
+    b"X####X......",
+    b"X#####X.....",
+    b"X######X....",
+    b"X#######X...",
+    b"X########X..",
+    b"X#########X.",
+    b"X#####XXXXXX",
+    b"X##X##X.....",
+    b"X#X.X##X....",
+    b"XX..X##X....",
+    b"X....X##X...",
+    b".....X##X...",
+    b"......X##X..",
+    b"......XX....",
+];
+
+/// Rasterize [`CURSOR`] at `scale` into tightly packed ARGB8888
+/// little-endian bytes (B, G, R, A). Nearest neighbor — it is a pointer.
+/// Returns (bytes, width, height).
+pub fn cursor_argb(scale: f32) -> (Vec<u8>, u32, u32) {
+    let scale = f64::from(scale.max(1.0));
+    let w = (CURSOR[0].len() as f64 * scale) as u32;
+    let h = (CURSOR.len() as f64 * scale) as u32;
+    let mut bytes = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        let row = CURSOR[((y as f64 / scale) as usize).min(CURSOR.len() - 1)];
+        for x in 0..w {
+            let cell = row[((x as f64 / scale) as usize).min(row.len() - 1)];
+            let i = ((y * w + x) * 4) as usize;
+            match cell {
+                b'X' => bytes[i..i + 4].copy_from_slice(&[0, 0, 0, 0xff]),
+                b'#' => bytes[i..i + 4].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]),
+                _ => {}
+            }
+        }
+    }
+    (bytes, w, h)
+}
+
 #[derive(Debug)]
 pub enum PresentError {
     /// The output vanished (hotplug/VT switch); the caller should drop this
@@ -147,6 +195,19 @@ pub trait Presenter {
     /// nothing, and the greeter has no way to notice it is showing a black
     /// screen.
     fn invalidate(&mut self);
+
+    /// Move, show (`Some((x, y))` in panel pixels, hotspot at the point) or
+    /// hide (`None`) a hardware cursor. Returns true when a cursor plane
+    /// took the update — the scene must then not composite a cursor of its
+    /// own. The default has no plane and says so.
+    ///
+    /// Position updates are latched and reach the screen on the next frame
+    /// the presenter submits — including a cursor-only flip of the current
+    /// framebuffer when the scene itself is clean.
+    fn set_cursor(&mut self, pos: Option<(i32, i32)>) -> bool {
+        let _ = pos;
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +402,35 @@ impl BackgroundFit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_rows_are_uniform() {
+        for row in CURSOR {
+            assert_eq!(row.len(), CURSOR[0].len());
+        }
+    }
+
+    #[test]
+    fn cursor_argb_scale_1_matches_bitmap() {
+        let (b, w, h) = cursor_argb(1.0);
+        assert_eq!((w, h), (12, 19));
+        assert_eq!(&b[0..4], &[0, 0, 0, 0xff], "outline at (0, 0)");
+        let fill = ((2 * 12) + 1) * 4;
+        assert_eq!(&b[fill..fill + 4], &[0xff, 0xff, 0xff, 0xff], "fill at (1, 2)");
+        let clear = 11 * 4;
+        assert_eq!(b[clear + 3], 0, "transparent at (11, 0)");
+    }
+
+    #[test]
+    fn cursor_argb_scale_2_doubles() {
+        let (b, w, h) = cursor_argb(2.0);
+        assert_eq!((w, h), (24, 38));
+        assert_eq!(&b[0..4], &[0, 0, 0, 0xff]);
+        let px11 = ((24) + 1) * 4;
+        assert_eq!(&b[px11..px11 + 4], &[0, 0, 0, 0xff]);
+        let clear = 23 * 4;
+        assert_eq!(b[clear + 3], 0);
+    }
 
     #[test]
     fn background_fit_parses_all_documented_modes() {

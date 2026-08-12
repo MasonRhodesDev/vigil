@@ -20,7 +20,7 @@ use slint::{
 };
 use slint_interpreter::{ComponentInstance, Value};
 use vigil_core::{
-    AuthUi, BackgroundFit, FrameTarget, InputEvent, OutputId, PowerAction, UiMessage,
+    AuthUi, BackgroundFit, CURSOR, FrameTarget, InputEvent, OutputId, PowerAction, UiMessage,
 };
 use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 
@@ -138,31 +138,6 @@ pub struct SoftwareBackend {
     /// wl_output/Hyprland transform: 0, 1, 2, 3 = 0, 90, 180, 270 degrees.
     transform: u8,
 }
-
-/// The software cursor (DESIGN.md §3: scene element, no cursor plane).
-/// `X` outline, `#` fill, `.` transparent; scaled by the output's HiDPI
-/// factor at blit time.
-const CURSOR: &[&[u8]] = &[
-    b"X...........",
-    b"XX..........",
-    b"X#X.........",
-    b"X##X........",
-    b"X###X.......",
-    b"X####X......",
-    b"X#####X.....",
-    b"X######X....",
-    b"X#######X...",
-    b"X########X..",
-    b"X#########X.",
-    b"X#####XXXXXX",
-    b"X##X##X.....",
-    b"X#X.X##X....",
-    b"XX..X##X....",
-    b"X....X##X...",
-    b".....X##X...",
-    b"......X##X..",
-    b"......XX....",
-];
 
 /// Scene pixel -> panel pixel for a wl_output/Hyprland transform.
 ///
@@ -308,8 +283,19 @@ impl OutputWindow {
 
     /// Route a normalized input event into this window.
     pub fn dispatch(&mut self, event: InputEvent) {
-        // Input can change what the scene shows (typed text, focus, hover).
-        self.touch();
+        // Keys and buttons change what the scene shows through paths
+        // Slint's one-shot redraw request cannot be trusted to re-arm for,
+        // so they bump the revision. Pointer motion does not: its only
+        // scene-visible effect (hover) does re-arm via the adapter's
+        // request_redraw, and a per-motion revision bump would make a
+        // hardware-cursor GL output re-render the scene for every pixel
+        // the pointer travels (#25).
+        if !matches!(
+            event,
+            InputEvent::PointerMotion { .. } | InputEvent::PointerAbsolute { .. }
+        ) {
+            self.touch();
+        }
         let window = self.component.window();
         match event {
             InputEvent::PointerMotion { dx, dy } => {
@@ -366,6 +352,11 @@ impl OutputWindow {
     /// from the panel's scanout size on a quarter-turn transform.
     pub fn scene_size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Current pointer position in scene pixels.
+    pub fn pointer(&self) -> (f64, f64) {
+        (self.pointer_x, self.pointer_y)
     }
 
     /// A description of the scene for the backend to draw.

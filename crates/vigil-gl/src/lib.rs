@@ -530,21 +530,28 @@ impl vigil_core::RenderBackend for GlBackend {
         // never re-arms, so it cannot be the only signal; the view's revision
         // is what actually tracks scene changes. Both are honoured.
         let scene_dirty = self.window.take_needs_redraw();
+        // The pointer is part of the view only when the scene composites a
+        // cursor from it; with a hardware cursor (#25) motion must not look
+        // like a scene change or GL re-renders per pixel travelled.
+        let mut key = *view;
+        if !key.cursor_visible {
+            key.pointer = (0.0, 0.0);
+        }
         if std::env::var_os("VIGIL_DEBUG_FRAMES").is_some() {
             eprintln!(
                 "vigil-gl: dirty={scene_dirty} force={} view_changed={}",
                 self.force,
-                self.last.as_ref() != Some(view)
+                self.last != Some(key)
             );
         }
-        if !self.force && !scene_dirty && self.last.as_ref() == Some(view) {
+        if !self.force && !scene_dirty && self.last == Some(key) {
             return false;
         }
         if let Err(e) = self.window.render() {
             eprintln!("vigil-gl: render: {e}");
             return false;
         }
-        self.last = Some(*view);
+        self.last = Some(key);
         self.force = false;
         true
     }
