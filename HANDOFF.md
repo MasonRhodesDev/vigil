@@ -69,8 +69,11 @@ Umbrella: **#20**. Nothing is blocked on anything else anymore.
   #27's metal session should also eyeball the #25 cursor arrow — QEMU
   keeps the cursor plane out of screendump, so it is verified by
   commit success + log only.
-- **#29 deployment drift** — needs Mason's call: should game mode's
-  greeter match the desktop one or stay pinned to the packaged RPM?
+- **#29 deployment drift** — direction chosen 2026-08-13 (design on the
+  issue): game mode becomes a static-greetd-config dispatcher plugin,
+  zero vigil coupling; implementation in the game_mode repo, not yet
+  green-lit. Do not just patch the config drift — the design supersedes
+  it.
 - **#6 hotplug**, **#7 suspend/resume** — the VM-coverable halves are
   done: `tests/hotplug/run.sh` PCI-unplugs a GPU under the greeter (and
   found + fixed the ENODEV zombie-output bug), and the VT round trip
