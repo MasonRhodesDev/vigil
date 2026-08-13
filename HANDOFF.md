@@ -57,7 +57,7 @@ What makes it work:
   detectors — codex's gate runs (long dep compiles in its own process
   group) look identical to a wedge and false-alarm constantly.
 
-## Open issues (6)
+## Open issues (5)
 
 Umbrella: **#20**. Nothing is blocked on anything else anymore.
 
@@ -77,11 +77,8 @@ Umbrella: **#20**. Nothing is blocked on anything else anymore.
   — virtio-gpu connectors are immutable, QEMU display devices refuse
   hotplug (bochs-display is the exception the harness uses), and
   vhost-user-fs wedges every suspend flavor.
-- **#10 login1 integration** — Lock/Unlock signals + `SetLockedHint`;
-  also carries a documented residual from #9: invalidate an active
-  grace window on `PrepareForSleep(true)`.
-
-Closed since 08-05: #14/#15/#16 (theme track), #17 (GL presenter),
+Closed since 08-05: #10 (login1, closed 08-06 — the 08-05 handoff
+listed it stale), #14/#15/#16 (theme track), #17 (GL presenter),
 #18 (banner), #19 (vendor), #21–#24 (greeter spec + EDID/transform),
 #28 (e2e frame assertions), #25 (GL cursor on a DRM cursor plane —
 atomic-then-hotspot cap order matters; see plane_probe.rs).
