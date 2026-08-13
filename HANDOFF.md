@@ -64,16 +64,21 @@ What makes it work:
 
 Umbrella: **#20**. Nothing is blocked on anything else anymore.
 
-- **#26 GL rotation**, **#27 multi-GPU GL** — need on-metal testing
-  with the dock (plane `rotation` property; virtio-gpu can't prove it).
-  #27's metal session should also eyeball the #25 cursor arrow — QEMU
-  keeps the cursor plane out of screendump, so it is verified by
-  commit success + log only.
-- **#29 deployment drift** — CLOSED: greetd_game_mode v0.2.0 ships the
-  static-config dispatcher (config.toml is rendered once, never
-  rewritten; vigil is the landing screen for every session exit; entry
-  countdown + approval progress ride vigil's banner channel). Migration
-  steps are on the issue — run them once the [mason] package lands.
+- **#26 GL rotation** — code SHIPPED (b0691fa): plane `rotation`
+  property, TEST-commit gated, software fallback verified in the VM
+  (`tests/e2e/run-rotated.sh`). What remains is the metal checklist on
+  the issue (direction proof on the portrait monitor; T=1→ROTATE_270
+  derivation is unit-pinned, and if metal disagrees the fix is
+  swapping 1↔3 in `plane_transform`).
+- **#27 multi-GPU GL** — pure metal validation; the same dock session
+  should also eyeball the #25 cursor arrow (QEMU keeps cursor planes
+  out of screendump) and walk the #6/#7/#26 checklists.
+- **#29 deployment drift** — CLOSED and RELEASED: greetd_game_mode
+  v0.2.0 is published (COPR + [mason]; the release run passed with the
+  new extra-repos CI input in packaging-workflows). Migration steps are
+  on the issue — pacman -Syu game-mode, game-mode setup (answer mason
+  at the autologin prompt), install the staged vigil.toml with
+  banner_file.
 - **#6 hotplug**, **#7 suspend/resume** — the VM-coverable halves are
   done: `tests/hotplug/run.sh` PCI-unplugs a GPU under the greeter (and
   found + fixed the ENODEV zombie-output bug), and the VT round trip
