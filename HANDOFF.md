@@ -68,9 +68,15 @@ Umbrella: **#20**. Nothing is blocked on anything else anymore.
   commit success + log only.
 - **#29 deployment drift** — needs Mason's call: should game mode's
   greeter match the desktop one or stay pinned to the packaged RPM?
-- **#6 hotplug at the greeter**, **#7 suspend/resume at the greeter** —
-  validation work; needs harness design (the dock's DP-1 is on the
-  second GPU, which makes it the interesting case).
+- **#6 hotplug**, **#7 suspend/resume** — the VM-coverable halves are
+  done: `tests/hotplug/run.sh` PCI-unplugs a GPU under the greeter (and
+  found + fixed the ENODEV zombie-output bug), and the VT round trip
+  pixel-asserts the display-loss recovery machinery. What remains on
+  both is a metal checklist (see the issue comments): dock plug/unplug
+  and a real `systemctl suspend` at the greeter. The VM can do neither
+  — virtio-gpu connectors are immutable, QEMU display devices refuse
+  hotplug (bochs-display is the exception the harness uses), and
+  vhost-user-fs wedges every suspend flavor.
 - **#10 login1 integration** — Lock/Unlock signals + `SetLockedHint`;
   also carries a documented residual from #9: invalidate an active
   grace window on `PrepareForSleep(true)`.
