@@ -14,7 +14,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.2
+Version:        0.2.4
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -97,6 +97,10 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Thu Aug 13 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.4-1
+- Reload shared monitor profiles while the greeter is running (#31).
+- Pin monitor-profiles to aef5f0e (to_toml/CLI release).
+
 * Thu Aug 06 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.2-1
 - logind integration (SetLockedHint, Lock/Unlock, sleep invalidates
   grace); user list with Other… fallback; session default policy

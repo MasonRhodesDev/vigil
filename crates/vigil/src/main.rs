@@ -47,6 +47,33 @@ const PRESENT_LOG_EVERY: u32 = 60;
 
 const OTHER_USER: &str = "Other…";
 
+/// Fingerprint of `*.toml` under a profiles dir (path + len + mtime).
+fn profiles_dir_fingerprint(dir: &std::path::Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    dir.hash(&mut hasher);
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return hasher.finish();
+    };
+    let mut entries: Vec<_> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+        .collect();
+    entries.sort();
+    for path in entries {
+        path.hash(&mut hasher);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified() {
+                modified.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
 struct Cli {
     user: Option<String>,
     socket: Option<String>,
@@ -191,6 +218,8 @@ struct App {
     /// One manager per GPU; the index IS the `OutputId` namespace, so a
     /// card that vanishes at runtime is tombstoned (`None`), never removed.
     outputs: Vec<Option<OutputManager>>,
+    profiles_dir: Option<PathBuf>,
+    profiles_fingerprint: u64,
     profiles: Vec<Profile>,
     layout: Vec<ResolvedOutput>,
     input: InputSystem,
@@ -307,6 +336,7 @@ impl App {
     /// Match a profile against the connected outputs and cache its resolved
     /// geometry. Returns the outputs to skip (profile says disabled).
     fn resolve_profile(&mut self) -> Vec<OutputId> {
+        self.reload_profiles_from_disk();
         self.layout.clear();
         if self.profiles.is_empty() {
             return Vec::new();
@@ -365,6 +395,25 @@ impl App {
         }
         self.layout = resolved.outputs;
         disabled
+    }
+
+    /// Re-read `profiles_dir` when its TOML set changes (#31). No-op when
+    /// the fingerprint matches; degrades to an empty set if the dir is gone.
+    fn reload_profiles_from_disk(&mut self) -> bool {
+        let Some(dir) = &self.profiles_dir else {
+            return false;
+        };
+        let fingerprint = profiles_dir_fingerprint(dir);
+        if fingerprint == self.profiles_fingerprint {
+            return false;
+        }
+        let (profiles, diags) = monitor_profiles::load_dir(dir);
+        for d in diags {
+            eprintln!("vigil: profile {}: {}", d.source, d.message);
+        }
+        self.profiles = profiles;
+        self.profiles_fingerprint = fingerprint;
+        true
     }
 
     /// Route a page-flip completion to the presenter it belongs to. CRTC
@@ -919,6 +968,11 @@ impl App {
         if self.last_banner.elapsed() >= BANNER_POLL {
             self.last_banner = Instant::now();
             self.refresh_banner();
+            // Shared profile TOML can change while the greeter is up (#31).
+            if self.reload_profiles_from_disk() {
+                let _ = self.resolve_profile();
+                self.rebuild_row();
+            }
         }
         self.pump_login();
         self.pump_messages();
@@ -1059,15 +1113,17 @@ fn run() -> Result<i32, String> {
     // Profiles are optional. A missing dir, unreadable files, or no matching
     // profile all degrade to today's scan-order layout — this is the login
     // screen; a layout file must never keep someone from logging in.
-    let profiles = match &config.profiles.dir {
+    let profiles_dir = config.profiles.dir.clone();
+    let (profiles, profiles_fingerprint) = match &profiles_dir {
         Some(dir) => {
             let (profiles, diags) = monitor_profiles::load_dir(dir);
             for d in diags {
                 eprintln!("vigil: profile {}: {}", d.source, d.message);
             }
-            profiles
+            let fingerprint = profiles_dir_fingerprint(dir);
+            (profiles, fingerprint)
         }
-        None => Vec::new(),
+        None => (Vec::new(), 0),
     };
 
     eprintln!(
@@ -1197,6 +1253,8 @@ fn run() -> Result<i32, String> {
     let mut app = App {
         session,
         outputs,
+        profiles_dir,
+        profiles_fingerprint,
         profiles,
         layout: Vec::new(),
         input,
