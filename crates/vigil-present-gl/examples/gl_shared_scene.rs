@@ -54,7 +54,7 @@ fn main() {
         .create_surface(crtc, mode, &[connector.handle()])
         .expect("drm surface");
     let context = Rc::new(GlContext::from_fd(fd).expect("gl context"));
-    let (mut presenter, gl) = GbmPresenter::new(surface, drm_fd, context, 1.0).expect("presenter");
+    let (mut presenter, gl) = GbmPresenter::new(surface, drm_fd, context, 1.0, 0).expect("presenter");
 
     // The platform is installed first, then told to vend this GL window for
     // the next instantiation: a component is bound to whatever adapter

@@ -77,6 +77,23 @@ pub const CURSOR: &[&[u8]] = &[
     b"......XX....",
 ];
 
+/// Scene pixel -> panel pixel for a wl_output/Hyprland transform.
+///
+/// The convention: the transform names how the panel is mounted, so content
+/// rotates the opposite way to come out upright. `(sw, sh)` are the scene's
+/// dimensions. Shared by the software renderer (per-pixel rotation and
+/// cursor blitting) and the GL path (cursor-plane placement and bitmap
+/// pre-rotation, #26).
+#[inline]
+pub fn scene_to_panel(transform: u8, sw: usize, sh: usize, sx: usize, sy: usize) -> (usize, usize) {
+    match transform {
+        1 => (sh - 1 - sy, sx),
+        2 => (sw - 1 - sx, sh - 1 - sy),
+        3 => (sy, sw - 1 - sx),
+        _ => (sx, sy),
+    }
+}
+
 /// Rasterize [`CURSOR`] at `scale` into tightly packed ARGB8888
 /// little-endian bytes (B, G, R, A). Nearest neighbor — it is a pointer.
 /// Returns (bytes, width, height).
@@ -196,7 +213,9 @@ pub trait Presenter {
     /// screen.
     fn invalidate(&mut self);
 
-    /// Move, show (`Some((x, y))` in panel pixels, hotspot at the point) or
+    /// Move, show (`Some((x, y))` in scene pixels — identical to panel
+    /// pixels on an untransformed output; a rotating presenter maps them,
+    /// hotspot at the point) or
     /// hide (`None`) a hardware cursor. Returns true when a cursor plane
     /// took the update — the scene must then not composite a cursor of its
     /// own. The default has no plane and says so.
@@ -402,6 +421,43 @@ impl BackgroundFit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the rotation convention by its corners. A quarter turn that goes
+    /// the wrong way still fills every pixel and still looks "rotated", so
+    /// only the corners catch it -- and getting it backwards puts the login
+    /// card upside down on a portrait monitor.
+    #[test]
+    fn transform_90_rotates_the_scene_clockwise() {
+        // 2x3 scene -> 3x2 panel.
+        let (sw, sh) = (2, 3);
+        // Scene top-left lands top-right.
+        assert_eq!(scene_to_panel(1, sw, sh, 0, 0), (2, 0));
+        // Scene bottom-left lands top-left.
+        assert_eq!(scene_to_panel(1, sw, sh, 0, 2), (0, 0));
+        // Scene top-right lands bottom-right.
+        assert_eq!(scene_to_panel(1, sw, sh, 1, 0), (2, 1));
+    }
+
+    #[test]
+    fn transform_270_rotates_the_scene_counter_clockwise() {
+        let (sw, sh) = (2, 3);
+        // Scene top-left lands bottom-left -- the mirror of the 90 case.
+        assert_eq!(scene_to_panel(3, sw, sh, 0, 0), (0, 1));
+        assert_eq!(scene_to_panel(3, sw, sh, 0, 2), (2, 1));
+        assert_eq!(scene_to_panel(3, sw, sh, 1, 0), (0, 0));
+    }
+
+    #[test]
+    fn transform_180_flips_both_axes() {
+        let (sw, sh) = (2, 3);
+        assert_eq!(scene_to_panel(2, sw, sh, 0, 0), (1, 2));
+        assert_eq!(scene_to_panel(2, sw, sh, 1, 2), (0, 0));
+    }
+
+    #[test]
+    fn transform_0_is_the_identity() {
+        assert_eq!(scene_to_panel(0, 2, 3, 1, 2), (1, 2));
+    }
 
     #[test]
     fn cursor_rows_are_uniform() {

@@ -47,6 +47,7 @@ use slint::platform::{Renderer, WindowAdapter};
 use slint::{PhysicalSize, Window};
 
 /// Re-exported so consumers can size a window without depending on slint.
+pub use gbm::{BufferObjectFlags as GbmBufferFlags, Format as GbmFormat};
 pub use slint::PhysicalSize as PhysicalSizeExport;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::egl::display::EGLDisplayHandle;
@@ -112,6 +113,13 @@ impl GlContext {
             display,
             device,
         })
+    }
+
+    /// The GBM device the context allocates on — for callers that need a
+    /// scanout-class buffer of their own (the rotation acceptance test
+    /// allocates one to ask the display hardware before committing to GL).
+    pub fn gbm_device(&self) -> &GbmDevice<Arc<OwnedFd>> {
+        &self.device
     }
 
     /// Make the context current with no surface bound. Rendering then targets

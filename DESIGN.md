@@ -115,6 +115,10 @@ calloop event loop
    ├─ cursor: software path composites it at present time; the GL path
    │  puts it on a DRM cursor plane and requires one, falling back to
    │  software rendering without it (#25)
+   ├─ rotation: software rotates per-pixel into the panel buffer; the GL
+   │  path scans the upright scene out through the DRM plane `rotation`
+   │  property, gated by a TEST-ONLY commit — hardware that refuses falls
+   │  back to software rendering (#26)
    └─ slint-interpreter runtime themes + compiled-in default (same contract)
 ```
 

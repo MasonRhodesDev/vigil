@@ -14,7 +14,7 @@ qmp_path, outdir = sys.argv[1], sys.argv[2]
 # Total layout width in pixels: the usb-tablet's absolute axes span ALL
 # outputs side by side, so click math needs the full row, not one screen.
 ROW_WIDTH = int(sys.argv[3]) if len(sys.argv) > 3 else 1280
-ROW_HEIGHT = 800
+ROW_HEIGHT = int(sys.argv[4]) if len(sys.argv) > 4 else 800
 s = socket.socket(socket.AF_UNIX)
 s.connect(qmp_path)
 f = s.makefile("rw")

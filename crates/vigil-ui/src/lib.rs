@@ -21,6 +21,7 @@ use slint::{
 use slint_interpreter::{ComponentInstance, Value};
 use vigil_core::{
     AuthUi, BackgroundFit, CURSOR, FrameTarget, InputEvent, OutputId, PowerAction, UiMessage,
+    scene_to_panel,
 };
 use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 
@@ -137,21 +138,6 @@ pub struct SoftwareBackend {
     panel_height: u32,
     /// wl_output/Hyprland transform: 0, 1, 2, 3 = 0, 90, 180, 270 degrees.
     transform: u8,
-}
-
-/// Scene pixel -> panel pixel for a wl_output/Hyprland transform.
-///
-/// See [`OutputWindow::to_panel`] for the convention: the transform names how
-/// the panel is mounted, so content rotates the opposite way to come out
-/// upright. `(sw, sh)` are the scene's dimensions.
-#[inline]
-fn scene_to_panel(transform: u8, sw: usize, sh: usize, sx: usize, sy: usize) -> (usize, usize) {
-    match transform {
-        1 => (sh - 1 - sy, sx),
-        2 => (sw - 1 - sx, sh - 1 - sy),
-        3 => (sy, sw - 1 - sx),
-        _ => (sx, sy),
-    }
 }
 
 impl OutputWindow {
@@ -901,45 +887,9 @@ impl SoftwareBackend {
 mod tests {
     use super::scene_to_panel;
 
-    /// Pins the rotation convention by its corners. A quarter turn that goes
-    /// the wrong way still fills every pixel and still looks "rotated", so
-    /// only the corners catch it -- and getting it backwards puts the login
-    /// card upside down on a portrait monitor.
-    #[test]
-    fn transform_90_rotates_the_scene_clockwise() {
-        // 2x3 scene -> 3x2 panel.
-        let (sw, sh) = (2, 3);
-        // Scene top-left lands top-right.
-        assert_eq!(scene_to_panel(1, sw, sh, 0, 0), (2, 0));
-        // Scene bottom-left lands top-left.
-        assert_eq!(scene_to_panel(1, sw, sh, 0, 2), (0, 0));
-        // Scene top-right lands bottom-right.
-        assert_eq!(scene_to_panel(1, sw, sh, 1, 0), (2, 1));
-    }
-
-    #[test]
-    fn transform_270_rotates_the_scene_counter_clockwise() {
-        let (sw, sh) = (2, 3);
-        // Scene top-left lands bottom-left -- the mirror of the 90 case.
-        assert_eq!(scene_to_panel(3, sw, sh, 0, 0), (0, 1));
-        assert_eq!(scene_to_panel(3, sw, sh, 0, 2), (2, 1));
-        assert_eq!(scene_to_panel(3, sw, sh, 1, 0), (0, 0));
-    }
-
-    #[test]
-    fn transform_180_flips_both_axes() {
-        let (sw, sh) = (2, 3);
-        assert_eq!(scene_to_panel(2, sw, sh, 0, 0), (1, 2));
-        assert_eq!(scene_to_panel(2, sw, sh, 1, 2), (0, 0));
-    }
-
-    #[test]
-    fn transform_0_is_the_identity() {
-        assert_eq!(scene_to_panel(0, 2, 3, 1, 2), (1, 2));
-    }
-
-    /// Every scene pixel must land on a distinct panel pixel: a mapping that
-    /// collides leaves holes in the frame.
+    // The corner-pinning rotation tests live in vigil-core next to
+    // scene_to_panel itself; the bijection property stays here with the
+    // renderer that relies on it.
     #[test]
     fn every_transform_is_a_bijection_onto_the_panel() {
         let (sw, sh) = (7, 5);

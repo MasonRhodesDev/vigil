@@ -29,7 +29,7 @@ use smithay::reexports::drm::control::{
     Device as ControlDevice, dumbbuffer::DumbBuffer, framebuffer, plane,
 };
 use smithay::utils::{Rectangle, Transform};
-use vigil_core::{Canvas, PresentError, Presenter};
+use vigil_core::{Canvas, PresentError, Presenter, scene_to_panel};
 use vigil_gl::{GbmWindow, GlContext, GlSurface};
 
 fn backend(e: impl std::fmt::Display) -> PresentError {
@@ -51,6 +51,35 @@ fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
         }
         e => backend(e),
     }
+}
+
+/// vigil transform (wl_output-style: how the panel is mounted; the scene is
+/// drawn rotated the OPPOSITE way — T=1 puts the scene on the panel turned
+/// 90° clockwise, see `vigil_core::scene_to_panel`) → the DRM rotation that
+/// reproduces it. The DRM `rotation` property is counter-clockwise, so the
+/// quarter turns invert: clockwise-90 needs ROTATE_270 and vice versa.
+fn plane_transform(transform: u8) -> Transform {
+    match transform % 4 {
+        1 => Transform::_270,
+        2 => Transform::_180,
+        3 => Transform::_90,
+        _ => Transform::Normal,
+    }
+}
+
+/// Where the cursor plane goes for a pointer at scene `pos`: the pointer's
+/// panel position, offset so the rotated buffer's hotspot pixel (the arrow
+/// tip, bitmap (0,0)) lands exactly there. Derivation mirrors the software
+/// path's blit_cursor pixel-for-pixel; see cursor_dst_matches_software_blit.
+fn cursor_dst(transform: u8, scene: (u32, u32), plane: (u32, u32), pos: (i32, i32)) -> (i32, i32) {
+    let (sw, sh) = (scene.0 as usize, scene.1 as usize);
+    let (sx, sy) = (
+        (pos.0.max(0) as usize).min(sw - 1),
+        (pos.1.max(0) as usize).min(sh - 1),
+    );
+    let p = scene_to_panel(transform, sw, sh, sx, sy);
+    let h = scene_to_panel(transform, plane.0 as usize, plane.1 as usize, 0, 0);
+    (p.0 as i32 - h.0 as i32, p.1 as i32 - h.1 as i32)
 }
 
 /// One frame's worth of scanout state: the buffer and the framebuffer made
@@ -75,7 +104,8 @@ struct CursorPlane {
     fb: framebuffer::Handle,
     /// Cursor buffer dimensions (the plane's preferred size).
     size: (u32, u32),
-    /// `Some(panel position)` = shown there; `None` = hidden.
+    /// `Some(scene position)` = shown there (mapped to panel coordinates
+    /// at submission); `None` = hidden.
     pos: Option<(i32, i32)>,
     /// The plane state changed and the next submission must carry it.
     dirty: bool,
@@ -92,8 +122,14 @@ pub struct GbmPresenter {
     previous: Option<Frame>,
     cursor: Option<CursorPlane>,
     modeset_done: bool,
+    /// Buffer/scene dimensions — what GL renders at. Swapped from the mode
+    /// on quarter turns; the plane rotates the buffer onto the panel (#26).
     width: u32,
     height: u32,
+    /// wl_output-style transform (0..=3 after normalization).
+    transform: u8,
+    /// Panel/CRTC dimensions, straight from the mode.
+    mode_size: (u32, u32),
 }
 
 impl GbmPresenter {
@@ -108,13 +144,18 @@ impl GbmPresenter {
         drm: DrmDeviceFd,
         context: Rc<GlContext>,
         cursor_scale: f32,
+        transform: u8,
     ) -> Result<(Self, GlSurface), PresentError> {
+        let transform = transform % 4;
         let mode = surface.pending_mode();
-        let (width, height) = mode.size();
-        let (width, height) = (width as u32, height as u32);
+        let (mw, mh) = mode.size();
+        let (mw, mh) = (mw as u32, mh as u32);
+        // The GL scene is rendered upright at scene dims; the plane rotates
+        // it onto the panel (#26). Quarter turns swap the buffer's aspect.
+        let (width, height) = if transform % 2 == 1 { (mh, mw) } else { (mw, mh) };
         let gl = GlSurface::new(context, width, height).map_err(backend)?;
         let gbm = gl.window();
-        let cursor = Self::cursor_plane(&surface, cursor_scale);
+        let cursor = Self::cursor_plane(&surface, cursor_scale, transform);
         Ok((
             Self {
                 surface,
@@ -126,18 +167,80 @@ impl GbmPresenter {
                 modeset_done: false,
                 width,
                 height,
+                transform,
+                mode_size: (mw, mh),
             },
             gl,
         ))
     }
 
-    /// Whether [`Self::new`] would find a cursor plane on this surface.
+    /// Whether [`Self::new`] would find a usable cursor plane on this
+    /// surface at this transform.
     ///
     /// For callers deciding between renderers BEFORE handing the surface
     /// over — construction consumes it, so a policy of "no plane, no GL"
-    /// must be able to ask first and keep the surface for software.
-    pub fn probe_cursor(surface: &DrmSurface) -> bool {
-        Self::find_cursor_plane(surface).is_some()
+    /// must be able to ask first and keep the surface for software. A
+    /// quarter-turned output needs a square cursor buffer (the bitmap is
+    /// pre-rotated in place, #26); a non-square plane on odd transforms
+    /// reads as unusable.
+    pub fn probe_cursor(surface: &DrmSurface, transform: u8) -> bool {
+        let Some(info) = Self::find_cursor_plane(surface) else {
+            return false;
+        };
+        if transform.is_multiple_of(2) {
+            return true;
+        }
+        let (pw, ph) = Self::cursor_plane_size(info);
+        pw == ph
+    }
+
+    /// Ask the display hardware whether it will scan out a rotated buffer,
+    /// BEFORE any GL state is built: a TEST_ONLY atomic commit of a
+    /// scanout-class GBM buffer at scene dims with the rotation set. Runs on
+    /// `&DrmSurface`, so a refusal leaves the surface free for the software
+    /// fallback (same pre-consumption contract as `probe_cursor`, #25).
+    /// virtio-gpu has no rotation property at all — smithay then refuses to
+    /// even build the request (UnknownProperty), which is exactly the signal.
+    pub fn test_transform(
+        surface: &DrmSurface,
+        drm: &DrmDeviceFd,
+        context: &GlContext,
+        transform: u8,
+    ) -> Result<(), String> {
+        let transform = transform % 4;
+        if transform == 0 {
+            return Ok(());
+        }
+        let mode = surface.pending_mode();
+        let (mw, mh) = mode.size();
+        let (mw, mh) = (mw as u32, mh as u32);
+        let (bw, bh) = if transform % 2 == 1 { (mh, mw) } else { (mw, mh) };
+        let bo = context
+            .gbm_device()
+            .create_buffer_object::<()>(
+                bw,
+                bh,
+                vigil_gl::GbmFormat::Xrgb8888,
+                vigil_gl::GbmBufferFlags::SCANOUT | vigil_gl::GbmBufferFlags::RENDERING,
+            )
+            .map_err(|e| format!("test buffer: {e}"))?;
+        let buffer = GbmBuffer::from_bo(bo, true);
+        let fb = framebuffer_from_bo(drm, &buffer, false).map_err(|e| format!("test fb: {e}"))?;
+        let state = PlaneState {
+            handle: surface.plane(),
+            config: Some(PlaneConfig {
+                src: Rectangle::from_size((bw as f64, bh as f64).into()),
+                dst: Rectangle::from_size((mw as i32, mh as i32).into()),
+                transform: plane_transform(transform),
+                alpha: 1.0,
+                damage_clips: None,
+                fb: *fb.as_ref(),
+                fence: None,
+            }),
+        };
+        surface
+            .test_state([state], true)
+            .map_err(|e| format!("rotation refused: {e}"))
     }
 
     fn find_cursor_plane(
@@ -154,13 +257,20 @@ impl GbmPresenter {
     /// `None` (with a log line left to the caller's policy) when the CRTC
     /// has no such plane — virtio-gpu hides it from clients that did not
     /// declare hotspot support, and legacy devices never reach here.
-    fn cursor_plane(surface: &DrmSurface, scale: f32) -> Option<CursorPlane> {
-        let info = Self::find_cursor_plane(surface)?;
-        let (pw, ph) = info
-            .size_hints
+    fn cursor_plane_size(info: &smithay::backend::drm::PlaneInfo) -> (u32, u32) {
+        info.size_hints
             .as_deref()
             .and_then(<[_]>::first)
-            .map_or((64, 64), |s| (u32::from(s.w), u32::from(s.h)));
+            .map_or((64, 64), |s| (u32::from(s.w), u32::from(s.h)))
+    }
+
+    fn cursor_plane(surface: &DrmSurface, scale: f32, transform: u8) -> Option<CursorPlane> {
+        let info = Self::find_cursor_plane(surface)?;
+        let (pw, ph) = Self::cursor_plane_size(info);
+        if transform % 2 == 1 && pw != ph {
+            // probe_cursor refused this combination; construction agrees.
+            return None;
+        }
         // The bitmap must fit the plane; a HiDPI factor that would overflow
         // it is clamped rather than clipped.
         let max_scale = (pw as f32 / vigil_core::CURSOR[0].len() as f32)
@@ -170,14 +280,22 @@ impl GbmPresenter {
         let mut buffer = surface
             .create_dumb_buffer((pw, ph), DrmFourcc::Argb8888, 32)
             .ok()?;
+        // The scene rotates onto the panel, so the cursor bitmap must make
+        // the same trip inside its own (square, for odd transforms) plane
+        // buffer — the software path does this per-pixel in blit_cursor;
+        // here it happens once at construction.
         {
             let pitch = buffer.pitch() as usize;
             let mut mapping = surface.map_dumb_buffer(&mut buffer).ok()?;
             let bytes = mapping.as_mut();
             bytes.fill(0);
             for y in 0..ch as usize {
-                let src = &argb[y * cw as usize * 4..(y + 1) * cw as usize * 4];
-                bytes[y * pitch..y * pitch + src.len()].copy_from_slice(src);
+                for x in 0..cw as usize {
+                    let src = (y * cw as usize + x) * 4;
+                    let (qx, qy) = scene_to_panel(transform, pw as usize, ph as usize, x, y);
+                    bytes[qy * pitch + qx * 4..qy * pitch + qx * 4 + 4]
+                        .copy_from_slice(&argb[src..src + 4]);
+                }
             }
         }
         let fb = surface.add_framebuffer(&buffer, 32, 32).ok()?;
@@ -206,12 +324,22 @@ impl GbmPresenter {
         let cursor = self.cursor.as_ref()?;
         Some(PlaneState {
             handle: cursor.plane,
-            config: cursor.pos.map(|(x, y)| PlaneConfig {
+            config: cursor.pos.map(|pos| PlaneConfig {
                 src: Rectangle::from_size(
                     (f64::from(cursor.size.0), f64::from(cursor.size.1)).into(),
                 ),
+                // pos is scene coordinates; the plane goes at its panel
+                // mapping. The cursor plane itself stays untransformed —
+                // the bitmap was pre-rotated at construction instead,
+                // which works on cursor planes with no rotation property.
                 dst: Rectangle::new(
-                    (x, y).into(),
+                    cursor_dst(
+                        self.transform,
+                        (self.width, self.height),
+                        cursor.size,
+                        pos,
+                    )
+                    .into(),
                     (cursor.size.0 as i32, cursor.size.1 as i32).into(),
                 ),
                 transform: Transform::Normal,
@@ -231,8 +359,10 @@ impl GbmPresenter {
             handle: self.surface.plane(),
             config: Some(PlaneConfig {
                 src: Rectangle::from_size((self.width as f64, self.height as f64).into()),
-                dst: Rectangle::from_size((self.width as i32, self.height as i32).into()),
-                transform: Transform::Normal,
+                dst: Rectangle::from_size(
+                    (self.mode_size.0 as i32, self.mode_size.1 as i32).into(),
+                ),
+                transform: plane_transform(self.transform),
                 alpha: 1.0,
                 damage_clips: None,
                 fb,
@@ -332,5 +462,38 @@ impl Presenter for GbmPresenter {
             _buffer: buffer,
         });
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plane_transform_inverts_quarter_turns() {
+        assert_eq!(plane_transform(0), Transform::Normal);
+        assert_eq!(plane_transform(1), Transform::_270); // scene drawn CW-90 → DRM CCW-270
+        assert_eq!(plane_transform(2), Transform::_180);
+        assert_eq!(plane_transform(3), Transform::_90);
+        assert_eq!(plane_transform(5), Transform::_270); // flipped variants rotate-without-flip
+    }
+
+    #[test]
+    fn cursor_dst_matches_software_blit() {
+        // Scene 4x6 (sw=4, sh=6), 2x2 cursor plane, pointer at scene (1,2).
+        // Software puts the tip at scene_to_panel(T, 4, 6, 1, 2); the plane
+        // dst is that point minus the rotated hotspot. Literals by hand:
+        assert_eq!(cursor_dst(0, (4, 6), (2, 2), (1, 2)), (1, 2));
+        assert_eq!(cursor_dst(1, (4, 6), (2, 2), (1, 2)), (2, 1)); // P=(3,1), H=(1,0)
+        assert_eq!(cursor_dst(3, (4, 6), (2, 2), (1, 2)), (2, 1)); // P=(2,2), H=(0,1)
+        assert_eq!(cursor_dst(2, (4, 6), (2, 2), (1, 2)), (1, 2)); // P=(2,3), H=(1,1)
+    }
+
+    #[test]
+    fn cursor_bitmap_rotates_within_square_buffer() {
+        // A 2x2 "bitmap" in a 2x2 buffer: pixel (0,0) must land where
+        // scene_to_panel sends it (T=1 → (1,0); T=3 → (0,1)).
+        assert_eq!(vigil_core::scene_to_panel(1, 2, 2, 0, 0), (1, 0));
+        assert_eq!(vigil_core::scene_to_panel(3, 2, 2, 0, 0), (0, 1));
     }
 }

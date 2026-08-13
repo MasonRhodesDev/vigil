@@ -436,14 +436,8 @@ impl App {
         device_fd: vigil_outputs::DrmDeviceFd,
     ) -> Result<(OutputWindow, Box<dyn Presenter>), String> {
         use std::sync::Arc;
-        // The GL path rotates via the DRM plane, which is not wired up yet,
-        // so a rotated output would scan out sideways. Software already
-        // rotates correctly -- let it, rather than render this one wrong.
-        if transform != 0 {
-            return Err(format!(
-                "transform {transform} not supported on the GL path"
-            ));
-        }
+        // Flipped variants rotate-without-the-flip, same as software.
+        let transform = transform % 4;
         // The cursor rides a DRM cursor plane, which needs atomic
         // commits — smithay's legacy path drives only the primary plane.
         if !atomic {
@@ -454,11 +448,10 @@ impl App {
         // Probed BEFORE the surface is consumed so the fallback can have it.
         if !surface_slot
             .as_ref()
-            .is_some_and(vigil_present_gl::GbmPresenter::probe_cursor)
+            .is_some_and(|s| vigil_present_gl::GbmPresenter::probe_cursor(s, transform))
         {
-            return Err("no ARGB8888 cursor plane".into());
+            return Err("no usable ARGB8888 cursor plane".into());
         }
-        let surface = surface_slot.take().ok_or("no DRM surface")?;
         // Duplicate the device's own descriptor: DRM master rides on the
         // open file description, so re-opening the node would not be master.
         let fd = Arc::new(
@@ -467,8 +460,25 @@ impl App {
                 .map_err(|e| format!("dup drm fd: {e}"))?,
         );
         let context = Rc::new(vigil_gl::GlContext::from_fd(fd).map_err(|e| e.to_string())?);
+        // Ask the hardware whether it will rotate a scanout buffer before
+        // committing to GL at all: a TEST-ONLY atomic commit on the borrowed
+        // surface. Refusal (virtio-gpu has no rotation property; some
+        // hardware rejects some angles) falls back to software, which
+        // rotates correctly — a rendering preference must never be why
+        // someone cannot log in (#26).
+        if let Some(s) = surface_slot.as_ref()
+            && let Err(e) = vigil_present_gl::GbmPresenter::test_transform(
+                s,
+                &device_fd,
+                &context,
+                transform,
+            )
+        {
+            return Err(format!("rotation test: {e}"));
+        }
+        let surface = surface_slot.take().ok_or("no DRM surface")?;
         let (presenter, gl_surface) =
-            vigil_present_gl::GbmPresenter::new(surface, device_fd, context, scale)
+            vigil_present_gl::GbmPresenter::new(surface, device_fd, context, scale, transform)
                 .map_err(|e| e.to_string())?;
         // The probe above said yes, so construction claiming the plane is
         // the invariant this asserts, not a fallback path.
