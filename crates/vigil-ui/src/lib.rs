@@ -812,8 +812,8 @@ impl SoftwareBackend {
     ///
     /// Convention (wl_output / Hyprland): the transform names how the panel
     /// is mounted, so the content is rotated the opposite way to come out
-    /// upright. `1` (90) therefore rotates the scene a quarter turn
-    /// *clockwise* into the panel, `3` (270) counter-clockwise.
+    /// upright. `1` (90) rotates the scene a quarter turn *counter-clockwise*
+    /// into the panel, `3` (270) clockwise — pinned on metal against Hyprland.
     #[inline]
     fn to_panel(&self, scene: (u32, u32), sx: usize, sy: usize) -> (usize, usize) {
         scene_to_panel(self.transform, scene.0 as usize, scene.1 as usize, sx, sy)

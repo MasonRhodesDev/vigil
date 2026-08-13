@@ -64,12 +64,11 @@ What makes it work:
 
 Umbrella: **#20**. Nothing is blocked on anything else anymore.
 
-- **#26 GL rotation** — code SHIPPED (b0691fa): plane `rotation`
-  property, TEST-commit gated, software fallback verified in the VM
-  (`tests/e2e/run-rotated.sh`). What remains is the metal checklist on
-  the issue (direction proof on the portrait monitor; T=1→ROTATE_270
-  derivation is unit-pinned, and if metal disagrees the fix is
-  swapping 1↔3 in `plane_transform`).
+- **#26 GL rotation** — code SHIPPED (b0691fa) + metal direction fix:
+  Hyprland T=3 is upright here; vigil had 1↔3 backwards in both
+  `scene_to_panel` and `plane_transform`. Always build the VT binary
+  with `--features gl` or you silently fall back to software (4K rotate
+  + vblank gate = unusable cursor). Re-verify upright + cursor on VT.
 - **#27 multi-GPU GL** — pure metal validation; the same dock session
   should also eyeball the #25 cursor arrow (QEMU keeps cursor planes
   out of screendump) and walk the #6/#7/#26 checklists.

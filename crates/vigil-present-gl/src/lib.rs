@@ -53,16 +53,15 @@ fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
     }
 }
 
-/// vigil transform (wl_output-style: how the panel is mounted; the scene is
-/// drawn rotated the OPPOSITE way — T=1 puts the scene on the panel turned
-/// 90° clockwise, see `vigil_core::scene_to_panel`) → the DRM rotation that
-/// reproduces it. The DRM `rotation` property is counter-clockwise, so the
-/// quarter turns invert: clockwise-90 needs ROTATE_270 and vice versa.
+/// vigil transform (wl_output-style: how the panel is mounted) → DRM plane
+/// `rotation`. Metal proof on amdgpu (portrait S2721QS, Hyprland T=3 upright
+/// in-session): the earlier CW↔CCW invert was wrong — T and DRM quarter
+/// turns match. See `plane_transform_matches_drm_quarter_turns`.
 fn plane_transform(transform: u8) -> Transform {
     match transform % 4 {
-        1 => Transform::_270,
+        1 => Transform::_90,
         2 => Transform::_180,
-        3 => Transform::_90,
+        3 => Transform::_270,
         _ => Transform::Normal,
     }
 }
@@ -494,12 +493,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plane_transform_inverts_quarter_turns() {
+    fn plane_transform_matches_drm_quarter_turns() {
+        // Metal: Hyprland T=3 is upright; the CW↔CCW invert put it the
+        // wrong way around. DRM enum values track wl_output T directly.
         assert_eq!(plane_transform(0), Transform::Normal);
-        assert_eq!(plane_transform(1), Transform::_270); // scene drawn CW-90 → DRM CCW-270
+        assert_eq!(plane_transform(1), Transform::_90);
         assert_eq!(plane_transform(2), Transform::_180);
-        assert_eq!(plane_transform(3), Transform::_90);
-        assert_eq!(plane_transform(5), Transform::_270); // flipped variants rotate-without-flip
+        assert_eq!(plane_transform(3), Transform::_270);
+        assert_eq!(plane_transform(5), Transform::_90); // flipped variants rotate-without-flip
     }
 
     #[test]
@@ -508,16 +509,16 @@ mod tests {
         // Software puts the tip at scene_to_panel(T, 4, 6, 1, 2); the plane
         // dst is that point minus the rotated hotspot. Literals by hand:
         assert_eq!(cursor_dst(0, (4, 6), (2, 2), (1, 2)), (1, 2));
-        assert_eq!(cursor_dst(1, (4, 6), (2, 2), (1, 2)), (2, 1)); // P=(3,1), H=(1,0)
-        assert_eq!(cursor_dst(3, (4, 6), (2, 2), (1, 2)), (2, 1)); // P=(2,2), H=(0,1)
+        assert_eq!(cursor_dst(1, (4, 6), (2, 2), (1, 2)), (2, 1)); // P=(2,2), H=(0,1)
+        assert_eq!(cursor_dst(3, (4, 6), (2, 2), (1, 2)), (2, 1)); // P=(3,1), H=(1,0)
         assert_eq!(cursor_dst(2, (4, 6), (2, 2), (1, 2)), (1, 2)); // P=(2,3), H=(1,1)
     }
 
     #[test]
     fn cursor_bitmap_rotates_within_square_buffer() {
         // A 2x2 "bitmap" in a 2x2 buffer: pixel (0,0) must land where
-        // scene_to_panel sends it (T=1 → (1,0); T=3 → (0,1)).
-        assert_eq!(vigil_core::scene_to_panel(1, 2, 2, 0, 0), (1, 0));
-        assert_eq!(vigil_core::scene_to_panel(3, 2, 2, 0, 0), (0, 1));
+        // scene_to_panel sends it (T=1 → (0,1); T=3 → (1,0)).
+        assert_eq!(vigil_core::scene_to_panel(1, 2, 2, 0, 0), (0, 1));
+        assert_eq!(vigil_core::scene_to_panel(3, 2, 2, 0, 0), (1, 0));
     }
 }

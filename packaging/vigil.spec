@@ -53,6 +53,7 @@ output, runtime .slint themes with a compiled-in fallback.
 %cargo_prep -v vendor
 
 %build
+# vigil's default features include `gl` (FemtoVG over GBM/EGL).
 %cargo_build
 %{cargo_license_summary}
 %{cargo_license} > LICENSE.dependencies

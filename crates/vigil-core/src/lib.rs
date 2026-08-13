@@ -86,10 +86,13 @@ pub const CURSOR: &[&[u8]] = &[
 /// pre-rotation, #26).
 #[inline]
 pub fn scene_to_panel(transform: u8, sw: usize, sh: usize, sx: usize, sy: usize) -> (usize, usize) {
+    // Metal (Hyprland T=3 upright on the portrait S2721QS): the earlier
+    // assignment had 1/3 swapped relative to wl_output/Hyprland. T=1 rotates
+    // content CCW onto the panel; T=3 rotates CW.
     match transform {
-        1 => (sh - 1 - sy, sx),
+        1 => (sy, sw - 1 - sx),
         2 => (sw - 1 - sx, sh - 1 - sy),
-        3 => (sy, sw - 1 - sx),
+        3 => (sh - 1 - sy, sx),
         _ => (sx, sy),
     }
 }
@@ -441,24 +444,24 @@ mod tests {
     /// only the corners catch it -- and getting it backwards puts the login
     /// card upside down on a portrait monitor.
     #[test]
-    fn transform_90_rotates_the_scene_clockwise() {
-        // 2x3 scene -> 3x2 panel.
+    fn transform_90_rotates_the_scene_counter_clockwise() {
+        // 2x3 scene -> 3x2 panel. Matches Hyprland/wl_output T=1 on metal.
         let (sw, sh) = (2, 3);
-        // Scene top-left lands top-right.
-        assert_eq!(scene_to_panel(1, sw, sh, 0, 0), (2, 0));
-        // Scene bottom-left lands top-left.
-        assert_eq!(scene_to_panel(1, sw, sh, 0, 2), (0, 0));
-        // Scene top-right lands bottom-right.
-        assert_eq!(scene_to_panel(1, sw, sh, 1, 0), (2, 1));
+        // Scene top-left lands bottom-left.
+        assert_eq!(scene_to_panel(1, sw, sh, 0, 0), (0, 1));
+        assert_eq!(scene_to_panel(1, sw, sh, 0, 2), (2, 1));
+        assert_eq!(scene_to_panel(1, sw, sh, 1, 0), (0, 0));
     }
 
     #[test]
-    fn transform_270_rotates_the_scene_counter_clockwise() {
+    fn transform_270_rotates_the_scene_clockwise() {
         let (sw, sh) = (2, 3);
-        // Scene top-left lands bottom-left -- the mirror of the 90 case.
-        assert_eq!(scene_to_panel(3, sw, sh, 0, 0), (0, 1));
-        assert_eq!(scene_to_panel(3, sw, sh, 0, 2), (2, 1));
-        assert_eq!(scene_to_panel(3, sw, sh, 1, 0), (0, 0));
+        // Scene top-left lands top-right -- the mirror of the 90 case.
+        assert_eq!(scene_to_panel(3, sw, sh, 0, 0), (2, 0));
+        // Scene bottom-left lands top-left.
+        assert_eq!(scene_to_panel(3, sw, sh, 0, 2), (0, 0));
+        // Scene top-right lands bottom-right.
+        assert_eq!(scene_to_panel(3, sw, sh, 1, 0), (2, 1));
     }
 
     #[test]

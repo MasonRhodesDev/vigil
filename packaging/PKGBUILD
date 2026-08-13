@@ -6,7 +6,7 @@
 # /usr/bin/vigil (and hypridle at vigil-lock) is operator configuration.
 
 pkgname=vigil
-pkgver=0.2.2
+pkgver=0.2.3
 pkgrel=1
 pkgdesc="Compositor-less greetd greeter and matching session lockscreen"
 arch=('x86_64')
