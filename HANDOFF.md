@@ -32,9 +32,12 @@ upgrade path.
 ## The PM loop (Mason's standing direction)
 
 Work the GitHub backlog in a loop: **research/plan with Claude Fable
-subagent forks → implement with `codex exec -m gpt-5.6-sol -c
-model_reasoning_effort=low` → PM verifies → ship**. It closed 11 issues
-in one day with one transient wedge.
+subagent forks → implement → PM verifies → ship**. On the Arch
+reference machine the implementer is Fable itself (Mason's direction,
+2026-08-13: no codex here — do not chase its auth); the codex-exec
+variant (`codex exec -m gpt-5.6-sol -c model_reasoning_effort=low`)
+was the Fedora machine's setup. It closed 11 issues in one day with
+one transient wedge.
 
 What makes it work:
 
@@ -117,9 +120,9 @@ atomic-then-hotspot cap order matters; see plane_probe.rs).
 
 ## Session notes (2026-08-12, Arch reference machine)
 
-- **codex auth is broken** (`refresh token was already used`); `codex
-  exec` dies instantly. Mason must re-run `codex login`. Until then,
-  implement directly.
+- **No codex on this machine** (a stale binary with dead auth sits on
+  PATH — ignore it). Implementation is Claude Fable directly, per
+  Mason.
 - e2e on Arch needs `virtme-ng` and `qemu-hw-display-virtio-gpu-pci`
   (both in extra, now installed) — Fedora's qemu bundles the device,
   Arch splits it. rustc had to move to 1.97 for the slint 1.17 lockfile.
