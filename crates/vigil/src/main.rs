@@ -367,6 +367,16 @@ impl App {
         disabled
     }
 
+    /// Route a page-flip completion to the presenter it belongs to. CRTC
+    /// ids are per-device, so the namespace disambiguates across GPUs.
+    fn vblank(&mut self, namespace: u32, crtc: u32) {
+        for e in self.entries.iter_mut() {
+            if e.id.0 >> 24 == namespace && e.presenter.crtc_id() == Some(crtc) {
+                e.presenter.vblank();
+            }
+        }
+    }
+
     fn rescan(&mut self) {
         let mut events = Vec::new();
         for slot in self.outputs.iter_mut() {
@@ -1079,6 +1089,7 @@ fn run() -> Result<i32, String> {
     // init is skipped with a log line, not fatal: a greeter with fewer
     // monitors beats no greeter.
     let mut outputs = Vec::new();
+    let mut drm_notifiers = Vec::new();
     for path in vigil_outputs::all_gpu_paths(&seat).map_err(|e| e.to_string())? {
         let namespace = outputs.len() as u32;
         let manager = session
@@ -1086,7 +1097,10 @@ fn run() -> Result<i32, String> {
             .map_err(|e| e.to_string())
             .and_then(|fd| OutputManager::new(fd, namespace).map_err(|e| e.to_string()));
         match manager {
-            Ok((manager, _drm_notifier)) => outputs.push(Some(manager)),
+            Ok((manager, drm_notifier)) => {
+                outputs.push(Some(manager));
+                drm_notifiers.push((namespace, drm_notifier));
+            }
             Err(e) => eprintln!("vigil: skipping GPU {}: {e}", path.display()),
         }
     }
@@ -1243,6 +1257,19 @@ fn run() -> Result<i32, String> {
             app.rescan();
         })
         .map_err(|e| format!("udev source: {e}"))?;
+    // Page-flip completion events re-open each presenter's submission gate
+    // (Presenter::vblank). Without this, flips under load race the vblank
+    // into EBUSY and the recovery modeset dies with ENOMEM on amdgpu —
+    // found on metal the moment continuous pointer motion met the cursor
+    // plane (#25).
+    for (namespace, notifier) in drm_notifiers {
+        handle
+            .insert_source(notifier, move |event, _, app: &mut App| match event {
+                vigil_outputs::DrmEvent::VBlank(crtc) => app.vblank(namespace, crtc.into()),
+                vigil_outputs::DrmEvent::Error(e) => eprintln!("vigil: drm event: {e}"),
+            })
+            .map_err(|e| format!("drm notifier source: {e}"))?;
+    }
 
     handle
         .insert_source(

@@ -122,6 +122,9 @@ pub struct GbmPresenter {
     previous: Option<Frame>,
     cursor: Option<CursorPlane>,
     modeset_done: bool,
+    /// A submitted flip has not yet been confirmed by its page-flip event.
+    /// `with_frame` refuses new work until it is — see `Presenter::vblank`.
+    flip_pending: bool,
     /// Buffer/scene dimensions — what GL renders at. Swapped from the mode
     /// on quarter turns; the plane rotates the buffer onto the panel (#26).
     width: u32,
@@ -165,6 +168,7 @@ impl GbmPresenter {
                 previous: None,
                 cursor,
                 modeset_done: false,
+                flip_pending: false,
                 width,
                 height,
                 transform,
@@ -379,9 +383,20 @@ impl Presenter for GbmPresenter {
 
     fn invalidate(&mut self) {
         self.modeset_done = false;
+        // Pending flips (and their events) do not survive a VT switch or
+        // resume; a stale gate here would deadlock the output.
+        self.flip_pending = false;
         if let Some(cursor) = self.cursor.as_mut() {
             cursor.dirty = true;
         }
+    }
+
+    fn vblank(&mut self) {
+        self.flip_pending = false;
+    }
+
+    fn crtc_id(&self) -> Option<u32> {
+        Some(self.surface.crtc().into())
     }
 
     fn set_cursor(&mut self, pos: Option<(i32, i32)>) -> bool {
@@ -404,6 +419,13 @@ impl Presenter for GbmPresenter {
         &mut self,
         draw: &mut dyn FnMut(Canvas<'_>) -> bool,
     ) -> Result<bool, PresentError> {
+        // A flip is in flight: drawing now would have to either double-swap
+        // the GBM surface or submit a second flip (EBUSY). Skip the frame
+        // entirely — nothing is consumed, so the scene stays dirty and the
+        // cursor position stays latched for the tick after the vblank.
+        if self.flip_pending {
+            return Ok(false);
+        }
         // The renderer draws with GL and swaps as part of presenting, so by
         // the time this returns the front buffer is the frame just drawn.
         let drew = draw(Canvas::Gl {
@@ -428,6 +450,7 @@ impl Presenter for GbmPresenter {
             if let Some(cursor) = self.cursor.as_mut() {
                 cursor.dirty = false;
             }
+            self.flip_pending = true;
             return Ok(true);
         }
 
@@ -450,6 +473,7 @@ impl Presenter for GbmPresenter {
         };
         result.map_err(present_error)?;
         self.modeset_done = true;
+        self.flip_pending = true;
         if let Some(cursor) = self.cursor.as_mut() {
             cursor.dirty = false;
         }

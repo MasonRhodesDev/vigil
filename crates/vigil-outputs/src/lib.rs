@@ -20,7 +20,7 @@ use vigil_core::{OutputEvent, OutputId, OutputInfo};
 
 /// Re-exported opaquely so the binary can hand surfaces to a presenter
 /// without naming smithay itself.
-pub use smithay::backend::drm::{DrmDeviceFd, DrmSurface};
+pub use smithay::backend::drm::{DrmDeviceFd, DrmEvent, DrmSurface};
 
 /// Opaque udev monitor: a calloop event source firing on GPU/connector
 /// changes. The binary registers it and calls [`OutputManager::scan`] on any

@@ -23,14 +23,13 @@ struct Slot {
 /// The first `with_frame` performs the modeset commit; every later frame is
 /// a page flip to the freshly drawn back buffer.
 //
-// TODO(M1 wiring): flips currently request no vblank event (`event: false`).
-// Once the binary registers the DrmDeviceNotifier, pass `true` and gate the
-// next flip on the vblank to avoid EBUSY under load.
 pub struct DumbBufferPresenter {
     surface: DrmSurface,
     slots: [Slot; 2],
     back: usize,
     modeset_done: bool,
+    /// A submitted flip has not yet been confirmed by its page-flip event.
+    flip_pending: bool,
     width: u32,
     height: u32,
 }
@@ -92,6 +91,7 @@ impl DumbBufferPresenter {
             slots,
             back: 0,
             modeset_done: false,
+            flip_pending: false,
             width,
             height,
         })
@@ -120,12 +120,28 @@ impl Presenter for DumbBufferPresenter {
 
     fn invalidate(&mut self) {
         self.modeset_done = false;
+        // Pending flips (and their events) do not survive a VT switch or
+        // resume; a stale gate here would deadlock the output.
+        self.flip_pending = false;
+    }
+
+    fn vblank(&mut self) {
+        self.flip_pending = false;
+    }
+
+    fn crtc_id(&self) -> Option<u32> {
+        Some(self.surface.crtc().into())
     }
 
     fn with_frame(
         &mut self,
         draw: &mut dyn FnMut(Canvas<'_>) -> bool,
     ) -> Result<bool, PresentError> {
+        // A flip is in flight: submitting another is EBUSY, and the error
+        // recovery (modeset mid-flip) is worse. Skip; nothing is consumed.
+        if self.flip_pending {
+            return Ok(false);
+        }
         let slot = &mut self.slots[self.back];
 
         let drew = {
@@ -147,14 +163,19 @@ impl Presenter for DumbBufferPresenter {
 
         let fb = slot.fb;
         let state = self.plane_state(fb);
+        // Request the vblank event (`true`): completion re-opens the gate
+        // above via `Presenter::vblank` — the day-1 TODO, finally forced by
+        // metal (cursor-plane flips under continuous pointer motion raced
+        // the vblank into an EBUSY -> modeset -> ENOMEM spiral).
         let result = if self.modeset_done {
-            self.surface.page_flip([state], false)
+            self.surface.page_flip([state], true)
         } else {
-            self.surface.commit([state], false)
+            self.surface.commit([state], true)
         };
         result.map_err(present_error)?;
 
         self.modeset_done = true;
+        self.flip_pending = true;
         self.back ^= 1;
         Ok(true)
     }

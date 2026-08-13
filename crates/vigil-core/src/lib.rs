@@ -227,6 +227,20 @@ pub trait Presenter {
         let _ = pos;
         false
     }
+
+    /// The display confirmed the last submission (the page-flip event for
+    /// this presenter's CRTC arrived). Until then a gating presenter's
+    /// `with_frame` refuses new submissions with `Ok(false)` — submitting a
+    /// second flip before the first completes is EBUSY, and the error
+    /// recovery (modeset-while-flipping) is ENOMEM on amdgpu: the freeze
+    /// that motivated this gate.
+    fn vblank(&mut self) {}
+
+    /// Raw CRTC id this presenter scans out on, for routing vblank events.
+    /// `None` opts out of routing (test presenters).
+    fn crtc_id(&self) -> Option<u32> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
