@@ -593,11 +593,12 @@ fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
 }
 
 /// Per-output background resolution, one precedence rule per dimension:
-/// CLI > `[output."NAME"]` override > `[look]` > default. An override keys
+/// CLI > `[output."NAME"]` override > `[look]` > caller fallback > default. An override keys
 /// on the exact connector name; with two GPUs exposing the same name
 /// (e.g. two DP-1s) the override applies to every one of them.
 pub struct Looks {
     pub cli_background: Option<std::path::PathBuf>,
+    pub fallback_background: Option<std::path::PathBuf>,
     pub cli_fit: Option<BackgroundFit>,
     pub config: vigil_config::Config,
 }
@@ -609,7 +610,8 @@ impl Looks {
             .cli_background
             .clone()
             .or_else(|| over.and_then(|o| o.background.clone()))
-            .or_else(|| self.config.look.background.clone());
+            .or_else(|| self.config.look.background.clone())
+            .or_else(|| self.fallback_background.clone());
         let fit = self
             .cli_fit
             .or_else(|| over.and_then(|o| parse_fit(o.fit.as_deref(), connector)))
@@ -931,6 +933,7 @@ mod tests {
     fn looks(toml: &str, cli_bg: Option<&str>, cli_fit: Option<BackgroundFit>) -> Looks {
         Looks {
             cli_background: cli_bg.map(PathBuf::from),
+            fallback_background: None,
             cli_fit,
             config: vigil_config::parse(toml).unwrap(),
         }
@@ -976,6 +979,22 @@ mod tests {
         assert_eq!(
             looks("", None, None).for_connector("DP-1"),
             (None, BackgroundFit::Fill)
+        );
+    }
+
+    #[test]
+    fn caller_background_is_the_last_fallback() {
+        let mut value = looks("", None, None);
+        value.fallback_background = Some("/current-wallpaper.png".into());
+        assert_eq!(
+            value.for_connector("DP-1"),
+            (Some("/current-wallpaper.png".into()), BackgroundFit::Fill)
+        );
+
+        value.config = vigil_config::parse("[look]\nbackground = \"/configured.png\"").unwrap();
+        assert_eq!(
+            value.for_connector("DP-1").0,
+            Some("/configured.png".into())
         );
     }
 

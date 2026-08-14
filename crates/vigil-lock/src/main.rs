@@ -192,6 +192,9 @@ impl Locker {
             user: cli.user,
             looks: Looks {
                 cli_background: cli.background.clone(),
+                fallback_background: std::env::var_os("WALLPAPER_PATH")
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
                 cli_fit: cli.bg_mode,
                 config,
             },

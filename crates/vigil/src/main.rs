@@ -1283,6 +1283,7 @@ fn run() -> Result<i32, String> {
         queue: Rc::new(RefCell::new(VecDeque::new())),
         looks: vigil_ui::Looks {
             cli_background: cli.background.clone(),
+            fallback_background: None,
             cli_fit: cli.bg_mode,
             config: config.clone(),
         },
