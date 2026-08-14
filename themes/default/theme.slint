@@ -63,13 +63,25 @@ export component DefaultTheme inherits Window {
         height: 100%;
     }
 
-    // Clock, top-right.
-    Text {
-        text: root.clock-text;
-        color: root.fg-clock;
-        font-size: 30px;
+    // Clock, top-right. Its own surface keeps it legible over both light and
+    // dark photographs instead of relying on the background for contrast.
+    Rectangle {
+        width: clock-label.width + 28px;
+        height: clock-label.height + 16px;
         x: parent.width - self.width - 36px;
         y: 28px;
+        background: root.card-bg;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: root.card-border;
+
+        clock-label := Text {
+            text: root.clock-text;
+            color: root.fg-clock;
+            font-size: 30px;
+            x: 14px;
+            y: 8px;
+        }
     }
 
     // Login card, centered, only on the panel output. `visible` (not `if`)
