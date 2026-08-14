@@ -17,7 +17,7 @@ makedepends=('cargo' 'clang' 'systemd')
 checkdepends=('ttf-dejavu')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::https://github.com/MasonRhodesDev/vigil/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP') # pin on release: updpkgsums
+sha256sums=('80371bc2a67adba7c300e68b05b029751627802c24632d6816f3e46e67c4e279')
 
 prepare() {
   cd "$pkgname-$pkgver"
