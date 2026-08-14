@@ -112,6 +112,34 @@ impl AuthMachine {
         }
     }
 
+    /// Begin or switch an account selected by the greeter's user list.
+    ///
+    /// Unlike [`Self::begin`] with `Some`, a listed account is not fixed:
+    /// the user may switch accounts or choose manual entry later. A selected
+    /// account goes directly to greetd's first authentication prompt; `None`
+    /// is the explicit manual-entry choice and shows the username prompt.
+    pub fn select_user(
+        &mut self,
+        user: Option<&str>,
+        ui: &mut dyn AuthUi,
+    ) -> Result<(), AuthError> {
+        if self.state == State::Complete {
+            return Err(AuthError("session has already started".into()));
+        }
+        self.fixed_user = false;
+        if self.state == State::AwaitingPrompt {
+            self.cancel(ui)?;
+        }
+        match user {
+            Some(user) => self.start(user, ui),
+            None => {
+                self.user = None;
+                self.prompt_username(ui);
+                Ok(())
+            }
+        }
+    }
+
     fn prompt_username(&mut self, ui: &mut dyn AuthUi) {
         ui.show_prompt(USERNAME_PROMPT, false);
         self.state = State::AwaitingUser;
@@ -601,6 +629,39 @@ mod tests {
                 &UiCall::Prompt("Password:".into(), true)
             ]
         );
+    }
+
+    #[test]
+    fn selectable_user_skips_username_and_manual_entry_restores_it() {
+        let Some(server) = FakeServer::spawn(|stream| {
+            assert_create(request(stream), "alice");
+            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
+            assert_cancel(request(stream));
+            respond(stream, Response::Success);
+            assert_create(request(stream), "bob");
+            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
+            assert_cancel(request(stream));
+            respond(stream, Response::Success);
+        }) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+
+        machine.select_user(Some("alice"), &mut ui).unwrap();
+        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password:".into(), true)));
+        assert_eq!(machine.user(), Some("alice"));
+
+        machine.select_user(Some("bob"), &mut ui).unwrap();
+        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password:".into(), true)));
+        assert_eq!(machine.user(), Some("bob"));
+
+        machine.select_user(None, &mut ui).unwrap();
+        assert_eq!(
+            ui.0.last(),
+            Some(&UiCall::Prompt(USERNAME_PROMPT.into(), false))
+        );
+        assert_eq!(machine.user(), None);
     }
 
     #[test]

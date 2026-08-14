@@ -936,10 +936,17 @@ impl App {
         self.selected_user = index;
         let default = (name != OTHER_USER).then(|| name.clone());
         self.auth.set_default_user(default.clone());
-        let label = default.unwrap_or_default();
+        let label = default.clone().unwrap_or_default();
         for e in self.entries.iter_mut() {
             e.window.set_user_index(index);
             e.window.set_user_name(&label);
+        }
+        let mut fan = FanUi {
+            entries: &mut self.entries,
+            snapshot: &mut self.snapshot,
+        };
+        if let Err(e) = self.auth.select_user(default.as_deref(), &mut fan) {
+            eprintln!("vigil: select user: {e}");
         }
     }
 
@@ -1037,11 +1044,12 @@ impl App {
                 Err(PresentError::DeviceLost) => dead.push(i),
                 Err(e) => {
                     // The frame was drawn and the scene's dirty flag consumed,
-                    // but nothing reached the CRTC. Without re-arming, a single
-                    // failure — most likely just after a resume, when the
-                    // device may not be fully back — leaves the greeter black
-                    // until something else happens to change the scene.
-                    presenter.invalidate();
+                    // but nothing reached the CRTC. Re-arm the scene, while
+                    // preserving the presenter's modeset state: turning a
+                    // failed page flip into a full modeset can race an in-flight
+                    // flip and produces an endless ENOMEM loop on amdgpu.
+                    // Resume/VT activation explicitly invalidate presenters at
+                    // the point where a modeset is actually required.
                     window.request_present();
                     // A persistent failure retries every frame; do not narrate
                     // it every frame.
@@ -1299,9 +1307,19 @@ fn run() -> Result<i32, String> {
             entries: &mut app.entries,
             snapshot: &mut app.snapshot,
         };
-        app.auth
-            .begin(resolved.user.as_deref(), &mut fan)
-            .map_err(|e| e.to_string())?;
+        if let Some(user) = resolved.user.as_deref() {
+            app.auth.begin(Some(user), &mut fan)
+        } else if !app.users.is_empty() {
+            let selected = app
+                .users
+                .get(app.selected_user)
+                .filter(|name| name.as_str() != OTHER_USER)
+                .cloned();
+            app.auth.select_user(selected.as_deref(), &mut fan)
+        } else {
+            app.auth.begin(None, &mut fan)
+        }
+        .map_err(|e| e.to_string())?;
     }
 
     handle

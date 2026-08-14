@@ -39,6 +39,9 @@ BuildRequires:  fontconfig-devel
 Requires:       greetd
 # groupadd in %pre for the shared monitor-profiles group.
 Requires(pre):  shadow-utils
+# The package creates this shared group in %%pre. Declare the capability so
+# RPM's file-owner dependency for /etc/monitor-profiles is self-satisfied.
+Provides:       group(monitor-profiles)
 
 %description
 vigil is a multi-monitor, themeable greetd greeter that renders directly on
@@ -51,6 +54,17 @@ output, runtime .slint themes with a compiled-in fallback.
 # -a1 unpacks the vendor tarball (vendor/ at its root) into the source dir.
 %autosetup -p1 -a1
 %cargo_prep -v vendor
+# cargo-rpm-macros replaces crates.io with the vendor directory, but it does
+# not emit the source stanza required for pinned Git dependencies. cargo
+# vendor includes monitor-profiles in Source1; map that source explicitly so
+# the offline RPM build can resolve it.
+cat >> .cargo/config.toml <<'EOF'
+
+[source."git+https://github.com/MasonRhodesDev/monitor-profiles?rev=aef5f0e"]
+git = "https://github.com/MasonRhodesDev/monitor-profiles"
+rev = "aef5f0e"
+replace-with = "vendored-sources"
+EOF
 
 %build
 # vigil's default features include `gl` (FemtoVG over GBM/EGL).
@@ -59,9 +73,11 @@ output, runtime .slint themes with a compiled-in fallback.
 %{cargo_license} > LICENSE.dependencies
 
 %install
-# Virtual workspace: install each bin crate from its own directory.
-(cd crates/vigil && %cargo_install)
-(cd crates/vigil-lock && %cargo_install)
+# The build phase already produced both workspace binaries. Installing those
+# artifacts avoids a second `cargo install` resolution from each member crate,
+# which has no workspace lockfile and cannot resolve vendored Git sources.
+install -Dpm0755 target/rpm/vigil %{buildroot}%{_bindir}/vigil
+install -Dpm0755 target/rpm/vigil-lock %{buildroot}%{_bindir}/vigil-lock
 
 install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
 install -Dpm0644 dist/vigil-lock.pam %{buildroot}%{_sysconfdir}/pam.d/vigil-lock
