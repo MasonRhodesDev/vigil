@@ -203,6 +203,7 @@ type DecodedBackground = Result<Option<(Vec<u8>, u32, u32)>, String>;
 
 struct BackgroundResult {
     generation: u64,
+    cache_key: String,
     outputs: Vec<(OutputId, DecodedBackground)>,
 }
 
@@ -271,6 +272,8 @@ struct App {
     background_tx: std::sync::mpsc::Sender<BackgroundResult>,
     background_rx: std::sync::mpsc::Receiver<BackgroundResult>,
     background_generation: u64,
+    background_cache: std::collections::HashMap<String, Vec<(OutputId, DecodedBackground)>>,
+    background_cache_key: String,
     power_enabled: bool,
     clock_format: String,
     banner_file: Option<PathBuf>,
@@ -990,6 +993,7 @@ impl App {
                 None
             })
             .unwrap_or_default();
+        self.background_cache_key = default.clone().unwrap_or_else(|| "<theme>".to_owned());
         self.refresh_backgrounds_async();
         let label = default.clone().unwrap_or_default();
         for e in self.entries.iter_mut() {
@@ -1008,6 +1012,11 @@ impl App {
     fn refresh_backgrounds_async(&mut self) {
         self.background_generation = self.background_generation.wrapping_add(1);
         let generation = self.background_generation;
+        let cache_key = self.background_cache_key.clone();
+        if let Some(outputs) = self.background_cache.get(&cache_key).cloned() {
+            self.apply_backgrounds(outputs);
+            return;
+        }
         let mut requests = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
             let resolved = self.appearance_registry.resolve(
@@ -1064,6 +1073,7 @@ impl App {
             });
             let _ = tx.send(BackgroundResult {
                 generation,
+                cache_key,
                 outputs,
             });
         });
@@ -1071,26 +1081,34 @@ impl App {
 
     fn pump_backgrounds(&mut self) {
         while let Ok(result) = self.background_rx.try_recv() {
-            if result.generation != self.background_generation {
+            self.background_cache
+                .insert(result.cache_key.clone(), result.outputs.clone());
+            if result.generation != self.background_generation
+                || result.cache_key != self.background_cache_key
+            {
                 continue;
             }
-            for (id, decoded) in result.outputs {
-                let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
-                    continue;
-                };
-                match decoded {
-                    Ok(Some((rgba, width, height))) => {
-                        eprintln!("vigil: background applied to {:?}", id);
-                        entry.window.set_background(rgba, width, height)
-                    }
-                    Ok(None) => {
-                        eprintln!("vigil: no background resolved for {:?}; using theme", id);
-                        entry.window.clear_background()
-                    }
-                    Err(error) => {
-                        eprintln!("vigil: background: {error}");
-                        entry.window.clear_background();
-                    }
+            self.apply_backgrounds(result.outputs);
+        }
+    }
+
+    fn apply_backgrounds(&mut self, outputs: Vec<(OutputId, DecodedBackground)>) {
+        for (id, decoded) in outputs {
+            let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+                continue;
+            };
+            match decoded {
+                Ok(Some((rgba, width, height))) => {
+                    eprintln!("vigil: background applied to {:?}", id);
+                    entry.window.set_background(rgba, width, height)
+                }
+                Ok(None) => {
+                    eprintln!("vigil: no background resolved for {:?}; using theme", id);
+                    entry.window.clear_background()
+                }
+                Err(error) => {
+                    eprintln!("vigil: background: {error}");
+                    entry.window.clear_background();
                 }
             }
         }
@@ -1414,6 +1432,7 @@ fn run() -> Result<i32, String> {
     let appearance_registry = appearance_user
         .and_then(|name| appearance_profiles::Registry::load_published(name).ok())
         .unwrap_or_default();
+    let background_cache_key = appearance_user.unwrap_or("<theme>").to_owned();
     let (background_tx, background_rx) = std::sync::mpsc::channel();
     let mut app = App {
         session,
@@ -1448,6 +1467,8 @@ fn run() -> Result<i32, String> {
         background_tx,
         background_rx,
         background_generation: 0,
+        background_cache: Default::default(),
+        background_cache_key,
         power_enabled: resolved.power_enabled,
         clock_format: resolved.clock_format.clone(),
         banner_file: config.greeter.banner_file.clone(),
@@ -1463,6 +1484,9 @@ fn run() -> Result<i32, String> {
     };
 
     app.rescan();
+    // Populate the selected user's monitor-sized cache while the greeter is
+    // becoming interactive. Subsequent switches back are memory-only.
+    app.refresh_backgrounds_async();
     app.refresh_banner();
     {
         let mut fan = FanUi {
