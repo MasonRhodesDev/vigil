@@ -4586,6 +4586,7 @@ name = "vigil-lock"
 version = "0.2.4"
 dependencies = [
  "appearance-profiles",
+ "monitor-profiles",
  "vigil-config",
  "vigil-core",
  "vigil-login",

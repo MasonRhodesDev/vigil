@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 vigil-core.workspace = true
+monitor-profiles.workspace = true
 appearance-profiles.workspace = true
 vigil-config.workspace = true
 vigil-login = { path = "../vigil-login" }

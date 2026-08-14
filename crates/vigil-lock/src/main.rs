@@ -101,6 +101,8 @@ fn appearance_fit(fit: appearance_profiles::Fit) -> BackgroundFit {
 
 struct Entry {
     id: OutputId,
+    connector: String,
+    description: String,
     window: OutputWindow,
 }
 
@@ -112,6 +114,7 @@ struct Locker {
     user: String,
     looks: Looks,
     appearance_registry: appearance_profiles::Registry,
+    monitor_profiles: Vec<monitor_profiles::Profile>,
     clock_format: String,
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
@@ -204,6 +207,18 @@ impl Locker {
         let (auth_tx, auth_rx) = mpsc::channel();
         let (login_tx, login_rx) = mpsc::channel();
         let (appearance_tx, appearance_rx) = mpsc::channel();
+        let monitor_profiles = config
+            .profiles
+            .dir
+            .as_deref()
+            .map(monitor_profiles::load_dir)
+            .map(|(profiles, diagnostics)| {
+                for diagnostic in diagnostics {
+                    eprintln!("vigil-lock: monitor profile: {diagnostic:?}");
+                }
+                profiles
+            })
+            .unwrap_or_default();
         let locker = Self {
             platform,
             theme,
@@ -224,6 +239,7 @@ impl Locker {
                     Default::default()
                 },
             ),
+            monitor_profiles,
             clock_format: clock_format.clone(),
             caps_lock: false,
             queue: Rc::default(),
@@ -377,6 +393,40 @@ impl Locker {
         }
     }
 
+    fn focus_profile_origin(&mut self) {
+        let signature: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| entry.description.clone())
+            .collect();
+        let connected: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| monitor_profiles::ConnectedOutput {
+                name: entry.connector.clone(),
+                description: entry.description.clone(),
+            })
+            .collect();
+        let Some(profile) = monitor_profiles::select(&signature, &self.monitor_profiles) else {
+            return;
+        };
+        let resolved = monitor_profiles::resolve(profile, &connected);
+        let Some(origin) = resolved
+            .outputs
+            .iter()
+            .find(|output| output.position == (0, 0))
+        else {
+            return;
+        };
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.connector == origin.name)
+        {
+            self.panel = index;
+        }
+    }
+
     /// Single exit path: clear the logind hint, then release the screen.
     fn unlock_now(&mut self) {
         if let Some(login) = &self.login {
@@ -434,7 +484,13 @@ impl LockSession for Locker {
                     "vigil-lock: output {} {}x{}@{:.2}",
                     info.connector, info.width, info.height, info.scale
                 );
-                self.entries.push(Entry { id, window });
+                self.entries.push(Entry {
+                    id,
+                    connector: info.connector.clone(),
+                    description: output_description(info).unwrap_or_else(|| info.connector.clone()),
+                    window,
+                });
+                self.focus_profile_origin();
                 self.apply_panel();
             }
             Err(e) => eprintln!("vigil-lock: skipping output {id:?}: {e}"),

@@ -821,6 +821,19 @@ impl App {
         }
         let (cx, cy) = self.row.clamp(self.cursor.0, self.cursor.1);
         self.cursor = (cx, cy);
+        if let Some(origin) = self.layout.iter().find(|output| output.position == (0, 0))
+            && let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.connector == origin.name)
+        {
+            self.panel = index;
+            let (width, height) = self.entries[index].window.scene_size();
+            self.cursor = self.row.clamp(
+                f64::from(origin.position.0) + f64::from(width) / 2.0,
+                f64::from(origin.position.1) + f64::from(height) / 2.0,
+            );
+        }
         self.apply_panel();
     }
 
