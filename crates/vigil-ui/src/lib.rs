@@ -262,6 +262,11 @@ impl OutputWindow {
         self.set_property("background-source", Value::Image(Image::from_rgba8(buffer)));
     }
 
+    /// Remove a previously rendered bitmap and reveal the theme background.
+    pub fn clear_background(&mut self) {
+        self.set_property("background-source", Value::Image(Image::default()));
+    }
+
     /// Whether this output hosts the login panel (theme `panel-visible`).
     pub fn set_panel_visible(&mut self, visible: bool) {
         self.set_property("panel-visible", Value::Bool(visible));
@@ -1007,6 +1012,35 @@ mod tests {
         assert_eq!(
             value.for_connector("DP-1").0,
             Some("/configured.png".into())
+        );
+    }
+
+    #[test]
+    fn dynamic_registry_fallback_is_replaceable_and_keeps_config_precedence() {
+        let value = looks("", None, None);
+        assert_eq!(
+            value.for_connector_with_fallback(
+                "DP-1",
+                Some("/system.png".into()),
+                Some(BackgroundFit::Center),
+            ),
+            (Some("/system.png".into()), BackgroundFit::Center)
+        );
+        assert_eq!(
+            value.for_connector_with_fallback("DP-1", None, None),
+            (None, BackgroundFit::Fill)
+        );
+
+        let configured = looks("[look]\nbackground = \"/operator.png\"", None, None);
+        assert_eq!(
+            configured
+                .for_connector_with_fallback(
+                    "DP-1",
+                    Some("/system.png".into()),
+                    Some(BackgroundFit::Center),
+                )
+                .0,
+            Some("/operator.png".into())
         );
     }
 

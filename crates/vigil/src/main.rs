@@ -199,6 +199,13 @@ struct Entry {
     present_failures: u32,
 }
 
+type DecodedBackground = Result<Option<(Vec<u8>, u32, u32)>, String>;
+
+struct BackgroundResult {
+    generation: u64,
+    outputs: Vec<(OutputId, DecodedBackground)>,
+}
+
 /// Fan-out AuthUi: every monitor mirrors the auth state.
 struct FanUi<'a> {
     entries: &'a mut [Entry],
@@ -261,6 +268,9 @@ struct App {
     queue: Rc<RefCell<VecDeque<UiMessage>>>,
     looks: vigil_ui::Looks,
     appearance_registry: appearance_profiles::Registry,
+    background_tx: std::sync::mpsc::Sender<BackgroundResult>,
+    background_rx: std::sync::mpsc::Receiver<BackgroundResult>,
+    background_generation: u64,
     power_enabled: bool,
     clock_format: String,
     banner_file: Option<PathBuf>,
@@ -980,7 +990,7 @@ impl App {
                 None
             })
             .unwrap_or_default();
-        self.refresh_backgrounds();
+        self.refresh_backgrounds_async();
         let label = default.clone().unwrap_or_default();
         for e in self.entries.iter_mut() {
             e.window.set_user_index(index);
@@ -995,8 +1005,11 @@ impl App {
         }
     }
 
-    fn refresh_backgrounds(&mut self) {
-        for entry in &mut self.entries {
+    fn refresh_backgrounds_async(&mut self) {
+        self.background_generation = self.background_generation.wrapping_add(1);
+        let generation = self.background_generation;
+        let mut requests = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
             let resolved = self.appearance_registry.resolve(
                 &appearance_profiles::OutputIdentity::new(
                     &entry.connector,
@@ -1009,11 +1022,48 @@ impl App {
                 resolved.path,
                 Some(appearance_fit(resolved.fit)),
             );
-            if let Some(path) = background {
-                let (width, height) = entry.window.scene_size();
-                match vigil_ui::background(&path, fit, width, height) {
-                    Ok(rgba) => entry.window.set_background(rgba, width, height),
-                    Err(e) => eprintln!("vigil: background: {e}"),
+            let (width, height) = entry.window.scene_size();
+            requests.push((entry.id, background, fit, width, height));
+        }
+        let tx = self.background_tx.clone();
+        std::thread::spawn(move || {
+            let outputs = requests
+                .into_iter()
+                .map(|(id, path, fit, width, height)| {
+                    let decoded = path
+                        .map(|path| {
+                            vigil_ui::background(&path, fit, width, height)
+                                .map(|rgba| (rgba, width, height))
+                        })
+                        .transpose();
+                    (id, decoded)
+                })
+                .collect();
+            let _ = tx.send(BackgroundResult {
+                generation,
+                outputs,
+            });
+        });
+    }
+
+    fn pump_backgrounds(&mut self) {
+        while let Ok(result) = self.background_rx.try_recv() {
+            if result.generation != self.background_generation {
+                continue;
+            }
+            for (id, decoded) in result.outputs {
+                let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+                    continue;
+                };
+                match decoded {
+                    Ok(Some((rgba, width, height))) => {
+                        entry.window.set_background(rgba, width, height)
+                    }
+                    Ok(None) => entry.window.clear_background(),
+                    Err(error) => {
+                        eprintln!("vigil: background: {error}");
+                        entry.window.clear_background();
+                    }
                 }
             }
         }
@@ -1021,6 +1071,7 @@ impl App {
 
     fn tick(&mut self) {
         vigil_ui::advance_timers();
+        self.pump_backgrounds();
         let repeats = self.input.tick_repeat(Instant::now());
         if !repeats.is_empty() {
             self.route(repeats);
@@ -1336,6 +1387,7 @@ fn run() -> Result<i32, String> {
     let appearance_registry = appearance_user
         .and_then(|name| appearance_profiles::Registry::load_published(name).ok())
         .unwrap_or_default();
+    let (background_tx, background_rx) = std::sync::mpsc::channel();
     let mut app = App {
         session,
         outputs,
@@ -1366,6 +1418,9 @@ fn run() -> Result<i32, String> {
             config: config.clone(),
         },
         appearance_registry,
+        background_tx,
+        background_rx,
+        background_generation: 0,
         power_enabled: resolved.power_enabled,
         clock_format: resolved.clock_format.clone(),
         banner_file: config.greeter.banner_file.clone(),
