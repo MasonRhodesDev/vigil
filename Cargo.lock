@@ -75,6 +75,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
+name = "appearance-profiles"
+version = "0.1.0"
+source = "git+https://github.com/MasonRhodesDev/appearance-profiles.git?rev=75d831a#75d831ad6c4cd3d2ec96afe45160ea45458f327c"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "appendlist"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4216,10 +4226,12 @@ version = "0.9.12+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
 dependencies = [
+ "indexmap",
  "serde_core",
  "serde_spanned",
  "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 0.7.15",
 ]
 
@@ -4508,6 +4520,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vigil"
 version = "0.2.4"
 dependencies = [
+ "appearance-profiles",
  "calloop 0.14.4",
  "image",
  "monitor-profiles",
@@ -4572,6 +4585,7 @@ dependencies = [
 name = "vigil-lock"
 version = "0.2.4"
 dependencies = [
+ "appearance-profiles",
  "vigil-config",
  "vigil-core",
  "vigil-login",

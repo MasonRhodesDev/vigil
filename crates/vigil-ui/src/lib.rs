@@ -605,17 +605,29 @@ pub struct Looks {
 
 impl Looks {
     pub fn for_connector(&self, connector: &str) -> (Option<std::path::PathBuf>, BackgroundFit) {
+        self.for_connector_with_fallback(connector, None, None)
+    }
+
+    /// Resolve application overrides above a dynamic registry fallback.
+    pub fn for_connector_with_fallback(
+        &self,
+        connector: &str,
+        background_fallback: Option<std::path::PathBuf>,
+        fit_fallback: Option<BackgroundFit>,
+    ) -> (Option<std::path::PathBuf>, BackgroundFit) {
         let over = self.config.output.get(connector);
         let background = self
             .cli_background
             .clone()
             .or_else(|| over.and_then(|o| o.background.clone()))
             .or_else(|| self.config.look.background.clone())
+            .or(background_fallback)
             .or_else(|| self.fallback_background.clone());
         let fit = self
             .cli_fit
             .or_else(|| over.and_then(|o| parse_fit(o.fit.as_deref(), connector)))
             .or_else(|| parse_fit(self.config.look.fit.as_deref(), "look"))
+            .or(fit_fallback)
             .unwrap_or_default();
         (background, fit)
     }

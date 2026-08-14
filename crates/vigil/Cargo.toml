@@ -11,6 +11,7 @@ repository.workspace = true
 vigil-core.workspace = true
 vigil-config.workspace = true
 monitor-profiles.workspace = true
+appearance-profiles.workspace = true
 vigil-session = { path = "../vigil-session" }
 vigil-outputs = { path = "../vigil-outputs" }
 vigil-present-dumb = { path = "../vigil-present-dumb" }

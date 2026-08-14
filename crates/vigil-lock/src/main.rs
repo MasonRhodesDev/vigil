@@ -80,6 +80,25 @@ fn whoami() -> Result<String, String> {
         .map_err(|_| "cannot determine user (USER/LOGNAME unset); pass --user".into())
 }
 
+fn output_description(info: &OutputInfo) -> Option<String> {
+    let value = [info.make.as_deref(), info.model.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!value.is_empty()).then_some(value)
+}
+
+fn appearance_fit(fit: appearance_profiles::Fit) -> BackgroundFit {
+    match fit {
+        appearance_profiles::Fit::Fill => BackgroundFit::Fill,
+        appearance_profiles::Fit::Fit => BackgroundFit::Fit,
+        appearance_profiles::Fit::Stretch => BackgroundFit::Stretch,
+        appearance_profiles::Fit::Center => BackgroundFit::Center,
+        appearance_profiles::Fit::Tile => BackgroundFit::Tile,
+    }
+}
+
 struct Entry {
     id: OutputId,
     window: OutputWindow,
@@ -92,6 +111,7 @@ struct Locker {
     panel: usize,
     user: String,
     looks: Looks,
+    appearance_registry: appearance_profiles::Registry,
     clock_format: String,
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
@@ -198,6 +218,12 @@ impl Locker {
                 cli_fit: cli.bg_mode,
                 config,
             },
+            appearance_registry: appearance_profiles::Registry::load_current_user().unwrap_or_else(
+                |e| {
+                    eprintln!("vigil-lock: appearance registry: {e}");
+                    Default::default()
+                },
+            ),
             clock_format: clock_format.clone(),
             caps_lock: false,
             queue: Rc::default(),
@@ -371,7 +397,18 @@ impl LockSession for Locker {
             let mut window =
                 OutputWindow::new(id, info.width, info.height, info.scale, adapter, component)
                     .map_err(|e| e.to_string())?;
-            let (background, fit) = self.looks.for_connector(&info.connector);
+            let resolved = self.appearance_registry.resolve(
+                &appearance_profiles::OutputIdentity::new(
+                    &info.connector,
+                    output_description(info),
+                ),
+                None,
+            );
+            let (background, fit) = self.looks.for_connector_with_fallback(
+                &info.connector,
+                resolved.path,
+                Some(appearance_fit(resolved.fit)),
+            );
             if let Some(path) = &background {
                 match vigil_ui::background(path, fit, info.width, info.height) {
                     Ok(rgba) => window.set_background(rgba, info.width, info.height),

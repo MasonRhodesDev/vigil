@@ -145,6 +145,25 @@ fn resolve(cli: &Cli, config: &Config) -> Resolved {
     }
 }
 
+fn output_description(info: &vigil_core::OutputInfo) -> Option<String> {
+    let value = [info.make.as_deref(), info.model.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!value.is_empty()).then_some(value)
+}
+
+fn appearance_fit(fit: appearance_profiles::Fit) -> BackgroundFit {
+    match fit {
+        appearance_profiles::Fit::Fill => BackgroundFit::Fill,
+        appearance_profiles::Fit::Fit => BackgroundFit::Fit,
+        appearance_profiles::Fit::Stretch => BackgroundFit::Stretch,
+        appearance_profiles::Fit::Center => BackgroundFit::Center,
+        appearance_profiles::Fit::Tile => BackgroundFit::Tile,
+    }
+}
+
 /// Session preselected at startup. Precedence: the user's own last
 /// successful session (when it still exists) > the operator's
 /// `[sessions] default` > first. A remembered name that no longer matches
@@ -167,6 +186,8 @@ fn initial_session(
 /// One live output: its swapchain and its scene.
 struct Entry {
     id: OutputId,
+    connector: String,
+    description: Option<String>,
     width: u32,
     height: u32,
     presenter: Box<dyn Presenter>,
@@ -239,6 +260,7 @@ struct App {
     panel: usize,
     queue: Rc<RefCell<VecDeque<UiMessage>>>,
     looks: vigil_ui::Looks,
+    appearance_registry: appearance_profiles::Registry,
     power_enabled: bool,
     clock_format: String,
     banner_file: Option<PathBuf>,
@@ -278,8 +300,12 @@ impl App {
                 // A render racing the pause can hit DeviceInactive and drop
                 // its entry, and no udev event replays a VT switch — so any
                 // output a manager still knows but we lost gets rebuilt.
-                let known: Vec<OutputId> =
-                    self.outputs.iter().flatten().flat_map(|gpu| gpu.ids()).collect();
+                let known: Vec<OutputId> = self
+                    .outputs
+                    .iter()
+                    .flatten()
+                    .flat_map(|gpu| gpu.ids())
+                    .collect();
                 for id in known {
                     if !self.entries.iter().any(|e| e.id == id)
                         && let Err(e) = self.add_output(id)
@@ -386,7 +412,10 @@ impl App {
             }
             if let Some(mode) = out.mode {
                 let want = (mode.width, mode.height, mode.refresh.round() as u32);
-                if let Some(gpu) = self.outputs.get_mut((id.0 >> 24) as usize).and_then(Option::as_mut)
+                if let Some(gpu) = self
+                    .outputs
+                    .get_mut((id.0 >> 24) as usize)
+                    .and_then(Option::as_mut)
                     && let Err(e) = gpu.set_mode(*id, want)
                 {
                     eprintln!("vigil: profile {}: {e}; using preferred mode", profile.name);
@@ -526,12 +555,8 @@ impl App {
         // rotates correctly — a rendering preference must never be why
         // someone cannot log in (#26).
         if let Some(s) = surface_slot.as_ref()
-            && let Err(e) = vigil_present_gl::GbmPresenter::test_transform(
-                s,
-                &device_fd,
-                &context,
-                transform,
-            )
+            && let Err(e) =
+                vigil_present_gl::GbmPresenter::test_transform(s, &device_fd, &context, transform)
         {
             return Err(format!("rotation test: {e}"));
         }
@@ -680,7 +705,15 @@ impl App {
         };
         let (scene_width, scene_height) = window.scene_size();
 
-        let (background, fit) = self.looks.for_connector(&info.connector);
+        let resolved_background = self.appearance_registry.resolve(
+            &appearance_profiles::OutputIdentity::new(&info.connector, output_description(&info)),
+            None,
+        );
+        let (background, fit) = self.looks.for_connector_with_fallback(
+            &info.connector,
+            resolved_background.path,
+            Some(appearance_fit(resolved_background.fit)),
+        );
         if let Some(path) = &background {
             match vigil_ui::background(path, fit, scene_width, scene_height) {
                 Ok(rgba) => window.set_background(rgba, scene_width, scene_height),
@@ -722,6 +755,8 @@ impl App {
         );
         self.entries.push(Entry {
             id,
+            connector: info.connector.clone(),
+            description: output_description(&info),
             // Scene dimensions: pointer routing works in the space the user
             // sees, so a portrait monitor must present as portrait here.
             width: scene_width,
@@ -936,6 +971,16 @@ impl App {
         self.selected_user = index;
         let default = (name != OTHER_USER).then(|| name.clone());
         self.auth.set_default_user(default.clone());
+        self.appearance_registry = default
+            .as_deref()
+            .map(appearance_profiles::Registry::load_published)
+            .transpose()
+            .unwrap_or_else(|e| {
+                eprintln!("vigil: appearance registry: {e}");
+                None
+            })
+            .unwrap_or_default();
+        self.refresh_backgrounds();
         let label = default.clone().unwrap_or_default();
         for e in self.entries.iter_mut() {
             e.window.set_user_index(index);
@@ -947,6 +992,30 @@ impl App {
         };
         if let Err(e) = self.auth.select_user(default.as_deref(), &mut fan) {
             eprintln!("vigil: select user: {e}");
+        }
+    }
+
+    fn refresh_backgrounds(&mut self) {
+        for entry in &mut self.entries {
+            let resolved = self.appearance_registry.resolve(
+                &appearance_profiles::OutputIdentity::new(
+                    &entry.connector,
+                    entry.description.clone(),
+                ),
+                None,
+            );
+            let (background, fit) = self.looks.for_connector_with_fallback(
+                &entry.connector,
+                resolved.path,
+                Some(appearance_fit(resolved.fit)),
+            );
+            if let Some(path) = background {
+                let (width, height) = entry.window.scene_size();
+                match vigil_ui::background(&path, fit, width, height) {
+                    Ok(rgba) => entry.window.set_background(rgba, width, height),
+                    Err(e) => eprintln!("vigil: background: {e}"),
+                }
+            }
         }
     }
 
@@ -1258,6 +1327,11 @@ fn run() -> Result<i32, String> {
         login.spawn_sleep_signals(login_tx);
     }
 
+    let appearance_registry = user_list
+        .get(selected_user)
+        .filter(|name| name.as_str() != OTHER_USER)
+        .and_then(|name| appearance_profiles::Registry::load_published(name).ok())
+        .unwrap_or_default();
     let mut app = App {
         session,
         outputs,
@@ -1287,6 +1361,7 @@ fn run() -> Result<i32, String> {
             cli_fit: cli.bg_mode,
             config: config.clone(),
         },
+        appearance_registry,
         power_enabled: resolved.power_enabled,
         clock_format: resolved.clock_format.clone(),
         banner_file: config.greeter.banner_file.clone(),
