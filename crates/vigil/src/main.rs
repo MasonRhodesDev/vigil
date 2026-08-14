@@ -1027,18 +1027,41 @@ impl App {
         }
         let tx = self.background_tx.clone();
         std::thread::spawn(move || {
-            let outputs = requests
-                .into_iter()
-                .map(|(id, path, fit, width, height)| {
-                    let decoded = path
-                        .map(|path| {
-                            vigil_ui::background(&path, fit, width, height)
-                                .map(|rgba| (rgba, width, height))
+            use std::collections::HashMap;
+            use std::sync::Arc;
+            let mut sources = HashMap::new();
+            for (_, path, _, _, _) in &requests {
+                if let Some(path) = path {
+                    sources
+                        .entry(path.clone())
+                        .or_insert_with(|| vigil_ui::load_background(path).map(Arc::new));
+                }
+            }
+            let outputs = std::thread::scope(|scope| {
+                requests
+                    .into_iter()
+                    .map(|(id, path, fit, width, height)| {
+                        let source = path.as_ref().map(|path| &sources[path]);
+                        scope.spawn(move || {
+                            let decoded = source
+                                .map(|source| {
+                                    source
+                                        .as_ref()
+                                        .map_err(Clone::clone)
+                                        .and_then(|source| {
+                                            vigil_ui::render_background(source, fit, width, height)
+                                        })
+                                        .map(|rgba| (rgba, width, height))
+                                })
+                                .transpose();
+                            (id, decoded)
                         })
-                        .transpose();
-                    (id, decoded)
-                })
-                .collect();
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().expect("background renderer panicked"))
+                    .collect()
+            });
             let _ = tx.send(BackgroundResult {
                 generation,
                 outputs,
@@ -1057,9 +1080,13 @@ impl App {
                 };
                 match decoded {
                     Ok(Some((rgba, width, height))) => {
+                        eprintln!("vigil: background applied to {:?}", id);
                         entry.window.set_background(rgba, width, height)
                     }
-                    Ok(None) => entry.window.clear_background(),
+                    Ok(None) => {
+                        eprintln!("vigil: no background resolved for {:?}; using theme", id);
+                        entry.window.clear_background()
+                    }
                     Err(error) => {
                         eprintln!("vigil: background: {error}");
                         entry.window.clear_background();

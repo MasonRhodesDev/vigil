@@ -661,8 +661,29 @@ pub fn background(
     if out_w == 0 || out_h == 0 {
         return Err("background dimensions must be non-zero".to_owned());
     }
-    let source = image::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    Ok(fit_background(&source, fit, out_w, out_h).into_raw())
+    let source = load_background(path)?;
+    render_background(&source, fit, out_w, out_h)
+}
+
+/// A source image decoded once and reusable for several output sizes.
+pub struct BackgroundImage(DynamicImage);
+
+pub fn load_background(path: &Path) -> Result<BackgroundImage, String> {
+    image::open(path)
+        .map(BackgroundImage)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+pub fn render_background(
+    source: &BackgroundImage,
+    fit: BackgroundFit,
+    out_w: u32,
+    out_h: u32,
+) -> Result<Vec<u8>, String> {
+    if out_w == 0 || out_h == 0 {
+        return Err("background dimensions must be non-zero".to_owned());
+    }
+    Ok(fit_background(&source.0, fit, out_w, out_h).into_raw())
 }
 
 fn fit_background(source: &DynamicImage, fit: BackgroundFit, out_w: u32, out_h: u32) -> RgbaImage {
