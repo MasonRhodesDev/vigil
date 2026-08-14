@@ -56,13 +56,18 @@ output, runtime .slint themes with a compiled-in fallback.
 %cargo_prep -v vendor
 # cargo-rpm-macros replaces crates.io with the vendor directory, but it does
 # not emit the source stanza required for pinned Git dependencies. cargo
-# vendor includes monitor-profiles in Source1; map that source explicitly so
-# the offline RPM build can resolve it.
+# vendor includes both standards libraries in Source1; map those sources
+# explicitly so the offline RPM build can resolve them.
 cat >> .cargo/config.toml <<'EOF'
 
 [source."git+https://github.com/MasonRhodesDev/monitor-profiles?rev=aef5f0e"]
 git = "https://github.com/MasonRhodesDev/monitor-profiles"
 rev = "aef5f0e"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/MasonRhodesDev/appearance-profiles.git?rev=75d831a"]
+git = "https://github.com/MasonRhodesDev/appearance-profiles.git"
+rev = "75d831a"
 replace-with = "vendored-sources"
 EOF
 
