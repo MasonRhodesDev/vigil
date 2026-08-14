@@ -1327,9 +1327,13 @@ fn run() -> Result<i32, String> {
         login.spawn_sleep_signals(login_tx);
     }
 
-    let appearance_registry = user_list
-        .get(selected_user)
-        .filter(|name| name.as_str() != OTHER_USER)
+    let appearance_user = resolved.user.as_deref().or_else(|| {
+        user_list
+            .get(selected_user)
+            .filter(|name| name.as_str() != OTHER_USER)
+            .map(String::as_str)
+    });
+    let appearance_registry = appearance_user
         .and_then(|name| appearance_profiles::Registry::load_published(name).ok())
         .unwrap_or_default();
     let mut app = App {
