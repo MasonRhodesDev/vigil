@@ -63,9 +63,8 @@ tar -cJf "$SOURCES/$NAME-$VER-vendor.tar.xz" -C "$VENDOR_DIR/src" vendor
 echo "==> building SRPM"
 SRPM=$(rpmbuild -bs "$SPEC" | sed -n 's/^Wrote: //p')
 echo "    $SRPM"
-# Gating: a clean tree should pass (domain-term/spelling noise filtered by the
-# rpmlintrc). Failures here are real spec defects worth stopping for.
-rpmlint --rpmlintrc "$REPO/packaging/$NAME.rpmlintrc" "$SRPM"
+# rpmlint is gated in CI against the SRPM and binary RPMs together. Linting
+# the SRPM alone treats binary-only filters as unused errors.
 
 if [ "${1:-}" = "--copr" ]; then
     echo "==> submitting to COPR project $COPR_PROJECT"
