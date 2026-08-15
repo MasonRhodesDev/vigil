@@ -59,11 +59,12 @@ sudo dnf copr enable solaris765/vigil
 sudo dnf install vigil
 ```
 
-The package installs files only. Point greetd at the greeter
-(`command = "/usr/bin/vigil"` in `/etc/greetd/config.toml`, then restart
-greetd — it reads its config once at startup), and hypridle/your lock
-keybind at `vigil-lock`. An example `vigil.toml` ships at
-`/usr/share/vigil/vigil.toml.example`.
+The package depends on greetd. On install it replaces a stock `agreety`
+command with `/usr/bin/vigil` and enables greetd as the display manager
+when none is set (`graphical.target`). It does not overwrite a custom
+greetd command and never restarts greetd (that tears down a live
+session). Point hypridle / your lock keybind at `vigil-lock`. An example
+`vigil.toml` ships at `/usr/share/vigil/vigil.toml.example`.
 
 ## Monitor layout
 

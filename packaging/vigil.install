@@ -17,8 +17,10 @@ _monitor_profiles_group() {
 
 post_install() {
     _monitor_profiles_group
+    /usr/lib/vigil/setup-greetd || true
 }
 
 post_upgrade() {
     _monitor_profiles_group
+    /usr/lib/vigil/setup-greetd || true
 }

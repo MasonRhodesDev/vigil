@@ -2,10 +2,9 @@
 # by packaging/build-srpm.sh (source tarball from the git tag + vendored
 # cargo deps as Source1 — no rust-*-devel packages needed).
 #
-# The package installs files only: binaries, the tmpfiles.d snippet for the
-# greeter-writable state dir, and reference copies of the example config and
-# default theme. The real /etc/greetd/vigil.toml stays operator-owned
-# (greetd owns that directory). /etc/pam.d/vigil-lock ships as a
+# The package depends on greetd. %post points stock agreety at vigil and
+# enables greetd as the display manager when none is set. Custom greetd
+# command lines stay operator-owned. /etc/pam.d/vigil-lock ships as a
 # pass-through hook (auth include login) — a named place for operator
 # policy, not an opinion about it.
 #
@@ -99,6 +98,7 @@ EOF
 install -Dpm0755 target/rpm/vigil %{buildroot}%{_bindir}/vigil
 install -Dpm0755 target/rpm/vigil-lock %{buildroot}%{_bindir}/vigil-lock
 
+install -Dpm0755 dist/setup-greetd %{buildroot}%{_prefix}/lib/vigil/setup-greetd
 install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
 install -Dpm0644 dist/vigil-lock.pam %{buildroot}%{_sysconfdir}/pam.d/vigil-lock
 install -Dpm0644 dist/vigil.toml.example %{buildroot}%{_datadir}/vigil/vigil.toml.example
@@ -122,11 +122,15 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 # /var/lib/vigil itself comes from the tmpfiles.d snippet via systemd's file
 # triggers (no scriptlet needed on current Fedora).
 
+%post
+%{_prefix}/lib/vigil/setup-greetd >/dev/null 2>&1 || :
+
 %files
 %license LICENSE LICENSE.dependencies
 %doc README.md
 %{_bindir}/vigil
 %{_bindir}/vigil-lock
+%{_prefix}/lib/vigil/setup-greetd
 %{_tmpfilesdir}/vigil.conf
 %config(noreplace) %{_sysconfdir}/pam.d/vigil-lock
 %{_datadir}/vigil/

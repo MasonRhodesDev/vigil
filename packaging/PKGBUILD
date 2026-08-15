@@ -2,8 +2,9 @@
 #
 # Arch package for vigil. Same payload as the Fedora RPM
 # (packaging/vigil.spec); all paths are identical across both distros. The
-# package installs files only — pointing greetd's `command =` at
-# /usr/bin/vigil (and hypridle at vigil-lock) is operator configuration.
+# package depends on greetd. post_install points stock agreety at vigil
+# and enables greetd as the display manager when none is set. Custom
+# greetd command lines (greetd-game-mode, operator) are left alone.
 
 pkgname=vigil
 pkgver=0.2.5
@@ -45,6 +46,7 @@ package() {
   install -Dm755 target/release/vigil "$pkgdir/usr/bin/vigil"
   install -Dm755 target/release/vigil-lock "$pkgdir/usr/bin/vigil-lock"
 
+  install -Dm755 dist/setup-greetd "$pkgdir/usr/lib/vigil/setup-greetd"
   install -Dm644 dist/vigil.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/vigil.conf"
   install -Dm644 dist/vigil-lock.pam "$pkgdir/etc/pam.d/vigil-lock"
   install -Dm644 dist/vigil.toml.example "$pkgdir/usr/share/vigil/vigil.toml.example"
