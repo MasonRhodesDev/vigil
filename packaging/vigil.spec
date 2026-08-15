@@ -69,6 +69,11 @@ replace-with = "vendored-sources"
 git = "https://github.com/MasonRhodesDev/appearance-profiles.git"
 rev = "75d831a"
 replace-with = "vendored-sources"
+
+[source."git+https://github.com/MasonRhodesDev/slint-kit?rev=ec810d9d6f1b079ee0f4cf3d89f26ad7e63ec125"]
+git = "https://github.com/MasonRhodesDev/slint-kit"
+rev = "ec810d9d6f1b079ee0f4cf3d89f26ad7e63ec125"
+replace-with = "vendored-sources"
 EOF
 
 %build

@@ -35,7 +35,4 @@ vigil-login = { path = "crates/vigil-login" }
 # blocking API over zbus's own internal executor: vigil has no async runtime
 # and must not gain one (the in-house `tokio` precedent does not apply here).
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
-# Path dep until slint-kit#19 lands on origin/main. The theme retint needs
-# kit_color_bindings / load_tokens_preferring / load_tokens_system, which are
-# not on 5e3a3a9c7e41585d681149b80070128f0987f0c8 (hyprstate-gui's pin).
-slint-kit = { path = "../slint-kit", default-features = false }
+slint-kit = { git = "https://github.com/MasonRhodesDev/slint-kit", rev = "ec810d9d6f1b079ee0f4cf3d89f26ad7e63ec125", default-features = false }

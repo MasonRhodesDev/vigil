@@ -3874,6 +3874,7 @@ dependencies = [
 [[package]]
 name = "slint-kit"
 version = "0.2.0"
+source = "git+https://github.com/MasonRhodesDev/slint-kit?rev=ec810d9d6f1b079ee0f4cf3d89f26ad7e63ec125#ec810d9d6f1b079ee0f4cf3d89f26ad7e63ec125"
 dependencies = [
  "dirs",
  "serde",
