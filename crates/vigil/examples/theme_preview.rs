@@ -37,8 +37,9 @@ fn main() {
     window.set_cursor_visible(true);
     window.set_clock("13:37");
     if std::env::var_os("PREVIEW_LIGHT").is_some() {
-        window.set_color_scheme("light");
-        window.set_accent_color((0.29, 0.44, 0.65));
+        window.apply_kit_tokens(&slint_kit::embedded_fallback("light"));
+    } else {
+        vigil_ui::apply_kit_tokens_from_disk(&mut window, "dark");
     }
     window.set_users(&["mason".into(), "Other…".into()]);
     window.set_user_index(0);

@@ -11,3 +11,4 @@ repository.workspace = true
 vigil-core.workspace = true
 slint.workspace = true
 slint-interpreter.workspace = true
+slint-kit.workspace = true

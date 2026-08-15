@@ -97,14 +97,24 @@ fn compile_path(path: &Path) -> Result<Theme, ThemeError> {
     } else {
         path.to_path_buf()
     };
-    let result = block_on(slint_interpreter::Compiler::default().build_from_path(&file));
+    let result = block_on(compiler().build_from_path(&file));
     finish_compilation(result)
 }
 
 fn compile_source(source: &str, path: PathBuf) -> Result<Theme, ThemeError> {
-    let result =
-        block_on(slint_interpreter::Compiler::default().build_from_source(source.to_owned(), path));
+    let result = block_on(compiler().build_from_source(source.to_owned(), path));
     finish_compilation(result)
+}
+
+fn compiler() -> slint_interpreter::Compiler {
+    let mut compiler = slint_interpreter::Compiler::default();
+    let ui = slint_kit::ui_dir();
+    let mut paths = vec![ui.clone()];
+    if let Some(root) = ui.parent() {
+        paths.push(root.to_path_buf());
+    }
+    compiler.set_include_paths(paths);
+    compiler
 }
 
 fn finish_compilation(result: slint_interpreter::CompilationResult) -> Result<Theme, ThemeError> {
@@ -128,11 +138,14 @@ fn finish_compilation(result: slint_interpreter::CompilationResult) -> Result<Th
         }));
     }
 
-    let component_name = result
-        .component_names()
-        .next()
+    let names: Vec<String> = result.component_names().map(|n| n.to_string()).collect();
+    let component_name = names
+        .iter()
+        .find(|n| *n == "DefaultTheme")
+        .cloned()
+        .or_else(|| names.into_iter().next())
         .ok_or_else(|| ThemeError::Compile("theme does not export a root component".to_owned()))?;
-    let definition = result.component(component_name).ok_or_else(|| {
+    let definition = result.component(&component_name).ok_or_else(|| {
         ThemeError::Compile(format!(
             "exported component `{component_name}` was not generated"
         ))

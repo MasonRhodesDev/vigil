@@ -19,6 +19,7 @@ use slint::{
     Color, ComponentHandle, Image, LogicalPosition, PhysicalSize, Rgba8Pixel, SharedPixelBuffer,
 };
 use slint_interpreter::{ComponentInstance, Value};
+use slint_kit::TokenSet;
 use vigil_core::{
     AuthUi, BackgroundFit, CURSOR, FrameTarget, InputEvent, OutputId, PowerAction, UiMessage,
     scene_to_panel,
@@ -500,6 +501,22 @@ impl OutputWindow {
         );
     }
 
+    /// Paint slint-kit `Theme` (if the theme exports it) plus contract
+    /// `color-scheme` / `accent-color` from an LMTT [`TokenSet`].
+    pub fn apply_kit_tokens(&mut self, tokens: &TokenSet) {
+        self.set_color_scheme(&tokens.mode);
+        let _ = self.component.set_global_property(
+            "Theme",
+            "mode",
+            Value::String(tokens.mode.as_str().into()),
+        );
+        for (name, color) in slint_kit::kit_color_bindings(tokens) {
+            let _ = self.component.set_global_property("Theme", name, color.into());
+        }
+        self.set_optional_property("accent-color", tokens.get("primary").into());
+        self.touch();
+    }
+
     fn set_property(&self, name: &str, value: Value) {
         let result = self.component.set_property(name, value);
         debug_assert!(result.is_ok());
@@ -517,6 +534,11 @@ impl OutputWindow {
     fn touch(&self) {
         self.revision.set(self.revision.get().wrapping_add(1));
     }
+}
+
+/// Load LMTT tokens (user → `/etc/matugen` → embedded) and paint them.
+pub fn apply_kit_tokens_from_disk(window: &mut OutputWindow, mode: &str) {
+    window.apply_kit_tokens(&slint_kit::load_tokens_preferring(mode));
 }
 
 impl AuthUi for OutputWindow {

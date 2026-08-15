@@ -20,6 +20,7 @@ vigil-auth = { path = "../vigil-auth" }
 vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }
 vigil-login = { path = "../vigil-login" }
+slint-kit.workspace = true
 # The GL path used to be opt-in (DESIGN.md §7). Production greeters on
 # HiDPI/rotated desks need it; packaging and the default feature gate now
 # enable GL. Software-only: `cargo build --no-default-features`.

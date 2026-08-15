@@ -16,7 +16,7 @@ use vigil_core::{
 use vigil_login::{AppearanceWatcher, LoginSession};
 use vigil_pam::PamAttempt;
 use vigil_theme::Theme;
-use vigil_ui::{Looks, OutputWindow, UiSnapshot, VigilPlatform};
+use vigil_ui::{Looks, OutputWindow, UiSnapshot, VigilPlatform, apply_kit_tokens_from_disk};
 use vigil_wayland::{LockOutcome, LockSession};
 
 struct Cli {
@@ -128,7 +128,6 @@ struct Locker {
     appearance_rx: mpsc::Receiver<AppearanceEvent>,
     appearance_tx: mpsc::Sender<AppearanceEvent>,
     scheme: ColorScheme,
-    accent: Option<(f32, f32, f32)>,
     unlocked: bool,
     last_clock: (Instant, String),
     ready_fd: Option<i32>,
@@ -253,7 +252,6 @@ impl Locker {
             appearance_rx,
             appearance_tx,
             scheme: ColorScheme::default(),
-            accent: None,
             unlocked: false,
             last_clock: (Instant::now(), clock_text(&clock_format)),
             ready_fd: cli.ready_fd,
@@ -379,15 +377,11 @@ impl Locker {
             match event {
                 AppearanceEvent::Scheme(scheme) => {
                     self.scheme = scheme;
-                    let text = scheme.as_theme_str();
-                    self.each_window(|w| w.set_color_scheme(text));
+                    self.retint();
                 }
-                AppearanceEvent::Accent(accent) => {
-                    self.accent = accent;
-                    // Unset leaves the theme's own default binding intact.
-                    if let Some(rgb) = accent {
-                        self.each_window(|w| w.set_accent_color(rgb));
-                    }
+                AppearanceEvent::Accent(_) => {
+                    // `lmtt switch` writes tokens then the portal; re-read LMTT.
+                    self.retint();
                 }
             }
         }
@@ -425,6 +419,11 @@ impl Locker {
         {
             self.panel = index;
         }
+    }
+
+    fn retint(&mut self) {
+        let mode = self.scheme.as_theme_str();
+        self.each_window(|w| apply_kit_tokens_from_disk(w, mode));
     }
 
     /// Single exit path: clear the logind hint, then release the screen.
@@ -469,10 +468,7 @@ impl LockSession for Locker {
             window.set_caps_lock(self.caps_lock);
             window.set_panel_visible(false);
             window.set_user_name(&self.user);
-            window.set_color_scheme(self.scheme.as_theme_str());
-            if let Some(rgb) = self.accent {
-                window.set_accent_color(rgb);
-            }
+            apply_kit_tokens_from_disk(&mut window, self.scheme.as_theme_str());
             self.snapshot.apply(&mut window);
             let queue = self.queue.clone();
             window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));

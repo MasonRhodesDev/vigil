@@ -15,7 +15,7 @@ use vigil_ui::{OutputWindow, VigilPlatform};
 
 const W: u32 = 1280;
 const H: u32 = 800;
-const BG: (u8, u8, u8) = (0x0f, 0x15, 0x1c);
+const BG: (u8, u8, u8) = (0x12, 0x13, 0x1a);
 
 struct Scene {
     window: OutputWindow,
@@ -119,8 +119,8 @@ fn default_theme_state_matrix() {
     scene.window.set_caps_lock(true);
     assert!(scene.render());
     assert!(
-        scene.any_in(CARD, |(r, g, b)| r > 150 && g > 120 && b < 120),
-        "caps-lock warning must surface yellow content"
+        scene.any_in(CARD, |(r, g, b)| r > 200 && g > 150 && b > 150),
+        "caps-lock warning must surface Theme.warning-fg in the card"
     );
     scene.window.set_caps_lock(false);
 
