@@ -47,7 +47,9 @@ fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
         DrmError::Access(ref a)
             if matches!(
                 rustix::io::Errno::from_io_error(&a.source),
-                Some(rustix::io::Errno::NODEV | rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)
+                Some(
+                    rustix::io::Errno::NODEV | rustix::io::Errno::ACCESS | rustix::io::Errno::PERM
+                )
             ) =>
         {
             PresentError::DeviceLost
@@ -157,7 +159,11 @@ impl GbmPresenter {
         let (mw, mh) = (mw as u32, mh as u32);
         // The GL scene is rendered upright at scene dims; the plane rotates
         // it onto the panel (#26). Quarter turns swap the buffer's aspect.
-        let (width, height) = if transform % 2 == 1 { (mh, mw) } else { (mw, mh) };
+        let (width, height) = if transform % 2 == 1 {
+            (mh, mw)
+        } else {
+            (mw, mh)
+        };
         let gl = GlSurface::new(context, width, height).map_err(backend)?;
         let gbm = gl.window();
         let cursor = Self::cursor_plane(&surface, cursor_scale, transform);
@@ -220,7 +226,11 @@ impl GbmPresenter {
         let mode = surface.pending_mode();
         let (mw, mh) = mode.size();
         let (mw, mh) = (mw as u32, mh as u32);
-        let (bw, bh) = if transform % 2 == 1 { (mh, mw) } else { (mw, mh) };
+        let (bw, bh) = if transform % 2 == 1 {
+            (mh, mw)
+        } else {
+            (mw, mh)
+        };
         let bo = context
             .gbm_device()
             .create_buffer_object::<()>(
@@ -249,9 +259,7 @@ impl GbmPresenter {
             .map_err(|e| format!("rotation refused: {e}"))
     }
 
-    fn find_cursor_plane(
-        surface: &DrmSurface,
-    ) -> Option<&smithay::backend::drm::PlaneInfo> {
+    fn find_cursor_plane(surface: &DrmSurface) -> Option<&smithay::backend::drm::PlaneInfo> {
         surface
             .planes()
             .cursor
@@ -339,13 +347,7 @@ impl GbmPresenter {
                 // the bitmap was pre-rotated at construction instead,
                 // which works on cursor planes with no rotation property.
                 dst: Rectangle::new(
-                    cursor_dst(
-                        self.transform,
-                        (self.width, self.height),
-                        cursor.size,
-                        pos,
-                    )
-                    .into(),
+                    cursor_dst(self.transform, (self.width, self.height), cursor.size, pos).into(),
                     (cursor.size.0 as i32, cursor.size.1 as i32).into(),
                 ),
                 transform: Transform::Normal,
@@ -448,7 +450,9 @@ impl Presenter for GbmPresenter {
             }
             let mut states = vec![self.plane_state(*current.fb.as_ref())];
             states.extend(self.cursor_state());
-            self.surface.page_flip(states, true).map_err(present_error)?;
+            self.surface
+                .page_flip(states, true)
+                .map_err(present_error)?;
             if let Some(cursor) = self.cursor.as_mut() {
                 cursor.dirty = false;
             }

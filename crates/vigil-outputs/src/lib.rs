@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 
 use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier};
-use smithay::reexports::drm::{ClientCapability, Device as _};
 use smithay::reexports::drm::control::{
     Device as ControlDevice, Mode, ModeTypeFlags, connector, crtc,
 };
+use smithay::reexports::drm::{ClientCapability, Device as _};
 use smithay::utils::DeviceFd;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use vigil_core::{OutputEvent, OutputId, OutputInfo};

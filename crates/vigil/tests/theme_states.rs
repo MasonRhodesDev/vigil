@@ -223,7 +223,10 @@ fn pointer_motion_without_scene_cursor_does_not_present() {
     scene.window.set_cursor_visible(false);
     assert!(scene.render(), "first frame draws");
     scene.render();
-    assert!(!scene.render(), "an unchanged scene must not keep presenting");
+    assert!(
+        !scene.render(),
+        "an unchanged scene must not keep presenting"
+    );
     scene
         .window
         .dispatch(vigil_core::InputEvent::PointerAbsolute { x: 0.5, y: 0.5 });

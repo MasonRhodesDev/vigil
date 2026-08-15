@@ -49,7 +49,9 @@ fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
         DrmError::Access(ref a)
             if matches!(
                 rustix::io::Errno::from_io_error(&a.source),
-                Some(rustix::io::Errno::NODEV | rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)
+                Some(
+                    rustix::io::Errno::NODEV | rustix::io::Errno::ACCESS | rustix::io::Errno::PERM
+                )
             ) =>
         {
             PresentError::DeviceLost

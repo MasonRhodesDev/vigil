@@ -511,7 +511,9 @@ impl OutputWindow {
             Value::String(tokens.mode.as_str().into()),
         );
         for (name, color) in slint_kit::kit_color_bindings(tokens) {
-            let _ = self.component.set_global_property("Theme", name, color.into());
+            let _ = self
+                .component
+                .set_global_property("Theme", name, color.into());
         }
         self.set_optional_property("accent-color", tokens.get("primary").into());
         self.touch();

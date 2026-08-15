@@ -489,7 +489,11 @@ mod tests {
         assert_eq!((w, h), (12, 19));
         assert_eq!(&b[0..4], &[0, 0, 0, 0xff], "outline at (0, 0)");
         let fill = ((2 * 12) + 1) * 4;
-        assert_eq!(&b[fill..fill + 4], &[0xff, 0xff, 0xff, 0xff], "fill at (1, 2)");
+        assert_eq!(
+            &b[fill..fill + 4],
+            &[0xff, 0xff, 0xff, 0xff],
+            "fill at (1, 2)"
+        );
         let clear = 11 * 4;
         assert_eq!(b[clear + 3], 0, "transparent at (11, 0)");
     }
