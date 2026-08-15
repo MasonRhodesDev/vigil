@@ -15,6 +15,7 @@ license=('GPL-3.0-only')
 depends=('greetd' 'seatd' 'libinput' 'libxkbcommon' 'systemd-libs' 'libdrm' 'mesa' 'pam' 'fontconfig')
 makedepends=('cargo' 'clang' 'systemd')
 checkdepends=('ttf-dejavu')
+backup=('etc/pam.d/vigil-lock')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::https://github.com/MasonRhodesDev/vigil/archive/v$pkgver.tar.gz")
 sha256sums=('80371bc2a67adba7c300e68b05b029751627802c24632d6816f3e46e67c4e279')
