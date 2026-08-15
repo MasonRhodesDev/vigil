@@ -70,9 +70,19 @@ git = "https://github.com/MasonRhodesDev/appearance-profiles.git"
 rev = "75d831a"
 replace-with = "vendored-sources"
 
-[source."git+https://github.com/MasonRhodesDev/slint-kit?rev=ec810d9d6f1b079ee0f4cf3d89f26ad7e63ec125"]
+[source."git+https://github.com/MasonRhodesDev/slint-kit?rev=60cee65c2bfa5622052d6983f1d88c03e9133d60"]
 git = "https://github.com/MasonRhodesDev/slint-kit"
-rev = "ec810d9d6f1b079ee0f4cf3d89f26ad7e63ec125"
+rev = "60cee65c2bfa5622052d6983f1d88c03e9133d60"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/MasonRhodesDev/linux-multi-theme-toggle?rev=130fbbf384fe3a19378fe0c2c26acb648d2cdd94"]
+git = "https://github.com/MasonRhodesDev/linux-multi-theme-toggle"
+rev = "130fbbf384fe3a19378fe0c2c26acb648d2cdd94"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/MasonRhodesDev/hypr-paths?rev=1f94b71311a989bff5f7ae9b0ef2afd23ee14b16"]
+git = "https://github.com/MasonRhodesDev/hypr-paths"
+rev = "1f94b71311a989bff5f7ae9b0ef2afd23ee14b16"
 replace-with = "vendored-sources"
 EOF
 

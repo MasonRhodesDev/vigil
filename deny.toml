@@ -55,5 +55,6 @@ allow-git = [
     "https://github.com/MasonRhodesDev/appearance-profiles",
     "https://github.com/MasonRhodesDev/slint-kit",
     "https://github.com/MasonRhodesDev/hypr-paths",
+    "https://github.com/MasonRhodesDev/linux-multi-theme-toggle",
 ]
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
