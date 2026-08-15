@@ -1549,6 +1549,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48ce8546b993eaf241d69ded33b1be6d205dd9857ec879d9d18bd05d3676e144"
 
 [[package]]
+name = "hypr-paths"
+version = "0.1.0"
+source = "git+https://github.com/MasonRhodesDev/hypr-paths?rev=535cec729936310b480c99203c05b5900d2a7e71#535cec729936310b480c99203c05b5900d2a7e71"
+
+[[package]]
 name = "i-slint-backend-linuxkms"
 version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4611,6 +4616,7 @@ dependencies = [
 name = "vigil-config"
 version = "0.2.5"
 dependencies = [
+ "hypr-paths",
  "serde",
  "toml 0.9.12+spec-1.1.0",
 ]

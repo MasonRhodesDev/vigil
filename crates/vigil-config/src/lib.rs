@@ -174,10 +174,9 @@ impl Config {
         if let Some(path) = path {
             return load_file(path).unwrap_or_default();
         }
-        let user_path = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|base| base.join("vigil/config.toml"));
+        let user_path = hypr_paths::ConfigDirs::from_env()
+            .ok()
+            .map(|dirs| dirs.config_dir("vigil").join("config.toml"));
         if let Some(path) = user_path
             && path.exists()
         {
