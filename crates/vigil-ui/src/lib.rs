@@ -537,8 +537,14 @@ impl OutputWindow {
 }
 
 /// Load LMTT tokens (user → `/etc/matugen` → embedded) and paint them.
+/// For vigil-lock (session owner has a home). The greeter must not call this.
 pub fn apply_kit_tokens_from_disk(window: &mut OutputWindow, mode: &str) {
     window.apply_kit_tokens(&slint_kit::load_tokens_preferring(mode));
+}
+
+/// Load LMTT tokens from `/etc/matugen` (then embedded). No `$HOME`.
+pub fn apply_kit_tokens_from_system(window: &mut OutputWindow, mode: &str) {
+    window.apply_kit_tokens(&slint_kit::load_tokens_system(mode));
 }
 
 impl AuthUi for OutputWindow {

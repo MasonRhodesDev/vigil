@@ -31,7 +31,7 @@ use vigil_outputs::OutputManager;
 use vigil_present_dumb::DumbBufferPresenter;
 use vigil_session::SessionManager;
 use vigil_theme::Theme;
-use vigil_ui::{OutputWindow, UiSnapshot, VigilPlatform, apply_kit_tokens_from_disk};
+use vigil_ui::{OutputWindow, UiSnapshot, VigilPlatform, apply_kit_tokens_from_system};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// How often the banner file is re-read. Host integrations update it at
@@ -752,7 +752,7 @@ impl App {
             }
         }
         self.snapshot.apply(&mut window);
-        apply_kit_tokens_from_disk(&mut window, "");
+        apply_kit_tokens_from_system(&mut window, "");
         let queue = self.queue.clone();
         window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
 
