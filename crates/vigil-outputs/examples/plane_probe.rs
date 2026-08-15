@@ -54,11 +54,7 @@ fn dump(card: &Card, label: &str) {
                 let formats: Vec<String> = info
                     .formats()
                     .iter()
-                    .map(|f| {
-                        f.to_le_bytes()
-                            .map(|b| (b as char).to_string())
-                            .concat()
-                    })
+                    .map(|f| f.to_le_bytes().map(|b| (b as char).to_string()).concat())
                     .collect();
                 println!(
                     "  plane {:?} {} crtcs={:?} formats=[{}]",

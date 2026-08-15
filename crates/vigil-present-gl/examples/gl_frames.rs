@@ -83,7 +83,8 @@ fn main() {
         .expect("drm surface");
 
     let context = Rc::new(GlContext::from_fd(fd).expect("gl context"));
-    let (mut presenter, gl) = GbmPresenter::new(surface, drm_fd, context, 1.0, 0).expect("presenter");
+    let (mut presenter, gl) =
+        GbmPresenter::new(surface, drm_fd, context, 1.0, 0).expect("presenter");
 
     let window = GlWindow::with_surface(gl, PhysicalSize::new(w, h)).expect("window");
     window.set_size(PhysicalSize::new(w, h));
