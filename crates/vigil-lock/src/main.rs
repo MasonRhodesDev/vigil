@@ -500,6 +500,9 @@ impl LockSession for Locker {
     }
 
     fn output_gone(&mut self, id: OutputId) {
+        if let Some(e) = self.entries.iter().find(|e| e.id == id) {
+            eprintln!("vigil-lock: output {} gone", e.connector);
+        }
         self.entries.retain(|e| e.id != id);
         if self.panel >= self.entries.len() {
             self.panel = 0;
@@ -555,6 +558,11 @@ impl LockSession for Locker {
         }
         if let Some(login) = &self.login {
             login.set_locked_hint(true);
+        }
+        // Auth belongs on a held lock. Starting PAM in main() made every
+        // denied second locker (hypridle re-lock) log a failed conversation.
+        if self.attempt.is_none() {
+            self.start_attempt();
         }
     }
 
@@ -649,14 +657,13 @@ fn main() {
     let config = Config::load_layered(cli.config.as_deref());
     cli.theme = cli.theme.or(config.look.theme.clone());
     let grace_secs = cli.grace.unwrap_or(config.lock.grace_secs);
-    let mut locker = match Locker::new(cli, config, grace_secs) {
+    let locker = match Locker::new(cli, config, grace_secs) {
         Ok(locker) => locker,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
             std::process::exit(1);
         }
     };
-    locker.start_attempt();
     match vigil_wayland::run(locker) {
         Ok(LockOutcome::Unlocked) => std::process::exit(0),
         Ok(LockOutcome::Denied) => {

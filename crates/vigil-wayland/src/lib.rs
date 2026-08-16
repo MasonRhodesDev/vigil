@@ -109,6 +109,10 @@ struct Entry {
     px: (u32, u32),
     pool: Option<SlotPool>,
     configured: bool,
+    /// A configured lock surface has committed a buffer of `px` at least
+    /// once. Reset on size change so the first present after a rebuild
+    /// cannot skip the commit (ext-session-lock blanks that output).
+    committed: bool,
 }
 
 struct App<S: LockSession + 'static> {
@@ -182,6 +186,7 @@ impl<S: LockSession> App<S> {
             px: (0, 0),
             pool: None,
             configured: false,
+            committed: false,
         });
     }
 
@@ -195,6 +200,9 @@ impl<S: LockSession> App<S> {
             (lw * scale120).div_ceil(120).max(1),
             (lh * scale120).div_ceil(120).max(1),
         );
+        if self.entries[idx].px != px {
+            self.entries[idx].committed = false;
+        }
         self.entries[idx].px = px;
         if let Some(viewport) = &self.entries[idx].viewport {
             viewport.set_destination(lw as i32, lh as i32);
@@ -202,7 +210,9 @@ impl<S: LockSession> App<S> {
         let len = px.0 as usize * px.1 as usize * 4;
         match self.entries[idx].pool.as_mut() {
             Some(pool) => {
-                let _ = pool.resize(len * 2);
+                if pool.resize(len * 2).is_err() {
+                    self.entries[idx].pool = SlotPool::new(len * 2, &self.shm).ok();
+                }
             }
             None => self.entries[idx].pool = SlotPool::new(len * 2, &self.shm).ok(),
         }
@@ -220,22 +230,31 @@ impl<S: LockSession> App<S> {
     }
 
     /// Render if the scene is dirty and commit the new buffer.
+    ///
+    /// After a configure, the compositor blanks the output until a buffer is
+    /// attached. Skipping that first commit (dirty-flag miss, shm alloc
+    /// fail, missing scene) is the metal black-screen after hotplug.
     fn present(&mut self, idx: usize) {
-        let entry = &mut self.entries[idx];
-        if !entry.configured {
+        if !self.entries[idx].configured {
             return;
         }
-        let (w, h) = entry.px;
-        let Some(pool) = entry.pool.as_mut() else {
+        let (w, h) = self.entries[idx].px;
+        let force = !self.entries[idx].committed;
+        let id = self.entries[idx].id;
+        let Some(pool) = self.entries[idx].pool.as_mut() else {
+            eprintln!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
             return;
         };
         let stride = w as usize * 4;
         let Ok((buffer, canvas)) =
             pool.create_buffer(w as i32, h as i32, stride as i32, wl_shm::Format::Xrgb8888)
         else {
+            eprintln!("vigil-lock: output {id:?}: shm buffer {w}x{h} failed");
             return;
         };
-        let id = entry.id;
+        if force {
+            canvas.fill(0);
+        }
         let drew = self.session.render(
             id,
             FrameTarget {
@@ -245,12 +264,17 @@ impl<S: LockSession> App<S> {
                 stride,
             },
         );
-        let entry = &self.entries[idx];
-        if drew {
-            let _ = buffer.attach_to(&entry.surface);
-            entry.surface.damage_buffer(0, 0, w as i32, h as i32);
-            entry.surface.commit();
+        if !drew && !force {
+            return;
         }
+        if !drew {
+            eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
+        }
+        let surface = &self.entries[idx].surface;
+        let _ = buffer.attach_to(surface);
+        surface.damage_buffer(0, 0, w as i32, h as i32);
+        surface.commit();
+        self.entries[idx].committed = true;
     }
 
     fn entry_idx_by_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
@@ -606,6 +630,7 @@ impl<S: LockSession> OutputHandler for App<S> {
     ) {
         if let Some(idx) = self.entries.iter().position(|e| e.output == output) {
             let entry = self.entries.remove(idx);
+            eprintln!("vigil-lock: output {:?} gone", entry.id);
             if let Some(fractional) = &entry.fractional {
                 fractional.destroy();
             }
