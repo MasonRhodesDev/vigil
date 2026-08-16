@@ -69,19 +69,14 @@ git = "https://github.com/MasonRhodesDev/appearance-profiles.git"
 rev = "75d831a"
 replace-with = "vendored-sources"
 
-[source."git+https://github.com/MasonRhodesDev/slint-kit?rev=464de0e4d5fc61516960ac0d25292d9cc2781ef5"]
+[source."git+https://github.com/MasonRhodesDev/slint-kit?rev=ccd7397c3da83ff835d6295d6ec3841fc32c8bac"]
 git = "https://github.com/MasonRhodesDev/slint-kit"
-rev = "464de0e4d5fc61516960ac0d25292d9cc2781ef5"
+rev = "ccd7397c3da83ff835d6295d6ec3841fc32c8bac"
 replace-with = "vendored-sources"
 
-[source."git+https://github.com/MasonRhodesDev/linux-multi-theme-toggle?rev=7e0bb1705d16a3a8d37a795fc3d324dae47fbda9"]
+[source."git+https://github.com/MasonRhodesDev/linux-multi-theme-toggle?rev=344529cd124c131da40409b152bc1604eebd53d0"]
 git = "https://github.com/MasonRhodesDev/linux-multi-theme-toggle"
-rev = "7e0bb1705d16a3a8d37a795fc3d324dae47fbda9"
-replace-with = "vendored-sources"
-
-[source."git+https://github.com/MasonRhodesDev/hypr-paths?rev=1f94b71311a989bff5f7ae9b0ef2afd23ee14b16"]
-git = "https://github.com/MasonRhodesDev/hypr-paths"
-rev = "1f94b71311a989bff5f7ae9b0ef2afd23ee14b16"
+rev = "344529cd124c131da40409b152bc1604eebd53d0"
 replace-with = "vendored-sources"
 EOF
 

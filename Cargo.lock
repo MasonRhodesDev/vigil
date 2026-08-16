@@ -1566,7 +1566,8 @@ checksum = "48ce8546b993eaf241d69ded33b1be6d205dd9857ec879d9d18bd05d3676e144"
 [[package]]
 name = "hypr-paths"
 version = "0.1.0"
-source = "git+https://github.com/MasonRhodesDev/hypr-paths?rev=1f94b71311a989bff5f7ae9b0ef2afd23ee14b16#1f94b71311a989bff5f7ae9b0ef2afd23ee14b16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2b57d35d5a9d1fe4892d499fca8fb64f331cf0a2618ca38b1fc32fdfef9f6ed"
 
 [[package]]
 name = "i-slint-backend-linuxkms"
@@ -2432,8 +2433,8 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "lmtt-core"
-version = "0.2.1"
-source = "git+https://github.com/MasonRhodesDev/linux-multi-theme-toggle?rev=7e0bb1705d16a3a8d37a795fc3d324dae47fbda9#7e0bb1705d16a3a8d37a795fc3d324dae47fbda9"
+version = "0.2.2"
+source = "git+https://github.com/MasonRhodesDev/linux-multi-theme-toggle?rev=344529cd124c131da40409b152bc1604eebd53d0#344529cd124c131da40409b152bc1604eebd53d0"
 dependencies = [
  "anyhow",
  "appearance-profiles",
@@ -4005,7 +4006,7 @@ dependencies = [
 [[package]]
 name = "slint-kit"
 version = "0.2.0"
-source = "git+https://github.com/MasonRhodesDev/slint-kit?rev=464de0e4d5fc61516960ac0d25292d9cc2781ef5#464de0e4d5fc61516960ac0d25292d9cc2781ef5"
+source = "git+https://github.com/MasonRhodesDev/slint-kit?rev=ccd7397c3da83ff835d6295d6ec3841fc32c8bac#ccd7397c3da83ff835d6295d6ec3841fc32c8bac"
 dependencies = [
  "lmtt-core",
  "slint",
@@ -4315,7 +4316,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
