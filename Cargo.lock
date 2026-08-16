@@ -4787,7 +4787,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vigil"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "appearance-profiles",
  "calloop 0.14.4",
@@ -4810,7 +4810,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-auth"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "greetd_ipc",
  "vigil-core",
@@ -4818,7 +4818,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-config"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "hypr-paths",
  "serde",
@@ -4827,11 +4827,11 @@ dependencies = [
 
 [[package]]
 name = "vigil-core"
-version = "0.2.5"
+version = "0.2.6"
 
 [[package]]
 name = "vigil-gl"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "drm",
  "gbm",
@@ -4844,7 +4844,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-input"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "input 0.9.1",
  "smithay",
@@ -4854,7 +4854,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-lock"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "appearance-profiles",
  "monitor-profiles",
@@ -4869,7 +4869,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-login"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "vigil-core",
  "zbus",
@@ -4877,7 +4877,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-outputs"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "smithay",
  "smithay-drm-extras",
@@ -4886,7 +4886,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-pam"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "pam-client",
  "vigil-core",
@@ -4894,7 +4894,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-present-dumb"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "smithay",
  "vigil-core",
@@ -4902,7 +4902,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-present-gl"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "gbm",
  "slint",
@@ -4916,7 +4916,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-session"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "smithay",
  "vigil-core",
@@ -4924,7 +4924,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-theme"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "slint",
  "slint-interpreter",
@@ -4934,7 +4934,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-ui"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytemuck",
  "image",
@@ -4947,7 +4947,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-wayland"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "calloop-wayland-source",
  "smithay-client-toolkit",
