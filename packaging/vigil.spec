@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.6
+Version:        0.2.7
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -132,6 +132,9 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Sun Aug 16 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.7-1
+- Snapshot Arch sources on tag builds so the PKGBUILD checksum can match.
+
 * Sun Aug 16 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.6-1
 - Commit lock buffers on every configure, including same-size DPMS/VT.
 - Defer lock wallpaper decode until after the first painted frame.
