@@ -447,9 +447,7 @@ impl Locker {
             return;
         };
         match vigil_ui::background(&path, fit, width, height) {
-            Ok(rgba) => self.entries[idx]
-                .window
-                .set_background(rgba, width, height),
+            Ok(rgba) => self.entries[idx].window.set_background(rgba, width, height),
             Err(e) => eprintln!("vigil-lock: background: {e}"),
         }
     }
@@ -477,10 +475,7 @@ impl LockSession for Locker {
                 }
             };
         let resolved = self.appearance_registry.resolve(
-            &appearance_profiles::OutputIdentity::new(
-                &info.connector,
-                output_description(info),
-            ),
+            &appearance_profiles::OutputIdentity::new(&info.connector, output_description(info)),
             None,
         );
         let (background, fit) = self.looks.for_connector_with_fallback(
