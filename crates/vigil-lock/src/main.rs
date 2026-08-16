@@ -104,6 +104,9 @@ struct Entry {
     connector: String,
     description: String,
     window: OutputWindow,
+    /// Wallpaper decode is deferred until after the first lock buffer so a
+    /// Lanczos resize cannot stall the Wayland thread while Hyprland blanks.
+    pending_bg: Option<(PathBuf, BackgroundFit, u32, u32)>,
 }
 
 struct Locker {
@@ -433,64 +436,79 @@ impl Locker {
         }
         self.unlocked = true;
     }
+
+    /// Decode at most one wallpaper per tick so the lock buffer is already
+    /// on screen before Lanczos runs.
+    fn apply_pending_background(&mut self) {
+        let Some(idx) = self.entries.iter().position(|e| e.pending_bg.is_some()) else {
+            return;
+        };
+        let Some((path, fit, width, height)) = self.entries[idx].pending_bg.take() else {
+            return;
+        };
+        match vigil_ui::background(&path, fit, width, height) {
+            Ok(rgba) => self.entries[idx]
+                .window
+                .set_background(rgba, width, height),
+            Err(e) => eprintln!("vigil-lock: background: {e}"),
+        }
+    }
 }
 
 impl LockSession for Locker {
     fn output_ready(&mut self, id: OutputId, info: &OutputInfo) {
-        let build = || -> Result<OutputWindow, String> {
-            let component = self.theme.instantiate().map_err(|e| e.to_string())?;
-            let adapter = self
-                .platform
-                .claim_last_adapter()
-                .ok_or("no adapter captured")?;
-            let mut window =
-                OutputWindow::new(id, info.width, info.height, info.scale, adapter, component)
-                    .map_err(|e| e.to_string())?;
-            let resolved = self.appearance_registry.resolve(
-                &appearance_profiles::OutputIdentity::new(
-                    &info.connector,
-                    output_description(info),
-                ),
-                None,
-            );
-            let (background, fit) = self.looks.for_connector_with_fallback(
-                &info.connector,
-                resolved.path,
-                Some(appearance_fit(resolved.fit)),
-            );
-            if let Some(path) = &background {
-                match vigil_ui::background(path, fit, info.width, info.height) {
-                    Ok(rgba) => window.set_background(rgba, info.width, info.height),
-                    Err(e) => eprintln!("vigil-lock: background: {e}"),
-                }
+        let component = match self.theme.instantiate() {
+            Ok(component) => component,
+            Err(e) => {
+                eprintln!("vigil-lock: skipping output {id:?}: {e}");
+                return;
             }
-            window.set_clock(&self.last_clock.1);
-            window.set_caps_lock(self.caps_lock);
-            window.set_panel_visible(false);
-            window.set_user_name(&self.user);
-            apply_kit_tokens_from_disk(&mut window, self.scheme.as_theme_str());
-            self.snapshot.apply(&mut window);
-            let queue = self.queue.clone();
-            window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
-            Ok(window)
         };
-        match build() {
-            Ok(window) => {
-                eprintln!(
-                    "vigil-lock: output {} {}x{}@{:.2}",
-                    info.connector, info.width, info.height, info.scale
-                );
-                self.entries.push(Entry {
-                    id,
-                    connector: info.connector.clone(),
-                    description: output_description(info).unwrap_or_else(|| info.connector.clone()),
-                    window,
-                });
-                self.focus_profile_origin();
-                self.apply_panel();
-            }
-            Err(e) => eprintln!("vigil-lock: skipping output {id:?}: {e}"),
-        }
+        let Some(adapter) = self.platform.claim_last_adapter() else {
+            eprintln!("vigil-lock: skipping output {id:?}: no adapter captured");
+            return;
+        };
+        let mut window =
+            match OutputWindow::new(id, info.width, info.height, info.scale, adapter, component) {
+                Ok(window) => window,
+                Err(e) => {
+                    eprintln!("vigil-lock: skipping output {id:?}: {e}");
+                    return;
+                }
+            };
+        let resolved = self.appearance_registry.resolve(
+            &appearance_profiles::OutputIdentity::new(
+                &info.connector,
+                output_description(info),
+            ),
+            None,
+        );
+        let (background, fit) = self.looks.for_connector_with_fallback(
+            &info.connector,
+            resolved.path,
+            Some(appearance_fit(resolved.fit)),
+        );
+        window.set_clock(&self.last_clock.1);
+        window.set_caps_lock(self.caps_lock);
+        window.set_panel_visible(false);
+        window.set_user_name(&self.user);
+        apply_kit_tokens_from_disk(&mut window, self.scheme.as_theme_str());
+        self.snapshot.apply(&mut window);
+        let queue = self.queue.clone();
+        window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
+        eprintln!(
+            "vigil-lock: output {} {}x{}@{:.2}",
+            info.connector, info.width, info.height, info.scale
+        );
+        self.entries.push(Entry {
+            id,
+            connector: info.connector.clone(),
+            description: output_description(info).unwrap_or_else(|| info.connector.clone()),
+            window,
+            pending_bg: background.map(|path| (path, fit, info.width, info.height)),
+        });
+        self.focus_profile_origin();
+        self.apply_panel();
     }
 
     fn output_resized(&mut self, id: OutputId, info: &OutputInfo) {
@@ -579,6 +597,7 @@ impl LockSession for Locker {
         self.pump_login();
         self.pump_appearance();
         self.pump_ui();
+        self.apply_pending_background();
     }
 
     fn render(&mut self, id: OutputId, target: FrameTarget<'_>) -> bool {

@@ -200,9 +200,13 @@ impl<S: LockSession> App<S> {
             (lw * scale120).div_ceil(120).max(1),
             (lh * scale120).div_ceil(120).max(1),
         );
-        if self.entries[idx].px != px {
-            self.entries[idx].committed = false;
-        }
+        let first = !self.entries[idx].configured;
+        let resized = self.entries[idx].configured && self.entries[idx].px != px;
+        // ext-session-lock blanks an output until a buffer matching this
+        // configure is attached — including same-size configures after
+        // DPMS/VT. Always force the next present; only rebuild the scene
+        // when the pixel size actually changed.
+        self.entries[idx].committed = false;
         self.entries[idx].px = px;
         if let Some(viewport) = &self.entries[idx].viewport {
             viewport.set_destination(lw as i32, lh as i32);
@@ -216,13 +220,12 @@ impl<S: LockSession> App<S> {
             }
             None => self.entries[idx].pool = SlotPool::new(len * 2, &self.shm).ok(),
         }
-        let first = !self.entries[idx].configured;
         self.entries[idx].configured = true;
         let id = self.entries[idx].id;
         let info = self.output_info(idx);
         if first {
             self.session.output_ready(id, &info);
-        } else {
+        } else if resized {
             self.session.output_resized(id, &info);
         }
         // Invariant: a configured lock surface gets a buffer promptly.
@@ -232,8 +235,8 @@ impl<S: LockSession> App<S> {
     /// Render if the scene is dirty and commit the new buffer.
     ///
     /// After a configure, the compositor blanks the output until a buffer is
-    /// attached. Skipping that first commit (dirty-flag miss, shm alloc
-    /// fail, missing scene) is the metal black-screen after hotplug.
+    /// attached. Skipping that commit (dirty-flag miss, shm alloc fail,
+    /// missing scene, same-size DPMS/VT configure) is the metal black screen.
     fn present(&mut self, idx: usize) {
         if !self.entries[idx].configured {
             return;
