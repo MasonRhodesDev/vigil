@@ -8,13 +8,17 @@ CFG=/etc/greetd/config.toml
 
 if [ ! -f "$CFG" ]; then
     mkdir -p /etc/greetd
-    cat > "$CFG" <<'EOF'
+    # The greeter account name is the distro's: Arch greetd creates "greeter",
+    # Fedora's creates "greetd". Probe rather than hardcode.
+    greeter_user=greeter
+    getent passwd greeter >/dev/null || greeter_user=greetd
+    cat > "$CFG" <<EOF
 [terminal]
 vt = 1
 
 [default_session]
 command = "/usr/bin/vigil"
-user = "greeter"
+user = "$greeter_user"
 EOF
 elif grep -qE 'command[[:space:]]*=[[:space:]]*".*agreety' "$CFG"; then
     tmp=$(mktemp)
