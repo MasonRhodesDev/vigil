@@ -1,0 +1,49 @@
+// Layout helpers — Tailwind gap / flex-1 / divide analogues.
+import { Theme } from "theme.slint";
+
+export component KitVStack inherits VerticalLayout {
+    in property <string> gap: "form"; // hair | tight | form | section | loose
+    /// Cross-axis alignment (Horizontal: items-*; Vertical: justify for children width).
+    in property <bool> center: false;
+    private property <length> gap-len:
+        root.gap == "hair" ? Theme.space-2xs
+        : (root.gap == "tight" ? Theme.space-xs
+            : (root.gap == "section" ? Theme.space-md
+                : (root.gap == "loose" ? Theme.space-lg : Theme.space-sm)));
+    spacing: root.gap-len;
+    alignment: LayoutAlignment.start;
+    cross-axis-alignment: root.center ? CrossAxisAlignment.center : CrossAxisAlignment.stretch;
+    width: 100%;
+}
+
+/// Row stack. `center` = CSS `items-center` (cross-axis), NOT justify-center.
+export component KitHStack inherits HorizontalLayout {
+    in property <string> gap: "form";
+    in property <bool> center: false;
+    private property <length> gap-len:
+        root.gap == "hair" ? Theme.space-2xs
+        : (root.gap == "tight" ? Theme.space-xs
+            : (root.gap == "section" ? Theme.space-md
+                : (root.gap == "loose" ? Theme.space-lg : Theme.space-sm)));
+    spacing: root.gap-len;
+    alignment: LayoutAlignment.start;
+    cross-axis-alignment: root.center ? CrossAxisAlignment.center : CrossAxisAlignment.stretch;
+}
+
+export component KitSpacer inherits Rectangle {
+    in property <string> axis: "both"; // vertical | horizontal | both
+    background: transparent;
+    vertical-stretch: root.axis == "horizontal" ? 0 : 1;
+    horizontal-stretch: root.axis == "vertical" ? 0 : 1;
+    min-width: 0px;
+    min-height: 0px;
+}
+
+export component KitDivider inherits Rectangle {
+    in property <bool> vertical: false;
+    background: Theme.border;
+    horizontal-stretch: root.vertical ? 0 : 1;
+    vertical-stretch: root.vertical ? 1 : 0;
+    height: root.vertical ? 0px : Theme.border-width;
+    width: root.vertical ? Theme.border-width : 0px;
+}

@@ -7,7 +7,7 @@
 # greetd command lines (greetd-game-mode, operator) are left alone.
 
 pkgname=vigil
-pkgver=0.2.7
+pkgver=0.2.8
 pkgrel=1
 pkgdesc="Compositor-less greetd greeter and matching session lockscreen"
 arch=('x86_64')
@@ -51,6 +51,8 @@ package() {
   install -Dm644 dist/vigil-lock.pam "$pkgdir/etc/pam.d/vigil-lock"
   install -Dm644 dist/vigil.toml.example "$pkgdir/usr/share/vigil/vigil.toml.example"
   install -Dm644 themes/default/theme.slint "$pkgdir/usr/share/vigil/themes/default.slint"
+  install -d "$pkgdir/usr/share/vigil/slint-kit/ui"
+  install -m644 themes/kit/ui/*.slint "$pkgdir/usr/share/vigil/slint-kit/ui/"
 
   # Shared monitor-profile directory (see vigil.install for the group).
   install -dm2775 "$pkgdir/etc/monitor-profiles"

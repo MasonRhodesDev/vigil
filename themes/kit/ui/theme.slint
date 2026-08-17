@@ -1,0 +1,99 @@
+// Material You theme tokens for Mason Slint apps.
+// Consumed via LMTT (`~/.config/matugen/lmtt-slint.json`) through ThemeBridge.
+//
+// Apps must `import { Theme } from "theme.slint";` and `export { Theme };`
+// so Rust can paint via `slint_kit::apply_theme!`.
+
+export global Theme {
+    // "light" | "dark"
+    in-out property <string> mode: "dark";
+
+    // Semantic aliases (prefer these in app UI)
+    in-out property <color> page-bg: #12131a;
+    in-out property <color> panel-bg: #1e1f27;
+    in-out property <color> panel-bg-high: #292931;
+    in-out property <color> fg: #e3e1ec;
+    in-out property <color> fg-muted: #c5c5d6;
+    in-out property <color> border: #44464f;
+    in-out property <color> accent: #9fd491;
+    in-out property <color> on-accent: #003a03;
+    in-out property <color> danger: #ffb4ab;
+    in-out property <color> on-danger: #690005;
+    in-out property <color> selection-bg: #22511c;
+    in-out property <color> canvas-bg: #0d0e14;
+    in-out property <color> tile-bg: #25262b;
+    in-out property <color> tile-selected: #2a4060;
+    in-out property <color> warning-fg: #edb8cd;
+
+    // Raw Material You tokens
+    in-out property <color> primary: #9fd491;
+    in-out property <color> on-primary: #003a03;
+    in-out property <color> primary-container: #22511c;
+    in-out property <color> on-primary-container: #bbf0aa;
+    in-out property <color> secondary: #edb8cd;
+    in-out property <color> on-secondary: #4a2532;
+    in-out property <color> tertiary: #bbc3fa;
+    in-out property <color> on-tertiary: #1e2a5a;
+    in-out property <color> surface: #12131a;
+    in-out property <color> on-surface: #e3e1ec;
+    in-out property <color> surface-variant: #44464f;
+    in-out property <color> on-surface-variant: #c5c5d6;
+    in-out property <color> surface-container: #1e1f27;
+    in-out property <color> surface-container-high: #292931;
+    in-out property <color> surface-container-highest: #33343c;
+    in-out property <color> outline: #8f909f;
+    in-out property <color> outline-variant: #44464f;
+    in-out property <color> background: #12131a;
+    in-out property <color> on-background: #e3e1ec;
+    in-out property <color> error: #ffb4ab;
+    in-out property <color> on-error: #690005;
+
+    // Density metrics (kit constants — not LMTT-driven)
+    in-out property <length> space-2xs: 2px;
+    in-out property <length> space-xs: 4px;
+    in-out property <length> space-sm: 8px;
+    in-out property <length> space-md: 12px;
+    in-out property <length> space-lg: 16px;
+    in-out property <length> space-xl: 24px;
+    in-out property <length> page-pad: 28px;
+    in-out property <length> control-height: 36px;
+    in-out property <length> control-height-sm: 32px;
+    in-out property <length> control-pad-x: 12px;
+    // Symmetric vertical pad inside fixed-height controls.
+    // Even value keeps control-height (36) − 2×pad on the pixel grid.
+    in-out property <length> control-pad-y: 6px;
+    in-out property <length> row-height: 44px;
+    in-out property <length> metric-min-width: 44px;
+    in-out property <length> side-panel-min-width: 140px;
+    in-out property <length> border-width: 1px;
+    in-out property <length> border-width-strong: 2px;
+    in-out property <length> radius-xs: 4px;
+    in-out property <length> radius-sm: 5px;
+    in-out property <length> radius-md: 8px;
+    in-out property <length> font-body: 14px;
+    in-out property <length> font-label: 12px;
+    in-out property <length> font-title: 18px;
+    in-out property <length> font-display: 24px;
+    in-out property <int> font-weight-semibold: 600;
+    in-out property <int> font-weight-bold: 700;
+    in-out property <float> overlay-alpha: 0.92;
+    in-out property <float> ghost-alpha: 0.5;
+
+    /// Approx CSS `text-box: trim-both cap alphabetic` — shift content down by a
+    /// fraction of the ghost space above cap-height. Always whole logical pixels
+    /// (fractional Y + FemtoVG = blurry glyphs). Returns 0 if metrics missing.
+    /// Apply as: padding-top: pad-y + shift; padding-bottom: pad-y - shift.
+    public pure function optical-shift(m: FontMetrics) -> length {
+        if (m.cap-height <= 0px) {
+            return 0px;
+        }
+        // Quantize to 0/1/2px — never fractional.
+        if ((m.ascent - m.cap-height) < 2px) {
+            return 0px;
+        }
+        if ((m.ascent - m.cap-height) < 6px) {
+            return 1px;
+        }
+        return 2px;
+    }
+}

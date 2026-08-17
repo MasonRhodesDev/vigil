@@ -1,0 +1,46 @@
+// Typography primitives — Tailwind-ish text recipes on Theme tokens.
+import { Theme } from "theme.slint";
+
+export component KitLabel inherits Text {
+    color: Theme.fg-muted;
+    font-size: Theme.font-label;
+    vertical-stretch: 0;
+    horizontal-alignment: left;
+    overflow: elide;
+}
+
+export component KitMuted inherits Text {
+    in property <bool> wrap-text: false;
+    color: Theme.fg-muted;
+    font-size: Theme.font-body;
+    vertical-stretch: 0;
+    horizontal-alignment: left;
+    overflow: elide;
+    wrap: root.wrap-text ? word-wrap : no-wrap;
+}
+
+export component KitTitle inherits Text {
+    color: Theme.fg;
+    font-size: Theme.font-title;
+    font-weight: Theme.font-weight-semibold;
+    vertical-stretch: 0;
+    horizontal-alignment: left;
+    overflow: elide;
+}
+
+export component KitDisplay inherits Text {
+    color: Theme.fg;
+    font-size: Theme.font-display;
+    font-weight: Theme.font-weight-bold;
+    vertical-stretch: 0;
+    horizontal-alignment: left;
+    overflow: elide;
+}
+
+export component KitWarning inherits Text {
+    color: Theme.warning-fg;
+    font-size: Theme.font-body;
+    vertical-stretch: 0;
+    horizontal-alignment: left;
+    wrap: word-wrap;
+}

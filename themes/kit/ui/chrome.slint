@@ -1,0 +1,260 @@
+// Chrome components — list rows, fields, headers, badges, panels.
+import { Theme } from "theme.slint";
+import { KitLabel, KitMuted, KitTitle } from "typography.slint";
+
+export component KitTextButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> muted: true;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: Theme.control-height-sm;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    min-width: layout.min-width;
+    background: transparent;
+
+    private property <length> o-shift: Theme.optical-shift(label.font-metrics);
+
+    ta := TouchArea {
+        x: 0; y: 0; width: 100%; height: 100%;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+
+    layout := HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-top: root.o-shift;
+        alignment: start;
+
+        label := Text {
+            text: root.text;
+            color: root.muted ? Theme.fg-muted : Theme.fg;
+            font-size: Theme.font-body;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 0;
+        }
+    }
+}
+
+export component KitDisclosure inherits Rectangle {
+    in-out property <bool> open: false;
+    in property <string> label: "Advanced";
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    height: Theme.control-height-sm;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    min-width: layout.min-width;
+    background: transparent;
+
+    private property <length> o-shift: Theme.optical-shift(label-text.font-metrics);
+
+    ta := TouchArea {
+        x: 0; y: 0; width: 100%; height: 100%;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            root.open = !root.open;
+            root.toggled(root.open);
+        }
+    }
+
+    layout := HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-top: root.o-shift;
+        alignment: start;
+
+        label-text := Text {
+            text: (root.open ? "▾ " : "▸ ") + root.label;
+            color: Theme.fg-muted;
+            font-size: Theme.font-body;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 0;
+        }
+    }
+}
+
+export component KitField inherits VerticalLayout {
+    in property <string> label;
+    in property <string> hint: "";
+    spacing: Theme.space-xs;
+    alignment: start;
+    vertical-stretch: 0;
+    width: 100%;
+    padding: 0;
+
+    KitLabel {
+        text: root.label;
+        width: 100%;
+        horizontal-alignment: left;
+    }
+    @children
+    if root.hint != "": KitLabel {
+        text: root.hint;
+        width: 100%;
+        horizontal-alignment: left;
+    }
+}
+
+/// Title + subtitle stack — shared start edge, no horizontal padding (Phase C).
+export component KitHeadingStack inherits VerticalLayout {
+    in property <string> title: "";
+    in property <string> subtitle: "";
+    spacing: Theme.space-2xs;
+    padding: 0;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    alignment: start;
+    min-width: 1px;
+
+    if root.title != "": KitTitle {
+        text: root.title;
+        width: 100%;
+        horizontal-alignment: left;
+    }
+    @children
+    if root.subtitle != "": KitMuted {
+        text: root.subtitle;
+        width: 100%;
+        horizontal-alignment: left;
+    }
+}
+
+/// Toolbar: stretch main axis so leading / center / trailing can pin; cross-center.
+export component KitToolbar inherits HorizontalLayout {
+    spacing: Theme.space-md;
+    padding: 0;
+    alignment: stretch;
+    cross-axis-alignment: center;
+    vertical-stretch: 0;
+    width: 100%;
+}
+
+export component KitListRow inherits Rectangle {
+    in property <string> title;
+    in property <string> meta: "";
+    in property <bool> matched: false;
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: Theme.row-height;
+    width: 100%;
+    vertical-stretch: 0;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius-sm;
+    background: ta.has-hover ? Theme.panel-bg-high : transparent;
+
+    ta := TouchArea {
+        x: 0; y: 0; width: 100%; height: 100%;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: Theme.space-md;
+        padding-right: Theme.space-md;
+        spacing: Theme.space-md;
+        alignment: stretch;
+        cross-axis-alignment: center;
+
+        Text {
+            text: root.matched ? "●" : " ";
+            color: Theme.accent;
+            font-size: Theme.font-body;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+        Text {
+            text: root.title;
+            color: Theme.fg;
+            font-size: Theme.font-title;
+            horizontal-stretch: 1;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if root.meta != "": Text {
+            text: root.meta;
+            color: Theme.fg-muted;
+            font-size: Theme.font-body;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+            overflow: elide;
+        }
+        if root.active: Text {
+            text: "✓";
+            color: Theme.accent;
+            font-size: Theme.font-body;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+    }
+}
+
+export component KitBadge inherits Rectangle {
+    in property <string> text;
+    in property <string> tone: "muted"; // accent | muted | danger
+
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: Theme.radius-sm;
+    background: root.tone == "accent" ? Theme.selection-bg
+        : (root.tone == "danger" ? Theme.danger.with-alpha(0.25) : Theme.panel-bg-high);
+    height: Theme.control-height-sm;
+    min-width: layout.min-width;
+
+    private property <length> o-shift: Theme.optical-shift(label.font-metrics);
+
+    layout := HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        padding-top: root.o-shift;
+        alignment: center;
+
+        label := Text {
+            text: root.text;
+            color: root.tone == "accent" ? Theme.accent
+                : (root.tone == "danger" ? Theme.danger : Theme.fg-muted);
+            font-size: Theme.font-label;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 0;
+        }
+    }
+}
+
+export component KitOverlayBar inherits Rectangle {
+    background: Theme.panel-bg.with-alpha(Theme.overlay-alpha);
+    border-radius: Theme.radius-sm;
+    border-width: Theme.border-width;
+    border-color: Theme.border;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    // No clip: clip + HorizontalLayout blurs glyphs (Slint #10499 / FemtoVG).
+}
+
+export component KitSidePanel inherits Rectangle {
+    background: Theme.panel-bg;
+    border-radius: Theme.radius-md;
+    border-width: Theme.border-width;
+    border-color: Theme.border;
+    min-width: Theme.side-panel-min-width;
+    // ScrollView inside clips; panel clip would soft-blit labels (Slint #10499).
+    horizontal-stretch: 1;
+}

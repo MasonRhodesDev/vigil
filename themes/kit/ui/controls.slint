@@ -1,0 +1,401 @@
+// Theme-native controls — layout-centered text (Fluent/Material/CodyHouse contract).
+// Phase A: HorizontalLayout fill + vertical-alignment: center (no absolute Y).
+// Phase B: Theme.optical-shift(font-metrics) biases pad-y (cap-alphabetic approx).
+import { Theme } from "theme.slint";
+
+export component KitButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> small: false;
+    callback clicked;
+
+    height: root.small ? Theme.control-height-sm : Theme.control-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    min-width: label.preferred-width + 2 * Theme.control-pad-x;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.border-width;
+    border-color: (root.primary || root.danger) ? transparent : Theme.border;
+    background: !root.enabled
+        ? Theme.tile-bg.with-alpha(0.45)
+        : root.danger
+            ? (ta.pressed ? Theme.danger.with-alpha(0.7) : (ta.has-hover ? Theme.danger.with-alpha(0.85) : Theme.danger))
+            : root.primary
+                ? (ta.pressed ? Theme.selection-bg : (ta.has-hover ? Theme.accent.with-alpha(0.85) : Theme.accent))
+                : (ta.pressed ? Theme.selection-bg : (ta.has-hover ? Theme.panel-bg-high : Theme.tile-bg));
+
+    private property <length> o-shift: Theme.optical-shift(label.font-metrics);
+
+    ta := TouchArea {
+        x: 0; y: 0; width: 100%; height: 100%;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+
+    layout := HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: Theme.control-pad-x;
+        padding-right: Theme.control-pad-x;
+        padding-top: Theme.control-pad-y + root.o-shift;
+        padding-bottom: Theme.control-pad-y - root.o-shift;
+        alignment: center;
+
+        label := Text {
+            text: root.text;
+            color: !root.enabled
+                ? Theme.fg-muted
+                : (root.primary || root.danger) ? (root.danger ? Theme.on-danger : Theme.on-accent) : Theme.fg;
+            font-size: Theme.font-body;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+/// Square glyph control — same centering contract as KitButton.
+export component KitIconButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> small: false;
+    callback clicked;
+
+    private property <length> side: root.small ? Theme.control-height-sm : Theme.control-height;
+    private property <length> o-shift: Theme.optical-shift(label.font-metrics);
+    width: root.side;
+    height: root.side;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.border-width;
+    border-color: (root.primary || root.danger) ? transparent : Theme.border;
+    background: !root.enabled
+        ? Theme.tile-bg.with-alpha(0.45)
+        : root.danger
+            ? (ta.pressed ? Theme.danger.with-alpha(0.7) : (ta.has-hover ? Theme.danger.with-alpha(0.85) : Theme.danger))
+            : root.primary
+                ? (ta.pressed ? Theme.selection-bg : (ta.has-hover ? Theme.accent.with-alpha(0.85) : Theme.accent))
+                : (ta.pressed ? Theme.selection-bg : (ta.has-hover ? Theme.panel-bg-high : Theme.tile-bg));
+
+    ta := TouchArea {
+        x: 0; y: 0; width: 100%; height: 100%;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-top: Theme.control-pad-y + root.o-shift;
+        padding-bottom: Theme.control-pad-y - root.o-shift;
+        alignment: center;
+
+        label := Text {
+            text: root.text;
+            color: !root.enabled
+                ? Theme.fg-muted
+                : (root.primary || root.danger) ? (root.danger ? Theme.on-danger : Theme.on-accent) : Theme.fg;
+            font-size: Theme.font-body;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+export component KitCheckBox inherits Rectangle {
+    in property <string> text;
+    in-out property <bool> checked: false;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    height: Theme.control-height-sm;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    min-width: layout.min-width;
+    background: transparent;
+
+    private property <length> o-shift: Theme.optical-shift(label.font-metrics);
+
+    ta := TouchArea {
+        x: 0; y: 0; width: 100%; height: 100%;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+
+    layout := HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        spacing: Theme.space-sm;
+        padding-top: root.o-shift;
+        padding-bottom: 0px - root.o-shift;
+        alignment: start;
+        cross-axis-alignment: center;
+
+        box := Rectangle {
+            width: 18px;
+            height: 18px;
+            border-radius: 3px;
+            border-width: Theme.border-width;
+            border-color: Theme.border;
+            background: root.checked ? Theme.accent : Theme.tile-bg;
+            horizontal-stretch: 0;
+            vertical-stretch: 0;
+
+            if root.checked: HorizontalLayout {
+                width: 100%;
+                height: 100%;
+                alignment: center;
+                Text {
+                    text: "✓";
+                    color: Theme.on-accent;
+                    font-size: Theme.font-body;
+                    font-weight: Theme.font-weight-bold;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        label := Text {
+            text: root.text;
+            color: root.enabled ? Theme.fg : Theme.fg-muted;
+            font-size: Theme.font-body;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+export component KitLineEdit inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> enabled: true;
+    callback edited(string);
+
+    height: Theme.control-height;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.border-width;
+    border-color: input.has-focus ? Theme.accent : Theme.border;
+    background: Theme.tile-bg;
+
+    private property <length> o-shift: Theme.optical-shift(input.font-metrics);
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: Theme.control-pad-x;
+        padding-right: Theme.control-pad-x;
+        padding-top: Theme.control-pad-y + root.o-shift;
+        padding-bottom: Theme.control-pad-y - root.o-shift;
+        alignment: stretch;
+
+        input := TextInput {
+            text <=> root.text;
+            enabled: root.enabled;
+            color: root.enabled ? Theme.fg : Theme.fg-muted;
+            font-size: Theme.font-body;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+            single-line: true;
+            horizontal-stretch: 1;
+            edited => { root.edited(self.text); }
+        }
+    }
+}
+
+export component KitComboBox inherits Rectangle {
+    in property <[string]> model: [];
+    in-out property <int> current-index: 0;
+    in property <bool> enabled: true;
+    callback selected(int);
+
+    private property <string> current-value:
+        root.model.length > 0 && root.current-index >= 0 && root.current-index < root.model.length
+            ? root.model[root.current-index]
+            : "";
+    private property <length> chevron-w: 16px;
+    private property <length> o-shift: Theme.optical-shift(value-text.font-metrics);
+
+    height: Theme.control-height;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.border-width;
+    border-color: Theme.border;
+    background: !root.enabled
+        ? Theme.tile-bg.with-alpha(0.45)
+        : (ta.has-hover ? Theme.panel-bg-high : Theme.tile-bg);
+
+    ta := TouchArea {
+        x: 0; y: 0; width: 100%; height: 100%;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { popup.show(); }
+    }
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: Theme.control-pad-x;
+        padding-right: Theme.control-pad-x;
+        padding-top: Theme.control-pad-y + root.o-shift;
+        padding-bottom: Theme.control-pad-y - root.o-shift;
+        spacing: Theme.space-sm;
+        alignment: stretch;
+
+        value-text := Text {
+            text: root.current-value;
+            color: root.enabled ? Theme.fg : Theme.fg-muted;
+            font-size: Theme.font-body;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Text {
+            width: root.chevron-w;
+            text: "▾";
+            color: Theme.fg-muted;
+            font-size: Theme.font-body;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+    }
+
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + Theme.space-xs;
+        width: root.width;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            background: Theme.panel-bg;
+            border-width: Theme.border-width;
+            border-color: Theme.border;
+            border-radius: Theme.radius-sm;
+
+            VerticalLayout {
+                padding: Theme.space-xs;
+                spacing: 0px;
+
+                for item[i] in root.model: Rectangle {
+                    height: Theme.control-height-sm;
+                    width: 100%;
+                    border-radius: Theme.radius-sm;
+                    background: i == root.current-index
+                        ? Theme.selection-bg
+                        : (row-ta.has-hover ? Theme.panel-bg-high : transparent);
+
+                    row-ta := TouchArea {
+                        x: 0; y: 0; width: 100%; height: 100%;
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.current-index = i;
+                            root.selected(i);
+                            popup.close();
+                        }
+                    }
+
+                    HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
+                        padding-left: Theme.control-pad-x;
+                        padding-right: Theme.control-pad-x;
+                        alignment: stretch;
+
+                        Text {
+                            text: item;
+                            color: Theme.fg;
+                            font-size: Theme.font-body;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Place-beside pad: Left/Right (vertical mid), Above/Below (horizontal mid).
+/// `place(0..3)` — Left, Right, Above, Below. Geometry stays in the app.
+export component KitAlignPad inherits Rectangle {
+    in property <bool> enabled: true;
+    callback place(int);
+
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    background: transparent;
+
+    VerticalLayout {
+        width: 100%;
+        spacing: Theme.space-xs;
+        alignment: start;
+
+        Text {
+            text: "Place beside nearest";
+            color: Theme.fg-muted;
+            font-size: Theme.font-label;
+            vertical-stretch: 0;
+            horizontal-alignment: left;
+        }
+
+        HorizontalLayout {
+            spacing: Theme.space-xs;
+            width: 100%;
+            KitButton {
+                text: "← Left";
+                small: true;
+                horizontal-stretch: 1;
+                enabled: root.enabled;
+                clicked => { root.place(0); }
+            }
+            KitButton {
+                text: "Right →";
+                small: true;
+                horizontal-stretch: 1;
+                enabled: root.enabled;
+                clicked => { root.place(1); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Theme.space-xs;
+            width: 100%;
+            KitButton {
+                text: "↑ Above";
+                small: true;
+                horizontal-stretch: 1;
+                enabled: root.enabled;
+                clicked => { root.place(2); }
+            }
+            KitButton {
+                text: "Below ↓";
+                small: true;
+                horizontal-stretch: 1;
+                enabled: root.enabled;
+                clicked => { root.place(3); }
+            }
+        }
+    }
+}

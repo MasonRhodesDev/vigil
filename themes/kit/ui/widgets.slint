@@ -1,0 +1,39 @@
+// Chrome + re-exports of Theme-native controls and helpers.
+import { Theme } from "theme.slint";
+import {
+    KitButton, KitIconButton, KitCheckBox, KitLineEdit, KitComboBox, KitAlignPad
+} from "controls.slint";
+import {
+    KitLabel, KitMuted, KitTitle, KitDisplay, KitWarning
+} from "typography.slint";
+import {
+    KitVStack, KitHStack, KitSpacer, KitDivider
+} from "layout.slint";
+import {
+    KitTextButton, KitDisclosure, KitField, KitHeadingStack, KitToolbar,
+    KitListRow, KitBadge, KitOverlayBar, KitSidePanel
+} from "chrome.slint";
+
+export {
+    KitButton, KitIconButton, KitCheckBox, KitLineEdit, KitComboBox, KitAlignPad,
+    KitLabel, KitMuted, KitTitle, KitDisplay, KitWarning,
+    KitVStack, KitHStack, KitSpacer, KitDivider,
+    KitTextButton, KitDisclosure, KitField, KitHeadingStack, KitToolbar,
+    KitListRow, KitBadge, KitOverlayBar, KitSidePanel
+}
+
+export component Page inherits Rectangle {
+    background: Theme.page-bg;
+}
+
+export component Panel inherits Rectangle {
+    in property <string> variant: "panel"; // panel | canvas | overlay
+    background: root.variant == "canvas" ? Theme.canvas-bg
+        : (root.variant == "overlay"
+            ? Theme.panel-bg.with-alpha(Theme.overlay-alpha)
+            : Theme.panel-bg);
+    border-width: Theme.border-width;
+    border-color: Theme.border;
+    border-radius: root.variant == "overlay" ? Theme.radius-sm : Theme.radius-md;
+    // Avoid clip here — soft text when children sit in HorizontalLayout (Slint #10499).
+}

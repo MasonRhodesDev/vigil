@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.7
+Version:        0.2.8
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -98,6 +98,8 @@ install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
 install -Dpm0644 dist/vigil-lock.pam %{buildroot}%{_sysconfdir}/pam.d/vigil-lock
 install -Dpm0644 dist/vigil.toml.example %{buildroot}%{_datadir}/vigil/vigil.toml.example
 install -Dpm0644 themes/default/theme.slint %{buildroot}%{_datadir}/vigil/themes/default.slint
+install -d %{buildroot}%{_datadir}/vigil/slint-kit/ui
+install -pm0644 themes/kit/ui/*.slint %{buildroot}%{_datadir}/vigil/slint-kit/ui/
 install -d -m2775 %{buildroot}%{_sysconfdir}/monitor-profiles
 
 %if %{with check}
@@ -132,6 +134,10 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Sun Aug 16 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.8-1
+- Embed slint-kit UI so the default theme compiles without the build-host
+  cargo git checkout (packaged greeter panic on a fresh install).
+
 * Sun Aug 16 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.7-1
 - Snapshot Arch sources on tag builds so the PKGBUILD checksum can match.
 

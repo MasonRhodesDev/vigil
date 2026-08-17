@@ -23,6 +23,57 @@ pub const DEFAULT_THEME_SOURCE: &str = include_str!(concat!(
     "/../../themes/default/theme.slint"
 ));
 
+/// slint-kit `ui/` sources, vendored at `themes/kit/ui/` (rev ccd7397).
+///
+/// The default theme `import`s `ui/theme.slint` etc. `slint_kit::ui_dir()` is
+/// `CARGO_MANIFEST_DIR` of the git checkout, which exists on the build host
+/// and nowhere else. Serving these from the binary is what makes a packaged
+/// greeter start on a fresh machine.
+const KIT_UI_FILES: &[(&str, &str)] = &[
+    (
+        "theme.slint",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../themes/kit/ui/theme.slint"
+        )),
+    ),
+    (
+        "controls.slint",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../themes/kit/ui/controls.slint"
+        )),
+    ),
+    (
+        "typography.slint",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../themes/kit/ui/typography.slint"
+        )),
+    ),
+    (
+        "chrome.slint",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../themes/kit/ui/chrome.slint"
+        )),
+    ),
+    (
+        "layout.slint",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../themes/kit/ui/layout.slint"
+        )),
+    ),
+    (
+        "widgets.slint",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../themes/kit/ui/widgets.slint"
+        )),
+    ),
+];
+
 #[derive(Debug)]
 pub enum ThemeError {
     /// Compile diagnostics, already formatted for the log.
@@ -106,15 +157,55 @@ fn compile_source(source: &str, path: PathBuf) -> Result<Theme, ThemeError> {
     finish_compilation(result)
 }
 
+fn kit_source_for(path: &Path) -> Option<&'static str> {
+    // `import { Theme } from "ui/theme.slint"` and nested `from "theme.slint"`
+    // inside those files both resolve to a path whose last two components are
+    // `ui/<file>` once the include search has failed (packaged install).
+    let name = path.file_name()?.to_str()?;
+    let parent = path.parent()?.file_name()?.to_str()?;
+    if parent != "ui" {
+        return None;
+    }
+    KIT_UI_FILES
+        .iter()
+        .find(|(file, _)| *file == name)
+        .map(|(_, source)| *source)
+}
+
+fn attach_embedded_kit(compiler: &mut slint_interpreter::Compiler) {
+    compiler.set_file_loader(|path| {
+        Box::pin(std::future::ready(
+            kit_source_for(path).map(|source| Ok(source.to_owned())),
+        ))
+    });
+}
+
 fn compiler() -> slint_interpreter::Compiler {
     let mut compiler = slint_interpreter::Compiler::default();
-    let ui = slint_kit::ui_dir();
-    let mut paths = vec![ui.clone()];
-    if let Some(root) = ui.parent() {
-        paths.push(root.to_path_buf());
-    }
-    compiler.set_include_paths(paths);
+    attach_embedded_kit(&mut compiler);
+    compiler.set_include_paths(kit_include_paths());
     compiler
+}
+
+fn kit_include_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let packaged = PathBuf::from("/usr/share/vigil/slint-kit");
+    let in_tree = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../themes/kit");
+    let cargo_kit = slint_kit::ui_dir();
+    for root in [
+        packaged,
+        in_tree,
+        cargo_kit
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf),
+    ] {
+        let ui = root.join("ui");
+        if ui.is_dir() {
+            paths.push(root);
+            paths.push(ui);
+        }
+    }
+    paths
 }
 
 fn finish_compilation(result: slint_interpreter::CompilationResult) -> Result<Theme, ThemeError> {
@@ -295,6 +386,34 @@ mod tests {
         init_headless();
         let theme = compile_source(DEFAULT_THEME_SOURCE, PathBuf::from("default.slint")).unwrap();
         theme.instantiate().unwrap();
+    }
+
+    #[test]
+    fn default_theme_compiles_from_embedded_kit_without_include_paths() {
+        // Packaged binaries do not have the cargo git checkout that
+        // `slint_kit::ui_dir()` points at. The greeter must still compile.
+        init_headless();
+        let mut compiler = slint_interpreter::Compiler::default();
+        attach_embedded_kit(&mut compiler);
+        compiler.set_include_paths(Vec::new());
+        let theme = finish_compilation(block_on(compiler.build_from_source(
+            DEFAULT_THEME_SOURCE.to_owned(),
+            PathBuf::from("<embedded-default-theme>"),
+        )))
+        .unwrap();
+        theme.instantiate().unwrap();
+    }
+
+    #[test]
+    fn vendored_kit_ui_matches_slint_kit_checkout() {
+        let ui = slint_kit::ui_dir();
+        if !ui.is_dir() {
+            return;
+        }
+        for (name, embedded) in KIT_UI_FILES {
+            let on_disk = std::fs::read_to_string(ui.join(name)).unwrap();
+            assert_eq!(&on_disk, embedded, "{name} drifted from slint-kit");
+        }
     }
 
     #[test]
