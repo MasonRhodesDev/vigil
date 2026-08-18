@@ -227,14 +227,18 @@ export component DefaultTheme inherits Window {
     HorizontalLayout {
         x: Theme.page-pad + Theme.space-sm;
         y: parent.height - Theme.page-pad - Theme.control-height;
+        width: 240px;
         height: Theme.control-height;
         spacing: Theme.space-md;
+        alignment: start;
 
         KitButton {
+            width: 104px;
             text: "Restart";
             clicked => { root.power-action("reboot"); }
         }
         KitButton {
+            width: 120px;
             text: "Shut Down";
             clicked => { root.power-action("poweroff"); }
         }

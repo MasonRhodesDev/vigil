@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.10
+Version:        0.2.11
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -138,6 +138,9 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Tue Aug 18 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.11-1
+- Keep the restart and shutdown controls left-aligned at bounded widths.
+
 * Tue Aug 18 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.10-1
 - Reconcile /var/lib/vigil ownership with the greeter account selected by an
   existing greetd config, preserving operator-owned configuration and state.
