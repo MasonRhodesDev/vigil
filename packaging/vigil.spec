@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.9
+Version:        0.2.10
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -95,9 +95,9 @@ install -Dpm0755 target/rpm/vigil-lock %{buildroot}%{_bindir}/vigil-lock
 
 install -Dpm0755 dist/setup-greetd %{buildroot}%{_prefix}/lib/vigil/setup-greetd
 install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
-# Fedora's greetd package creates user "greetd", not Arch's "greeter" — with
-# the wrong owner systemd-tmpfiles refuses the line and /var/lib/vigil (the
-# remembered user/session state) is never created.
+# Fedora's greetd package creates user "greetd", not Arch's "greeter".
+# setup-greetd subsequently reconciles the directory with the account in an
+# existing operator-owned greetd config, which may deliberately be different.
 sed -i 's/ greeter greeter / greetd greetd /' %{buildroot}%{_tmpfilesdir}/vigil.conf
 install -Dpm0644 dist/vigil-lock.pam %{buildroot}%{_sysconfdir}/pam.d/vigil-lock
 install -Dpm0644 dist/vigil.toml.example %{buildroot}%{_datadir}/vigil/vigil.toml.example
@@ -138,6 +138,10 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Tue Aug 18 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.10-1
+- Reconcile /var/lib/vigil ownership with the greeter account selected by an
+  existing greetd config, preserving operator-owned configuration and state.
+
 * Mon Aug 17 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.9-1
 - Fedora: own /var/lib/vigil as greetd's "greetd" user (Arch's is "greeter"),
   so remembered user/session state actually persists; setup-greetd probes for
