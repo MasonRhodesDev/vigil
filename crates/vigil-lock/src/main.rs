@@ -915,7 +915,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::SystemTime;
 
     fn key() -> InputEvent {
@@ -1037,10 +1036,9 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let worker = BackgroundWorker::new(tx);
-        let woke = Arc::new(AtomicBool::new(false));
-        let wake_flag = woke.clone();
+        let (wake_tx, wake_rx) = mpsc::channel();
         let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            wake_flag.store(true, Ordering::Release);
+            wake_tx.send(()).unwrap();
         });
         let key = BackgroundKey {
             path: path.clone(),
@@ -1053,14 +1051,13 @@ mod tests {
         let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(first.pixels.is_ok());
         assert!(!first.cache_hit);
-        assert!(woke.load(Ordering::Acquire));
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        woke.store(false, Ordering::Release);
         worker.render_prepared(OutputId(2), key, None, Some(waker));
         let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(second.pixels.is_ok());
         assert!(second.cache_hit);
-        assert!(woke.load(Ordering::Acquire));
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
         std::fs::remove_file(path).unwrap();
     }

@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.12
+Version:        0.2.13
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -143,6 +143,9 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Wed Aug 19 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.13-1
+- Synchronize the background-worker wake test with the callback it verifies.
+
 * Wed Aug 19 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.12-1
 - Reuse shared canonical monitor identity across greeter and lockscreen.
 - Stabilize Wayland output identity and detach daemonized lock startup cleanly.
