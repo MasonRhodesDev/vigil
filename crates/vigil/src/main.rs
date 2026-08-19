@@ -269,6 +269,7 @@ struct App {
     queue: Rc<RefCell<VecDeque<UiMessage>>>,
     looks: vigil_ui::Looks,
     appearance_registry: appearance_profiles::Registry,
+    appearance_bundle: Option<appearance_profiles::PreparedBundle>,
     background_tx: std::sync::mpsc::Sender<BackgroundResult>,
     background_rx: std::sync::mpsc::Receiver<BackgroundResult>,
     background_generation: u64,
@@ -1007,6 +1008,10 @@ impl App {
                 None
             })
             .unwrap_or_default();
+        self.appearance_bundle = default
+            .as_deref()
+            .and_then(|name| appearance_profiles::PreparedBundle::load_published(name).ok())
+            .flatten();
         self.background_cache_key = default.clone().unwrap_or_else(|| "<theme>".to_owned());
         self.refresh_backgrounds_async();
         let label = default.clone().unwrap_or_default();
@@ -1033,27 +1038,39 @@ impl App {
         }
         let mut requests = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
-            let resolved = self.appearance_registry.resolve(
-                &appearance_profiles::OutputIdentity::new(
-                    &entry.connector,
-                    entry.description.clone(),
-                ),
-                None,
+            let identity = appearance_profiles::OutputIdentity::new(
+                &entry.connector,
+                entry.description.clone(),
             );
+            let resolved = self.appearance_registry.resolve(&identity, None);
+            let resolved_path = resolved.path.clone();
+            let resolved_fit = resolved.fit;
             let (background, fit) = self.looks.for_connector_with_fallback(
                 &entry.connector,
                 resolved.path,
                 Some(appearance_fit(resolved.fit)),
             );
             let (width, height) = entry.window.scene_size();
-            requests.push((entry.id, background, fit, width, height));
+            let prepared = (background.as_ref() == resolved_path.as_ref()
+                && fit == appearance_fit(resolved_fit))
+            .then(|| {
+                self.appearance_bundle
+                    .as_ref()
+                    .and_then(|bundle| bundle.resolve(&identity, width, height, resolved_fit))
+                    .cloned()
+            })
+            .flatten();
+            requests.push((entry.id, background, fit, width, height, prepared));
         }
         let tx = self.background_tx.clone();
         std::thread::spawn(move || {
             use std::collections::HashMap;
             use std::sync::Arc;
             let mut sources = HashMap::new();
-            for (_, path, _, _, _) in &requests {
+            for (_, path, _, _, _, prepared) in &requests {
+                if prepared.is_some() {
+                    continue;
+                }
                 if let Some(path) = path {
                     sources
                         .entry(path.clone())
@@ -1063,20 +1080,28 @@ impl App {
             let outputs = std::thread::scope(|scope| {
                 requests
                     .into_iter()
-                    .map(|(id, path, fit, width, height)| {
+                    .map(|(id, path, fit, width, height, prepared)| {
                         let source = path.as_ref().map(|path| &sources[path]);
                         scope.spawn(move || {
-                            let decoded = source
-                                .map(|source| {
-                                    source
-                                        .as_ref()
-                                        .map_err(Clone::clone)
-                                        .and_then(|source| {
-                                            vigil_ui::render_background(source, fit, width, height)
-                                        })
-                                        .map(|rgba| (rgba, width, height))
-                                })
-                                .transpose();
+                            let decoded = if let Some(prepared) = prepared {
+                                appearance_profiles::read_prepared_pixels(&prepared)
+                                    .map(|rgba| Some((rgba, width, height)))
+                                    .map_err(|error| error.to_string())
+                            } else {
+                                source
+                                    .map(|source| {
+                                        source
+                                            .as_ref()
+                                            .map_err(Clone::clone)
+                                            .and_then(|source| {
+                                                vigil_ui::render_background(
+                                                    source, fit, width, height,
+                                                )
+                                            })
+                                            .map(|rgba| (rgba, width, height))
+                                    })
+                                    .transpose()
+                            };
                             (id, decoded)
                         })
                     })
@@ -1446,6 +1471,9 @@ fn run() -> Result<i32, String> {
     let appearance_registry = appearance_user
         .and_then(|name| appearance_profiles::Registry::load_published(name).ok())
         .unwrap_or_default();
+    let appearance_bundle = appearance_user
+        .and_then(|name| appearance_profiles::PreparedBundle::load_published(name).ok())
+        .flatten();
     let background_cache_key = appearance_user.unwrap_or("<theme>").to_owned();
     let (background_tx, background_rx) = std::sync::mpsc::channel();
     let mut app = App {
@@ -1478,6 +1506,7 @@ fn run() -> Result<i32, String> {
             config: config.clone(),
         },
         appearance_registry,
+        appearance_bundle,
         background_tx,
         background_rx,
         background_generation: 0,

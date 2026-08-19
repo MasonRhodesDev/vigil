@@ -412,7 +412,7 @@ pub enum SessionEvent {
 // ---------------------------------------------------------------------------
 
 /// Background fit behavior, one per output (DESIGN.md §6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BackgroundFit {
     Stretch,
     #[default]

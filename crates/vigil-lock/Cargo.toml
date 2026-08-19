@@ -17,3 +17,6 @@ vigil-wayland = { path = "../vigil-wayland" }
 vigil-pam = { path = "../vigil-pam" }
 vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }
+
+[dev-dependencies]
+image.workspace = true

@@ -11,16 +11,14 @@
 //! windows + auth) and calls [`run`]; the event loop lives here because the
 //! Wayland connection *is* the loop for a lock client.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     output::{OutputHandler, OutputState},
-    reexports::calloop::{
-        EventLoop,
-        timer::{TimeoutAction, Timer},
-    },
+    reexports::calloop::EventLoop,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -51,6 +49,10 @@ use vigil_core::{FrameTarget, InputEvent, OutputId, OutputInfo};
 
 /// What the binary implements: its composition of theme windows and auth.
 pub trait LockSession {
+    /// Install a thread-safe wakeup for asynchronous work. Calling it makes
+    /// the Wayland loop run a tick immediately instead of waiting for the
+    /// next frame deadline.
+    fn set_waker(&mut self, _waker: Arc<dyn Fn() + Send + Sync>) {}
     /// An output has its first configured size; create its scene.
     fn output_ready(&mut self, id: OutputId, info: &OutputInfo);
     /// The output's pixel size or scale changed.
@@ -138,20 +140,20 @@ struct App<S: LockSession + 'static> {
 impl<S: LockSession> App<S> {
     fn output_info(&self, idx: usize) -> OutputInfo {
         let entry = &self.entries[idx];
-        let connector = self
-            .outputs
-            .info(&entry.output)
-            .and_then(|i| i.name)
+        let wayland_info = self.outputs.info(&entry.output);
+        let connector = wayland_info
+            .as_ref()
+            .and_then(|info| info.name.clone())
             .unwrap_or_else(|| format!("output-{}", entry.id.0));
         OutputInfo {
             connector,
             width: entry.px.0,
             height: entry.px.1,
             refresh_mhz: 0,
-            // wl_output carries make/model, but the lock has no use for
-            // monitor identity: the compositor already told it the scale.
+            // Preserve the compositor's stable description so monitor and
+            // prepared-appearance profiles can match across connector moves.
             make: None,
-            model: None,
+            model: wayland_info.and_then(|info| info.description),
             scale: entry.scale120 as f32 / 120.0,
         }
     }
@@ -191,6 +193,7 @@ impl<S: LockSession> App<S> {
     }
 
     fn apply_geometry(&mut self, idx: usize) {
+        let configure_started = std::time::Instant::now();
         let (lw, lh) = self.entries[idx].logical;
         if lw == 0 || lh == 0 {
             return;
@@ -230,6 +233,13 @@ impl<S: LockSession> App<S> {
         }
         // Invariant: a configured lock surface gets a buffer promptly.
         self.present(idx);
+        let elapsed = configure_started.elapsed();
+        if elapsed >= Duration::from_millis(8) {
+            eprintln!(
+                "vigil-lock: output {:?} configure and first present: {:?}",
+                id, elapsed
+            );
+        }
     }
 
     /// Render if the scene is dirty and commit the new buffer.
@@ -258,6 +268,7 @@ impl<S: LockSession> App<S> {
         if force {
             canvas.fill(0);
         }
+        let render_started = std::time::Instant::now();
         let drew = self.session.render(
             id,
             FrameTarget {
@@ -267,6 +278,7 @@ impl<S: LockSession> App<S> {
                 stride,
             },
         );
+        let render_elapsed = render_started.elapsed();
         if !drew && !force {
             return;
         }
@@ -274,10 +286,19 @@ impl<S: LockSession> App<S> {
             eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
         }
         let surface = &self.entries[idx].surface;
+        let commit_started = std::time::Instant::now();
         let _ = buffer.attach_to(surface);
         surface.damage_buffer(0, 0, w as i32, h as i32);
         surface.commit();
         self.entries[idx].committed = true;
+        let commit_elapsed = commit_started.elapsed();
+        if render_elapsed >= Duration::from_millis(8) || commit_elapsed >= Duration::from_millis(8)
+        {
+            eprintln!(
+                "vigil-lock: output {id:?} present: render {:?}, commit {:?}",
+                render_elapsed, commit_elapsed
+            );
+        }
     }
 
     fn entry_idx_by_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
@@ -350,21 +371,14 @@ pub fn run<S: LockSession + 'static>(session: S) -> Result<LockOutcome, LockErro
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .map_err(err)?;
-    event_loop
-        .handle()
-        .insert_source(
-            Timer::from_duration(FRAME_INTERVAL),
-            |_, _, app: &mut App<S>| {
-                app.tick();
-                TimeoutAction::ToDuration(FRAME_INTERVAL)
-            },
-        )
-        .map_err(err)?;
+    let signal = event_loop.get_signal();
+    app.session.set_waker(Arc::new(move || signal.wakeup()));
 
     while app.outcome.is_none() && app.error.is_none() {
-        event_loop
-            .dispatch(Duration::from_millis(16), &mut app)
-            .map_err(err)?;
+        event_loop.dispatch(FRAME_INTERVAL, &mut app).map_err(err)?;
+        // A frame deadline, Wayland input, or an asynchronous worker wakeup
+        // all converge here. No expensive client work belongs in callbacks.
+        app.tick();
     }
     match (app.error, app.outcome) {
         (Some(e), _) => Err(e),

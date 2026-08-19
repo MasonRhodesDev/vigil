@@ -256,10 +256,17 @@ impl OutputWindow {
 
     /// Set the pre-fit background bitmap (from `background` below).
     pub fn set_background(&mut self, rgba: Vec<u8>, width: u32, height: u32) {
+        self.set_background_pixels(&rgba, width, height);
+    }
+
+    /// Set a pre-fit background without requiring ownership of its backing
+    /// cache entry. Slint takes its own pixel-buffer copy here, so workers can
+    /// share one rendered bitmap between equal-sized outputs.
+    pub fn set_background_pixels(&mut self, rgba: &[u8], width: u32, height: u32) {
         if rgba.len() != width as usize * height as usize * 4 {
             return;
         }
-        let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba, width, height);
+        let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(rgba, width, height);
         self.set_property("background-source", Value::Image(Image::from_rgba8(buffer)));
     }
 

@@ -91,6 +91,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "appearance-profiles"
+version = "0.2.0"
+source = "git+https://github.com/MasonRhodesDev/appearance-profiles.git?rev=54741430fe095dc6a8c78a4b1d7d0170cba3f0b9#54741430fe095dc6a8c78a4b1d7d0170cba3f0b9"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "appendlist"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2437,7 +2447,7 @@ version = "0.2.2"
 source = "git+https://github.com/MasonRhodesDev/linux-multi-theme-toggle?rev=344529cd124c131da40409b152bc1604eebd53d0#344529cd124c131da40409b152bc1604eebd53d0"
 dependencies = [
  "anyhow",
- "appearance-profiles",
+ "appearance-profiles 0.1.0",
  "dirs",
  "hypr-paths",
  "palette",
@@ -4789,7 +4799,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vigil"
 version = "0.2.11"
 dependencies = [
- "appearance-profiles",
+ "appearance-profiles 0.2.0",
  "calloop 0.14.4",
  "image",
  "monitor-profiles",
@@ -4856,7 +4866,8 @@ dependencies = [
 name = "vigil-lock"
 version = "0.2.11"
 dependencies = [
- "appearance-profiles",
+ "appearance-profiles 0.2.0",
+ "image",
  "monitor-profiles",
  "vigil-config",
  "vigil-core",

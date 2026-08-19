@@ -2,10 +2,10 @@
 //! (DESIGN.md §12). Policy layer only: vigil-wayland owns the protocol,
 //! vigil-pam owns authentication, vigil-ui/-theme own the scene.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use vigil_config::Config;
@@ -104,9 +104,120 @@ struct Entry {
     connector: String,
     description: String,
     window: OutputWindow,
-    /// Wallpaper decode is deferred until after the first lock buffer so a
-    /// Lanczos resize cannot stall the Wayland thread while Hyprland blanks.
-    pending_bg: Option<(PathBuf, BackgroundFit, u32, u32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BackgroundKey {
+    path: PathBuf,
+    fit: BackgroundFit,
+    width: u32,
+    height: u32,
+}
+
+type BackgroundPixels = Result<Arc<Vec<u8>>, String>;
+type SourceImage = Result<Arc<vigil_ui::BackgroundImage>, String>;
+
+struct BackgroundResult {
+    id: OutputId,
+    key: BackgroundKey,
+    pixels: BackgroundPixels,
+    elapsed: Duration,
+    cache_hit: bool,
+}
+
+/// Process-lifetime wallpaper cache and renderer. Expensive image work never
+/// runs on the Wayland thread; OnceLock coalesces equal source decodes and
+/// equal output-sized renders when outputs arrive together.
+struct BackgroundWorker {
+    tx: mpsc::Sender<BackgroundResult>,
+    sources: Arc<Mutex<HashMap<PathBuf, Arc<OnceLock<SourceImage>>>>>,
+    rendered: Arc<Mutex<HashMap<BackgroundKey, Arc<OnceLock<BackgroundPixels>>>>>,
+}
+
+impl BackgroundWorker {
+    fn new(tx: mpsc::Sender<BackgroundResult>) -> Self {
+        Self {
+            tx,
+            sources: Arc::default(),
+            rendered: Arc::default(),
+        }
+    }
+
+    fn render_prepared(
+        &self,
+        id: OutputId,
+        key: BackgroundKey,
+        prepared: Option<appearance_profiles::PreparedBackground>,
+        waker: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        let tx = self.tx.clone();
+        let sources = self.sources.clone();
+        let rendered = self.rendered.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let cell = rendered
+                .lock()
+                .expect("background render cache poisoned")
+                .entry(key.clone())
+                .or_default()
+                .clone();
+            let cache_hit = cell.get().is_some();
+            let pixels = cell
+                .get_or_init(|| {
+                    if let Some(prepared) = prepared.as_ref() {
+                        let read_started = Instant::now();
+                        let result =
+                            appearance_profiles::read_prepared_pixels(prepared).map(Arc::new);
+                        eprintln!(
+                            "vigil-lock: prepared background read {}: {:?}",
+                            prepared.asset.display(),
+                            read_started.elapsed()
+                        );
+                        return result.map_err(|error| error.to_string());
+                    }
+                    let source_cell = sources
+                        .lock()
+                        .expect("background source cache poisoned")
+                        .entry(key.path.clone())
+                        .or_default()
+                        .clone();
+                    let source = source_cell.get_or_init(|| {
+                        let decode_started = Instant::now();
+                        let result = vigil_ui::load_background(&key.path).map(Arc::new);
+                        eprintln!(
+                            "vigil-lock: background decode {}: {:?}",
+                            key.path.display(),
+                            decode_started.elapsed()
+                        );
+                        result
+                    });
+                    source.as_ref().map_err(Clone::clone).and_then(|source| {
+                        let render_started = Instant::now();
+                        let result =
+                            vigil_ui::render_background(source, key.fit, key.width, key.height)
+                                .map(Arc::new);
+                        eprintln!(
+                            "vigil-lock: background resize {}x{}: {:?}",
+                            key.width,
+                            key.height,
+                            render_started.elapsed()
+                        );
+                        result
+                    })
+                })
+                .clone();
+            let _ = tx.send(BackgroundResult {
+                id,
+                key,
+                pixels,
+                elapsed: started.elapsed(),
+                cache_hit,
+            });
+            if let Some(waker) = waker {
+                waker();
+            }
+        });
+    }
 }
 
 struct Locker {
@@ -117,6 +228,7 @@ struct Locker {
     user: String,
     looks: Looks,
     appearance_registry: appearance_profiles::Registry,
+    appearance_bundle: Option<appearance_profiles::PreparedBundle>,
     monitor_profiles: Vec<monitor_profiles::Profile>,
     clock_format: String,
     caps_lock: bool,
@@ -139,6 +251,9 @@ struct Locker {
     /// Auth state to replay onto scenes rebuilt mid-lock (resume/resize
     /// recreates outputs; a fresh theme instance starts blank).
     snapshot: UiSnapshot,
+    background_worker: BackgroundWorker,
+    background_rx: mpsc::Receiver<BackgroundResult>,
+    background_waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Grace window: unlock without auth shortly after locking. Two deadlines
@@ -221,6 +336,12 @@ impl Locker {
                 profiles
             })
             .unwrap_or_default();
+        let (background_tx, background_rx) = mpsc::channel();
+        let appearance_bundle = appearance_profiles::PreparedBundle::load_published(&cli.user)
+            .unwrap_or_else(|error| {
+                eprintln!("vigil-lock: prepared appearance bundle: {error}");
+                None
+            });
         let locker = Self {
             platform,
             theme,
@@ -241,6 +362,7 @@ impl Locker {
                     Default::default()
                 },
             ),
+            appearance_bundle,
             monitor_profiles,
             clock_format: clock_format.clone(),
             caps_lock: false,
@@ -269,6 +391,9 @@ impl Locker {
                 snapshot.on_prompt("Password", true);
                 snapshot
             },
+            background_worker: BackgroundWorker::new(background_tx),
+            background_rx,
+            background_waker: None,
         };
         if let Some(login) = &locker.login {
             login.spawn_signals(locker.login_tx.clone());
@@ -437,24 +562,45 @@ impl Locker {
         self.unlocked = true;
     }
 
-    /// Decode at most one wallpaper per tick so the lock buffer is already
-    /// on screen before Lanczos runs.
-    fn apply_pending_background(&mut self) {
-        let Some(idx) = self.entries.iter().position(|e| e.pending_bg.is_some()) else {
-            return;
-        };
-        let Some((path, fit, width, height)) = self.entries[idx].pending_bg.take() else {
-            return;
-        };
-        match vigil_ui::background(&path, fit, width, height) {
-            Ok(rgba) => self.entries[idx].window.set_background(rgba, width, height),
-            Err(e) => eprintln!("vigil-lock: background: {e}"),
+    fn pump_backgrounds(&mut self) {
+        while let Ok(result) = self.background_rx.try_recv() {
+            let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == result.id) else {
+                continue;
+            };
+            if entry.window.scene_size() != (result.key.width, result.key.height) {
+                eprintln!(
+                    "vigil-lock: discarding stale background for {} ({}x{})",
+                    entry.connector, result.key.width, result.key.height
+                );
+                continue;
+            }
+            match result.pixels {
+                Ok(rgba) => {
+                    entry.window.set_background_pixels(
+                        rgba.as_slice(),
+                        result.key.width,
+                        result.key.height,
+                    );
+                    eprintln!(
+                        "vigil-lock: background ready for {} in {:?}{}",
+                        entry.connector,
+                        result.elapsed,
+                        if result.cache_hit { " (cache hit)" } else { "" }
+                    );
+                }
+                Err(error) => eprintln!("vigil-lock: background: {error}"),
+            }
         }
     }
 }
 
 impl LockSession for Locker {
+    fn set_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
+        self.background_waker = Some(waker);
+    }
+
     fn output_ready(&mut self, id: OutputId, info: &OutputInfo) {
+        let scene_started = Instant::now();
         let component = match self.theme.instantiate() {
             Ok(component) => component,
             Err(e) => {
@@ -474,10 +620,11 @@ impl LockSession for Locker {
                     return;
                 }
             };
-        let resolved = self.appearance_registry.resolve(
-            &appearance_profiles::OutputIdentity::new(&info.connector, output_description(info)),
-            None,
-        );
+        let identity =
+            appearance_profiles::OutputIdentity::new(&info.connector, output_description(info));
+        let resolved = self.appearance_registry.resolve(&identity, None);
+        let resolved_path = resolved.path.clone();
+        let resolved_fit = resolved.fit;
         let (background, fit) = self.looks.for_connector_with_fallback(
             &info.connector,
             resolved.path,
@@ -500,10 +647,38 @@ impl LockSession for Locker {
             connector: info.connector.clone(),
             description: output_description(info).unwrap_or_else(|| info.connector.clone()),
             window,
-            pending_bg: background.map(|path| (path, fit, info.width, info.height)),
         });
         self.focus_profile_origin();
         self.apply_panel();
+        eprintln!(
+            "vigil-lock: scene ready for {} in {:?}",
+            info.connector,
+            scene_started.elapsed()
+        );
+        if let Some(path) = background {
+            let prepared = (Some(&path) == resolved_path.as_ref()
+                && fit == appearance_fit(resolved_fit))
+            .then(|| {
+                self.appearance_bundle
+                    .as_ref()
+                    .and_then(|bundle| {
+                        bundle.resolve(&identity, info.width, info.height, resolved_fit)
+                    })
+                    .cloned()
+            })
+            .flatten();
+            self.background_worker.render_prepared(
+                id,
+                BackgroundKey {
+                    path,
+                    fit,
+                    width: info.width,
+                    height: info.height,
+                },
+                prepared,
+                self.background_waker.clone(),
+            );
+        }
     }
 
     fn output_resized(&mut self, id: OutputId, info: &OutputInfo) {
@@ -592,7 +767,7 @@ impl LockSession for Locker {
         self.pump_login();
         self.pump_appearance();
         self.pump_ui();
-        self.apply_pending_background();
+        self.pump_backgrounds();
     }
 
     fn render(&mut self, id: OutputId, target: FrameTarget<'_>) -> bool {
@@ -698,6 +873,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::SystemTime;
 
     fn key() -> InputEvent {
@@ -805,5 +981,45 @@ mod tests {
         handle_login_event(LoginEvent::PrepareForSleep(true), &mut grace);
         assert!(grace.is_none());
         assert!(!Grace::new(0).dismisses(&key(), Instant::now(), SystemTime::now()));
+    }
+
+    #[test]
+    fn background_worker_wakes_and_reuses_rendered_pixels() {
+        let path = std::env::temp_dir().join(format!(
+            "vigil-lock-background-worker-{}.png",
+            std::process::id()
+        ));
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255]))
+            .save(&path)
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let worker = BackgroundWorker::new(tx);
+        let woke = Arc::new(AtomicBool::new(false));
+        let wake_flag = woke.clone();
+        let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            wake_flag.store(true, Ordering::Release);
+        });
+        let key = BackgroundKey {
+            path: path.clone(),
+            fit: BackgroundFit::Fill,
+            width: 16,
+            height: 16,
+        };
+
+        worker.render_prepared(OutputId(1), key.clone(), None, Some(waker.clone()));
+        let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(first.pixels.is_ok());
+        assert!(!first.cache_hit);
+        assert!(woke.load(Ordering::Acquire));
+
+        woke.store(false, Ordering::Release);
+        worker.render_prepared(OutputId(2), key, None, Some(waker));
+        let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(second.pixels.is_ok());
+        assert!(second.cache_hit);
+        assert!(woke.load(Ordering::Acquire));
+
+        std::fs::remove_file(path).unwrap();
     }
 }
