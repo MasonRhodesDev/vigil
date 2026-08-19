@@ -199,7 +199,13 @@ struct Entry {
     present_failures: u32,
 }
 
-type DecodedBackground = Result<Option<(Vec<u8>, u32, u32)>, String>;
+#[derive(Clone)]
+enum BackgroundBitmap {
+    Rgba(Vec<u8>, u32, u32),
+    Xrgb(std::sync::Arc<[u8]>, u32, u32),
+}
+
+type DecodedBackground = Result<Option<BackgroundBitmap>, String>;
 
 struct BackgroundResult {
     generation: u64,
@@ -1059,7 +1065,11 @@ impl App {
                     .and_then(|bundle| bundle.resolve(&identity, width, height, resolved_fit))
                     .cloned()
             })
-            .flatten();
+            .flatten()
+            .filter(|prepared| {
+                prepared.format != appearance_profiles::PixelFormat::Xrgb8888Le
+                    || entry.window.supports_native_background()
+            });
             requests.push((entry.id, background, fit, width, height, prepared));
         }
         let tx = self.background_tx.clone();
@@ -1084,8 +1094,21 @@ impl App {
                         let source = path.as_ref().map(|path| &sources[path]);
                         scope.spawn(move || {
                             let decoded = if let Some(prepared) = prepared {
-                                appearance_profiles::read_prepared_pixels(&prepared)
-                                    .map(|rgba| Some((rgba, width, height)))
+                                appearance_profiles::read_prepared_asset(&prepared)
+                                    .map(|asset| {
+                                        Some(match asset.format {
+                                            appearance_profiles::PixelFormat::Rgba8 => {
+                                                BackgroundBitmap::Rgba(asset.bytes, width, height)
+                                            }
+                                            appearance_profiles::PixelFormat::Xrgb8888Le => {
+                                                BackgroundBitmap::Xrgb(
+                                                    asset.bytes.into(),
+                                                    width,
+                                                    height,
+                                                )
+                                            }
+                                        })
+                                    })
                                     .map_err(|error| error.to_string())
                             } else {
                                 source
@@ -1098,7 +1121,7 @@ impl App {
                                                     source, fit, width, height,
                                                 )
                                             })
-                                            .map(|rgba| (rgba, width, height))
+                                            .map(|rgba| BackgroundBitmap::Rgba(rgba, width, height))
                                     })
                                     .transpose()
                             };
@@ -1137,9 +1160,17 @@ impl App {
                 continue;
             };
             match decoded {
-                Ok(Some((rgba, width, height))) => {
+                Ok(Some(BackgroundBitmap::Rgba(rgba, width, height))) => {
                     eprintln!("vigil: background applied to {:?}", id);
                     entry.window.set_background(rgba, width, height)
+                }
+                Ok(Some(BackgroundBitmap::Xrgb(xrgb, width, height))) => {
+                    if entry.window.set_native_background_xrgb(xrgb, width, height) {
+                        eprintln!("vigil: native background applied to {:?}", id);
+                    } else {
+                        eprintln!("vigil: native background unsupported for {:?}", id);
+                        entry.window.clear_background();
+                    }
                 }
                 Ok(None) => {
                     eprintln!("vigil: no background resolved for {:?}; using theme", id);

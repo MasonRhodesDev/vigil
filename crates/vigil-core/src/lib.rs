@@ -168,6 +168,24 @@ pub trait RenderBackend {
 
     /// Force the next frame to present even if the scene is unchanged.
     fn request_present(&mut self);
+
+    /// Install a scene-sized, little-endian XRGB8888 background that the
+    /// backend can copy below a transparent UI overlay. Unsupported backends
+    /// return false and keep their existing rendering path.
+    fn set_native_background(
+        &mut self,
+        _pixels: std::sync::Arc<[u8]>,
+        _width: u32,
+        _height: u32,
+    ) -> bool {
+        false
+    }
+
+    fn supports_native_background(&self) -> bool {
+        false
+    }
+
+    fn clear_native_background(&mut self) {}
 }
 
 /// What a presenter hands the renderer for one frame.

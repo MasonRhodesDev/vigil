@@ -139,6 +139,9 @@ pub struct SoftwareBackend {
     panel_height: u32,
     /// wl_output/Hyprland transform: 0, 1, 2, 3 = 0, 90, 180, 270 degrees.
     transform: u8,
+    /// Scanout-ready scene pixels copied below a transparent Slint overlay.
+    native_background: Option<std::sync::Arc<[u8]>>,
+    native_overlay: Vec<u8>,
 }
 
 impl OutputWindow {
@@ -225,6 +228,8 @@ impl OutputWindow {
                 panel_width,
                 panel_height,
                 transform,
+                native_background: None,
+                native_overlay: Vec::new(),
             }),
             width,
             height,
@@ -270,8 +275,51 @@ impl OutputWindow {
         self.set_property("background-source", Value::Image(Image::from_rgba8(buffer)));
     }
 
+    /// Use a prepared XRGB frame as the renderer's immutable base layer.
+    /// Themes predating the optional `native-background` property stay on
+    /// the image path so custom themes remain compatible.
+    pub fn set_native_background_xrgb(
+        &mut self,
+        xrgb: std::sync::Arc<[u8]>,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if xrgb.len() != width as usize * height as usize * 4
+            || (width, height) != self.scene_size()
+        {
+            return false;
+        }
+        if self
+            .component
+            .set_property("native-background", Value::Bool(true))
+            .is_err()
+        {
+            return false;
+        }
+        if !self.backend.set_native_background(xrgb, width, height) {
+            let _ = self
+                .component
+                .set_property("native-background", Value::Bool(false));
+            return false;
+        }
+        let _ = self
+            .component
+            .set_property("background-source", Value::Image(Image::default()));
+        self.touch();
+        true
+    }
+
+    pub fn supports_native_background(&self) -> bool {
+        self.backend.supports_native_background()
+            && self.component.get_property("native-background").is_ok()
+    }
+
     /// Remove a previously rendered bitmap and reveal the theme background.
     pub fn clear_background(&mut self) {
+        self.backend.clear_native_background();
+        let _ = self
+            .component
+            .set_property("native-background", Value::Bool(false));
         self.set_property("background-source", Value::Image(Image::default()));
     }
 
@@ -598,6 +646,36 @@ impl TargetPixel for Xrgb8888 {
     }
 }
 
+/// Premultiplied ARGB8888 overlay pixel (little-endian B, G, R, A).
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct Argb8888(u32);
+
+unsafe impl bytemuck::Zeroable for Argb8888 {}
+unsafe impl bytemuck::Pod for Argb8888 {}
+
+impl TargetPixel for Argb8888 {
+    fn blend(&mut self, color: PremultipliedRgbaColor) {
+        let inverse_alpha = u16::from(u8::MAX - color.alpha);
+        let red = color.red as u16 + ((self.0 >> 16) & 0xff) as u16 * inverse_alpha / 255;
+        let green = color.green as u16 + ((self.0 >> 8) & 0xff) as u16 * inverse_alpha / 255;
+        let blue = color.blue as u16 + (self.0 & 0xff) as u16 * inverse_alpha / 255;
+        let alpha = color.alpha as u16 + ((self.0 >> 24) & 0xff) as u16 * inverse_alpha / 255;
+        self.0 = u32::from(blue as u8)
+            | (u32::from(green as u8) << 8)
+            | (u32::from(red as u8) << 16)
+            | (u32::from(alpha as u8) << 24);
+    }
+
+    fn from_rgb(red: u8, green: u8, blue: u8) -> Self {
+        Self(u32::from(blue) | (u32::from(green) << 8) | (u32::from(red) << 16) | 0xff00_0000)
+    }
+
+    fn background() -> Self {
+        Self(0)
+    }
+}
+
 fn pointer_button(button: u32) -> PointerEventButton {
     match button {
         0x110 => PointerEventButton::Left,
@@ -813,6 +891,35 @@ impl RenderBackend for SoftwareBackend {
         self.needs_present = true;
     }
 
+    fn set_native_background(
+        &mut self,
+        pixels: std::sync::Arc<[u8]>,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if width == 0
+            || height == 0
+            || width as usize * height as usize * 4 != self.shadow.len()
+            || pixels.len() != self.shadow.len()
+        {
+            return false;
+        }
+        self.native_background = Some(pixels);
+        self.native_overlay.resize(self.shadow.len(), 0);
+        self.needs_present = true;
+        true
+    }
+
+    fn supports_native_background(&self) -> bool {
+        true
+    }
+
+    fn clear_native_background(&mut self) {
+        self.native_background = None;
+        self.native_overlay.clear();
+        self.needs_present = true;
+    }
+
     fn render(&mut self, view: &SceneView, canvas: CoreCanvas<'_>) -> bool {
         let CoreCanvas::Cpu(target) = canvas else {
             eprintln!("vigil-ui: software backend given a GL canvas");
@@ -841,13 +948,20 @@ impl RenderBackend for SoftwareBackend {
         // Slint partial-repaints into the persistent shadow (ReusedBuffer
         // contract: same buffer, contents preserved between renders).
         let shadow_stride = scene_w as usize;
-        {
-            let shadow_pixels = bytemuck::cast_slice_mut::<u8, Xrgb8888>(&mut self.shadow);
-            if self.adapter.draw_if_needed(|renderer| {
+        let native_background = self.native_background.clone();
+        if self.adapter.draw_if_needed(|renderer| {
+            if let Some(background) = &native_background {
+                renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+                let overlay = bytemuck::cast_slice_mut::<u8, Argb8888>(&mut self.native_overlay);
+                renderer.render(overlay, shadow_stride);
+                composite_native_background(background, overlay, &mut self.shadow);
+            } else {
+                renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+                let shadow_pixels = bytemuck::cast_slice_mut::<u8, Xrgb8888>(&mut self.shadow);
                 renderer.render(shadow_pixels, shadow_stride);
-            }) {
-                self.needs_present = true;
             }
+        }) {
+            self.needs_present = true;
         }
         if !self.needs_present {
             return false;
@@ -881,6 +995,28 @@ impl RenderBackend for SoftwareBackend {
         }
         self.needs_present = false;
         true
+    }
+}
+
+fn composite_native_background(background: &[u8], overlay: &[Argb8888], output: &mut [u8]) {
+    let background = bytemuck::cast_slice::<u8, Xrgb8888>(background);
+    let output = bytemuck::cast_slice_mut::<u8, Xrgb8888>(output);
+    for ((background, overlay), output) in background.iter().zip(overlay).zip(output) {
+        let alpha = overlay.0 >> 24;
+        output.0 = if alpha == 0 {
+            background.0
+        } else if alpha == 255 {
+            overlay.0 & 0x00ff_ffff
+        } else {
+            let inverse = 255 - alpha;
+            let br = (background.0 >> 16) & 0xff;
+            let bg = (background.0 >> 8) & 0xff;
+            let bb = background.0 & 0xff;
+            let red = ((overlay.0 >> 16) & 0xff) + br * inverse / 255;
+            let green = ((overlay.0 >> 8) & 0xff) + bg * inverse / 255;
+            let blue = (overlay.0 & 0xff) + bb * inverse / 255;
+            (red << 16) | (green << 8) | blue
+        };
     }
 }
 
@@ -1186,6 +1322,47 @@ mod tests {
                 0x60, 0x40, 0x20, 0, 0x60, 0x40, 0x20, 0, 0x60, 0x40, 0x20, 0, 0x60, 0x40, 0x20, 0
             ]
         );
+
+        let source = r#"
+            export component Native inherits Window {
+                in property <bool> native-background: false;
+                in property <bool> show-box: true;
+                background: native-background ? transparent : #000000;
+                Rectangle {
+                    visible: show-box;
+                    x: 0px; y: 0px; width: 1px; height: 1px; background: #ff0000;
+                }
+            }
+        "#;
+        let result = block_on(
+            slint_interpreter::Compiler::default()
+                .build_from_source(source.to_owned(), "native.slint".into()),
+        );
+        assert!(!result.has_errors());
+        let component = result.component("Native").unwrap().create().unwrap();
+        let adapter = platform.claim_last_adapter().unwrap();
+        let mut window = OutputWindow::new(OutputId(2), 2, 2, 1.0, adapter, component).unwrap();
+        assert!(window.supports_native_background());
+        assert!(window.set_native_background_xrgb([0xff, 0, 0, 0].repeat(4).into(), 2, 2));
+        let mut buffer = vec![0_u8; 16];
+        assert!(window.render_if_needed(FrameTarget {
+            buffer: &mut buffer,
+            width: 2,
+            height: 2,
+            stride: 8,
+        }));
+        assert_eq!(
+            buffer,
+            [0, 0, 0xff, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0]
+        );
+        window.set_optional_property("show-box", Value::Bool(false));
+        assert!(window.render_if_needed(FrameTarget {
+            buffer: &mut buffer,
+            width: 2,
+            height: 2,
+            stride: 8,
+        }));
+        assert_eq!(buffer, [0xff, 0, 0, 0].repeat(4));
     }
 
     struct ThreadWaker(std::thread::Thread);

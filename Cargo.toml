@@ -13,7 +13,7 @@ repository = "https://github.com/MasonRhodesDev/vigil"
 vigil-core = { path = "crates/vigil-core" }
 vigil-config = { path = "crates/vigil-config" }
 monitor-profiles = { git = "https://github.com/MasonRhodesDev/monitor-profiles", rev = "aef5f0e" }
-appearance-profiles = { git = "https://github.com/MasonRhodesDev/appearance-profiles.git", rev = "54741430fe095dc6a8c78a4b1d7d0170cba3f0b9" }
+appearance-profiles = { git = "https://github.com/MasonRhodesDev/appearance-profiles.git", rev = "780296ec160b18411c65982d323562e5617d6465" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 smithay = { version = "0.7.0", default-features = false }

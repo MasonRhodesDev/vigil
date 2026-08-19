@@ -93,7 +93,7 @@ dependencies = [
 [[package]]
 name = "appearance-profiles"
 version = "0.2.0"
-source = "git+https://github.com/MasonRhodesDev/appearance-profiles.git?rev=54741430fe095dc6a8c78a4b1d7d0170cba3f0b9#54741430fe095dc6a8c78a4b1d7d0170cba3f0b9"
+source = "git+https://github.com/MasonRhodesDev/appearance-profiles.git?rev=780296ec160b18411c65982d323562e5617d6465#780296ec160b18411c65982d323562e5617d6465"
 dependencies = [
  "serde",
  "thiserror 2.0.19",

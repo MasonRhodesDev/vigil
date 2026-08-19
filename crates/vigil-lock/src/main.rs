@@ -114,7 +114,13 @@ struct BackgroundKey {
     height: u32,
 }
 
-type BackgroundPixels = Result<Arc<Vec<u8>>, String>;
+#[derive(Clone)]
+enum BackgroundData {
+    Rgba(Arc<Vec<u8>>),
+    Xrgb(Arc<[u8]>),
+}
+
+type BackgroundPixels = Result<BackgroundData, String>;
 type SourceImage = Result<Arc<vigil_ui::BackgroundImage>, String>;
 
 struct BackgroundResult {
@@ -167,7 +173,16 @@ impl BackgroundWorker {
                     if let Some(prepared) = prepared.as_ref() {
                         let read_started = Instant::now();
                         let result =
-                            appearance_profiles::read_prepared_pixels(prepared).map(Arc::new);
+                            appearance_profiles::read_prepared_asset(prepared).map(|asset| {
+                                match asset.format {
+                                    appearance_profiles::PixelFormat::Rgba8 => {
+                                        BackgroundData::Rgba(Arc::new(asset.bytes))
+                                    }
+                                    appearance_profiles::PixelFormat::Xrgb8888Le => {
+                                        BackgroundData::Xrgb(asset.bytes.into())
+                                    }
+                                }
+                            });
                         eprintln!(
                             "vigil-lock: prepared background read {}: {:?}",
                             prepared.asset.display(),
@@ -195,7 +210,7 @@ impl BackgroundWorker {
                         let render_started = Instant::now();
                         let result =
                             vigil_ui::render_background(source, key.fit, key.width, key.height)
-                                .map(Arc::new);
+                                .map(|rgba| BackgroundData::Rgba(Arc::new(rgba)));
                         eprintln!(
                             "vigil-lock: background resize {}x{}: {:?}",
                             key.width,
@@ -575,14 +590,31 @@ impl Locker {
                 continue;
             }
             match result.pixels {
-                Ok(rgba) => {
-                    entry.window.set_background_pixels(
-                        rgba.as_slice(),
-                        result.key.width,
-                        result.key.height,
-                    );
+                Ok(BackgroundData::Rgba(rgba)) => {
+                    entry
+                        .window
+                        .set_background_pixels(&rgba, result.key.width, result.key.height);
                     eprintln!(
                         "vigil-lock: background ready for {} in {:?}{}",
+                        entry.connector,
+                        result.elapsed,
+                        if result.cache_hit { " (cache hit)" } else { "" }
+                    );
+                }
+                Ok(BackgroundData::Xrgb(xrgb)) => {
+                    if !entry.window.set_native_background_xrgb(
+                        xrgb,
+                        result.key.width,
+                        result.key.height,
+                    ) {
+                        eprintln!(
+                            "vigil-lock: native background unsupported for {}; using fallback",
+                            entry.connector
+                        );
+                        continue;
+                    }
+                    eprintln!(
+                        "vigil-lock: native background ready for {} in {:?}{}",
                         entry.connector,
                         result.elapsed,
                         if result.cache_hit { " (cache hit)" } else { "" }
@@ -636,6 +668,7 @@ impl LockSession for Locker {
         window.set_user_name(&self.user);
         apply_kit_tokens_from_disk(&mut window, self.scheme.as_theme_str());
         self.snapshot.apply(&mut window);
+        let native_background_supported = window.supports_native_background();
         let queue = self.queue.clone();
         window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
         eprintln!(
@@ -666,7 +699,11 @@ impl LockSession for Locker {
                     })
                     .cloned()
             })
-            .flatten();
+            .flatten()
+            .filter(|prepared| {
+                prepared.format != appearance_profiles::PixelFormat::Xrgb8888Le
+                    || native_background_supported
+            });
             self.background_worker.render_prepared(
                 id,
                 BackgroundKey {
