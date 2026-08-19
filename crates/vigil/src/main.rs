@@ -145,15 +145,6 @@ fn resolve(cli: &Cli, config: &Config) -> Resolved {
     }
 }
 
-fn output_description(info: &vigil_core::OutputInfo) -> Option<String> {
-    let value = [info.make.as_deref(), info.model.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!value.is_empty()).then_some(value)
-}
-
 fn appearance_fit(fit: appearance_profiles::Fit) -> BackgroundFit {
     match fit {
         appearance_profiles::Fit::Fill => BackgroundFit::Fill,
@@ -726,7 +717,7 @@ impl App {
         let (scene_width, scene_height) = window.scene_size();
 
         let resolved_background = self.appearance_registry.resolve(
-            &appearance_profiles::OutputIdentity::new(&info.connector, output_description(&info)),
+            &appearance_profiles::OutputIdentity::new(&info.connector, info.description()),
             None,
         );
         let (background, fit) = self.looks.for_connector_with_fallback(
@@ -777,7 +768,7 @@ impl App {
         self.entries.push(Entry {
             id,
             connector: info.connector.clone(),
-            description: output_description(&info),
+            description: info.description(),
             // Scene dimensions: pointer routing works in the space the user
             // sees, so a portrait monitor must present as portrait here.
             width: scene_width,

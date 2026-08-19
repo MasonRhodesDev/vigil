@@ -12,7 +12,7 @@ repository = "https://github.com/MasonRhodesDev/vigil"
 [workspace.dependencies]
 vigil-core = { path = "crates/vigil-core" }
 vigil-config = { path = "crates/vigil-config" }
-monitor-profiles = { git = "https://github.com/MasonRhodesDev/monitor-profiles", rev = "aef5f0e" }
+monitor-profiles = { git = "https://github.com/MasonRhodesDev/monitor-profiles", rev = "64d5d1ed079582a2014ebf23c403a3ca03ee9c64" }
 appearance-profiles = { git = "https://github.com/MasonRhodesDev/appearance-profiles.git", rev = "780296ec160b18411c65982d323562e5617d6465" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
@@ -37,3 +37,4 @@ vigil-login = { path = "crates/vigil-login" }
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 slint-kit = { git = "https://github.com/MasonRhodesDev/slint-kit", rev = "ccd7397c3da83ff835d6295d6ec3841fc32c8bac", default-features = false }
 hypr-paths = "0.1.0"
+libc = "0.2"

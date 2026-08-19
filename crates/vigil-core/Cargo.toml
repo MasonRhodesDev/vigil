@@ -6,3 +6,6 @@ publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+monitor-profiles.workspace = true

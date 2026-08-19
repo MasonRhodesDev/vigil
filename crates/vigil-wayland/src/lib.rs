@@ -33,7 +33,7 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use wayland_client::{
-    Connection, Dispatch, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
     globals::registry_queue_init,
     protocol::{wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
@@ -162,10 +162,12 @@ impl<S: LockSession> App<S> {
         let Some(lock) = self.lock.as_ref() else {
             return;
         };
-        let id = OutputId(self.outputs.info(&output).map(|i| i.id).unwrap_or_default());
-        if self.entries.iter().any(|e| e.id == id) {
+        // The initial snapshot and later metadata callback can name the same
+        // object. Object identity is authoritative even before metadata exists.
+        if self.entries.iter().any(|e| e.output == output) {
             return;
         }
+        let id = OutputId(output.id().protocol_id());
         let surface = self.compositor.create_surface(qh);
         let viewport = self
             .viewporter

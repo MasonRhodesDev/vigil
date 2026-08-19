@@ -80,15 +80,6 @@ fn whoami() -> Result<String, String> {
         .map_err(|_| "cannot determine user (USER/LOGNAME unset); pass --user".into())
 }
 
-fn output_description(info: &OutputInfo) -> Option<String> {
-    let value = [info.make.as_deref(), info.model.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!value.is_empty()).then_some(value)
-}
-
 fn appearance_fit(fit: appearance_profiles::Fit) -> BackgroundFit {
     match fit {
         appearance_profiles::Fit::Fill => BackgroundFit::Fill,
@@ -653,7 +644,7 @@ impl LockSession for Locker {
                 }
             };
         let identity =
-            appearance_profiles::OutputIdentity::new(&info.connector, output_description(info));
+            appearance_profiles::OutputIdentity::new(&info.connector, info.description());
         let resolved = self.appearance_registry.resolve(&identity, None);
         let resolved_path = resolved.path.clone();
         let resolved_fit = resolved.fit;
@@ -678,7 +669,7 @@ impl LockSession for Locker {
         self.entries.push(Entry {
             id,
             connector: info.connector.clone(),
-            description: output_description(info).unwrap_or_else(|| info.connector.clone()),
+            description: info.description().unwrap_or_else(|| info.connector.clone()),
             window,
         });
         self.focus_profile_origin();
@@ -837,17 +828,31 @@ fn daemonize() -> ! {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
 
     let result = (|| -> Result<i32, String> {
         let (mut parent_end, child_end) =
             UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-        let mut child = std::process::Command::new(exe)
+        let mut command = std::process::Command::new(exe);
+        command
             .args(std::env::args().skip(1).filter(|a| a != "--daemonize"))
             .args(["--ready-fd", "1"])
-            .stdout(std::process::Stdio::from(OwnedFd::from(child_end)))
-            .spawn()
-            .map_err(|e| format!("spawn locker: {e}"))?;
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(OwnedFd::from(child_end)));
+        // SAFETY: this hook runs in the forked child before exec and calls only
+        // the async-signal-safe setsid(2). A new child is not a process-group
+        // leader, so it can create a session and detach from the caller's TTY.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().map_err(|e| format!("spawn locker: {e}"))?;
         let mut byte = [0u8; 1];
         match parent_end.read_exact(&mut byte) {
             Ok(()) => Ok(0),

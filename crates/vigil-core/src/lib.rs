@@ -31,6 +31,49 @@ pub struct OutputInfo {
     pub scale: f32,
 }
 
+impl OutputInfo {
+    /// Canonical EDID-style description used by `desc:` selectors. Wayland
+    /// compositors may append the connector in parentheses; it is already a
+    /// separate field and changes across desks.
+    pub fn description(&self) -> Option<String> {
+        let value = [self.make.as_deref(), self.model.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        monitor_profiles::MonitorIdentity::new(&self.connector, Some(value)).description
+    }
+}
+
+#[cfg(test)]
+mod output_description_tests {
+    use super::OutputInfo;
+
+    fn info(connector: &str, model: &str) -> OutputInfo {
+        OutputInfo {
+            connector: connector.into(),
+            width: 0,
+            height: 0,
+            refresh_mhz: 0,
+            make: None,
+            model: Some(model.into()),
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn drops_only_the_matching_connector_suffix() {
+        assert_eq!(
+            info("DP-4", "HP Inc. HP E243 CNK7510Y4B (DP-4)").description(),
+            Some("HP Inc. HP E243 CNK7510Y4B".into())
+        );
+        assert_eq!(
+            info("DP-4", "HP Inc. HP E243 CNK7510Y4B (DP-1)").description(),
+            Some("HP Inc. HP E243 CNK7510Y4B (DP-1)".into())
+        );
+    }
+}
+
 /// Output lifecycle, emitted by vigil-outputs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputEvent {
