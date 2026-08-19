@@ -7,7 +7,7 @@
 # greetd command lines (greetd-game-mode, operator) are left alone.
 
 pkgname=vigil
-pkgver=0.2.11
+pkgver=0.2.12
 pkgrel=1
 pkgdesc="Compositor-less greetd greeter and matching session lockscreen"
 arch=('x86_64')

@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.11
+Version:        0.2.12
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -59,14 +59,19 @@ output, runtime .slint themes with a compiled-in fallback.
 # explicitly so the offline RPM build can resolve them.
 cat >> .cargo/config.toml <<'EOF'
 
-[source."git+https://github.com/MasonRhodesDev/monitor-profiles?rev=aef5f0e"]
+[source."git+https://github.com/MasonRhodesDev/monitor-profiles?rev=64d5d1ed079582a2014ebf23c403a3ca03ee9c64#64d5d1ed079582a2014ebf23c403a3ca03ee9c64"]
 git = "https://github.com/MasonRhodesDev/monitor-profiles"
-rev = "aef5f0e"
+rev = "64d5d1ed079582a2014ebf23c403a3ca03ee9c64"
 replace-with = "vendored-sources"
 
 [source."git+https://github.com/MasonRhodesDev/appearance-profiles.git?rev=75d831a"]
 git = "https://github.com/MasonRhodesDev/appearance-profiles.git"
 rev = "75d831a"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/MasonRhodesDev/appearance-profiles.git?rev=780296ec160b18411c65982d323562e5617d6465#780296ec160b18411c65982d323562e5617d6465"]
+git = "https://github.com/MasonRhodesDev/appearance-profiles.git"
+rev = "780296ec160b18411c65982d323562e5617d6465"
 replace-with = "vendored-sources"
 
 [source."git+https://github.com/MasonRhodesDev/slint-kit?rev=ccd7397c3da83ff835d6295d6ec3841fc32c8bac"]
@@ -138,6 +143,11 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Wed Aug 19 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.12-1
+- Reuse shared canonical monitor identity across greeter and lockscreen.
+- Stabilize Wayland output identity and detach daemonized lock startup cleanly.
+- Preserve non-blocking native cached background presentation on every output.
+
 * Tue Aug 18 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.11-1
 - Keep the restart and shutdown controls left-aligned at bounded widths.
 
