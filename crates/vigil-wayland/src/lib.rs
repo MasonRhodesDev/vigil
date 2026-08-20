@@ -151,6 +151,10 @@ enum SurfaceRole {
     Lock { _surface: SessionLockSurface },
 }
 
+fn present_priority(is_lock: bool) -> u8 {
+    u8::from(!is_lock)
+}
+
 struct Entry {
     id: OutputId,
     output: wl_output::WlOutput,
@@ -169,6 +173,15 @@ struct Entry {
     /// once. Reset on size change so the first present after a rebuild
     /// cannot skip the commit (ext-session-lock blanks that output).
     committed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FractionalTarget {
+    surface: wl_surface::WlSurface,
+}
+
+fn initial_scale120(inherited: Option<u32>) -> u32 {
+    inherited.unwrap_or(120).max(1)
 }
 
 struct App<S: LockSession + 'static> {
@@ -258,15 +271,28 @@ impl<S: LockSession> App<S> {
             return;
         }
         let id = OutputId(output.id().protocol_id());
+        // Warning and lock surfaces overlap during secure handoff. Fractional
+        // scale for the new lock surface may arrive after its first configure,
+        // so inherit the already-known scale for this wl_output.
+        let inherited_scale120 = self
+            .entries
+            .iter()
+            .find(|entry| entry.output == output)
+            .map(|entry| entry.scale120);
         let surface = self.compositor.create_surface(qh);
         let viewport = self
             .viewporter
             .as_ref()
             .map(|v| v.get_viewport(&surface, qh, ()));
-        let fractional = self
-            .fractional_mgr
-            .as_ref()
-            .map(|m| m.get_fractional_scale(&surface, qh, id));
+        let fractional = self.fractional_mgr.as_ref().map(|m| {
+            m.get_fractional_scale(
+                &surface,
+                qh,
+                FractionalTarget {
+                    surface: surface.clone(),
+                },
+            )
+        });
         let (role, background_effect) = if self.warning.is_some() {
             let Some(layer_shell) = self.layer_shell.as_ref() else {
                 return;
@@ -312,7 +338,7 @@ impl<S: LockSession> App<S> {
             background_effect,
             viewport,
             fractional,
-            scale120: 120,
+            scale120: initial_scale120(inherited_scale120),
             logical: (0, 0),
             px: (0, 0),
             pool: None,
@@ -531,12 +557,19 @@ impl<S: LockSession> App<S> {
             return;
         }
         for id in self.dirty.take_all() {
-            let indices: Vec<_> = self
+            let mut indices: Vec<_> = self
                 .entries
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, entry)| (entry.id == id).then_some(idx))
                 .collect();
+            // During handoff both surfaces deliberately share one output ID
+            // and one retained OutputWindow. Render the fresh lock surface
+            // first; otherwise the warning surface consumes the one pending
+            // software frame and the lock surface commits its black fallback.
+            indices.sort_by_key(|idx| {
+                present_priority(matches!(self.entries[*idx].role, SurfaceRole::Lock { .. }))
+            });
             for idx in indices {
                 self.present(idx);
             }
@@ -1074,17 +1107,20 @@ impl<S: LockSession> OutputHandler for App<S> {
 // helpers for these; the manual impls don't overlap the Dispatch2 blanket
 // because our user-data types don't implement Dispatch2).
 
-impl<S: LockSession> Dispatch<WpFractionalScaleV1, OutputId> for App<S> {
+impl<S: LockSession> Dispatch<WpFractionalScaleV1, FractionalTarget> for App<S> {
     fn event(
         state: &mut Self,
         _: &WpFractionalScaleV1,
         event: wp_fractional_scale_v1::Event,
-        id: &OutputId,
+        target: &FractionalTarget,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
-            && let Some(idx) = state.entries.iter().position(|e| e.id == *id)
+            && let Some(idx) = state
+                .entries
+                .iter()
+                .position(|entry| entry.surface == target.surface)
             && state.entries[idx].scale120 != scale
         {
             state.entries[idx].scale120 = scale;
@@ -1099,6 +1135,22 @@ wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpFrac
 wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore wl_buffer::WlBuffer);
 wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore wl_region::WlRegion);
+
+#[cfg(test)]
+mod tests {
+    use super::{initial_scale120, present_priority};
+
+    #[test]
+    fn lock_handoff_inherits_fractional_output_scale() {
+        assert_eq!(initial_scale120(Some(150)), 150);
+        assert_eq!(initial_scale120(None), 120);
+    }
+
+    #[test]
+    fn lock_surface_renders_before_overlapping_warning_surface() {
+        assert!(present_priority(true) < present_priority(false));
+    }
+}
 
 impl<S: LockSession> ProvidesRegistryState for App<S> {
     fn registry(&mut self) -> &mut RegistryState {
