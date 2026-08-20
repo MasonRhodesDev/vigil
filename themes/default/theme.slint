@@ -18,6 +18,7 @@ export component DefaultTheme inherits Window {
     // Who this screen belongs to (lock: the session user). Empty = hidden.
     in property <string> user-name;
     in property <bool> panel-visible: true;
+    in property <bool> power-visible: true;
     in property <image> background-source;
     in property <bool> native-background: false;
     in property <string> clock-text;
@@ -227,6 +228,7 @@ export component DefaultTheme inherits Window {
 
     // Power actions, bottom-left.
     HorizontalLayout {
+        visible: root.power-visible;
         x: Theme.page-pad + Theme.space-sm;
         y: parent.height - Theme.page-pad - Theme.control-height;
         width: 240px;

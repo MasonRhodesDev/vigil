@@ -420,6 +420,11 @@ impl OutputWindow {
         self.set_property("panel-visible", Value::Bool(visible));
     }
 
+    /// Whether the theme's host power actions are visible.
+    pub fn set_power_visible(&mut self, visible: bool) {
+        self.set_optional_property("power-visible", Value::Bool(visible));
+    }
+
     /// Route a normalized input event into this window.
     pub fn dispatch(&mut self, event: InputEvent) {
         // Keys and buttons change what the scene shows through paths
