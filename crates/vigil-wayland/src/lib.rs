@@ -11,10 +11,12 @@
 //! windows + auth) and calls [`run`]; the event loop lives here because the
 //! Wayland connection *is* the loop for a lock client.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use calloop_wayland_source::WaylandSource;
+use hypr_slint_runtime::{DirtySet, Metrics, WaitDecision, WakeHandle};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     output::{OutputHandler, OutputState},
@@ -52,7 +54,13 @@ pub trait LockSession {
     /// Install a thread-safe wakeup for asynchronous work. Calling it makes
     /// the Wayland loop run a tick immediately instead of waiting for the
     /// next frame deadline.
-    fn set_waker(&mut self, _waker: Arc<dyn Fn() + Send + Sync>) {}
+    fn set_runtime(
+        &mut self,
+        _wake: WakeHandle,
+        _dirty: Arc<DirtySet<OutputId>>,
+        _metrics: Arc<Metrics>,
+    ) {
+    }
     /// An output has its first configured size; create its scene.
     fn output_ready(&mut self, id: OutputId, info: &OutputInfo);
     /// The output's pixel size or scale changed.
@@ -70,6 +78,7 @@ pub trait LockSession {
     fn render(&mut self, id: OutputId, target: FrameTarget<'_>) -> bool;
     /// Checked after every tick: true once auth succeeded.
     fn wants_unlock(&self) -> bool;
+    fn wait_decision(&self) -> WaitDecision;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,8 +104,6 @@ impl std::error::Error for LockError {}
 fn err(e: impl std::fmt::Display) -> LockError {
     LockError(e.to_string())
 }
-
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 struct Entry {
     id: OutputId,
@@ -135,9 +142,23 @@ struct App<S: LockSession + 'static> {
     got_locked: bool,
     outcome: Option<LockOutcome>,
     error: Option<LockError>,
+    wake: WakeHandle,
+    dirty: Arc<DirtySet<OutputId>>,
+    metrics: Arc<Metrics>,
+    present_retry: BTreeMap<OutputId, (std::time::Instant, u32)>,
 }
 
 impl<S: LockSession> App<S> {
+    fn schedule_present_retry(&mut self, id: OutputId) {
+        let attempt = self
+            .present_retry
+            .get(&id)
+            .map_or(0, |(_, attempt)| attempt.saturating_add(1));
+        let delay = Duration::from_millis(100 * (1_u64 << attempt.min(5)));
+        self.present_retry
+            .insert(id, (std::time::Instant::now() + delay, attempt));
+    }
+
     fn output_info(&self, idx: usize) -> OutputInfo {
         let entry = &self.entries[idx];
         let wayland_info = self.outputs.info(&entry.output);
@@ -233,14 +254,14 @@ impl<S: LockSession> App<S> {
         } else if resized {
             self.session.output_resized(id, &info);
         }
-        // Invariant: a configured lock surface gets a buffer promptly.
-        self.present(idx);
+        // Invariant: a configured lock surface gets a buffer in this event-loop
+        // iteration. Presentation stays outside protocol callbacks so redraws
+        // coalesce and buffer acquisition has one audited entry point.
+        self.dirty.mark(id);
+        self.wake.wake();
         let elapsed = configure_started.elapsed();
         if elapsed >= Duration::from_millis(8) {
-            eprintln!(
-                "vigil-lock: output {:?} configure and first present: {:?}",
-                id, elapsed
-            );
+            eprintln!("vigil-lock: output {:?} configure: {:?}", id, elapsed);
         }
     }
 
@@ -258,13 +279,16 @@ impl<S: LockSession> App<S> {
         let id = self.entries[idx].id;
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             eprintln!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
+            self.schedule_present_retry(id);
             return;
         };
+        self.metrics.record_buffer_acquire();
         let stride = w as usize * 4;
         let Ok((buffer, canvas)) =
             pool.create_buffer(w as i32, h as i32, stride as i32, wl_shm::Format::Xrgb8888)
         else {
             eprintln!("vigil-lock: output {id:?}: shm buffer {w}x{h} failed");
+            self.schedule_present_retry(id);
             return;
         };
         if force {
@@ -282,7 +306,11 @@ impl<S: LockSession> App<S> {
         );
         let render_elapsed = render_started.elapsed();
         if !drew && !force {
+            self.present_retry.remove(&id);
             return;
+        }
+        if drew {
+            self.metrics.record_render();
         }
         if !drew {
             eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
@@ -292,7 +320,9 @@ impl<S: LockSession> App<S> {
         let _ = buffer.attach_to(surface);
         surface.damage_buffer(0, 0, w as i32, h as i32);
         surface.commit();
+        self.metrics.record_commit();
         self.entries[idx].committed = true;
+        self.present_retry.remove(&id);
         let commit_elapsed = commit_started.elapsed();
         if render_elapsed >= Duration::from_millis(8) || commit_elapsed >= Duration::from_millis(8)
         {
@@ -308,13 +338,21 @@ impl<S: LockSession> App<S> {
     }
 
     fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        for (&id, &(deadline, _)) in &self.present_retry {
+            if deadline <= now {
+                self.dirty.mark(id);
+            }
+        }
         self.session.tick();
         if self.session.wants_unlock() {
             self.finish_unlock();
             return;
         }
-        for idx in 0..self.entries.len() {
-            self.present(idx);
+        for id in self.dirty.take_all() {
+            if let Some(idx) = self.entries.iter().position(|entry| entry.id == id) {
+                self.present(idx);
+            }
         }
     }
 
@@ -337,6 +375,11 @@ pub fn run<S: LockSession + 'static>(session: S) -> Result<LockOutcome, LockErro
     let (globals, event_queue) = registry_queue_init(&conn).map_err(err)?;
     let qh: QueueHandle<App<S>> = event_queue.handle();
     let mut event_loop: EventLoop<App<S>> = EventLoop::try_new().map_err(err)?;
+    let signal = event_loop.get_signal();
+    let wake_signal = signal.clone();
+    let wake = WakeHandle::new(move || wake_signal.wakeup());
+    let dirty = Arc::new(DirtySet::new());
+    let metrics = Arc::new(Metrics::new());
 
     let mut app = App {
         session,
@@ -356,6 +399,10 @@ pub fn run<S: LockSession + 'static>(session: S) -> Result<LockOutcome, LockErro
         got_locked: false,
         outcome: None,
         error: None,
+        wake: wake.clone(),
+        dirty: dirty.clone(),
+        metrics: metrics.clone(),
+        present_retry: BTreeMap::new(),
     };
 
     app.lock = Some(
@@ -373,11 +420,24 @@ pub fn run<S: LockSession + 'static>(session: S) -> Result<LockOutcome, LockErro
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .map_err(err)?;
-    let signal = event_loop.get_signal();
-    app.session.set_waker(Arc::new(move || signal.wakeup()));
+    app.session.set_runtime(wake, dirty, metrics);
 
     while app.outcome.is_none() && app.error.is_none() {
-        event_loop.dispatch(FRAME_INTERVAL, &mut app).map_err(err)?;
+        let mut timeout = match app.session.wait_decision() {
+            WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
+            WaitDecision::Indefinite => None,
+        };
+        if let Some(retry) = app
+            .present_retry
+            .values()
+            .map(|(deadline, _)| deadline.saturating_duration_since(std::time::Instant::now()))
+            .min()
+        {
+            timeout = Some(timeout.map_or(retry, |current| current.min(retry)));
+        }
+        event_loop.dispatch(timeout, &mut app).map_err(err)?;
+        app.wake.acknowledge();
+        app.metrics.record_wake();
         // A frame deadline, Wayland input, or an asynchronous worker wakeup
         // all converge here. No expensive client work belongs in callbacks.
         app.tick();

@@ -8,12 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+hypr-slint-runtime.workspace = true
 vigil-core.workspace = true
 # Not the workspace slint entry: enabling renderer-femtovg there would unify
 # the feature onto every crate in the graph, and the shipped greeter is
 # deliberately software-only (DESIGN.md §7 -- GL is fidelity on top, never
 # the baseline).
-slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "renderer-femtovg"] }
+slint = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2", "renderer-femtovg"] }
 smithay = { workspace = true, features = ["backend_egl", "backend_gbm", "backend_drm"] }
 # Same version smithay's backend_gbm pulls; the surface has to be shared
 # between the EGL window surface and whoever locks the front buffer.

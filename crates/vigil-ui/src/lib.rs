@@ -6,8 +6,10 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
+use hypr_slint_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use image::{DynamicImage, RgbaImage, imageops};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType, TargetPixel,
@@ -17,6 +19,7 @@ use slint::platform::{
 };
 use slint::{
     Color, ComponentHandle, Image, LogicalPosition, PhysicalSize, Rgba8Pixel, SharedPixelBuffer,
+    WindowSize,
 };
 use slint_interpreter::{ComponentInstance, Value};
 use slint_kit::TokenSet;
@@ -38,6 +41,43 @@ pub struct VigilPlatform {
     /// exists after that output's surface does. The binary sets this, then
     /// instantiates.
     next: Rc<RefCell<Option<Rc<dyn WindowAdapter>>>>,
+    runtime: Rc<RefCell<Option<RuntimeBinding>>>,
+    next_output: Rc<RefCell<Option<OutputId>>>,
+}
+
+#[derive(Clone)]
+struct RuntimeBinding {
+    wake: WakeHandle,
+    dirty: Arc<DirtySet<OutputId>>,
+    metrics: Arc<Metrics>,
+}
+
+struct TrackedSoftwareWindow {
+    inner: Rc<MinimalSoftwareWindow>,
+    redraw: RedrawHandle<OutputId>,
+}
+
+impl WindowAdapter for TrackedSoftwareWindow {
+    fn window(&self) -> &slint::Window {
+        self.inner.window()
+    }
+
+    fn set_size(&self, size: WindowSize) {
+        WindowAdapter::set_size(self.inner.as_ref(), size);
+    }
+
+    fn size(&self) -> PhysicalSize {
+        WindowAdapter::size(self.inner.as_ref())
+    }
+
+    fn request_redraw(&self) {
+        WindowAdapter::request_redraw(self.inner.as_ref());
+        self.redraw.request_redraw();
+    }
+
+    fn renderer(&self) -> &dyn slint::platform::Renderer {
+        WindowAdapter::renderer(self.inner.as_ref())
+    }
 }
 
 impl VigilPlatform {
@@ -47,6 +87,28 @@ impl VigilPlatform {
         let platform = Self::default();
         slint::platform::set_platform(Box::new(platform.clone()))?;
         Ok(platform)
+    }
+
+    pub fn set_runtime(
+        &self,
+        wake: WakeHandle,
+        dirty: Arc<DirtySet<OutputId>>,
+        metrics: Arc<Metrics>,
+    ) {
+        *self.runtime.borrow_mut() = Some(RuntimeBinding {
+            wake,
+            dirty,
+            metrics,
+        });
+    }
+
+    /// Associate the next theme instantiation with one physical output.
+    pub fn set_next_output(&self, output: OutputId) {
+        *self.next_output.borrow_mut() = Some(output);
+    }
+
+    pub fn clear_next_output(&self) {
+        *self.next_output.borrow_mut() = None;
     }
 
     /// Claim the adapter created by the most recently instantiated component.
@@ -76,6 +138,12 @@ impl VigilPlatform {
 }
 
 impl Platform for VigilPlatform {
+    fn cursor_flash_cycle(&self) -> Duration {
+        // Login/lock prompts may remain focused for hours. A blinking caret
+        // must not keep every fullscreen output's animation clock alive.
+        Duration::ZERO
+    }
+
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
         // A one-shot override: taken, so the next instantiation goes back to
         // the software default rather than silently reusing this adapter.
@@ -93,7 +161,24 @@ impl Platform for VigilPlatform {
         // what made the first on-metal run drop keystrokes.
         let adapter = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
         self.adapters.borrow_mut().push(adapter.clone());
-        Ok(adapter)
+        let Some(runtime) = self.runtime.borrow().clone() else {
+            return Ok(adapter);
+        };
+        let output = self
+            .next_output
+            .borrow()
+            .as_ref()
+            .copied()
+            .expect("output must be set before a runtime-backed theme is instantiated");
+        let redraw = runtime
+            .wake
+            .redraw_handle(runtime.dirty, runtime.metrics, output);
+        // Showing a new scene always owes its output one initial frame.
+        redraw.request_redraw();
+        Ok(Rc::new(TrackedSoftwareWindow {
+            inner: adapter,
+            redraw,
+        }))
     }
 }
 
@@ -250,12 +335,19 @@ impl OutputWindow {
     /// there is nothing to be gained by trusting them.
     pub fn request_present(&mut self) {
         self.backend.request_present();
+        self.component.window().request_redraw();
+    }
+
+    /// Re-arm rendering without waking immediately. Presenters use this with
+    /// a bounded retry deadline after a device error.
+    pub fn request_present_deferred(&mut self) {
+        self.backend.request_present();
     }
 
     pub fn set_cursor_visible(&mut self, visible: bool) {
         if self.cursor_visible != visible {
             self.cursor_visible = visible;
-            self.backend.request_present();
+            self.request_present();
         }
     }
 
@@ -354,7 +446,7 @@ impl OutputWindow {
                     position: self.pointer_position(),
                 });
                 if self.cursor_visible {
-                    self.backend.request_present();
+                    self.request_present();
                 }
             }
             InputEvent::PointerAbsolute { x, y } => {
@@ -364,7 +456,7 @@ impl OutputWindow {
                     position: self.pointer_position(),
                 });
                 if self.cursor_visible {
-                    self.backend.request_present();
+                    self.request_present();
                 }
             }
             InputEvent::PointerButton { button, pressed } => {
@@ -590,6 +682,11 @@ impl OutputWindow {
     /// Mark the scene changed.
     fn touch(&self) {
         self.revision.set(self.revision.get().wrapping_add(1));
+        self.component.window().request_redraw();
+    }
+
+    pub fn slint_window(&self) -> &slint::Window {
+        self.component.window()
     }
 }
 
@@ -1294,6 +1391,15 @@ mod tests {
     #[test]
     fn interpreter_component_renders_into_xrgb_target() {
         let platform = VigilPlatform::install().unwrap();
+        let dirty = Arc::new(DirtySet::new());
+        let metrics = Arc::new(Metrics::new());
+        let wake_edges = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_edges_for_callback = wake_edges.clone();
+        let wake = WakeHandle::new(move || {
+            wake_edges_for_callback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        platform.set_runtime(wake.clone(), dirty.clone(), metrics.clone());
+        platform.set_next_output(OutputId(1));
         // Compile a tiny interpreter component here instead of depending on vigil-theme;
         // the crate boundary requires vigil-ui to remain theme-implementation agnostic.
         let source = r#"
@@ -1307,8 +1413,11 @@ mod tests {
         );
         assert!(!result.has_errors());
         let component = result.component("Smoke").unwrap().create().unwrap();
+        platform.clear_next_output();
         let adapter = platform.claim_last_adapter().unwrap();
         let mut window = OutputWindow::new(OutputId(1), 2, 2, 1.0, adapter, component).unwrap();
+        assert_eq!(dirty.take_all(), vec![OutputId(1)]);
+        wake.acknowledge();
         let mut buffer = vec![0_u8; 16];
         assert!(window.render_if_needed(FrameTarget {
             buffer: &mut buffer,
@@ -1322,6 +1431,8 @@ mod tests {
                 0x60, 0x40, 0x20, 0, 0x60, 0x40, 0x20, 0, 0x60, 0x40, 0x20, 0, 0x60, 0x40, 0x20, 0
             ]
         );
+        // A static visible frame does not re-arm itself.
+        assert!(dirty.take_all().is_empty());
 
         let source = r#"
             export component Native inherits Window {
@@ -1339,7 +1450,9 @@ mod tests {
                 .build_from_source(source.to_owned(), "native.slint".into()),
         );
         assert!(!result.has_errors());
+        platform.set_next_output(OutputId(2));
         let component = result.component("Native").unwrap().create().unwrap();
+        platform.clear_next_output();
         let adapter = platform.claim_last_adapter().unwrap();
         let mut window = OutputWindow::new(OutputId(2), 2, 2, 1.0, adapter, component).unwrap();
         assert!(window.supports_native_background());
@@ -1356,6 +1469,8 @@ mod tests {
             [0, 0, 0xff, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0]
         );
         window.set_optional_property("show-box", Value::Bool(false));
+        assert_eq!(dirty.take_all(), vec![OutputId(2)]);
+        assert!(wake_edges.load(std::sync::atomic::Ordering::Relaxed) >= 2);
         assert!(window.render_if_needed(FrameTarget {
             buffer: &mut buffer,
             width: 2,

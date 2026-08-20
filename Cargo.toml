@@ -20,8 +20,9 @@ smithay = { version = "0.7.0", default-features = false }
 # default display-info feature needs system libdisplay-info < 0.3 (Fedora 44 ships 0.3).
 # We only need DrmScanner; EDID names come in M2 via libdisplay-info 0.3 directly.
 smithay-drm-extras = { version = "0.1", default-features = false }
-slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "renderer-software", "software-renderer-systemfonts"] }
-slint-interpreter = { version = "1.17", default-features = false, features = ["std", "compat-1-2"] }
+slint = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "software-renderer-systemfonts"] }
+slint-interpreter = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2"] }
+hypr-slint-runtime = { git = "https://github.com/MasonRhodesDev/hypr-slint-runtime", tag = "v0.1.0" }
 greetd_ipc = { version = "0.10", features = ["sync-codec"] }
 xkbcommon = "0.9"
 calloop = "0.14"

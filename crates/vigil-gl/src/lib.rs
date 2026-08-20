@@ -404,6 +404,7 @@ pub struct GlWindow {
     /// it a GL greeter would redraw and flip forever on an idle login
     /// screen; the software path gets the same signal from `draw_if_needed`.
     needs_redraw: std::cell::Cell<bool>,
+    redraw: std::cell::RefCell<Option<hypr_slint_runtime::RedrawHandle<vigil_core::OutputId>>>,
     /// Present when rendering on-screen; absent for a context-only window,
     /// which can compile and instantiate a scene but not produce pixels.
     gbm: Option<GbmWindow>,
@@ -444,8 +445,17 @@ impl GlWindow {
             size: std::cell::Cell::new(size),
             // Draw the first frame unconditionally.
             needs_redraw: std::cell::Cell::new(true),
+            redraw: std::cell::RefCell::new(None),
             gbm,
         }))
+    }
+
+    pub fn set_redraw_handle(
+        &self,
+        redraw: hypr_slint_runtime::RedrawHandle<vigil_core::OutputId>,
+    ) {
+        redraw.request_redraw();
+        *self.redraw.borrow_mut() = Some(redraw);
     }
 
     /// Draw the current scene and swap. The swapped buffer is then available
@@ -491,6 +501,9 @@ impl WindowAdapter for GlWindow {
 
     fn request_redraw(&self) {
         self.needs_redraw.set(true);
+        if let Some(redraw) = self.redraw.borrow().as_ref() {
+            redraw.request_redraw();
+        }
     }
 }
 

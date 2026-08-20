@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
+use hypr_slint_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use vigil_config::Config;
 use vigil_core::{
     AppearanceEvent, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget, InputEvent,
@@ -33,6 +34,17 @@ struct Cli {
     /// the blocking form a `before_sleep_cmd` needs: the caller's sleep
     /// inhibitor is not released until the screen is already secured.
     daemonize: bool,
+}
+
+fn clock_interval(format: &str) -> Duration {
+    if ["%S", "%T", "%X", "%r"]
+        .iter()
+        .any(|token| format.contains(token))
+    {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(60)
+    }
 }
 
 fn parse_cli() -> Result<Cli, String> {
@@ -260,6 +272,26 @@ struct Locker {
     background_worker: BackgroundWorker,
     background_rx: mpsc::Receiver<BackgroundResult>,
     background_waker: Option<Arc<dyn Fn() + Send + Sync>>,
+    event_waker: Arc<Mutex<Option<WakeHandle>>>,
+    scheduler: IdleScheduler,
+}
+
+fn forwarded_channel<T: Send + 'static>(
+    waker: Arc<Mutex<Option<WakeHandle>>>,
+) -> (mpsc::Sender<T>, mpsc::Receiver<T>) {
+    let (source_tx, source_rx) = mpsc::channel();
+    let (app_tx, app_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(event) = source_rx.recv() {
+            if app_tx.send(event).is_err() {
+                break;
+            }
+            if let Some(wake) = waker.lock().expect("event waker poisoned").as_ref() {
+                wake.wake();
+            }
+        }
+    });
+    (source_tx, app_rx)
 }
 
 /// Grace window: unlock without auth shortly after locking. Two deadlines
@@ -327,9 +359,10 @@ impl Locker {
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
         let clock_format = config.look.clock_format.clone();
+        let event_waker = Arc::new(Mutex::new(None));
         let (auth_tx, auth_rx) = mpsc::channel();
-        let (login_tx, login_rx) = mpsc::channel();
-        let (appearance_tx, appearance_rx) = mpsc::channel();
+        let (login_tx, login_rx) = forwarded_channel(event_waker.clone());
+        let (appearance_tx, appearance_rx) = forwarded_channel(event_waker.clone());
         let monitor_profiles = config
             .profiles
             .dir
@@ -400,6 +433,8 @@ impl Locker {
             background_worker: BackgroundWorker::new(background_tx),
             background_rx,
             background_waker: None,
+            event_waker,
+            scheduler: IdleScheduler::default(),
         };
         if let Some(login) = &locker.login {
             login.spawn_signals(locker.login_tx.clone());
@@ -414,8 +449,12 @@ impl Locker {
 
     fn start_attempt(&mut self) {
         let tx = self.auth_tx.clone();
+        let waker = self.event_waker.clone();
         self.attempt = Some(PamAttempt::start(&self.user, move |event| {
             let _ = tx.send(event);
+            if let Some(wake) = waker.lock().expect("event waker poisoned").as_ref() {
+                wake.wake();
+            }
         }));
     }
 
@@ -618,13 +657,25 @@ impl Locker {
 }
 
 impl LockSession for Locker {
-    fn set_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
-        self.background_waker = Some(waker);
+    fn set_runtime(
+        &mut self,
+        wake: WakeHandle,
+        dirty: Arc<DirtySet<OutputId>>,
+        metrics: Arc<Metrics>,
+    ) {
+        self.platform.set_runtime(wake.clone(), dirty, metrics);
+        *self.event_waker.lock().expect("event waker poisoned") = Some(wake.clone());
+        self.background_waker = Some(Arc::new(move || {
+            wake.wake();
+        }));
     }
 
     fn output_ready(&mut self, id: OutputId, info: &OutputInfo) {
         let scene_started = Instant::now();
-        let component = match self.theme.instantiate() {
+        self.platform.set_next_output(id);
+        let component = self.theme.instantiate();
+        self.platform.clear_next_output();
+        let component = match component {
             Ok(component) => component,
             Err(e) => {
                 eprintln!("vigil-lock: skipping output {id:?}: {e}");
@@ -784,7 +835,7 @@ impl LockSession for Locker {
 
     fn tick(&mut self) {
         vigil_ui::advance_timers();
-        if self.last_clock.0.elapsed() >= Duration::from_secs(1) {
+        if self.last_clock.0.elapsed() >= clock_interval(&self.clock_format) {
             let text = clock_text(&self.clock_format);
             if text != self.last_clock.1 {
                 self.each_window(|w| w.set_clock(&text));
@@ -808,6 +859,18 @@ impl LockSession for Locker {
 
     fn wants_unlock(&self) -> bool {
         self.unlocked
+    }
+
+    fn wait_decision(&self) -> WaitDecision {
+        let slint = self
+            .scheduler
+            .from_slint(self.entries.iter().map(|entry| entry.window.slint_window()));
+        let clock = clock_interval(&self.clock_format).saturating_sub(self.last_clock.0.elapsed());
+        match slint {
+            WaitDecision::Frame(delay) => WaitDecision::Frame(delay.min(clock)),
+            WaitDecision::Timer(delay) => WaitDecision::Timer(delay.min(clock)),
+            WaitDecision::Indefinite => WaitDecision::Timer(clock),
+        }
     }
 }
 
@@ -1061,4 +1124,9 @@ mod tests {
 
         std::fs::remove_file(path).unwrap();
     }
+}
+#[test]
+fn static_clock_uses_minute_deadline() {
+    assert_eq!(clock_interval("%H:%M"), Duration::from_secs(60));
+    assert_eq!(clock_interval("%H:%M:%S"), Duration::from_secs(1));
 }

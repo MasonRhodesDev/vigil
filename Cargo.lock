@@ -1580,6 +1580,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2b57d35d5a9d1fe4892d499fca8fb64f331cf0a2618ca38b1fc32fdfef9f6ed"
 
 [[package]]
+name = "hypr-slint-runtime"
+version = "0.1.0"
+source = "git+https://github.com/MasonRhodesDev/hypr-slint-runtime?tag=v0.1.0#2c18ead7ea713ba20cfcc9871e7eada23f12fdf9"
+dependencies = [
+ "slint",
+]
+
+[[package]]
 name = "i-slint-backend-linuxkms"
 version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4801,6 +4809,7 @@ version = "0.2.13"
 dependencies = [
  "appearance-profiles 0.2.0",
  "calloop 0.14.4",
+ "hypr-slint-runtime",
  "image",
  "monitor-profiles",
  "slint-kit",
@@ -4848,6 +4857,7 @@ version = "0.2.13"
 dependencies = [
  "drm",
  "gbm",
+ "hypr-slint-runtime",
  "image",
  "slint",
  "slint-interpreter",
@@ -4870,6 +4880,7 @@ name = "vigil-lock"
 version = "0.2.13"
 dependencies = [
  "appearance-profiles 0.2.0",
+ "hypr-slint-runtime",
  "image",
  "libc",
  "monitor-profiles",
@@ -4952,6 +4963,7 @@ name = "vigil-ui"
 version = "0.2.13"
 dependencies = [
  "bytemuck",
+ "hypr-slint-runtime",
  "image",
  "slint",
  "slint-interpreter",
@@ -4965,6 +4977,7 @@ name = "vigil-wayland"
 version = "0.2.13"
 dependencies = [
  "calloop-wayland-source",
+ "hypr-slint-runtime",
  "smithay-client-toolkit",
  "vigil-core",
  "wayland-client",

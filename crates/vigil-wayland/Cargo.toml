@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+hypr-slint-runtime.workspace = true
 vigil-core.workspace = true
 smithay-client-toolkit.workspace = true
 calloop-wayland-source.workspace = true

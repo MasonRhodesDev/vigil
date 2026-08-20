@@ -16,8 +16,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
-use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
+use hypr_slint_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use monitor_profiles::{ConnectedOutput, Profile, ResolvedOutput};
 use vigil_auth::AuthMachine;
 use vigil_config::Config;
@@ -33,7 +33,6 @@ use vigil_session::SessionManager;
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, UiSnapshot, VigilPlatform, apply_kit_tokens_from_system};
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// How often the banner file is re-read. Host integrations update it at
 /// human timescale; a 1s poll costs one small read and needs no watcher.
 const BANNER_POLL: Duration = Duration::from_secs(1);
@@ -72,6 +71,17 @@ fn profiles_dir_fingerprint(dir: &std::path::Path) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn clock_interval(format: &str) -> Duration {
+    if ["%S", "%T", "%X", "%r"]
+        .iter()
+        .any(|token| format.contains(token))
+    {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(60)
+    }
 }
 
 struct Cli {
@@ -287,10 +297,42 @@ struct App {
     /// kernel may have dropped its display state.
     login_rx: std::sync::mpsc::Receiver<LoginEvent>,
     signal: LoopSignal,
+    wake: WakeHandle,
+    dirty: std::sync::Arc<DirtySet<OutputId>>,
+    metrics: std::sync::Arc<Metrics>,
+    scheduler: IdleScheduler,
+    running: bool,
+    present_retry: std::collections::BTreeMap<OutputId, (Instant, u32)>,
     exit_code: i32,
 }
 
 impl App {
+    fn wait_timeout(&self) -> Option<Duration> {
+        let slint = match self
+            .scheduler
+            .from_slint(self.entries.iter().map(|entry| entry.window.slint_window()))
+        {
+            WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
+            WaitDecision::Indefinite => None,
+        };
+        // These are real application deadlines, not a frame clock. The clock
+        // and host banner are sampled only when their displayed value may change.
+        let clock = clock_interval(&self.clock_format).saturating_sub(self.last_clock.0.elapsed());
+        let banner = self
+            .banner_file
+            .as_ref()
+            .map(|_| BANNER_POLL.saturating_sub(self.last_banner.elapsed()));
+        let retry = self
+            .present_retry
+            .values()
+            .map(|(deadline, _)| deadline.saturating_duration_since(Instant::now()))
+            .min();
+        [slint, Some(clock), banner, retry]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     fn on_session(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::Pause => {
@@ -505,7 +547,11 @@ impl App {
                     }
                 }
                 OutputEvent::Removed(id) => self.remove_output(id),
-                OutputEvent::NeedsRedraw(_) => {}
+                OutputEvent::NeedsRedraw(id) => {
+                    if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+                        entry.window.request_present();
+                    }
+                }
             }
         }
         self.rebuild_row();
@@ -584,6 +630,11 @@ impl App {
         let gl_window =
             vigil_gl::GlWindow::with_surface(gl_surface, vigil_gl::PhysicalSizeExport::new(w, h))
                 .map_err(|e| e.to_string())?;
+        gl_window.set_redraw_handle(self.wake.redraw_handle(
+            self.dirty.clone(),
+            self.metrics.clone(),
+            id,
+        ));
         gl_window.set_size(vigil_gl::PhysicalSizeExport::new(w, h));
 
         // One instantiation asks for an adapter more than once, so the
@@ -592,9 +643,11 @@ impl App {
         // unclaimed adapter: earlier outputs leave their own behind, and a
         // leftover is not evidence about this one.
         let before = self.platform.adapters_created();
+        self.platform.set_next_output(id);
         self.platform.use_next_adapter(gl_window.clone());
         let component = self.theme.instantiate();
         self.platform.clear_adapter_override();
+        self.platform.clear_next_output();
         let component = component.map_err(|e| e.to_string())?;
         if self.platform.adapters_created() > before {
             return Err("theme bound to a software adapter".into());
@@ -696,7 +749,10 @@ impl App {
                     .ok_or("DRM surface consumed by a failed GL attempt")?;
                 let presenter: Box<dyn Presenter> =
                     Box::new(DumbBufferPresenter::new(surface).map_err(|e| e.to_string())?);
-                let component = self.theme.instantiate().map_err(|e| e.to_string())?;
+                self.platform.set_next_output(id);
+                let component = self.theme.instantiate();
+                self.platform.clear_next_output();
+                let component = component.map_err(|e| e.to_string())?;
                 let adapter = self
                     .platform
                     .claim_last_adapter()
@@ -947,6 +1003,7 @@ impl App {
                     }
                     .store(&self.state_file);
                 }
+                self.running = false;
                 self.signal.stop();
                 return;
             }
@@ -1064,6 +1121,7 @@ impl App {
             requests.push((entry.id, background, fit, width, height, prepared));
         }
         let tx = self.background_tx.clone();
+        let wake = self.wake.clone();
         std::thread::spawn(move || {
             use std::collections::HashMap;
             use std::sync::Arc;
@@ -1129,6 +1187,7 @@ impl App {
                 cache_key,
                 outputs,
             });
+            wake.wake();
         });
     }
 
@@ -1176,6 +1235,12 @@ impl App {
     }
 
     fn tick(&mut self) {
+        let now = Instant::now();
+        for (&id, &(deadline, _)) in &self.present_retry {
+            if deadline <= now {
+                self.dirty.mark(id);
+            }
+        }
         vigil_ui::advance_timers();
         self.pump_backgrounds();
         let repeats = self.input.tick_repeat(Instant::now());
@@ -1189,7 +1254,7 @@ impl App {
                 e.window.set_caps_lock(caps);
             }
         }
-        if self.last_clock.0.elapsed() >= Duration::from_secs(1) {
+        if self.last_clock.0.elapsed() >= clock_interval(&self.clock_format) {
             let text = clock_text(&self.clock_format);
             if text != self.last_clock.1 {
                 for e in self.entries.iter_mut() {
@@ -1209,7 +1274,8 @@ impl App {
         }
         self.pump_login();
         self.pump_messages();
-        self.render();
+        let dirty = self.dirty.take_all();
+        self.render(&dirty);
     }
 
     /// Re-read the banner file and push any change to every output. A
@@ -1230,12 +1296,15 @@ impl App {
         }
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, dirty: &[OutputId]) {
         if !self.active {
             return;
         }
         let mut dead = Vec::new();
         for (i, entry) in self.entries.iter_mut().enumerate() {
+            if !dirty.contains(&entry.id) {
+                continue;
+            }
             let Entry {
                 presenter,
                 window,
@@ -1243,6 +1312,7 @@ impl App {
                 ..
             } = entry;
             let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
+            self.metrics.record_buffer_acquire();
             match presenter.with_frame(&mut |canvas| {
                 // Either canvas: the window knows which backend it has, and
                 // the presenter hands out the matching kind.
@@ -1266,7 +1336,14 @@ impl App {
                 }
                 drew
             }) {
-                Ok(_) => *present_failures = 0,
+                Ok(drew) => {
+                    if drew {
+                        self.metrics.record_render();
+                        self.metrics.record_commit();
+                    }
+                    self.present_retry.remove(&entry.id);
+                    *present_failures = 0
+                }
                 Err(PresentError::DeviceLost) => dead.push(i),
                 Err(e) => {
                     // The frame was drawn and the scene's dirty flag consumed,
@@ -1276,7 +1353,11 @@ impl App {
                     // flip and produces an endless ENOMEM loop on amdgpu.
                     // Resume/VT activation explicitly invalidate presenters at
                     // the point where a modeset is actually required.
-                    window.request_present();
+                    window.request_present_deferred();
+                    let exponent = (*present_failures).min(5);
+                    let delay = Duration::from_millis(100 * (1_u64 << exponent));
+                    self.present_retry
+                        .insert(entry.id, (Instant::now() + delay, *present_failures));
                     // A persistent failure retries every frame; do not narrate
                     // it every frame.
                     if *present_failures % PRESENT_LOG_EVERY == 0 {
@@ -1473,12 +1554,28 @@ fn run() -> Result<i32, String> {
     let mut event_loop: EventLoop<App> =
         EventLoop::try_new().map_err(|e| format!("event loop: {e}"))?;
     let handle = event_loop.handle();
+    let signal = event_loop.get_signal();
+    let wake_signal = signal.clone();
+    let wake = WakeHandle::new(move || wake_signal.wakeup());
+    let dirty = std::sync::Arc::new(DirtySet::new());
+    let metrics = std::sync::Arc::new(Metrics::new());
+    platform.set_runtime(wake.clone(), dirty.clone(), metrics.clone());
 
     // Sleep signals on a worker thread (the vigil-pam pattern: the event loop
     // is calloop-driven and must never block on D-Bus). logind being absent
     // is survivable — the greeter then behaves exactly as it did before, so
     // this must never be fatal.
-    let (login_tx, login_rx) = std::sync::mpsc::channel();
+    let (login_tx, login_worker_rx) = std::sync::mpsc::channel();
+    let (login_app_tx, login_rx) = std::sync::mpsc::channel();
+    let login_wake = wake.clone();
+    std::thread::spawn(move || {
+        while let Ok(event) = login_worker_rx.recv() {
+            if login_app_tx.send(event).is_err() {
+                break;
+            }
+            login_wake.wake();
+        }
+    });
     let login = LoginSession::connect_for("vigil");
     if let Some(login) = &login {
         login.spawn_sleep_signals(login_tx);
@@ -1544,7 +1641,13 @@ fn run() -> Result<i32, String> {
         snapshot: UiSnapshot::default(),
         active: true,
         login_rx,
-        signal: event_loop.get_signal(),
+        signal,
+        wake,
+        dirty,
+        metrics,
+        scheduler: IdleScheduler::default(),
+        running: true,
+        present_retry: Default::default(),
         exit_code: 1,
     };
 
@@ -1613,19 +1716,17 @@ fn run() -> Result<i32, String> {
         )
         .map_err(|e| format!("input source: {e}"))?;
 
-    handle
-        .insert_source(
-            Timer::from_duration(FRAME_INTERVAL),
-            |_deadline, _, app: &mut App| {
-                app.tick();
-                TimeoutAction::ToDuration(FRAME_INTERVAL)
-            },
-        )
-        .map_err(|e| format!("timer source: {e}"))?;
-
-    event_loop
-        .run(None, &mut app, |_| {})
-        .map_err(|e| format!("event loop run: {e}"))?;
+    // A static scene has no frame timer. calloop blocks until input, DRM,
+    // lifecycle/worker wakeups, or a real Slint/application deadline.
+    while app.running {
+        let timeout = app.wait_timeout();
+        event_loop
+            .dispatch(timeout, &mut app)
+            .map_err(|e| format!("event loop dispatch: {e}"))?;
+        app.wake.acknowledge();
+        app.metrics.record_wake();
+        app.tick();
+    }
 
     Ok(app.exit_code)
 }
@@ -1643,6 +1744,12 @@ fn main() {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn static_clock_uses_minute_deadline() {
+        assert_eq!(clock_interval("%H:%M"), Duration::from_secs(60));
+        assert_eq!(clock_interval("%H:%M:%S"), Duration::from_secs(1));
+    }
 
     #[test]
     fn banner_text_collapses_to_one_line() {
