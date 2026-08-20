@@ -15,7 +15,7 @@ use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
@@ -115,6 +115,16 @@ impl Simulator {
         }
     }
 
+    fn pointer_position(&self, position: PhysicalPosition<f64>) -> (f64, f64) {
+        let Some(window) = self.window.as_ref() else {
+            return (position.x, position.y);
+        };
+        let size = window.inner_size();
+        let x = position.x * f64::from(WIDTH) / f64::from(size.width.max(1));
+        let y = position.y * f64::from(HEIGHT) / f64::from(size.height.max(1));
+        (x, y)
+    }
+
     fn render(&mut self) {
         let Some(scene) = self.scene.as_mut() else {
             return;
@@ -158,7 +168,7 @@ impl ApplicationHandler for Simulator {
         let attributes = WindowAttributes::default()
             .with_title(title)
             .with_resizable(false)
-            .with_inner_size(LogicalSize::new(WIDTH, HEIGHT));
+            .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT));
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
         let context = Context::new(window.clone()).expect("softbuffer context");
         let surface = Surface::new(&context, window.clone()).expect("softbuffer surface");
@@ -179,7 +189,7 @@ impl ApplicationHandler for Simulator {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::CursorMoved { position, .. } => {
-                let PhysicalPosition { x, y } = position;
+                let (x, y) = self.pointer_position(position);
                 self.dispatch(InputEvent::PointerAbsolute { x, y });
             }
             WindowEvent::MouseInput { state, button, .. } => {
