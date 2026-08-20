@@ -145,6 +145,106 @@ pub struct Lock {
     /// Seconds after locking during which a key/click unlocks without
     /// auth (0 = disabled). Never survives suspend (dual-clock deadline).
     pub grace_secs: u64,
+    pub warning: LockWarning,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LockWarning {
+    pub duration_ms: u64,
+    pub frost_in_ms: u64,
+    pub frost_alpha: f32,
+    pub wallpaper_in_ms: u64,
+    pub easing: WarningEasing,
+    pub cancel_on_motion_px: f64,
+    pub gui: WarningGui,
+}
+
+impl Default for LockWarning {
+    fn default() -> Self {
+        Self {
+            duration_ms: 0,
+            frost_in_ms: 1_500,
+            frost_alpha: 0.35,
+            wallpaper_in_ms: 1_500,
+            easing: WarningEasing::EaseOut,
+            cancel_on_motion_px: 8.0,
+            gui: WarningGui::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningEasing {
+    Linear,
+    EaseOut,
+    EaseInOut,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WarningGui {
+    pub start: WarningKeyframe,
+    pub offset_ms: u64,
+    pub duration_ms: u64,
+    pub kind: WarningAnimation,
+    pub element: Vec<WarningElement>,
+}
+
+impl Default for WarningGui {
+    fn default() -> Self {
+        Self {
+            start: WarningKeyframe::Locked,
+            offset_ms: 0,
+            duration_ms: 400,
+            kind: WarningAnimation::Fade,
+            element: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WarningElement {
+    pub selector: String,
+    pub start: WarningKeyframe,
+    pub offset_ms: u64,
+    pub duration_ms: u64,
+    pub kind: WarningAnimation,
+}
+
+impl Default for WarningElement {
+    fn default() -> Self {
+        Self {
+            selector: String::new(),
+            start: WarningKeyframe::None,
+            offset_ms: 0,
+            duration_ms: 0,
+            kind: WarningAnimation::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningKeyframe {
+    Painted,
+    FrostStart,
+    FrostEnd,
+    WallpaperStart,
+    WallpaperSolid,
+    Locked,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningAnimation {
+    Fade,
+    SlideUp,
+    Scale,
+    None,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -366,6 +466,40 @@ scale = 1.25
     fn unknown_keys_ignored() {
         let config = parse("[look]\nbogus = 1\ntheme = \"/x\"\n[nonsense]\na = 2").unwrap();
         assert_eq!(config.look.theme, Some(PathBuf::from("/x")));
+    }
+
+    #[test]
+    fn parses_warning_and_element_timeline() {
+        let config = parse(
+            r#"
+[lock.warning]
+duration_ms = 10000
+frost_in_ms = 1500
+frost_alpha = 0.4
+wallpaper_in_ms = 1200
+easing = "ease_in_out"
+cancel_on_motion_px = 9.5
+
+[lock.warning.gui]
+start = "locked"
+duration_ms = 400
+kind = "fade"
+
+[[lock.warning.gui.element]]
+selector = "clock"
+start = "painted"
+duration_ms = 0
+kind = "none"
+"#,
+        )
+        .unwrap();
+        let warning = config.lock.warning;
+        assert_eq!(warning.duration_ms, 10_000);
+        assert_eq!(warning.easing, WarningEasing::EaseInOut);
+        assert_eq!(warning.gui.element.len(), 1);
+        assert_eq!(warning.gui.element[0].selector, "clock");
+        assert_eq!(warning.gui.element[0].start, WarningKeyframe::Painted);
+        assert_eq!(warning.gui.element[0].kind, WarningAnimation::None);
     }
 
     #[test]

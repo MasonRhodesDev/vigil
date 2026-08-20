@@ -1,0 +1,16 @@
+[package]
+name = "vigil-sim"
+description = "Safe in-session simulator for Vigil greeter and lock UI"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+vigil-theme = { path = "../vigil-theme" }
+vigil-ui = { path = "../vigil-ui" }
+slint-kit.workspace = true
+winit.workspace = true
+softbuffer.workspace = true
