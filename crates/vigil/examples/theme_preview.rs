@@ -101,7 +101,7 @@ fn main() {
 
     // XRGB -> RGB for the PNG
     let mut rgb = Vec::with_capacity((W * H * 3) as usize);
-    for px in buf.chunks_exact(4) {
+    for px in buf.as_chunks::<4>().0 {
         rgb.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     image::save_buffer(&out, &rgb, pw, ph, image::ColorType::Rgb8).expect("png");
