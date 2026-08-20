@@ -8,13 +8,14 @@ use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use softbuffer::{Context, Surface};
 use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
+use vigil_warning::Timeline;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -59,6 +60,10 @@ struct Simulator {
     pixels: Vec<u8>,
     trace: Rc<RefCell<Vec<String>>>,
     started: Instant,
+    last_tick: Instant,
+    sim_now: Duration,
+    warning: Option<Timeline>,
+    paused: bool,
 }
 
 impl Simulator {
@@ -75,6 +80,10 @@ impl Simulator {
             pixels: vec![0; (WIDTH * HEIGHT * 4) as usize],
             trace: Rc::new(RefCell::new(Vec::new())),
             started: Instant::now(),
+            last_tick: Instant::now(),
+            sim_now: Duration::ZERO,
+            warning: None,
+            paused: false,
         }
     }
 
@@ -118,6 +127,15 @@ impl Simulator {
                 scene.set_sessions(&[]);
                 scene.show_info("SIMULATED WARNING — press any key to cancel");
                 scene.set_status_banner("Frost stage (tint-only preview)");
+                let config = vigil_config::LockWarning {
+                    duration_ms: 10_000,
+                    ..Default::default()
+                };
+                let mut warning = Timeline::new(config);
+                warning.start(Duration::ZERO);
+                self.sim_now = Duration::ZERO;
+                self.last_tick = Instant::now();
+                self.warning = Some(warning);
             }
         }
         let trace = self.trace.clone();
@@ -188,6 +206,33 @@ impl Simulator {
         buffer.present().expect("present simulated output");
     }
 
+    fn update_warning(&mut self) {
+        if self.mode != Mode::Warning {
+            return;
+        }
+        let now = Instant::now();
+        if !self.paused {
+            self.sim_now += now.saturating_duration_since(self.last_tick);
+        }
+        self.last_tick = now;
+        let Some(timeline) = self.warning.as_mut() else {
+            return;
+        };
+        let sample = timeline.sample(self.sim_now);
+        if let Some(scene) = self.scene.as_mut() {
+            scene.set_warning_progress(sample.frost, sample.wallpaper);
+            scene.set_status_banner(&format!(
+                "Warning {:.1}s · frost {:.0}% · wallpaper {:.0}%",
+                self.sim_now.as_secs_f32(),
+                sample.frost * 100.0,
+                sample.wallpaper * 100.0
+            ));
+        }
+        if sample.should_commit {
+            self.select_mode(Mode::Lock);
+        }
+    }
+
     fn select_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.trace.borrow_mut().push(format!("state: {mode:?}"));
@@ -209,14 +254,29 @@ impl Simulator {
             self.select_mode(Mode::Warning);
             self.trace.borrow_mut().push("warning: restart".into());
         } else if (358..390).contains(&y) {
+            self.paused = !self.paused;
             self.trace.borrow_mut().push("warning: pause/resume".into());
         } else if (400..432).contains(&y) {
+            self.sim_now += Duration::from_secs(1);
             self.trace.borrow_mut().push("warning: advance 1s".into());
         } else if (442..474).contains(&y) {
+            if let Some(warning) = self.warning.as_mut() {
+                warning.request_commit();
+            }
             self.trace.borrow_mut().push("warning: commit".into());
         } else if (484..516).contains(&y) {
+            if let Some(warning) = self.warning.as_mut() {
+                warning.input(&InputEvent::Key {
+                    keysym: 1,
+                    utf8: None,
+                    pressed: true,
+                });
+            }
             self.trace.borrow_mut().push("warning: cancel".into());
         } else if (526..558).contains(&y) {
+            if let Some(warning) = self.warning.as_mut() {
+                warning.hotplug();
+            }
             self.trace.borrow_mut().push("warning: hotplug".into());
         } else if (568..600).contains(&y) {
             self.trace.borrow_mut().push("warning: toggle blur".into());
@@ -310,6 +370,16 @@ impl ApplicationHandler for Simulator {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         vigil_ui::advance_timers();
+        self.update_warning();
+        if self.mode == Mode::Warning && !self.paused {
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(33),
+            ));
+            return;
+        }
         if let Some(delay) = vigil_ui::duration_until_next_timer_update() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
             if let Some(window) = self.window.as_ref() {

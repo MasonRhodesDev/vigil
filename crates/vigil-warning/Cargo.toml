@@ -1,0 +1,12 @@
+[package]
+name = "vigil-warning"
+description = "Deterministic pre-lock warning timeline shared by vigil-lock and vigil-sim"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+vigil-config.workspace = true

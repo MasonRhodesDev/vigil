@@ -11,6 +11,8 @@ repository.workspace = true
 vigil-core.workspace = true
 vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }
+vigil-warning = { path = "../vigil-warning" }
+vigil-config.workspace = true
 slint-kit.workspace = true
 winit.workspace = true
 softbuffer.workspace = true

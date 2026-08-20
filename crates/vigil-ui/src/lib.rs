@@ -425,6 +425,11 @@ impl OutputWindow {
         self.set_optional_property("power-visible", Value::Bool(visible));
     }
 
+    pub fn set_warning_progress(&mut self, frost: f32, wallpaper: f32) {
+        self.set_optional_property("warning-frost", Value::Number(frost as f64));
+        self.set_optional_property("warning-wallpaper", Value::Number(wallpaper as f64));
+    }
+
     /// Route a normalized input event into this window.
     pub fn dispatch(&mut self, event: InputEvent) {
         // Keys and buttons change what the scene shows through paths

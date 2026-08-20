@@ -5134,9 +5134,11 @@ dependencies = [
  "font8x8",
  "slint-kit",
  "softbuffer",
+ "vigil-config",
  "vigil-core",
  "vigil-theme",
  "vigil-ui",
+ "vigil-warning",
  "winit",
 ]
 
@@ -5160,6 +5162,14 @@ dependencies = [
  "slint",
  "slint-interpreter",
  "slint-kit",
+ "vigil-config",
+ "vigil-core",
+]
+
+[[package]]
+name = "vigil-warning"
+version = "0.2.16"
+dependencies = [
  "vigil-config",
  "vigil-core",
 ]

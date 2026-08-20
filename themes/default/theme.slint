@@ -19,6 +19,8 @@ export component DefaultTheme inherits Window {
     in property <string> user-name;
     in property <bool> panel-visible: true;
     in property <bool> power-visible: true;
+    in property <float> warning-frost: 0;
+    in property <float> warning-wallpaper: 0;
     in property <image> background-source;
     in property <bool> native-background: false;
     in property <string> clock-text;
@@ -61,6 +63,13 @@ export component DefaultTheme inherits Window {
         source: root.background-source;
         width: 100%;
         height: 100%;
+    }
+
+    Rectangle {
+        background: #10141a.with-alpha(root.warning-frost * 0.35);
+    }
+    Rectangle {
+        background: Theme.page-bg.with-alpha(root.warning-wallpaper);
     }
 
     // Clock, top-right.
