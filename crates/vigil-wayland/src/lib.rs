@@ -434,7 +434,7 @@ impl<S: LockSession> App<S> {
                 (self.warning_progress.0 * self.warning_frost_alpha * (1.0 - wallpaper))
                     .clamp(0.0, 1.0);
             let alpha = wallpaper + tint_alpha;
-            for pixel in canvas.chunks_exact_mut(4) {
+            for pixel in canvas.as_chunks_mut::<4>().0 {
                 for channel in &mut pixel[..3] {
                     let wallpaper_channel = f32::from(*channel) * wallpaper;
                     let tint_channel = 18.0 * tint_alpha;
