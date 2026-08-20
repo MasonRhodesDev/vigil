@@ -87,7 +87,6 @@ impl Simulator {
         scene.set_cursor_visible(true);
         scene.set_clock("13:37");
         scene.set_user_name("mason");
-        scene.set_background(fake_desktop(), WIDTH, HEIGHT);
         vigil_ui::apply_kit_tokens_from_disk(&mut scene, "dark");
         match self.mode {
             Mode::Login => {
@@ -108,6 +107,11 @@ impl Simulator {
                 scene.set_status_banner("SIMULATED LOCK — host session unaffected");
             }
             Mode::Warning => {
+                // The fake desktop is exclusively the pre-lock plane used to
+                // verify capture-free frost. It must never back Login or the
+                // committed Lock state, where the resolved lock wallpaper is
+                // opaque before authentication becomes visible.
+                scene.set_background(fake_desktop(), WIDTH, HEIGHT);
                 scene.set_panel_visible(false);
                 scene.set_power_visible(false);
                 scene.set_users(&[]);
