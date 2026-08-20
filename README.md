@@ -87,9 +87,11 @@ blur, and D opens the state drawer. The state file is rewritten only when its
 contents change, so a frozen simulator has no polling or write loop.
 The newline command socket accepts `state login|lock|warning`, `lock --wait`, `pause`,
 `resume`, `advance MS`, `commit`, `cancel`, `hotplug`, `blur on|off|toggle`,
+`export PATH.png`,
 and `drawer open|close|toggle`; it replies only after the UI thread applies the
 command. `lock --wait` mirrors the production readiness contract and replies
-only after the simulated lock frame is presented. This is the stable automation interface for screenshots and agent
+only after the simulated lock frame is presented. `export PATH.png` responds
+only after the current rendered frame has been written. This is the stable automation interface for screenshots and agent
 driven regression work, independent of the host compositor.
 
 Headless scenario fixtures exercise the same theme, UI renderer, injected

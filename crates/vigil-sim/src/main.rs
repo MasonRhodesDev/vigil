@@ -153,13 +153,18 @@ struct Simulator {
     warning_input_after: Instant,
     last_state: RefCell<String>,
     warning_visual_key: Option<(u128, bool)>,
-    pending_acks: Vec<std::sync::mpsc::SyncSender<Result<(), String>>>,
+    pending_acks: Vec<PendingAck>,
 }
 
 #[derive(Debug)]
 struct UserCommand(String, std::sync::mpsc::SyncSender<Result<(), String>>);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingAck {
+    sender: std::sync::mpsc::SyncSender<Result<(), String>>,
+    export: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlCommand {
     State(Mode),
     LockWait,
@@ -171,6 +176,7 @@ enum ControlCommand {
     Hotplug,
     Blur(Option<bool>),
     Drawer(Option<bool>),
+    Export(std::path::PathBuf),
 }
 
 fn parse_control_command(command: &str) -> Result<ControlCommand, String> {
@@ -195,6 +201,8 @@ fn parse_control_command(command: &str) -> Result<ControlCommand, String> {
         ["drawer", "open"] => Ok(ControlCommand::Drawer(Some(true))),
         ["drawer", "close"] => Ok(ControlCommand::Drawer(Some(false))),
         ["drawer", "toggle"] => Ok(ControlCommand::Drawer(None)),
+        ["export", path] => Ok(ControlCommand::Export((*path).into())),
+        ["export"] => Err("export requires a PNG path".into()),
         [] => Err("empty command".into()),
         _ => Err(format!("unknown command {command:?}")),
     }
@@ -428,7 +436,22 @@ impl Simulator {
         }
         buffer.present().expect("present simulated output");
         for ack in self.pending_acks.drain(..) {
-            let _ = ack.send(Ok(()));
+            let result = ack.export.map_or(Ok(()), |path| {
+                let mut rgba = self.pixels.clone();
+                for pixel in rgba.as_chunks_mut::<4>().0 {
+                    pixel[3] = 255;
+                }
+                image::save_buffer_with_format(
+                    &path,
+                    &rgba,
+                    WIDTH,
+                    HEIGHT,
+                    image::ColorType::Rgba8,
+                    image::ImageFormat::Png,
+                )
+                .map_err(|error| format!("export {}: {error}", path.display()))
+            });
+            let _ = ack.sender.send(result);
         }
     }
 
@@ -584,7 +607,8 @@ impl Simulator {
         true
     }
 
-    fn apply_command(&mut self, command: &str) -> Result<(), String> {
+    fn apply_command(&mut self, command: &str) -> Result<Option<std::path::PathBuf>, String> {
+        let mut export = None;
         match parse_control_command(command)? {
             // Mirrors `vigil-lock --wait`: the socket response is emitted
             // only after the resulting lock frame has been presented.
@@ -633,6 +657,10 @@ impl Simulator {
                 self.drawer_open = value.unwrap_or(!self.drawer_open);
                 self.record("drawer: changed (socket)");
             }
+            ControlCommand::Export(path) => {
+                self.record(format!("frame: export {}", path.display()));
+                export = Some(path);
+            }
             _ => return Err(format!("command is unavailable in {:?} mode", self.mode)),
         }
         self.update_warning();
@@ -640,7 +668,7 @@ impl Simulator {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
-        Ok(())
+        Ok(export)
     }
 }
 
@@ -775,8 +803,11 @@ impl ApplicationHandler<UserCommand> for Simulator {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserCommand) {
         match self.apply_command(&event.0) {
-            Ok(()) => {
-                self.pending_acks.push(event.1);
+            Ok(export) => {
+                self.pending_acks.push(PendingAck {
+                    sender: event.1,
+                    export,
+                });
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
@@ -1090,7 +1121,7 @@ fn run_scenario(platform: VigilPlatform, path: &std::path::Path) -> Result<(), S
     simulator.update_warning();
     render_scenario_frame(&mut simulator)?;
     for command in &fixture.commands {
-        simulator
+        let _ = simulator
             .apply_command(command)
             .map_err(|error| format!("scenario command {command:?}: {error}"))?;
         render_scenario_frame(&mut simulator)?;
@@ -1173,6 +1204,11 @@ mod tests {
         assert!(parse_control_command("advance tomorrow").is_err());
         assert!(parse_control_command("lock --maybe").is_err());
         assert!(parse_control_command("state locked-ish").is_err());
+        assert_eq!(
+            parse_control_command("export /tmp/frame.png").unwrap(),
+            ControlCommand::Export("/tmp/frame.png".into())
+        );
+        assert!(parse_control_command("export").is_err());
     }
 
     #[test]
