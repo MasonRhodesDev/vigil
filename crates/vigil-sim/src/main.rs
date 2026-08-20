@@ -24,8 +24,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 800;
-const CONTROL_WIDTH: u32 = 420;
-const CONTROL_HEIGHT: u32 = 640;
+const DRAWER_WIDTH: u32 = 420;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -54,10 +53,8 @@ struct Simulator {
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
-    control_window: Option<Arc<Window>>,
-    control_context: Option<Context<Arc<Window>>>,
-    control_surface: Option<Surface<Arc<Window>, Arc<Window>>>,
-    control_pointer: PhysicalPosition<f64>,
+    pointer: PhysicalPosition<f64>,
+    drawer_open: bool,
     scene: Option<OutputWindow>,
     pixels: Vec<u8>,
     trace: Rc<RefCell<Vec<String>>>,
@@ -72,10 +69,8 @@ impl Simulator {
             window: None,
             context: None,
             surface: None,
-            control_window: None,
-            control_context: None,
-            control_surface: None,
-            control_pointer: PhysicalPosition::new(0.0, 0.0),
+            pointer: PhysicalPosition::new(0.0, 0.0),
+            drawer_open: false,
             scene: None,
             pixels: vec![0; (WIDTH * HEIGHT * 4) as usize],
             trace: Rc::new(RefCell::new(Vec::new())),
@@ -92,6 +87,7 @@ impl Simulator {
         scene.set_cursor_visible(true);
         scene.set_clock("13:37");
         scene.set_user_name("mason");
+        scene.set_background(fake_desktop(), WIDTH, HEIGHT);
         vigil_ui::apply_kit_tokens_from_disk(&mut scene, "dark");
         match self.mode {
             Mode::Login => {
@@ -165,7 +161,7 @@ impl Simulator {
             height: HEIGHT,
             stride: (WIDTH * 4) as usize,
         });
-        if !drew && self.started.elapsed().as_millis() > 100 {
+        if !drew && self.started.elapsed().as_millis() > 100 && !self.drawer_open {
             return;
         }
         let Some(surface) = self.surface.as_mut() else {
@@ -181,6 +177,10 @@ impl Simulator {
         for (out, px) in buffer.iter_mut().zip(self.pixels.chunks_exact(4)) {
             *out = u32::from_le_bytes([px[0], px[1], px[2], 0]);
         }
+        draw_hamburger(&mut buffer);
+        if self.drawer_open {
+            draw_drawer(&mut buffer, self.mode);
+        }
         buffer.present().expect("present simulated output");
     }
 
@@ -188,71 +188,13 @@ impl Simulator {
         self.mode = mode;
         self.trace.borrow_mut().push(format!("state: {mode:?}"));
         self.create_scene();
-        if let Some(window) = self.control_window.as_ref() {
+        if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
     }
 
-    fn render_controls(&mut self) {
-        let mut pixels = vec![0x00110e0c_u32; (CONTROL_WIDTH * CONTROL_HEIGHT) as usize];
-        draw_text(&mut pixels, 24, 22, "VIGIL SIMULATION", 0x00ffb77a, 2);
-        draw_text(
-            &mut pixels,
-            24,
-            52,
-            "HOST SESSION UNAFFECTED",
-            0x00b7ada6,
-            1,
-        );
-        draw_text(&mut pixels, 24, 88, "STATE", 0x00f4eee9, 1);
-        let modes = [
-            (Mode::Login, "LOGIN"),
-            (Mode::Lock, "LOCK"),
-            (Mode::Warning, "IDLE WARNING"),
-        ];
-        for (idx, (mode, label)) in modes.iter().enumerate() {
-            let y = 112 + idx as u32 * 54;
-            let color = if *mode == self.mode {
-                0x00a95f2c
-            } else {
-                0x00352b26
-            };
-            fill_rect(&mut pixels, 24, y, 372, 42, color);
-            draw_text(&mut pixels, 40, y + 13, label, 0x00fff5ee, 1);
-        }
-        draw_text(&mut pixels, 24, 292, "WARNING CONTROLS", 0x00f4eee9, 1);
-        for (idx, label) in [
-            "RESTART TIMELINE",
-            "PAUSE / RESUME",
-            "+ 1 SECOND",
-            "COMMIT NOW",
-            "CANCEL INPUT",
-            "HOTPLUG",
-            "TOGGLE BLUR",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let y = 316 + idx as u32 * 42;
-            fill_rect(&mut pixels, 24, y, 372, 32, 0x00251f1c);
-            draw_text(&mut pixels, 40, y + 9, label, 0x00ddd3cc, 1);
-        }
-        let Some(surface) = self.control_surface.as_mut() else {
-            return;
-        };
-        surface
-            .resize(
-                NonZeroU32::new(CONTROL_WIDTH).unwrap(),
-                NonZeroU32::new(CONTROL_HEIGHT).unwrap(),
-            )
-            .expect("resize controls");
-        let mut buffer = surface.buffer_mut().expect("control buffer");
-        buffer.copy_from_slice(&pixels);
-        buffer.present().expect("present controls");
-    }
-
     fn control_click(&mut self) {
-        let y = self.control_pointer.y.max(0.0) as u32;
+        let y = self.pointer.y.max(0.0) as u32;
         if (112..154).contains(&y) {
             self.select_mode(Mode::Login);
         } else if (166..208).contains(&y) {
@@ -297,25 +239,8 @@ impl ApplicationHandler for Simulator {
         self.window = Some(window.clone());
         self.context = Some(context);
         self.surface = Some(surface);
-        let control = Arc::new(
-            event_loop
-                .create_window(
-                    WindowAttributes::default()
-                        .with_title("Vigil Simulation Controls")
-                        .with_resizable(false)
-                        .with_inner_size(PhysicalSize::new(CONTROL_WIDTH, CONTROL_HEIGHT)),
-                )
-                .expect("create controls"),
-        );
-        let control_context = Context::new(control.clone()).expect("control context");
-        let control_surface =
-            Surface::new(&control_context, control.clone()).expect("control surface");
-        self.control_window = Some(control.clone());
-        self.control_context = Some(control_context);
-        self.control_surface = Some(control_surface);
         self.create_scene();
         window.request_redraw();
-        control.request_redraw();
     }
 
     fn window_event(
@@ -324,32 +249,35 @@ impl ApplicationHandler for Simulator {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let is_control = self
-            .control_window
-            .as_ref()
-            .is_some_and(|w| w.id() == window_id);
-        if is_control {
-            match event {
-                WindowEvent::CloseRequested => event_loop.exit(),
-                WindowEvent::RedrawRequested => self.render_controls(),
-                WindowEvent::CursorMoved { position, .. } => self.control_pointer = position,
-                WindowEvent::MouseInput {
-                    state: ElementState::Pressed,
-                    button: MouseButton::Left,
-                    ..
-                } => self.control_click(),
-                _ => {}
-            }
-            return;
-        }
+        let _ = window_id;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = position;
                 let (x, y) = self.pointer_position(position);
                 self.dispatch(InputEvent::PointerAbsolute { x, y });
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left && state == ElementState::Pressed {
+                    let x = self.pointer.x.max(0.0) as u32;
+                    let y = self.pointer.y.max(0.0) as u32;
+                    if (!self.drawer_open && x < 56 && y < 56)
+                        || (self.drawer_open && x < DRAWER_WIDTH)
+                    {
+                        if !self.drawer_open {
+                            self.drawer_open = true;
+                        } else if x < 56 && y < 56 {
+                            self.drawer_open = false;
+                        } else {
+                            self.control_click();
+                        }
+                        if let Some(window) = self.window.as_ref() {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+                }
                 let button = match button {
                     MouseButton::Left => 0x110,
                     MouseButton::Right => 0x111,
@@ -389,10 +317,82 @@ impl ApplicationHandler for Simulator {
     }
 }
 
-fn fill_rect(pixels: &mut [u32], x: u32, y: u32, width: u32, height: u32, color: u32) {
-    for row in y..(y + height).min(CONTROL_HEIGHT) {
-        let start = (row * CONTROL_WIDTH + x) as usize;
-        let end = (row * CONTROL_WIDTH + (x + width).min(CONTROL_WIDTH)) as usize;
+fn draw_hamburger(pixels: &mut [u32]) {
+    fill_rect(pixels, (WIDTH, HEIGHT), 12, 12, 44, 40, 0x00_251f1c);
+    for y in [21, 27, 33] {
+        fill_rect(pixels, (WIDTH, HEIGHT), 22, y, 20, 2, 0x00_fff5ee);
+    }
+}
+
+fn draw_drawer(pixels: &mut [u32], mode: Mode) {
+    fill_rect(
+        pixels,
+        (WIDTH, HEIGHT),
+        0,
+        0,
+        DRAWER_WIDTH,
+        HEIGHT,
+        0x00_110e0c,
+    );
+    draw_text(pixels, 24, 22, "VIGIL SIMULATION", 0x00_ffb77a, 2);
+    draw_text(pixels, 24, 52, "HOST SESSION UNAFFECTED", 0x00_b7ada6, 1);
+    draw_text(pixels, 24, 88, "STATE", 0x00_f4eee9, 1);
+    for (idx, (state, label)) in [
+        (Mode::Login, "LOGIN"),
+        (Mode::Lock, "LOCK"),
+        (Mode::Warning, "IDLE WARNING"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let y = 112 + idx as u32 * 54;
+        fill_rect(
+            pixels,
+            (WIDTH, HEIGHT),
+            24,
+            y,
+            372,
+            42,
+            if *state == mode {
+                0x00_a95f2c
+            } else {
+                0x00_352b26
+            },
+        );
+        draw_text(pixels, 40, y + 13, label, 0x00_fff5ee, 1);
+    }
+    draw_text(pixels, 24, 292, "WARNING CONTROLS", 0x00_f4eee9, 1);
+    for (idx, label) in [
+        "RESTART TIMELINE",
+        "PAUSE / RESUME",
+        "+ 1 SECOND",
+        "COMMIT NOW",
+        "CANCEL INPUT",
+        "HOTPLUG",
+        "TOGGLE BLUR",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let y = 316 + idx as u32 * 42;
+        fill_rect(pixels, (WIDTH, HEIGHT), 24, y, 372, 32, 0x00_251f1c);
+        draw_text(pixels, 40, y + 9, label, 0x00_ddd3cc, 1);
+    }
+}
+
+fn fill_rect(
+    pixels: &mut [u32],
+    canvas: (u32, u32),
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    color: u32,
+) {
+    let (canvas_width, canvas_height) = canvas;
+    for row in y..(y + height).min(canvas_height) {
+        let start = (row * canvas_width + x) as usize;
+        let end = (row * canvas_width + (x + width).min(canvas_width)) as usize;
         pixels[start..end].fill(color);
     }
 }
@@ -406,6 +406,7 @@ fn draw_text(pixels: &mut [u32], x: u32, y: u32, text: &str, color: u32, scale: 
                     if bits & (1 << gx) != 0 {
                         fill_rect(
                             pixels,
+                            (WIDTH, HEIGHT),
                             pen_x + gx * scale,
                             y + gy as u32 * scale,
                             scale,
@@ -418,6 +419,33 @@ fn draw_text(pixels: &mut [u32], x: u32, y: u32, text: &str, color: u32, scale: 
         }
         pen_x += 9 * scale;
     }
+}
+
+fn fake_desktop() -> Vec<u8> {
+    let mut rgba = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let i = ((y * WIDTH + x) * 4) as usize;
+            rgba[i] = (38 + x * 34 / WIDTH) as u8;
+            rgba[i + 1] = (52 + y * 42 / HEIGHT) as u8;
+            rgba[i + 2] = (76 + (x + y) * 44 / (WIDTH + HEIGHT)) as u8;
+            rgba[i + 3] = 255;
+        }
+    }
+    for (x, y, w, h, c) in [
+        (0, 0, WIDTH, 32, [24, 27, 36, 255]),
+        (90, 105, 720, 470, [238, 235, 226, 255]),
+        (850, 150, 330, 390, [35, 39, 52, 255]),
+        (120, 140, 660, 44, [66, 91, 135, 255]),
+    ] {
+        for row in y..y + h {
+            for col in x..x + w {
+                let i = ((row * WIDTH + col) * 4) as usize;
+                rgba[i..i + 4].copy_from_slice(&c);
+            }
+        }
+    }
+    rgba
 }
 
 fn key_event(key: &Key) -> (u32, Option<String>) {
