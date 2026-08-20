@@ -7,7 +7,7 @@
 # greetd command lines (greetd-game-mode, operator) are left alone.
 
 pkgname=vigil
-pkgver=0.2.16
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Compositor-less greetd greeter and matching session lockscreen"
 arch=('x86_64')
@@ -45,6 +45,7 @@ package() {
 
   install -Dm755 target/release/vigil "$pkgdir/usr/bin/vigil"
   install -Dm755 target/release/vigil-lock "$pkgdir/usr/bin/vigil-lock"
+  install -Dm755 target/release/vigil-sim "$pkgdir/usr/bin/vigil-sim"
 
   install -Dm755 dist/setup-greetd "$pkgdir/usr/lib/vigil/setup-greetd"
   install -Dm644 dist/vigil.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/vigil.conf"

@@ -17,3 +17,4 @@ slint-kit.workspace = true
 winit.workspace = true
 softbuffer.workspace = true
 font8x8.workspace = true
+image.workspace = true

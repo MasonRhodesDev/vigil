@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 hypr-slint-runtime.workspace = true
 vigil-core.workspace = true
+vigil-config.workspace = true
+vigil-warning = { path = "../vigil-warning" }
 smithay-client-toolkit.workspace = true
 calloop-wayland-source.workspace = true
 wayland-client.workspace = true

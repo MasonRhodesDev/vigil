@@ -5,7 +5,11 @@
 //! an in-memory trace and can never affect the host session.
 
 use std::cell::RefCell;
+use std::fs;
+use std::io::{Read, Write};
 use std::num::NonZeroU32;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixListener;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,6 +19,7 @@ use softbuffer::{Context, Surface};
 use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
+use vigil_warning::Phase;
 use vigil_warning::Timeline;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -35,17 +40,78 @@ enum Mode {
 }
 
 impl Mode {
-    fn parse() -> Self {
-        match std::env::args().nth(1).as_deref() {
-            Some("login") | None => Self::Login,
-            Some("lock") => Self::Lock,
-            Some("warning") => Self::Warning,
-            Some(other) => {
-                eprintln!("usage: vigil-sim [login|lock|warning] (got {other:?})");
-                std::process::exit(2);
-            }
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "login" => Some(Self::Login),
+            "lock" => Some(Self::Lock),
+            "warning" => Some(Self::Warning),
+            _ => None,
         }
     }
+}
+
+struct SimArgs {
+    mode: Mode,
+    paused: bool,
+    at: Duration,
+    state_file: Option<std::path::PathBuf>,
+    control_socket: Option<std::path::PathBuf>,
+}
+
+impl SimArgs {
+    fn parse() -> Self {
+        let mut args = std::env::args().skip(1);
+        let mut parsed = Self {
+            mode: Mode::Login,
+            paused: false,
+            at: Duration::ZERO,
+            state_file: None,
+            control_socket: None,
+        };
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "login" | "lock" | "warning" => parsed.mode = Mode::parse(&arg).unwrap(),
+                "--paused" => parsed.paused = true,
+                "--at-ms" => {
+                    let value = args
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or_else(|| usage("--at-ms requires an integer"));
+                    parsed.at = Duration::from_millis(value);
+                }
+                "--state-file" => {
+                    parsed.state_file = Some(
+                        args.next()
+                            .map(Into::into)
+                            .unwrap_or_else(|| usage("--state-file requires a path")),
+                    )
+                }
+                "--control-socket" => {
+                    parsed.control_socket = Some(
+                        args.next()
+                            .map(Into::into)
+                            .unwrap_or_else(|| usage("--control-socket requires a path")),
+                    );
+                }
+                "-h" | "--help" => usage(""),
+                _ => usage(&format!("unknown argument {arg:?}")),
+            }
+        }
+        if parsed.at != Duration::ZERO {
+            parsed.paused = true;
+        }
+        parsed
+    }
+}
+
+fn usage(error: &str) -> ! {
+    if !error.is_empty() {
+        eprintln!("error: {error}");
+    }
+    eprintln!(
+        "usage: vigil-sim [login|lock|warning] [--paused] [--at-ms MS] [--state-file PATH] [--control-socket PATH]"
+    );
+    std::process::exit(if error.is_empty() { 0 } else { 2 });
 }
 
 struct Simulator {
@@ -54,6 +120,7 @@ struct Simulator {
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
+    /// Pointer position in the simulator's fixed 1280x800 canvas.
     pointer: PhysicalPosition<f64>,
     drawer_open: bool,
     scene: Option<OutputWindow>,
@@ -64,10 +131,35 @@ struct Simulator {
     sim_now: Duration,
     warning: Option<Timeline>,
     paused: bool,
+    blur_enabled: bool,
+    desktop_sharp: Arc<Vec<u8>>,
+    desktop_blurred: Arc<Vec<u8>>,
+    lock_wallpaper: Arc<Vec<u8>>,
+    warning_wait: Option<Duration>,
+    warning_phase: Option<Phase>,
+    state_file: Option<std::path::PathBuf>,
+    accept_warning_input: bool,
+    warning_pointer_origin: Option<PhysicalPosition<f64>>,
+    warning_input_after: Instant,
+    last_state: RefCell<String>,
+    warning_visual_key: Option<(u128, bool)>,
+    pending_acks: Vec<std::sync::mpsc::SyncSender<()>>,
 }
 
+#[derive(Debug)]
+struct UserCommand(String, std::sync::mpsc::SyncSender<()>);
+
 impl Simulator {
-    fn new(mode: Mode, platform: VigilPlatform) -> Self {
+    fn new(
+        mode: Mode,
+        platform: VigilPlatform,
+        paused: bool,
+        at: Duration,
+        state_file: Option<std::path::PathBuf>,
+    ) -> Self {
+        let desktop_sharp = Arc::new(fake_desktop());
+        let desktop_blurred = Arc::new(blur_rgba(&desktop_sharp, WIDTH, HEIGHT));
+        let lock_wallpaper = Arc::new(fake_lock_wallpaper());
         Self {
             mode,
             platform,
@@ -81,9 +173,53 @@ impl Simulator {
             trace: Rc::new(RefCell::new(Vec::new())),
             started: Instant::now(),
             last_tick: Instant::now(),
-            sim_now: Duration::ZERO,
+            sim_now: at,
             warning: None,
-            paused: false,
+            paused,
+            blur_enabled: true,
+            desktop_sharp,
+            desktop_blurred,
+            lock_wallpaper,
+            warning_wait: None,
+            warning_phase: None,
+            state_file,
+            accept_warning_input: false,
+            warning_pointer_origin: None,
+            warning_input_after: Instant::now(),
+            last_state: RefCell::new(String::new()),
+            warning_visual_key: None,
+            pending_acks: Vec::new(),
+        }
+    }
+
+    fn record(&self, message: impl Into<String>) {
+        let message = message.into();
+        eprintln!("[vigil-sim] {message}");
+        self.trace.borrow_mut().push(message);
+        self.write_state();
+    }
+
+    fn write_state(&self) {
+        let Some(path) = self.state_file.as_ref() else {
+            return;
+        };
+        let phase = self.warning_phase.map(|phase| format!("{phase:?}"));
+        let body = format!(
+            "{{\n  \"mode\": \"{:?}\",\n  \"warning_phase\": {},\n  \"time_ms\": {},\n  \"paused\": {},\n  \"blur_enabled\": {},\n  \"drawer_open\": {}\n}}\n",
+            self.mode,
+            phase.map_or_else(|| "null".into(), |value| format!("\"{value}\"")),
+            self.sim_now.as_millis(),
+            self.paused,
+            self.blur_enabled,
+            self.drawer_open
+        );
+        if *self.last_state.borrow() == body {
+            return;
+        }
+        if let Err(error) = fs::write(path, &body) {
+            eprintln!("[vigil-sim] state write failed: {error}");
+        } else {
+            *self.last_state.borrow_mut() = body;
         }
     }
 
@@ -93,7 +229,10 @@ impl Simulator {
         let adapter = self.platform.claim_last_adapter().expect("theme adapter");
         let mut scene = OutputWindow::new(OutputId(1), WIDTH, HEIGHT, 1.0, adapter, component)
             .expect("create simulated output");
-        scene.set_cursor_visible(true);
+        // The host compositor already supplies a cursor for this ordinary
+        // window. Drawing Vigil's DRM/session cursor too creates a misleading
+        // duplicate whose coordinates diverge under output scaling.
+        scene.set_cursor_visible(false);
         scene.set_clock("13:37");
         scene.set_user_name("mason");
         vigil_ui::apply_kit_tokens_from_disk(&mut scene, "dark");
@@ -108,6 +247,7 @@ impl Simulator {
                 scene.show_prompt("Password:", true);
             }
             Mode::Lock => {
+                scene.set_background((*self.lock_wallpaper).clone(), WIDTH, HEIGHT);
                 scene.set_panel_visible(true);
                 scene.set_power_visible(true);
                 scene.set_users(&["mason".into()]);
@@ -120,22 +260,28 @@ impl Simulator {
                 // verify capture-free frost. It must never back Login or the
                 // committed Lock state, where the resolved lock wallpaper is
                 // opaque before authentication becomes visible.
-                scene.set_background(fake_desktop(), WIDTH, HEIGHT);
+                scene.set_background((*self.desktop_sharp).clone(), WIDTH, HEIGHT);
                 scene.set_panel_visible(false);
                 scene.set_power_visible(false);
                 scene.set_users(&[]);
                 scene.set_sessions(&[]);
                 scene.show_info("SIMULATED WARNING — press any key to cancel");
-                scene.set_status_banner("Frost stage (tint-only preview)");
+                scene.set_status_banner("Frost stage (simulated compositor blur)");
                 let config = vigil_config::LockWarning {
                     duration_ms: 10_000,
                     ..Default::default()
                 };
                 let mut warning = Timeline::new(config);
                 warning.start(Duration::ZERO);
-                self.sim_now = Duration::ZERO;
                 self.last_tick = Instant::now();
                 self.warning = Some(warning);
+                self.warning_phase = Some(Phase::Mapped);
+                self.accept_warning_input = false;
+                self.warning_pointer_origin = None;
+                self.warning_visual_key = None;
+                // Winit/compositors emit synthetic enter/motion events while
+                // mapping a new window. They are not user activity.
+                self.warning_input_after = Instant::now() + Duration::from_secs(1);
             }
         }
         let trace = self.trace.clone();
@@ -143,6 +289,7 @@ impl Simulator {
             trace.borrow_mut().push(format!("ui: {message:?}"));
         }));
         self.scene = Some(scene);
+        self.write_state();
         if let Some(window) = self.window.as_ref() {
             window.set_title(&format!(
                 "Vigil Simulation — {:?} — HOST SESSION UNAFFECTED",
@@ -154,6 +301,14 @@ impl Simulator {
 
     fn dispatch(&mut self, event: InputEvent) {
         self.trace.borrow_mut().push(format!("input: {event:?}"));
+        if self.mode == Mode::Warning
+            && !self.paused
+            && !self.drawer_open
+            && self.accept_warning_input
+            && let Some(warning) = self.warning.as_mut()
+        {
+            warning.input(&event);
+        }
         if let Some(scene) = self.scene.as_mut() {
             scene.dispatch(event);
         }
@@ -183,27 +338,45 @@ impl Simulator {
             height: HEIGHT,
             stride: (WIDTH * 4) as usize,
         });
-        if !drew && self.started.elapsed().as_millis() > 100 && !self.drawer_open {
+        if !drew
+            && self.started.elapsed().as_millis() > 100
+            && !self.drawer_open
+            && self.pending_acks.is_empty()
+        {
             return;
         }
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
+        let size = self.window.as_ref().expect("window").inner_size();
         surface
             .resize(
-                NonZeroU32::new(WIDTH).unwrap(),
-                NonZeroU32::new(HEIGHT).unwrap(),
+                NonZeroU32::new(size.width).unwrap(),
+                NonZeroU32::new(size.height).unwrap(),
             )
             .expect("resize surface");
         let mut buffer = surface.buffer_mut().expect("acquire window buffer");
-        for (out, px) in buffer.iter_mut().zip(self.pixels.chunks_exact(4)) {
-            *out = u32::from_le_bytes([px[0], px[1], px[2], 0]);
-        }
-        draw_hamburger(&mut buffer);
+        let mut canvas: Vec<u32> = self
+            .pixels
+            .chunks_exact(4)
+            .map(|px| u32::from_le_bytes([px[0], px[1], px[2], 0]))
+            .collect();
+        draw_hamburger(&mut canvas);
         if self.drawer_open {
-            draw_drawer(&mut buffer, self.mode);
+            draw_drawer(&mut canvas, self.mode);
+        }
+        for y in 0..size.height {
+            let source_y = y * HEIGHT / size.height;
+            for x in 0..size.width {
+                let source_x = x * WIDTH / size.width;
+                buffer[(y * size.width + x) as usize] =
+                    canvas[(source_y * WIDTH + source_x) as usize];
+            }
         }
         buffer.present().expect("present simulated output");
+        for ack in self.pending_acks.drain(..) {
+            let _ = ack.send(());
+        }
     }
 
     fn update_warning(&mut self) {
@@ -219,8 +392,39 @@ impl Simulator {
             return;
         };
         let sample = timeline.sample(self.sim_now);
-        if let Some(scene) = self.scene.as_mut() {
-            scene.set_warning_progress(sample.frost, sample.wallpaper);
+        let elements = timeline.element_samples(self.sim_now);
+        let visual_key = (self.sim_now.as_millis(), self.blur_enabled);
+        let visual_changed = self.warning_visual_key != Some(visual_key);
+        self.warning_visual_key = Some(visual_key);
+        self.warning_phase = Some(sample.phase);
+        self.write_state();
+        self.warning_wait = sample.next_frame;
+        if visual_changed && let Some(scene) = self.scene.as_mut() {
+            let panel_visible = elements.iter().any(|element| {
+                matches!(element.selector.as_str(), "user_selector" | "password")
+                    && element.progress > 0.001
+            });
+            let power_visible = elements
+                .iter()
+                .any(|element| element.selector == "power" && element.progress > 0.001);
+            scene.set_panel_visible(panel_visible);
+            scene.set_power_visible(power_visible);
+            let frost = if self.blur_enabled { sample.frost } else { 0.0 };
+            let frame = blend_warning_frame(
+                &self.desktop_sharp,
+                &self.desktop_blurred,
+                &self.lock_wallpaper,
+                frost,
+                sample.wallpaper,
+            );
+            scene.set_background(frame, WIDTH, HEIGHT);
+            // The production frost plane is supplied by the compositor. The
+            // simulator models that plane in pixels, so disable the old tint
+            // placeholder rather than stacking it over the preview.
+            scene.set_warning_progress(0.0, 0.0);
+            for element in elements {
+                scene.set_warning_element(&element.selector, element.progress);
+            }
             scene.set_status_banner(&format!(
                 "Warning {:.1}s · frost {:.0}% · wallpaper {:.0}%",
                 self.sim_now.as_secs_f32(),
@@ -228,14 +432,28 @@ impl Simulator {
                 sample.wallpaper * 100.0
             ));
         }
+        if visual_changed && let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+        if sample.phase == Phase::Cancelled {
+            self.record("warning: cancelled");
+            self.select_mode(Mode::Login);
+            return;
+        }
         if sample.should_commit {
             self.select_mode(Mode::Lock);
         }
     }
 
     fn select_mode(&mut self, mode: Mode) {
+        if mode == Mode::Warning {
+            self.sim_now = Duration::ZERO;
+            self.last_tick = Instant::now();
+        } else {
+            self.warning_phase = None;
+        }
         self.mode = mode;
-        self.trace.borrow_mut().push(format!("state: {mode:?}"));
+        self.record(format!("state: {mode:?}"));
         self.create_scene();
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
@@ -255,10 +473,10 @@ impl Simulator {
             self.trace.borrow_mut().push("warning: restart".into());
         } else if (358..390).contains(&y) {
             self.paused = !self.paused;
-            self.trace.borrow_mut().push("warning: pause/resume".into());
+            self.record("warning: pause/resume");
         } else if (400..432).contains(&y) {
             self.sim_now += Duration::from_secs(1);
-            self.trace.borrow_mut().push("warning: advance 1s".into());
+            self.record("warning: advance 1s");
         } else if (442..474).contains(&y) {
             if let Some(warning) = self.warning.as_mut() {
                 warning.request_commit();
@@ -279,12 +497,115 @@ impl Simulator {
             }
             self.trace.borrow_mut().push("warning: hotplug".into());
         } else if (568..600).contains(&y) {
+            self.blur_enabled = !self.blur_enabled;
             self.trace.borrow_mut().push("warning: toggle blur".into());
+        }
+    }
+
+    fn handle_shortcut(&mut self, key: &Key) -> bool {
+        match key {
+            Key::Named(NamedKey::F1) => self.select_mode(Mode::Login),
+            Key::Named(NamedKey::F2) => self.select_mode(Mode::Lock),
+            Key::Named(NamedKey::F3) => self.select_mode(Mode::Warning),
+            Key::Named(NamedKey::Space) if self.mode == Mode::Warning => {
+                self.paused = !self.paused;
+                self.record("warning: pause/resume (keyboard)");
+            }
+            Key::Named(NamedKey::ArrowRight) if self.mode == Mode::Warning && self.paused => {
+                self.sim_now += Duration::from_secs(1);
+                self.record("warning: advance 1s (keyboard)");
+            }
+            Key::Character(key) if key.eq_ignore_ascii_case("d") => {
+                self.drawer_open = !self.drawer_open;
+                self.record("drawer: toggle (keyboard)");
+            }
+            Key::Character(key) if key.eq_ignore_ascii_case("b") && self.mode == Mode::Warning => {
+                self.blur_enabled = !self.blur_enabled;
+                self.record("warning: toggle blur (keyboard)");
+            }
+            _ => return false,
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+        true
+    }
+
+    fn apply_command(&mut self, command: &str) {
+        let mut words = command.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("state"), Some("login")) => self.select_mode(Mode::Login),
+            (Some("state"), Some("lock")) => self.select_mode(Mode::Lock),
+            (Some("state"), Some("warning")) => self.select_mode(Mode::Warning),
+            (Some("pause"), None) => {
+                self.paused = true;
+                self.record("warning: pause (socket)");
+            }
+            (Some("resume"), None) => {
+                self.paused = false;
+                self.last_tick = Instant::now();
+                self.record("warning: resume (socket)");
+            }
+            (Some("advance"), Some(ms)) if self.mode == Mode::Warning => {
+                if let Ok(ms) = ms.parse::<u64>() {
+                    self.sim_now += Duration::from_millis(ms);
+                    self.record(format!("warning: advance {ms}ms (socket)"));
+                }
+            }
+            (Some("commit"), None) if self.mode == Mode::Warning => {
+                if let Some(warning) = self.warning.as_mut() {
+                    warning.request_commit();
+                }
+                self.record("warning: commit (socket)");
+            }
+            (Some("cancel"), None) if self.mode == Mode::Warning => {
+                if let Some(warning) = self.warning.as_mut() {
+                    warning.input(&InputEvent::Key {
+                        keysym: 1,
+                        utf8: None,
+                        pressed: true,
+                    });
+                }
+                self.record("warning: cancel (socket)");
+            }
+            (Some("hotplug"), None) if self.mode == Mode::Warning => {
+                if let Some(warning) = self.warning.as_mut() {
+                    warning.hotplug();
+                }
+                self.record("warning: hotplug (socket)");
+            }
+            (Some("blur"), Some(value)) if self.mode == Mode::Warning => {
+                match value {
+                    "on" => self.blur_enabled = true,
+                    "off" => self.blur_enabled = false,
+                    "toggle" => self.blur_enabled = !self.blur_enabled,
+                    _ => return,
+                }
+                self.record(format!("warning: blur {value} (socket)"));
+            }
+            (Some("drawer"), Some(value)) => {
+                match value {
+                    "open" => self.drawer_open = true,
+                    "close" => self.drawer_open = false,
+                    "toggle" => self.drawer_open = !self.drawer_open,
+                    _ => return,
+                }
+                self.record(format!("drawer: {value} (socket)"));
+            }
+            _ => {
+                self.record(format!("command rejected: {command}"));
+                return;
+            }
+        }
+        self.update_warning();
+        self.write_state();
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
         }
     }
 }
 
-impl ApplicationHandler for Simulator {
+impl ApplicationHandler<UserCommand> for Simulator {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -318,9 +639,21 @@ impl ApplicationHandler for Simulator {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::CursorMoved { position, .. } => {
-                self.pointer = position;
                 let (x, y) = self.pointer_position(position);
+                self.pointer = PhysicalPosition::new(x, y);
+                self.accept_warning_input = Instant::now() >= self.warning_input_after
+                    && self.warning_pointer_origin.is_some_and(|origin| {
+                        let dx = origin.x - x;
+                        let dy = origin.y - y;
+                        dx * dx + dy * dy >= 64.0
+                    });
+                if Instant::now() < self.warning_input_after {
+                    self.warning_pointer_origin = Some(self.pointer);
+                } else {
+                    self.warning_pointer_origin.get_or_insert(self.pointer);
+                }
                 self.dispatch(InputEvent::PointerAbsolute { x, y });
+                self.accept_warning_input = false;
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left && state == ElementState::Pressed {
@@ -350,19 +683,26 @@ impl ApplicationHandler for Simulator {
                     MouseButton::Forward => 0x115,
                     MouseButton::Other(value) => u32::from(value),
                 };
+                self.accept_warning_input = true;
                 self.dispatch(InputEvent::PointerButton {
                     button,
                     pressed: state == ElementState::Pressed,
                 });
+                self.accept_warning_input = false;
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
+                if pressed && self.handle_shortcut(&event.logical_key) {
+                    return;
+                }
                 let (keysym, utf8) = key_event(&event.logical_key);
+                self.accept_warning_input = true;
                 self.dispatch(InputEvent::Key {
                     keysym,
                     utf8,
                     pressed,
                 });
+                self.accept_warning_input = false;
             }
             _ => {}
         }
@@ -371,13 +711,17 @@ impl ApplicationHandler for Simulator {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         vigil_ui::advance_timers();
         self.update_warning();
-        if self.mode == Mode::Warning && !self.paused {
-            if let Some(window) = self.window.as_ref() {
-                window.request_redraw();
+        if self.mode == Mode::Warning {
+            if !self.paused
+                && let Some(delay) = self.warning_wait
+            {
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(33),
-            ));
             return;
         }
         if let Some(delay) = vigil_ui::duration_until_next_timer_update() {
@@ -389,6 +733,47 @@ impl ApplicationHandler for Simulator {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserCommand) {
+        self.apply_command(&event.0);
+        self.pending_acks.push(event.1);
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+}
+
+fn start_control_socket(
+    path: std::path::PathBuf,
+    proxy: winit::event_loop::EventLoopProxy<UserCommand>,
+) {
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if !metadata.file_type().is_socket() {
+            usage(&format!("control path is not a socket: {}", path.display()));
+        }
+        fs::remove_file(&path)
+            .unwrap_or_else(|error| usage(&format!("cannot replace control socket: {error}")));
+    }
+    let listener = UnixListener::bind(&path)
+        .unwrap_or_else(|error| usage(&format!("cannot bind control socket: {error}")));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut command = String::new();
+            if stream.read_to_string(&mut command).is_ok() && !command.trim().is_empty() {
+                let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+                if proxy
+                    .send_event(UserCommand(command.trim().to_owned(), done_tx))
+                    .is_ok()
+                    && done_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+                {
+                    let _ = stream.write_all(b"applied\n");
+                } else {
+                    let _ = stream.write_all(b"failed\n");
+                }
+            }
+        }
+    });
 }
 
 fn draw_hamburger(pixels: &mut [u32]) {
@@ -522,6 +907,65 @@ fn fake_desktop() -> Vec<u8> {
     rgba
 }
 
+/// CPU blur exists only in the safe simulator. Production uses the Wayland
+/// background-effect protocol and never captures or reads desktop pixels.
+fn blur_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+        .expect("simulator desktop dimensions");
+    // A full-resolution Gaussian is several seconds in an unoptimized dev
+    // build and delays the very harness intended to accelerate UI work.
+    // Downsample/upsample is a deterministic, sub-frame approximation of the
+    // compositor blur plane and is deliberately simulator-only.
+    let small = image::imageops::resize(
+        &image,
+        (width / 16).max(1),
+        (height / 16).max(1),
+        image::imageops::FilterType::Triangle,
+    );
+    image::imageops::resize(
+        &small,
+        width,
+        height,
+        image::imageops::FilterType::CatmullRom,
+    )
+    .into_raw()
+}
+
+fn fake_lock_wallpaper() -> Vec<u8> {
+    let mut rgba = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let i = ((y * WIDTH + x) * 4) as usize;
+            let glow = ((x as f32 / WIDTH as f32 * std::f32::consts::PI).sin() * 30.0) as u8;
+            rgba[i] = 18 + glow / 3;
+            rgba[i + 1] = 28 + glow / 2;
+            rgba[i + 2] = 44 + glow;
+            rgba[i + 3] = 255;
+        }
+    }
+    rgba
+}
+
+fn blend_warning_frame(
+    sharp: &[u8],
+    blurred: &[u8],
+    wallpaper: &[u8],
+    frost: f32,
+    wallpaper_alpha: f32,
+) -> Vec<u8> {
+    sharp
+        .iter()
+        .zip(blurred)
+        .zip(wallpaper)
+        .map(|((&sharp, &blurred), &wallpaper)| {
+            let frosted = sharp as f32 + (blurred as f32 - sharp as f32) * frost;
+            (frosted + (wallpaper as f32 - frosted) * wallpaper_alpha)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        })
+        .collect()
+}
+
 fn key_event(key: &Key) -> (u32, Option<String>) {
     match key {
         Key::Character(text) => {
@@ -542,9 +986,38 @@ fn key_event(key: &Key) -> (u32, Option<String>) {
 }
 
 fn main() {
-    let mode = Mode::parse();
+    let args = SimArgs::parse();
     let platform = VigilPlatform::install().expect("install Vigil Slint platform");
-    let event_loop = EventLoop::new().expect("create event loop");
-    let mut simulator = Simulator::new(mode, platform);
+    let event_loop = EventLoop::<UserCommand>::with_user_event()
+        .build()
+        .expect("create event loop");
+    if let Some(path) = args.control_socket.clone() {
+        start_control_socket(path, event_loop.create_proxy());
+    }
+    let mut simulator = Simulator::new(args.mode, platform, args.paused, args.at, args.state_file);
     event_loop.run_app(&mut simulator).expect("run simulator");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warning_blend_has_exact_endpoints() {
+        let sharp = [0, 10, 20, 255];
+        let blurred = [100, 110, 120, 255];
+        let wallpaper = [200, 210, 220, 255];
+        assert_eq!(
+            blend_warning_frame(&sharp, &blurred, &wallpaper, 0.0, 0.0),
+            sharp
+        );
+        assert_eq!(
+            blend_warning_frame(&sharp, &blurred, &wallpaper, 1.0, 0.0),
+            blurred
+        );
+        assert_eq!(
+            blend_warning_frame(&sharp, &blurred, &wallpaper, 1.0, 1.0),
+            wallpaper
+        );
+    }
 }

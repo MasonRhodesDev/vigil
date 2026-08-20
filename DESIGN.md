@@ -513,6 +513,9 @@ contract: if the lock client dies, the session stays locked (spec-mandated)
 ```
 vigil-lock (calloop, mirrors the greeter binary's wiring)
 ├─ vigil-wayland ── smithay-client-toolkit (pinned) glue:
+│   ├─ Warning: ARGB layer-shell surface per output + standard staging
+│   │   ext-background-effect-v1 blur; tint-only fallback; no capture
+│   │   protocol; opaque handoff retained until lock buffers commit
 │   ├─ SessionLockState: lock → per-output lock surfaces (created on lock
 │   │   AND on output hotplug), configure/ack, unlock → roundtrip → exit
 │   ├─ WlShmPresenter: THIRD Presenter impl — SlotPool buffer mapped as

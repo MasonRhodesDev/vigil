@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.16
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -71,6 +71,7 @@ cat vendor-git-sources.toml >> "$cfg"
 # which has no workspace lockfile and cannot resolve vendored Git sources.
 install -Dpm0755 target/rpm/vigil %{buildroot}%{_bindir}/vigil
 install -Dpm0755 target/rpm/vigil-lock %{buildroot}%{_bindir}/vigil-lock
+install -Dpm0755 target/rpm/vigil-sim %{buildroot}%{_bindir}/vigil-sim
 
 install -Dpm0755 dist/setup-greetd %{buildroot}%{_prefix}/lib/vigil/setup-greetd
 install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
@@ -110,6 +111,7 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %doc README.md
 %{_bindir}/vigil
 %{_bindir}/vigil-lock
+%{_bindir}/vigil-sim
 %{_prefix}/lib/vigil/setup-greetd
 %{_tmpfilesdir}/vigil.conf
 %config(noreplace) %{_sysconfdir}/pam.d/vigil-lock
@@ -117,6 +119,11 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Thu Aug 20 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.0-1
+- Add capture-free compositor frost warnings with tint-only fallback.
+- Add cancelable idle policy, atomic session-lock handoff, and join IPC.
+- Ship the safe in-session simulator for login, lock, and warning development.
+
 * Thu Aug 20 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.16-1
 - Vendor exact Cargo Git source replacements for fully offline RPM builds.
 - Preflight the vendored dependency graph offline while constructing the SRPM.

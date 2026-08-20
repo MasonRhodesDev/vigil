@@ -428,6 +428,19 @@ impl OutputWindow {
     pub fn set_warning_progress(&mut self, frost: f32, wallpaper: f32) {
         self.set_optional_property("warning-frost", Value::Number(frost as f64));
         self.set_optional_property("warning-wallpaper", Value::Number(wallpaper as f64));
+        self.request_present();
+    }
+
+    pub fn set_warning_element(&mut self, selector: &str, progress: f32) {
+        let property = match selector {
+            "clock" => "warning-clock-progress",
+            "user_selector" => "warning-user-selector-progress",
+            "password" => "warning-password-progress",
+            "status" => "warning-status-progress",
+            "power" => "warning-power-progress",
+            _ => return,
+        };
+        self.set_optional_property(property, Value::Number(progress.clamp(0.0, 1.0) as f64));
     }
 
     /// Route a normalized input event into this window.

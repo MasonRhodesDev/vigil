@@ -261,6 +261,28 @@ pub fn parse(source: &str) -> Result<Config, toml::de::Error> {
 }
 
 impl Config {
+    pub fn validate_warning(&self) -> Result<(), String> {
+        const SELECTORS: [&str; 5] = ["clock", "user_selector", "password", "status", "power"];
+        let unknown: Vec<_> = self
+            .lock
+            .warning
+            .gui
+            .element
+            .iter()
+            .map(|element| element.selector.as_str())
+            .filter(|selector| !SELECTORS.contains(selector))
+            .collect();
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "unknown lock.warning.gui selectors: {}; supported: {}",
+                unknown.join(", "),
+                SELECTORS.join(", ")
+            ))
+        }
+    }
+
     /// Greeter load: explicit path, else SYSTEM_CONFIG. Missing file =
     /// silent defaults; unreadable/invalid = eprintln!("vigil-config: {path}: {err}; using defaults") + defaults.
     pub fn load(path: Option<&Path>) -> Config {
@@ -500,6 +522,23 @@ kind = "none"
         assert_eq!(warning.gui.element[0].selector, "clock");
         assert_eq!(warning.gui.element[0].start, WarningKeyframe::Painted);
         assert_eq!(warning.gui.element[0].kind, WarningAnimation::None);
+    }
+
+    #[test]
+    fn warning_rejects_unknown_element_selectors() {
+        let config = parse(
+            r#"
+[[lock.warning.gui.element]]
+selector = "not-a-real-component"
+"#,
+        )
+        .unwrap();
+        assert!(
+            config
+                .validate_warning()
+                .unwrap_err()
+                .contains("not-a-real-component")
+        );
     }
 
     #[test]

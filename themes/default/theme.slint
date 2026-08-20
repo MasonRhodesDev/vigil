@@ -21,6 +21,11 @@ export component DefaultTheme inherits Window {
     in property <bool> power-visible: true;
     in property <float> warning-frost: 0;
     in property <float> warning-wallpaper: 0;
+    in property <float> warning-clock-progress: 1;
+    in property <float> warning-user-selector-progress: 1;
+    in property <float> warning-password-progress: 1;
+    in property <float> warning-status-progress: 1;
+    in property <float> warning-power-progress: 1;
     in property <image> background-source;
     in property <bool> native-background: false;
     in property <string> clock-text;
@@ -65,15 +70,9 @@ export component DefaultTheme inherits Window {
         height: 100%;
     }
 
-    Rectangle {
-        background: #10141a.with-alpha(root.warning-frost * 0.35);
-    }
-    Rectangle {
-        background: Theme.page-bg.with-alpha(root.warning-wallpaper);
-    }
-
     // Clock, top-right.
     KitDisplay {
+        opacity: root.warning-clock-progress;
         text: root.clock-text;
         x: parent.width - self.width - Theme.page-pad - Theme.space-sm;
         y: Theme.page-pad;
@@ -83,6 +82,7 @@ export component DefaultTheme inherits Window {
     // keeps the TextInput alive so keyboard focus survives panel moves.
     Rectangle {
         visible: root.panel-visible;
+        opacity: max(root.warning-user-selector-progress, root.warning-password-progress);
         width: 400px;
         height: 300px;
         x: (parent.width - self.width) / 2;
@@ -238,6 +238,7 @@ export component DefaultTheme inherits Window {
     // Power actions, bottom-left.
     HorizontalLayout {
         visible: root.power-visible;
+        opacity: root.warning-power-progress;
         x: Theme.page-pad + Theme.space-sm;
         y: parent.height - Theme.page-pad - Theme.control-height;
         width: 240px;
@@ -260,6 +261,7 @@ export component DefaultTheme inherits Window {
     // Host-integration status banner, bottom-center (reserved contract
     // surface: empty = hidden).
     if root.status-banner != "": Rectangle {
+        opacity: root.warning-status-progress;
         height: Theme.control-height;
         width: banner.width + 2 * Theme.page-pad;
         x: (parent.width - self.width) / 2;

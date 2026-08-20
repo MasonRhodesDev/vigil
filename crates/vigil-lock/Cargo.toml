@@ -15,6 +15,7 @@ appearance-profiles.workspace = true
 vigil-config.workspace = true
 vigil-login = { path = "../vigil-login" }
 vigil-wayland = { path = "../vigil-wayland" }
+vigil-warning = { path = "../vigil-warning" }
 vigil-pam = { path = "../vigil-pam" }
 vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }

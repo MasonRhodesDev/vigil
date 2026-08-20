@@ -66,6 +66,36 @@ greetd command and never restarts greetd (that tears down a live
 session). Point hypridle / your lock keybind at `vigil-lock`. An example
 `vigil.toml` ships at `/usr/share/vigil/vigil.toml.example`.
 
+For safe UI development inside a running session, use `vigil-sim login`,
+`vigil-sim lock`, or `vigil-sim warning`. The simulator has no PAM, logind,
+greetd, DRM, power, or session-lock dependencies; its hamburger drawer selects
+states and controls the injected warning clock. Its generated fake desktop is
+blurred only to preview the compositor-owned frost effect.
+
+For deterministic visual inspection, freeze a warning keyframe and expose its
+machine-readable state:
+
+```sh
+vigil-sim warning --at-ms 3000 \
+  --state-file /tmp/vigil-sim.json \
+  --control-socket /tmp/vigil-sim.sock
+```
+
+`--at-ms` implies pause. F1/F2/F3 switch to login/lock/warning, Space pauses,
+Right advances a paused warning by one second, B toggles simulated compositor
+blur, and D opens the state drawer. The state file is rewritten only when its
+contents change, so a frozen simulator has no polling or write loop.
+The newline command socket accepts `state login|lock|warning`, `pause`,
+`resume`, `advance MS`, `commit`, `cancel`, `hotplug`, `blur on|off|toggle`,
+and `drawer open|close|toggle`; it replies only after the UI thread applies the
+command. This is the stable automation interface for screenshots and agent
+driven regression work, independent of the host compositor.
+
+`vigil-lock --warn 10` presents a cancelable, capture-free idle warning before
+locking. It requests `ext-background-effect-v1` blur when available and uses a
+tint-only fallback otherwise. `--no-warn`, manual lock, and suspend paths lock
+immediately. Activity before commitment exits 3.
+
 ## Monitor layout
 
 A greeter with no compositor has no layout to inherit: without help it lights

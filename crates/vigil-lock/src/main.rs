@@ -3,6 +3,8 @@
 //! vigil-pam owns authentication, vigil-ui/-theme own the scene.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -18,6 +20,7 @@ use vigil_login::{AppearanceWatcher, LoginSession};
 use vigil_pam::PamAttempt;
 use vigil_theme::Theme;
 use vigil_ui::{Looks, OutputWindow, UiSnapshot, VigilPlatform, apply_kit_tokens_from_disk};
+use vigil_warning::ElementSample;
 use vigil_wayland::{LockOutcome, LockSession};
 
 struct Cli {
@@ -34,6 +37,7 @@ struct Cli {
     /// the blocking form a `before_sleep_cmd` needs: the caller's sleep
     /// inhibitor is not released until the screen is already secured.
     daemonize: bool,
+    warning_ms: Option<u64>,
 }
 
 fn clock_interval(format: &str) -> Duration {
@@ -57,6 +61,7 @@ fn parse_cli() -> Result<Cli, String> {
         grace: None,
         ready_fd: None,
         daemonize: false,
+        warning_ms: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -79,6 +84,12 @@ fn parse_cli() -> Result<Cli, String> {
                 cli.ready_fd = Some(v.parse().map_err(|_| format!("bad --ready-fd {v}"))?);
             }
             "--daemonize" => cli.daemonize = true,
+            "--warn" => {
+                let v = value("--warn")?;
+                let seconds: f64 = v.parse().map_err(|_| format!("bad --warn {v}"))?;
+                cli.warning_ms = Some((seconds.max(0.0) * 1000.0).round() as u64);
+            }
+            "--no-warn" => cli.warning_ms = Some(0),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -274,6 +285,10 @@ struct Locker {
     background_waker: Option<Arc<dyn Fn() + Send + Sync>>,
     event_waker: Arc<Mutex<Option<WakeHandle>>>,
     scheduler: IdleScheduler,
+    warning_active: bool,
+    warning_commit: bool,
+    warning_ipc: Arc<Mutex<WarningIpcState>>,
+    warning_backgrounds: std::collections::HashSet<OutputId>,
 }
 
 fn forwarded_channel<T: Send + 'static>(
@@ -355,7 +370,13 @@ fn handle_login_event(event: LoginEvent, grace: &mut Option<Grace>) -> LoginActi
 }
 
 impl Locker {
-    fn new(cli: Cli, config: Config, grace_secs: u64) -> Result<Self, String> {
+    fn new(
+        cli: Cli,
+        config: Config,
+        grace_secs: u64,
+        warning_ipc: Arc<Mutex<WarningIpcState>>,
+    ) -> Result<Self, String> {
+        let warning_active = config.lock.warning.duration_ms > 0;
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
         let clock_format = config.look.clock_format.clone();
@@ -435,6 +456,10 @@ impl Locker {
             background_waker: None,
             event_waker,
             scheduler: IdleScheduler::default(),
+            warning_active,
+            warning_commit: false,
+            warning_ipc,
+            warning_backgrounds: std::collections::HashSet::new(),
         };
         if let Some(login) = &locker.login {
             login.spawn_signals(locker.login_tx.clone());
@@ -537,6 +562,11 @@ impl Locker {
 
     fn pump_login(&mut self) {
         while let Ok(event) = self.login_rx.try_recv() {
+            if self.warning_active
+                && matches!(event, LoginEvent::Lock | LoginEvent::PrepareForSleep(true))
+            {
+                self.warning_commit = true;
+            }
             if handle_login_event(event, &mut self.grace) == LoginAction::Unlock {
                 self.unlock_now();
             }
@@ -609,6 +639,7 @@ impl Locker {
 
     fn pump_backgrounds(&mut self) {
         while let Ok(result) = self.background_rx.try_recv() {
+            self.warning_backgrounds.remove(&result.id);
             let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == result.id) else {
                 continue;
             };
@@ -664,6 +695,7 @@ impl LockSession for Locker {
         metrics: Arc<Metrics>,
     ) {
         self.platform.set_runtime(wake.clone(), dirty, metrics);
+        self.warning_ipc.lock().expect("warning IPC poisoned").waker = Some(wake.clone());
         *self.event_waker.lock().expect("event waker poisoned") = Some(wake.clone());
         self.background_waker = Some(Arc::new(move || {
             wake.wake();
@@ -731,6 +763,7 @@ impl LockSession for Locker {
             scene_started.elapsed()
         );
         if let Some(path) = background {
+            self.warning_backgrounds.insert(id);
             let prepared = (Some(&path) == resolved_path.as_ref()
                 && fit == appearance_fit(resolved_fit))
             .then(|| {
@@ -760,10 +793,25 @@ impl LockSession for Locker {
         }
     }
 
+    fn warning_output_ready(&mut self, id: OutputId, info: &OutputInfo) {
+        self.output_ready(id, info);
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            for selector in vigil_warning::DEFAULT_SELECTORS {
+                entry.window.set_warning_element(selector, 0.0);
+            }
+        }
+    }
+
     fn output_resized(&mut self, id: OutputId, info: &OutputInfo) {
         // Simplest correct handling: rebuild the scene at the new geometry.
         self.entries.retain(|e| e.id != id);
         self.output_ready(id, info);
+    }
+
+    fn output_rebound(&mut self, id: OutputId, _info: &OutputInfo) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.window.request_present();
+        }
     }
 
     fn output_gone(&mut self, id: OutputId) {
@@ -800,6 +848,36 @@ impl LockSession for Locker {
         }
     }
 
+    fn warning_progress(&mut self, _frost: f32, _wallpaper: f32) {
+        // Surface opacity and compositor frost are owned by vigil-wayland.
+        // The lock scene contributes only its wallpaper during this phase.
+        self.each_window(|window| {
+            window.set_panel_visible(false);
+            window.set_cursor_visible(false);
+            window.request_present();
+        });
+    }
+
+    fn warning_elements(&mut self, elements: &[ElementSample]) {
+        self.each_window(|window| {
+            for element in elements {
+                window.set_warning_element(&element.selector, element.progress);
+            }
+        });
+    }
+
+    fn warning_commit_requested(&mut self) -> bool {
+        let ipc_commit = {
+            let mut ipc = self.warning_ipc.lock().expect("warning IPC poisoned");
+            std::mem::take(&mut ipc.commit_requested)
+        };
+        std::mem::take(&mut self.warning_commit) || ipc_commit
+    }
+
+    fn warning_wallpaper_ready(&self) -> bool {
+        !self.entries.is_empty() && self.warning_backgrounds.is_empty()
+    }
+
     fn caps_lock(&mut self, on: bool) {
         if self.caps_lock != on {
             self.caps_lock = on;
@@ -809,6 +887,16 @@ impl LockSession for Locker {
 
     fn locked(&mut self) {
         eprintln!("vigil-lock: session locked");
+        self.warning_active = false;
+        let joiners = {
+            let mut ipc = self.warning_ipc.lock().expect("warning IPC poisoned");
+            ipc.locked = true;
+            std::mem::take(&mut ipc.joiners)
+        };
+        for mut joiner in joiners {
+            let _ = joiner.write_all(b"locked\n");
+        }
+        self.apply_panel();
         // Readiness: the compositor holds the lock from this moment — it
         // will never reveal the session again without unlock_and_destroy,
         // even if we have not painted yet. Safe to let a suspend proceed.
@@ -937,6 +1025,118 @@ fn daemonize() -> ! {
     }
 }
 
+struct WarningSocket {
+    path: PathBuf,
+}
+
+#[derive(Default)]
+struct WarningIpcState {
+    locked: bool,
+    commit_requested: bool,
+    joiners: Vec<UnixStream>,
+    waker: Option<WakeHandle>,
+}
+
+impl Drop for WarningSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn warning_socket_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|path| path.join("vigil-lock-warning.sock"))
+}
+
+/// Join an already-running warning. Success means the compositor has
+/// confirmed session-lock, not merely that the commit request was accepted.
+fn join_warning() -> Result<bool, String> {
+    let Some(path) = warning_socket_path() else {
+        return Ok(false);
+    };
+    join_warning_at(&path)
+}
+
+fn join_warning_at(path: &std::path::Path) -> Result<bool, String> {
+    let mut stream = match UnixStream::connect(path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(format!("join warning {}: {error}", path.display())),
+    };
+    stream
+        .write_all(b"commit\n")
+        .map_err(|error| format!("request warning commit: {error}"))?;
+    let mut response = [0_u8; 7];
+    stream
+        .read_exact(&mut response)
+        .map_err(|error| format!("wait for warning lock: {error}"))?;
+    Ok(response == *b"locked\n")
+}
+
+fn start_warning_ipc() -> Result<(WarningSocket, Arc<Mutex<WarningIpcState>>), String> {
+    let path = warning_socket_path().ok_or("XDG_RUNTIME_DIR is unset")?;
+    start_warning_ipc_at(path)
+}
+
+fn start_warning_ipc_at(
+    path: PathBuf,
+) -> Result<(WarningSocket, Arc<Mutex<WarningIpcState>>), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if path.exists() {
+        if UnixStream::connect(&path).is_ok() {
+            return Err(format!(
+                "warning socket {} is already active",
+                path.display()
+            ));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    let listener = UnixListener::bind(&path)
+        .map_err(|error| format!("bind warning socket {}: {error}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("secure warning socket {}: {error}", path.display()))?;
+    let state = Arc::new(Mutex::new(WarningIpcState::default()));
+    let server_state = state.clone();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(mut stream) = incoming else { break };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut command = [0_u8; 7];
+            if stream.read_exact(&mut command).is_ok() && command == *b"commit\n" {
+                let mut state = server_state.lock().expect("warning IPC poisoned");
+                if state.locked {
+                    let _ = stream.write_all(b"locked\n");
+                } else {
+                    eprintln!("vigil-lock: warning join requested immediate lock");
+                    state.commit_requested = true;
+                    state.joiners.push(stream);
+                    if let Some(waker) = state.waker.clone() {
+                        waker.wake();
+                    }
+                }
+            }
+        }
+    });
+    Ok((WarningSocket { path }, state))
+}
+
+fn signal_ready_fd(ready_fd: Option<i32>) {
+    if let Some(fd) = ready_fd {
+        use std::os::fd::FromRawFd;
+        let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
+        let _ = ready.write_all(b"1");
+    }
+}
+
 fn main() {
     let mut cli = match parse_cli() {
         Ok(cli) => cli,
@@ -948,17 +1148,50 @@ fn main() {
     if cli.daemonize {
         daemonize();
     }
-    let config = Config::load_layered(cli.config.as_deref());
+    let mut config = Config::load_layered(cli.config.as_deref());
+    if let Some(duration_ms) = cli.warning_ms {
+        config.lock.warning.duration_ms = duration_ms;
+    }
+    if let Err(error) = config.validate_warning() {
+        eprintln!("vigil-lock: {error}");
+        std::process::exit(2);
+    }
+    match join_warning() {
+        Ok(true) => {
+            signal_ready_fd(cli.ready_fd.take());
+            std::process::exit(0);
+        }
+        Ok(false) => {}
+        Err(error) => eprintln!("vigil-lock: {error}; starting a new lock"),
+    }
+    let mut warning = config.lock.warning.clone();
     cli.theme = cli.theme.or(config.look.theme.clone());
     let grace_secs = cli.grace.unwrap_or(config.lock.grace_secs);
-    let locker = match Locker::new(cli, config, grace_secs) {
+    let (warning_socket, warning_ipc) = if warning.duration_ms > 0 {
+        match start_warning_ipc() {
+            Ok((guard, state)) => (Some(guard), state),
+            Err(error) => {
+                if let Ok(true) = join_warning() {
+                    signal_ready_fd(cli.ready_fd.take());
+                    std::process::exit(0);
+                }
+                eprintln!("vigil-lock: warning IPC unavailable: {error}; locking immediately");
+                warning.duration_ms = 0;
+                (None, Arc::new(Mutex::new(WarningIpcState::default())))
+            }
+        }
+    } else {
+        (None, Arc::new(Mutex::new(WarningIpcState::default())))
+    };
+    let locker = match Locker::new(cli, config, grace_secs, warning_ipc) {
         Ok(locker) => locker,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
             std::process::exit(1);
         }
     };
-    match vigil_wayland::run(locker) {
+    let _warning_socket = warning_socket;
+    match vigil_wayland::run_with_warning(locker, warning) {
         Ok(LockOutcome::Unlocked) => std::process::exit(0),
         Ok(LockOutcome::Denied) => {
             eprintln!("vigil-lock: lock denied (another locker running?)");
@@ -968,6 +1201,7 @@ fn main() {
             eprintln!("vigil-lock: lock invalidated by the compositor");
             std::process::exit(1);
         }
+        Ok(LockOutcome::Cancelled) => std::process::exit(3),
         Err(e) => {
             eprintln!("vigil-lock: {e}");
             std::process::exit(1);
@@ -1123,6 +1357,35 @@ mod tests {
         wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn warning_join_waits_for_locked_acknowledgement() {
+        let path = std::env::temp_dir().join(format!(
+            "vigil-warning-ipc-test-{}-{}.sock",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let (guard, state) = start_warning_ipc_at(path.clone()).unwrap();
+        let join = std::thread::spawn(move || join_warning_at(&path).unwrap());
+
+        for _ in 0..200 {
+            if state.lock().unwrap().commit_requested {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let joiners = {
+            let mut state = state.lock().unwrap();
+            assert!(state.commit_requested);
+            state.locked = true;
+            std::mem::take(&mut state.joiners)
+        };
+        for mut stream in joiners {
+            stream.write_all(b"locked\n").unwrap();
+        }
+        assert!(join.join().unwrap());
+        drop(guard);
     }
 }
 #[test]
