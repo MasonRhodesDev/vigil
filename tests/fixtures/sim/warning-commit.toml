@@ -1,0 +1,4 @@
+mode = "warning"
+at_ms = 3000
+commands = ["commit"]
+expect_mode = "Lock"

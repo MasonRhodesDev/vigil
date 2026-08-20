@@ -15,6 +15,7 @@ vigil-config = { path = "crates/vigil-config" }
 monitor-profiles = { git = "https://github.com/MasonRhodesDev/monitor-profiles", rev = "64d5d1ed079582a2014ebf23c403a3ca03ee9c64" }
 appearance-profiles = { git = "https://github.com/MasonRhodesDev/appearance-profiles.git", rev = "780296ec160b18411c65982d323562e5617d6465" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 smithay = { version = "0.7.0", default-features = false }
 # default display-info feature needs system libdisplay-info < 0.3 (Fedora 44 ships 0.3).

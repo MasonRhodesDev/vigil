@@ -18,8 +18,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo fmt --all --check
       - run: ./tests/check-sim-safety.sh
+      - run: ./tests/check-warning-safety.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: ./tests/check-sim-scenario.sh
 
   # The render-state matrix (crates/vigil/tests/theme_states.rs) runs in the
   # `check` job's cargo test — headless, no GPU, gates merges.

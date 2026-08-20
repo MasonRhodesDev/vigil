@@ -92,6 +92,17 @@ command. `lock --wait` mirrors the production readiness contract and replies
 only after the simulated lock frame is presented. This is the stable automation interface for screenshots and agent
 driven regression work, independent of the host compositor.
 
+Headless scenario fixtures exercise the same theme, UI renderer, injected
+warning clock, and control commands without opening a window or sleeping:
+
+```sh
+vigil-sim scenario tests/fixtures/sim/warning-commit.toml
+```
+
+The JSON result includes final mode/phase, the event trace, and a stable frame
+hash. Optional `expect_mode` and `expect_phase` fields make a fixture fail fast
+when its contract changes.
+
 `vigil-lock --wait` detaches and returns success only after the compositor has
 confirmed that the session is locked (`--daemonize` remains a compatibility
 alias). `vigil-lock --warn 10` presents a cancelable, capture-free idle warning before

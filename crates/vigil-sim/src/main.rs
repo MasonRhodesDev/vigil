@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use font8x8::{BASIC_FONTS, UnicodeFonts};
+use serde::Deserialize;
 use softbuffer::{Context, Surface};
 use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
 use vigil_theme::Theme;
@@ -56,6 +57,7 @@ struct SimArgs {
     at: Duration,
     state_file: Option<std::path::PathBuf>,
     control_socket: Option<std::path::PathBuf>,
+    scenario: Option<std::path::PathBuf>,
 }
 
 impl SimArgs {
@@ -67,10 +69,18 @@ impl SimArgs {
             at: Duration::ZERO,
             state_file: None,
             control_socket: None,
+            scenario: None,
         };
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "login" | "lock" | "warning" => parsed.mode = Mode::parse(&arg).unwrap(),
+                "scenario" => {
+                    parsed.scenario = Some(
+                        args.next()
+                            .map(Into::into)
+                            .unwrap_or_else(|| usage("scenario requires a fixture path")),
+                    );
+                }
                 "--paused" => parsed.paused = true,
                 "--at-ms" => {
                     let value = args
@@ -109,7 +119,7 @@ fn usage(error: &str) -> ! {
         eprintln!("error: {error}");
     }
     eprintln!(
-        "usage: vigil-sim [login|lock|warning] [--paused] [--at-ms MS] [--state-file PATH] [--control-socket PATH]"
+        "usage: vigil-sim [login|lock|warning] [--paused] [--at-ms MS] [--state-file PATH] [--control-socket PATH]\n       vigil-sim scenario FIXTURE.toml"
     );
     std::process::exit(if error.is_empty() { 0 } else { 2 });
 }
@@ -1030,9 +1040,112 @@ fn key_event(key: &Key) -> (u32, Option<String>) {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScenarioFixture {
+    mode: String,
+    #[serde(default)]
+    at_ms: u64,
+    #[serde(default)]
+    commands: Vec<String>,
+    expect_mode: Option<String>,
+    expect_phase: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ScenarioResult {
+    mode: String,
+    warning_phase: Option<String>,
+    time_ms: u128,
+    frame_hash: String,
+    trace: Vec<String>,
+}
+
+fn frame_hash(bytes: &[u8]) -> String {
+    // Stable FNV-1a rather than DefaultHasher, whose algorithm is deliberately
+    // unspecified. This value is an observability fingerprint, not security.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn run_scenario(platform: VigilPlatform, path: &std::path::Path) -> Result<(), String> {
+    let source = fs::read_to_string(path)
+        .map_err(|error| format!("read scenario {}: {error}", path.display()))?;
+    let fixture: ScenarioFixture = toml::from_str(&source)
+        .map_err(|error| format!("parse scenario {}: {error}", path.display()))?;
+    let mode = Mode::parse(&fixture.mode)
+        .ok_or_else(|| format!("scenario has unknown mode {:?}", fixture.mode))?;
+    let mut simulator = Simulator::new(
+        mode,
+        platform,
+        true,
+        Duration::from_millis(fixture.at_ms),
+        None,
+    );
+    simulator.create_scene();
+    simulator.update_warning();
+    render_scenario_frame(&mut simulator)?;
+    for command in &fixture.commands {
+        simulator
+            .apply_command(command)
+            .map_err(|error| format!("scenario command {command:?}: {error}"))?;
+        render_scenario_frame(&mut simulator)?;
+    }
+    let mode = format!("{:?}", simulator.mode);
+    let phase = simulator.warning_phase.map(|value| format!("{value:?}"));
+    if let Some(expected) = fixture.expect_mode.as_deref()
+        && !mode.eq_ignore_ascii_case(expected)
+    {
+        return Err(format!("expected mode {expected:?}, got {mode:?}"));
+    }
+    if let Some(expected) = fixture.expect_phase.as_deref()
+        && phase.as_deref() != Some(expected)
+    {
+        return Err(format!("expected phase {expected:?}, got {phase:?}"));
+    }
+    let result = ScenarioResult {
+        mode,
+        warning_phase: phase,
+        time_ms: simulator.sim_now.as_millis(),
+        frame_hash: frame_hash(&simulator.pixels),
+        trace: simulator.trace.borrow().clone(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn render_scenario_frame(simulator: &mut Simulator) -> Result<(), String> {
+    let scene = simulator
+        .scene
+        .as_mut()
+        .ok_or_else(|| "scenario has no scene".to_owned())?;
+    vigil_ui::advance_timers();
+    scene.render_if_needed(FrameTarget {
+        buffer: &mut simulator.pixels,
+        width: WIDTH,
+        height: HEIGHT,
+        stride: (WIDTH * 4) as usize,
+    });
+    Ok(())
+}
+
 fn main() {
     let args = SimArgs::parse();
     let platform = VigilPlatform::install().expect("install Vigil Slint platform");
+    if let Some(path) = args.scenario.as_deref() {
+        if let Err(error) = run_scenario(platform, path) {
+            eprintln!("vigil-sim: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     let event_loop = EventLoop::<UserCommand>::with_user_event()
         .build()
         .expect("create event loop");

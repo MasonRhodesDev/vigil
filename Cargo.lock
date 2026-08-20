@@ -5134,8 +5134,11 @@ version = "0.3.0"
 dependencies = [
  "font8x8",
  "image",
+ "serde",
+ "serde_json",
  "slint-kit",
  "softbuffer",
+ "toml 0.9.12+spec-1.1.0",
  "vigil-config",
  "vigil-core",
  "vigil-theme",
