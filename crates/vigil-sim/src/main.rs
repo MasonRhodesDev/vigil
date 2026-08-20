@@ -143,11 +143,52 @@ struct Simulator {
     warning_input_after: Instant,
     last_state: RefCell<String>,
     warning_visual_key: Option<(u128, bool)>,
-    pending_acks: Vec<std::sync::mpsc::SyncSender<()>>,
+    pending_acks: Vec<std::sync::mpsc::SyncSender<Result<(), String>>>,
 }
 
 #[derive(Debug)]
-struct UserCommand(String, std::sync::mpsc::SyncSender<()>);
+struct UserCommand(String, std::sync::mpsc::SyncSender<Result<(), String>>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlCommand {
+    State(Mode),
+    LockWait,
+    Pause,
+    Resume,
+    Advance(u64),
+    Commit,
+    Cancel,
+    Hotplug,
+    Blur(Option<bool>),
+    Drawer(Option<bool>),
+}
+
+fn parse_control_command(command: &str) -> Result<ControlCommand, String> {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    match words.as_slice() {
+        ["state", mode] => Mode::parse(mode)
+            .map(ControlCommand::State)
+            .ok_or_else(|| format!("unknown state {mode:?}")),
+        ["lock", "--wait"] => Ok(ControlCommand::LockWait),
+        ["pause"] => Ok(ControlCommand::Pause),
+        ["resume"] => Ok(ControlCommand::Resume),
+        ["advance", ms] => ms
+            .parse::<u64>()
+            .map(ControlCommand::Advance)
+            .map_err(|_| format!("invalid millisecond value {ms:?}")),
+        ["commit"] => Ok(ControlCommand::Commit),
+        ["cancel"] => Ok(ControlCommand::Cancel),
+        ["hotplug"] => Ok(ControlCommand::Hotplug),
+        ["blur", "on"] => Ok(ControlCommand::Blur(Some(true))),
+        ["blur", "off"] => Ok(ControlCommand::Blur(Some(false))),
+        ["blur", "toggle"] => Ok(ControlCommand::Blur(None)),
+        ["drawer", "open"] => Ok(ControlCommand::Drawer(Some(true))),
+        ["drawer", "close"] => Ok(ControlCommand::Drawer(Some(false))),
+        ["drawer", "toggle"] => Ok(ControlCommand::Drawer(None)),
+        [] => Err("empty command".into()),
+        _ => Err(format!("unknown command {command:?}")),
+    }
+}
 
 impl Simulator {
     fn new(
@@ -377,7 +418,7 @@ impl Simulator {
         }
         buffer.present().expect("present simulated output");
         for ack in self.pending_acks.drain(..) {
-            let _ = ack.send(());
+            let _ = ack.send(Ok(()));
         }
     }
 
@@ -533,39 +574,32 @@ impl Simulator {
         true
     }
 
-    fn apply_command(&mut self, command: &str) {
-        let mut words = command.split_whitespace();
-        match (words.next(), words.next()) {
+    fn apply_command(&mut self, command: &str) -> Result<(), String> {
+        match parse_control_command(command)? {
             // Mirrors `vigil-lock --wait`: the socket response is emitted
             // only after the resulting lock frame has been presented.
-            (Some("lock"), Some("--wait")) if words.next().is_none() => {
-                self.select_mode(Mode::Lock)
-            }
-            (Some("state"), Some("login")) => self.select_mode(Mode::Login),
-            (Some("state"), Some("lock")) => self.select_mode(Mode::Lock),
-            (Some("state"), Some("warning")) => self.select_mode(Mode::Warning),
-            (Some("pause"), None) => {
+            ControlCommand::LockWait => self.select_mode(Mode::Lock),
+            ControlCommand::State(mode) => self.select_mode(mode),
+            ControlCommand::Pause => {
                 self.paused = true;
                 self.record("warning: pause (socket)");
             }
-            (Some("resume"), None) => {
+            ControlCommand::Resume => {
                 self.paused = false;
                 self.last_tick = Instant::now();
                 self.record("warning: resume (socket)");
             }
-            (Some("advance"), Some(ms)) if self.mode == Mode::Warning => {
-                if let Ok(ms) = ms.parse::<u64>() {
-                    self.sim_now += Duration::from_millis(ms);
-                    self.record(format!("warning: advance {ms}ms (socket)"));
-                }
+            ControlCommand::Advance(ms) if self.mode == Mode::Warning => {
+                self.sim_now += Duration::from_millis(ms);
+                self.record(format!("warning: advance {ms}ms (socket)"));
             }
-            (Some("commit"), None) if self.mode == Mode::Warning => {
+            ControlCommand::Commit if self.mode == Mode::Warning => {
                 if let Some(warning) = self.warning.as_mut() {
                     warning.request_commit();
                 }
                 self.record("warning: commit (socket)");
             }
-            (Some("cancel"), None) if self.mode == Mode::Warning => {
+            ControlCommand::Cancel if self.mode == Mode::Warning => {
                 if let Some(warning) = self.warning.as_mut() {
                     warning.input(&InputEvent::Key {
                         keysym: 1,
@@ -575,40 +609,28 @@ impl Simulator {
                 }
                 self.record("warning: cancel (socket)");
             }
-            (Some("hotplug"), None) if self.mode == Mode::Warning => {
+            ControlCommand::Hotplug if self.mode == Mode::Warning => {
                 if let Some(warning) = self.warning.as_mut() {
                     warning.hotplug();
                 }
                 self.record("warning: hotplug (socket)");
             }
-            (Some("blur"), Some(value)) if self.mode == Mode::Warning => {
-                match value {
-                    "on" => self.blur_enabled = true,
-                    "off" => self.blur_enabled = false,
-                    "toggle" => self.blur_enabled = !self.blur_enabled,
-                    _ => return,
-                }
-                self.record(format!("warning: blur {value} (socket)"));
+            ControlCommand::Blur(value) if self.mode == Mode::Warning => {
+                self.blur_enabled = value.unwrap_or(!self.blur_enabled);
+                self.record("warning: blur changed (socket)");
             }
-            (Some("drawer"), Some(value)) => {
-                match value {
-                    "open" => self.drawer_open = true,
-                    "close" => self.drawer_open = false,
-                    "toggle" => self.drawer_open = !self.drawer_open,
-                    _ => return,
-                }
-                self.record(format!("drawer: {value} (socket)"));
+            ControlCommand::Drawer(value) => {
+                self.drawer_open = value.unwrap_or(!self.drawer_open);
+                self.record("drawer: changed (socket)");
             }
-            _ => {
-                self.record(format!("command rejected: {command}"));
-                return;
-            }
+            _ => return Err(format!("command is unavailable in {:?} mode", self.mode)),
         }
         self.update_warning();
         self.write_state();
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+        Ok(())
     }
 }
 
@@ -742,10 +764,17 @@ impl ApplicationHandler<UserCommand> for Simulator {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserCommand) {
-        self.apply_command(&event.0);
-        self.pending_acks.push(event.1);
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
+        match self.apply_command(&event.0) {
+            Ok(()) => {
+                self.pending_acks.push(event.1);
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+            Err(error) => {
+                self.record(format!("command rejected: {error}"));
+                let _ = event.1.send(Err(error));
+            }
         }
     }
 }
@@ -772,11 +801,20 @@ fn start_control_socket(
                 if proxy
                     .send_event(UserCommand(command.trim().to_owned(), done_tx))
                     .is_ok()
-                    && done_rx.recv_timeout(Duration::from_secs(2)).is_ok()
                 {
-                    let _ = stream.write_all(b"applied\n");
+                    match done_rx.recv_timeout(Duration::from_secs(2)) {
+                        Ok(Ok(())) => {
+                            let _ = stream.write_all(b"applied\n");
+                        }
+                        Ok(Err(error)) => {
+                            let _ = writeln!(stream, "rejected: {error}");
+                        }
+                        Err(_) => {
+                            let _ = stream.write_all(b"failed: presentation timeout\n");
+                        }
+                    }
                 } else {
-                    let _ = stream.write_all(b"failed\n");
+                    let _ = stream.write_all(b"failed: simulator unavailable\n");
                 }
             }
         }
@@ -1008,6 +1046,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_parser_accepts_wait_and_rejects_malformed_commands() {
+        assert_eq!(
+            parse_control_command("lock --wait").unwrap(),
+            ControlCommand::LockWait
+        );
+        assert_eq!(
+            parse_control_command("advance 125").unwrap(),
+            ControlCommand::Advance(125)
+        );
+        assert!(parse_control_command("advance tomorrow").is_err());
+        assert!(parse_control_command("lock --maybe").is_err());
+        assert!(parse_control_command("state locked-ish").is_err());
+    }
 
     #[test]
     fn warning_blend_has_exact_endpoints() {
