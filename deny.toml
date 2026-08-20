@@ -55,5 +55,8 @@ allow-git = [
     "https://github.com/MasonRhodesDev/appearance-profiles",
     "https://github.com/MasonRhodesDev/slint-kit",
     "https://github.com/MasonRhodesDev/linux-multi-theme-toggle",
+    # Cargo.toml pins tag v0.1.0 and Cargo.lock pins 2c18ead7; cargo-deny
+    # allow-git matches repository URLs while those files enforce revision.
+    "https://github.com/MasonRhodesDev/hypr-slint-runtime",
 ]
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
