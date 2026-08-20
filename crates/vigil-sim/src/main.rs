@@ -536,6 +536,11 @@ impl Simulator {
     fn apply_command(&mut self, command: &str) {
         let mut words = command.split_whitespace();
         match (words.next(), words.next()) {
+            // Mirrors `vigil-lock --wait`: the socket response is emitted
+            // only after the resulting lock frame has been presented.
+            (Some("lock"), Some("--wait")) if words.next().is_none() => {
+                self.select_mode(Mode::Lock)
+            }
             (Some("state"), Some("login")) => self.select_mode(Mode::Login),
             (Some("state"), Some("lock")) => self.select_mode(Mode::Lock),
             (Some("state"), Some("warning")) => self.select_mode(Mode::Warning),

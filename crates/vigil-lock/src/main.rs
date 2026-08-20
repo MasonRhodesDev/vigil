@@ -36,7 +36,7 @@ struct Cli {
     /// Re-exec as a background child and exit 0 only once it is locked —
     /// the blocking form a `before_sleep_cmd` needs: the caller's sleep
     /// inhibitor is not released until the screen is already secured.
-    daemonize: bool,
+    wait: bool,
     warning_ms: Option<u64>,
 }
 
@@ -52,6 +52,10 @@ fn clock_interval(format: &str) -> Duration {
 }
 
 fn parse_cli() -> Result<Cli, String> {
+    parse_cli_from(std::env::args().skip(1))
+}
+
+fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut cli = Cli {
         user: whoami()?,
         config: None,
@@ -60,10 +64,10 @@ fn parse_cli() -> Result<Cli, String> {
         bg_mode: None,
         grace: None,
         ready_fd: None,
-        daemonize: false,
+        wait: false,
         warning_ms: None,
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
@@ -83,7 +87,10 @@ fn parse_cli() -> Result<Cli, String> {
                 let v = value("--ready-fd")?;
                 cli.ready_fd = Some(v.parse().map_err(|_| format!("bad --ready-fd {v}"))?);
             }
-            "--daemonize" => cli.daemonize = true,
+            // `--wait` is the user-facing readiness contract: detach the
+            // locker and return only after the compositor confirms K5. Keep
+            // the old spelling for callers upgraded independently.
+            "--wait" | "--daemonize" => cli.wait = true,
             "--warn" => {
                 let v = value("--warn")?;
                 let seconds: f64 = v.parse().map_err(|_| format!("bad --warn {v}"))?;
@@ -905,7 +912,7 @@ impl LockSession for Locker {
             use std::os::fd::FromRawFd;
             let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
             let _ = ready.write_all(b"1");
-            // Dropping closes the fd; a --daemonize parent unblocks on
+            // Dropping closes the fd; a --wait parent unblocks on
             // either the byte or the EOF.
         }
         if self.grace_secs > 0 {
@@ -972,10 +979,10 @@ fn clock_text(format: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The blocking half of `--daemonize`: spawn the real locker as a child
+/// The blocking half of `--wait`: spawn the real locker as a child
 /// whose stdout is our socketpair, and return only when it reports locked
 /// (one byte) or dies first (EOF). Exit 0 here == the session IS locked.
-fn daemonize() -> ! {
+fn detach_and_wait_for_lock() -> ! {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -987,7 +994,7 @@ fn daemonize() -> ! {
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let mut command = std::process::Command::new(exe);
         command
-            .args(std::env::args().skip(1).filter(|a| a != "--daemonize"))
+            .args(daemon_child_args(std::env::args().skip(1)))
             .args(["--ready-fd", "1"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(OwnedFd::from(child_end)));
@@ -1019,10 +1026,16 @@ fn daemonize() -> ! {
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("vigil-lock: daemonize: {e}");
+            eprintln!("vigil-lock: wait: {e}");
             std::process::exit(1);
         }
     }
+}
+
+fn daemon_child_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    args.into_iter()
+        .filter(|arg| arg != "--wait" && arg != "--daemonize")
+        .collect()
 }
 
 struct WarningSocket {
@@ -1145,8 +1158,8 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if cli.daemonize {
-        daemonize();
+    if cli.wait {
+        detach_and_wait_for_lock();
     }
     let mut config = Config::load_layered(cli.config.as_deref());
     if let Some(duration_ms) = cli.warning_ms {
@@ -1212,6 +1225,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_requests_blocking_lock_readiness() {
+        let cli = parse_cli_from(["--wait".to_owned()]).unwrap();
+        assert!(cli.wait);
+    }
+
+    #[test]
+    fn daemonize_remains_a_compatibility_alias() {
+        let cli = parse_cli_from(["--daemonize".to_owned()]).unwrap();
+        assert!(cli.wait);
+    }
+
+    #[test]
+    fn readiness_flag_is_not_forwarded_to_detached_child() {
+        assert_eq!(
+            daemon_child_args([
+                "--wait".to_owned(),
+                "--warn".to_owned(),
+                "10".to_owned(),
+                "--daemonize".to_owned(),
+            ]),
+            ["--warn", "10"]
+        );
+    }
     use std::time::SystemTime;
 
     fn key() -> InputEvent {

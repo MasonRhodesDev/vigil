@@ -85,13 +85,16 @@ vigil-sim warning --at-ms 3000 \
 Right advances a paused warning by one second, B toggles simulated compositor
 blur, and D opens the state drawer. The state file is rewritten only when its
 contents change, so a frozen simulator has no polling or write loop.
-The newline command socket accepts `state login|lock|warning`, `pause`,
+The newline command socket accepts `state login|lock|warning`, `lock --wait`, `pause`,
 `resume`, `advance MS`, `commit`, `cancel`, `hotplug`, `blur on|off|toggle`,
 and `drawer open|close|toggle`; it replies only after the UI thread applies the
-command. This is the stable automation interface for screenshots and agent
+command. `lock --wait` mirrors the production readiness contract and replies
+only after the simulated lock frame is presented. This is the stable automation interface for screenshots and agent
 driven regression work, independent of the host compositor.
 
-`vigil-lock --warn 10` presents a cancelable, capture-free idle warning before
+`vigil-lock --wait` detaches and returns success only after the compositor has
+confirmed that the session is locked (`--daemonize` remains a compatibility
+alias). `vigil-lock --warn 10` presents a cancelable, capture-free idle warning before
 locking. It requests `ext-background-effect-v1` blur when available and uses a
 tint-only fallback otherwise. `--no-warn`, manual lock, and suspend paths lock
 immediately. Activity before commitment exits 3.
