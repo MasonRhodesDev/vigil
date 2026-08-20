@@ -358,7 +358,9 @@ impl Simulator {
         let mut buffer = surface.buffer_mut().expect("acquire window buffer");
         let mut canvas: Vec<u32> = self
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| u32::from_le_bytes([px[0], px[1], px[2], 0]))
             .collect();
         draw_hamburger(&mut canvas);
