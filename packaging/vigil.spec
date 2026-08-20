@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.2.14
+Version:        0.2.15
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -143,6 +143,9 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Thu Aug 20 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.15-1
+- Admit the pinned hypr-slint-runtime release in the supply-chain policy.
+
 * Thu Aug 20 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.2.14-1
 - Replace fixed-rate Slint polling with event-driven, per-output rendering.
 - Defer fullscreen buffer acquisition until an output is actually dirty.
