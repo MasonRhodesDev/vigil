@@ -50,40 +50,14 @@ config, and auth seams. One Rust binary per surface, Slint scenes per
 output, runtime .slint themes with a compiled-in fallback.
 
 %prep
-# -a1 unpacks the vendor tarball (vendor/ at its root) into the source dir.
+# -a1 unpacks vendor/ and its generated git source replacements.
 %autosetup -p1 -a1
 %cargo_prep -v vendor
-# cargo-rpm-macros replaces crates.io with the vendor directory, but it does
-# not emit the source stanza required for pinned Git dependencies. cargo
-# vendor includes both standards libraries in Source1; map those sources
-# explicitly so the offline RPM build can resolve them.
-cat >> .cargo/config.toml <<'EOF'
-
-[source."git+https://github.com/MasonRhodesDev/monitor-profiles?rev=64d5d1ed079582a2014ebf23c403a3ca03ee9c64#64d5d1ed079582a2014ebf23c403a3ca03ee9c64"]
-git = "https://github.com/MasonRhodesDev/monitor-profiles"
-rev = "64d5d1ed079582a2014ebf23c403a3ca03ee9c64"
-replace-with = "vendored-sources"
-
-[source."git+https://github.com/MasonRhodesDev/appearance-profiles.git?rev=75d831a"]
-git = "https://github.com/MasonRhodesDev/appearance-profiles.git"
-rev = "75d831a"
-replace-with = "vendored-sources"
-
-[source."git+https://github.com/MasonRhodesDev/appearance-profiles.git?rev=780296ec160b18411c65982d323562e5617d6465#780296ec160b18411c65982d323562e5617d6465"]
-git = "https://github.com/MasonRhodesDev/appearance-profiles.git"
-rev = "780296ec160b18411c65982d323562e5617d6465"
-replace-with = "vendored-sources"
-
-[source."git+https://github.com/MasonRhodesDev/slint-kit?rev=ccd7397c3da83ff835d6295d6ec3841fc32c8bac"]
-git = "https://github.com/MasonRhodesDev/slint-kit"
-rev = "ccd7397c3da83ff835d6295d6ec3841fc32c8bac"
-replace-with = "vendored-sources"
-
-[source."git+https://github.com/MasonRhodesDev/linux-multi-theme-toggle?rev=344529cd124c131da40409b152bc1604eebd53d0"]
-git = "https://github.com/MasonRhodesDev/linux-multi-theme-toggle"
-rev = "344529cd124c131da40409b152bc1604eebd53d0"
-replace-with = "vendored-sources"
-EOF
+# %%cargo_prep redirects crates.io only. Append the exact tagged/revision git
+# replacements captured by cargo vendor in build-srpm.sh.
+cfg=.cargo/config.toml
+[ -f "$cfg" ] || cfg=.cargo/config
+cat vendor-git-sources.toml >> "$cfg"
 
 %build
 # vigil's default features include `gl` (FemtoVG over GBM/EGL).

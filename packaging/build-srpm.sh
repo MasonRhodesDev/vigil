@@ -53,12 +53,30 @@ echo "==> source tarball from $REF"
 git -C "$REPO" archive --format=tar.gz --prefix="$NAME-$VER/" \
     -o "$SOURCES/$NAME-$VER.tar.gz" "$REF"
 
-echo "==> vendoring cargo dependencies"
+echo "==> vendoring cargo dependencies (crates.io + pinned git sources)"
 VENDOR_DIR=$(mktemp -d)
 trap 'rm -rf "$VENDOR_DIR"' EXIT
 git -C "$REPO" archive --prefix=src/ "$REF" | tar -x -C "$VENDOR_DIR"
-(cd "$VENDOR_DIR/src" && cargo vendor --locked >/dev/null)
-tar -cJf "$SOURCES/$NAME-$VER-vendor.tar.xz" -C "$VENDOR_DIR/src" vendor
+(cd "$VENDOR_DIR/src" && cargo vendor --locked > "$VENDOR_DIR/vendor-config.toml")
+# cargo-rpm-macros supplies the crates.io replacement. Preserve cargo
+# vendor's exact git source IDs separately so tagged/revision dependencies
+# resolve from the same offline vendor directory without a hand-maintained
+# list drifting every time the workspace gains a shared crate.
+awk '/^\[/{p = /^\[source\."git\+/} p' \
+    "$VENDOR_DIR/vendor-config.toml" > "$VENDOR_DIR/vendor-git-sources.toml"
+test -s "$VENDOR_DIR/vendor-git-sources.toml" || {
+    echo "ERROR: cargo vendor emitted no git source replacements" >&2
+    exit 1
+}
+# Prove the archived workspace resolves without network before producing an
+# SRPM. This catches a missing tagged/revision replacement at source-bundle
+# construction time instead of minutes later inside rpmbuild.
+mkdir -p "$VENDOR_DIR/src/.cargo" "$VENDOR_DIR/cargo-home"
+cp "$VENDOR_DIR/vendor-config.toml" "$VENDOR_DIR/src/.cargo/config.toml"
+(cd "$VENDOR_DIR/src" && CARGO_HOME="$VENDOR_DIR/cargo-home" \
+    cargo metadata --offline --locked --no-deps --format-version 1 >/dev/null)
+tar -cJf "$SOURCES/$NAME-$VER-vendor.tar.xz" -C "$VENDOR_DIR/src" vendor \
+    -C "$VENDOR_DIR" vendor-git-sources.toml
 
 echo "==> building SRPM"
 SRPM=$(rpmbuild -bs "$SPEC" | sed -n 's/^Wrote: //p')
