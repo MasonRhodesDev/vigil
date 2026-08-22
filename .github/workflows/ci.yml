@@ -27,6 +27,28 @@ jobs:
   # The render-state matrix (crates/vigil/tests/theme_states.rs) runs in the
   # `check` job's cargo test — headless, no GPU, gates merges.
 
+  # Nested-compositor lock-readiness suite (issue #44): protocol ordering,
+  # singleton/join, cancel, handoff, hotplug — against headless sway.
+  # Gates release: release.yml requires this workflow to be green on the
+  # tagged commit.
+  nested:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: System deps (sway headless + build deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseat-dev libinput-dev libxkbcommon-dev \
+            libudev-dev libgbm-dev libdrm-dev libfontconfig-dev libclang-dev libpam0g-dev \
+            sway wtype
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Install the lock PAM service (grace unlocks; auth never succeeds)
+        run: sudo install -Dm644 dist/vigil-lock.pam /etc/pam.d/vigil-lock
+      - run: cargo build -p vigil-lock
+      - run: cargo build -p vigil-wayland --example lock_probe
+      - run: ./tests/nested/run.sh
+
   # Best-effort KMS smoke test: runner kernels may lack vkms (risk #4), so
   # this must never block a merge; the QEMU e2e (tests/e2e/) needs KVM and
   # stays a local/manual gate for now.
