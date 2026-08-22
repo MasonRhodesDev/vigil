@@ -88,6 +88,10 @@ pub trait LockSession {
     fn output_rebound(&mut self, id: OutputId, info: &OutputInfo) {
         self.output_resized(id, info);
     }
+    /// Mark this output's scene as needing a full repaint even though no
+    /// Slint state changed. Called before a forced present would otherwise
+    /// commit an empty buffer (issue #35).
+    fn force_repaint(&mut self, _id: OutputId) {}
     fn output_gone(&mut self, id: OutputId);
     /// A pre-lock warning surface is ready. The default creates the same scene
     /// as a lock surface; implementations can keep authentication controls
@@ -155,6 +159,15 @@ fn present_priority(is_lock: bool) -> u8 {
     u8::from(!is_lock)
 }
 
+/// Which role a new output surface gets. A warning overlay is only correct
+/// while the warning is showing AND the session lock has not been taken:
+/// once locked, a warning surface would be destroyed by warning cleanup and
+/// leave the output with no lock surface at all — permanently black, DESIGN
+/// §12 invariant 4 (issue #35 hotplug case).
+fn surface_role_is_warning(warning_active: bool, lock_taken: bool) -> bool {
+    warning_active && !lock_taken
+}
+
 struct Entry {
     id: OutputId,
     output: wl_output::WlOutput,
@@ -210,6 +223,10 @@ struct App<S: LockSession + 'static> {
     metrics: Arc<Metrics>,
     qh: QueueHandle<App<S>>,
     present_retry: BTreeMap<OutputId, (std::time::Instant, u32)>,
+    /// First-configured surfaces whose scenes are built on the next tick,
+    /// outside the protocol callback: (output, is-lock-role). Inline scene
+    /// construction serialized the lock reveal across outputs (issue #37).
+    pending_scenes: Vec<(OutputId, bool)>,
     warning: Option<Timeline>,
     warning_started: std::time::Instant,
     warning_progress: (f32, f32),
@@ -263,7 +280,7 @@ impl<S: LockSession> App<S> {
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         // The initial snapshot and later metadata callback can name the same
         // object. Object identity is authoritative even before metadata exists.
-        let adding_warning = self.warning.is_some() && self.lock.is_none();
+        let adding_warning = surface_role_is_warning(self.warning.is_some(), self.lock.is_some());
         if self.entries.iter().any(|entry| {
             entry.output == output
                 && matches!(entry.role, SurfaceRole::Warning(_)) == adding_warning
@@ -293,7 +310,7 @@ impl<S: LockSession> App<S> {
                 },
             )
         });
-        let (role, background_effect) = if self.warning.is_some() {
+        let (role, background_effect) = if adding_warning {
             let Some(layer_shell) = self.layer_shell.as_ref() else {
                 return;
             };
@@ -382,19 +399,26 @@ impl<S: LockSession> App<S> {
         let id = self.entries[idx].id;
         let info = self.output_info(idx);
         if first {
-            if matches!(self.entries[idx].role, SurfaceRole::Warning(_)) {
-                if self.scene_ids.insert(id) {
-                    self.session.warning_output_ready(id, &info);
-                } else {
-                    self.session.output_resized(id, &info);
-                }
-            } else if self.scene_ids.insert(id) {
-                self.session.output_ready(id, &info);
-            } else {
-                self.session.output_rebound(id, &info);
+            let is_lock = matches!(self.entries[idx].role, SurfaceRole::Lock { .. });
+            if is_lock {
+                // All outputs lock together (issue #37): ext-session-lock
+                // blanks an output until a buffer matching this configure
+                // arrives, and building the Slint scene inline here
+                // serialized the reveal across outputs. Satisfy the
+                // configure with a solid buffer now; the scene is built on
+                // the next tick and paints over it.
+                self.commit_solid(idx);
             }
+            self.pending_scenes.push((id, is_lock));
         } else if resized {
             self.session.output_resized(id, &info);
+        } else {
+            // Same-size reconfigure (DPMS wake, VT switch, hotplug
+            // re-layout): the scene is quiescent, but this configure
+            // invalidated the buffer. Without a repaint request, present()
+            // commits a zeroed buffer and the output stays black until the
+            // next clock tick (issue #35).
+            self.session.output_rebound(id, &info);
         }
         // Invariant: a configured lock surface gets a buffer in this event-loop
         // iteration. Presentation stays outside protocol callbacks so redraws
@@ -405,6 +429,33 @@ impl<S: LockSession> App<S> {
         if elapsed >= Duration::from_millis(8) {
             eprintln!("vigil-lock: output {:?} configure: {:?}", id, elapsed);
         }
+    }
+
+    /// Commit a solid black buffer to satisfy a lock-surface configure
+    /// before its scene exists. Kept next to present() so buffer
+    /// acquisition has exactly two audited entry points.
+    fn commit_solid(&mut self, idx: usize) {
+        let (w, h) = self.entries[idx].px;
+        let id = self.entries[idx].id;
+        let Some(pool) = self.entries[idx].pool.as_mut() else {
+            self.schedule_present_retry(id);
+            return;
+        };
+        let stride = w as usize * 4;
+        let Ok((buffer, canvas)) =
+            pool.create_buffer(w as i32, h as i32, stride as i32, wl_shm::Format::Xrgb8888)
+        else {
+            self.schedule_present_retry(id);
+            return;
+        };
+        canvas.fill(0);
+        self.metrics.record_buffer_acquire();
+        let surface = &self.entries[idx].surface;
+        let _ = buffer.attach_to(surface);
+        surface.damage_buffer(0, 0, w as i32, h as i32);
+        surface.commit();
+        self.metrics.record_commit();
+        self.entries[idx].committed = true;
     }
 
     /// Render if the scene is dirty and commit the new buffer.
@@ -442,15 +493,30 @@ impl<S: LockSession> App<S> {
             canvas.fill(0);
         }
         let render_started = std::time::Instant::now();
-        let drew = self.session.render(
+        let mut drew = self.session.render(
             id,
             FrameTarget {
-                buffer: canvas,
+                buffer: &mut *canvas,
                 width: w,
                 height: h,
                 stride,
             },
         );
+        if !drew && force {
+            // A forced present over a quiescent scene: request a repaint
+            // and re-render once before ever committing an empty buffer —
+            // the black-until-next-clock-tick failure of issue #35.
+            self.session.force_repaint(id);
+            drew = self.session.render(
+                id,
+                FrameTarget {
+                    buffer: &mut *canvas,
+                    width: w,
+                    height: h,
+                    stride,
+                },
+            );
+        }
         if warning && self.warning.is_some() {
             // wl_shm ARGB8888 is premultiplied. Fade the rendered lock
             // wallpaper in over a neutral frost tint while the compositor
@@ -550,6 +616,34 @@ impl<S: LockSession> App<S> {
             if self.got_locked && timeline.gui_complete(elapsed) {
                 self.warning = None;
             }
+        }
+        // Build deferred scenes in one batch: every output whose configure
+        // landed since the last tick already holds a solid placeholder, so
+        // the themed content appears on all of them together (issue #37).
+        for (id, is_lock) in std::mem::take(&mut self.pending_scenes) {
+            let Some(idx) = self.entries.iter().position(|entry| {
+                entry.id == id
+                    && entry.configured
+                    && matches!(entry.role, SurfaceRole::Lock { .. }) == is_lock
+            }) else {
+                continue;
+            };
+            let info = self.output_info(idx);
+            if !is_lock {
+                if self.scene_ids.insert(id) {
+                    self.session.warning_output_ready(id, &info);
+                } else {
+                    self.session.output_resized(id, &info);
+                }
+            } else if self.scene_ids.insert(id) {
+                self.session.output_ready(id, &info);
+            } else {
+                self.session.output_rebound(id, &info);
+            }
+            // The placeholder marked the surface committed, so the coming
+            // present is not forced: guarantee the fresh scene paints.
+            self.session.force_repaint(id);
+            self.dirty.mark(id);
         }
         self.session.tick();
         if self.session.wants_unlock() {
@@ -683,6 +777,7 @@ pub fn run_with_warning<S: LockSession + 'static>(
         metrics: metrics.clone(),
         qh: qh.clone(),
         present_retry: BTreeMap::new(),
+        pending_scenes: Vec::new(),
         warning,
         warning_started: std::time::Instant::now(),
         warning_progress: (0.0, 0.0),
@@ -1138,7 +1233,19 @@ wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore wl_reg
 
 #[cfg(test)]
 mod tests {
-    use super::{initial_scale120, present_priority};
+    use super::{initial_scale120, present_priority, surface_role_is_warning};
+
+    #[test]
+    fn hotplug_after_lock_creates_a_lock_surface_not_a_warning() {
+        // The warning timeline object is retained until its GUI completes,
+        // so "warning object exists" must not decide the role once the lock
+        // is held (issue #35: the warning surface was destroyed by cleanup,
+        // leaving the hotplugged output permanently black).
+        assert!(surface_role_is_warning(true, false));
+        assert!(!surface_role_is_warning(true, true));
+        assert!(!surface_role_is_warning(false, false));
+        assert!(!surface_role_is_warning(false, true));
+    }
 
     #[test]
     fn lock_handoff_inherits_fractional_output_scale() {
