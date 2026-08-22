@@ -24,6 +24,7 @@ smithay-drm-extras = { version = "0.1", default-features = false }
 slint = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "software-renderer-systemfonts"] }
 slint-interpreter = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2"] }
 hypr-slint-runtime = { git = "https://github.com/MasonRhodesDev/hypr-slint-runtime", tag = "v0.1.0" }
+hypr-singleton = { git = "https://github.com/MasonRhodesDev/hypr-commons", rev = "42bdc63283e50b9a1c55d00bd4d25a8f55863233" }
 greetd_ipc = { version = "0.10", features = ["sync-codec"] }
 xkbcommon = "0.9"
 calloop = "0.14"

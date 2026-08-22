@@ -95,14 +95,24 @@ impl PamAttempt {
     pub fn cancel(&mut self) {
         self.responses = None;
     }
+
+    /// Abandon the worker thread: cancel the conversation and let the thread
+    /// finish (or not) on its own. A PAM module can block outside the
+    /// conversation entirely — pam_fprintd waits on a D-Bus verify that only
+    /// ends when a finger arrives — so there is no bound under which joining
+    /// is safe. Unlock and process exit must never wait on PAM.
+    pub fn detach(&mut self) {
+        self.responses = None;
+        drop(self.worker.take());
+    }
 }
 
 impl Drop for PamAttempt {
     fn drop(&mut self) {
-        self.responses = None;
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // Deliberately no join: a worker wedged inside a PAM module would
+        // wedge this drop — and this drop runs on the unlock path (issue
+        // #49: lockers that survived unlock and logout were stuck here).
+        self.detach();
     }
 }
 
@@ -160,6 +170,30 @@ mod tests {
             .prompt_echo_off(&CString::new("Password:").unwrap())
             .unwrap_err();
         assert_eq!(err, ErrorCode::CONV_ERR);
+    }
+
+    #[test]
+    fn drop_never_waits_on_a_wedged_worker() {
+        // Issue #49: a PAM module can block outside the conversation
+        // (pam_fprintd waiting on a finger). Dropping the attempt — which
+        // happens on every unlock/teardown path — must return immediately,
+        // not join the thread.
+        let (tx, _rx) = mpsc::channel();
+        let attempt = PamAttempt {
+            responses: Some(tx),
+            worker: Some(std::thread::spawn(|| {
+                loop {
+                    std::thread::park();
+                }
+            })),
+        };
+        let start = std::time::Instant::now();
+        drop(attempt);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "drop blocked for {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

@@ -24,7 +24,9 @@ use vigil_warning::ElementSample;
 use vigil_wayland::{LockOutcome, LockSession};
 
 struct Cli {
-    user: String,
+    /// None until resolved by `parse_cli` — parsing itself never reads the
+    /// environment, so tests can exercise flags with USER/LOGNAME unset.
+    user: Option<String>,
     config: Option<PathBuf>,
     theme: Option<PathBuf>,
     background: Option<PathBuf>,
@@ -52,12 +54,18 @@ fn clock_interval(format: &str) -> Duration {
 }
 
 fn parse_cli() -> Result<Cli, String> {
-    parse_cli_from(std::env::args().skip(1))
+    let mut cli = parse_cli_from(std::env::args().skip(1))?;
+    cli.user = Some(resolve_user(
+        cli.user.take(),
+        std::env::var("USER").ok(),
+        std::env::var("LOGNAME").ok(),
+    )?);
+    Ok(cli)
 }
 
 fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut cli = Cli {
-        user: whoami()?,
+        user: None,
         config: None,
         theme: None,
         background: None,
@@ -71,7 +79,7 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
-            "--user" => cli.user = value("--user")?,
+            "--user" => cli.user = Some(value("--user")?),
             "--config" => cli.config = Some(PathBuf::from(value("--config")?)),
             "--theme" => cli.theme = Some(PathBuf::from(value("--theme")?)),
             "--background" => cli.background = Some(PathBuf::from(value("--background")?)),
@@ -103,11 +111,18 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
     Ok(cli)
 }
 
-/// The user to authenticate: the session owner, not a CLI guess.
-fn whoami() -> Result<String, String> {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .map_err(|_| "cannot determine user (USER/LOGNAME unset); pass --user".into())
+/// The user to authenticate: an explicit `--user` wins; otherwise the
+/// session environment. Pure, so the error path is unit-testable without
+/// mutating the process environment (unsafe in edition 2024).
+fn resolve_user(
+    explicit: Option<String>,
+    env_user: Option<String>,
+    env_logname: Option<String>,
+) -> Result<String, String> {
+    explicit
+        .or(env_user)
+        .or(env_logname)
+        .ok_or_else(|| "cannot determine user (USER/LOGNAME unset); pass --user".into())
 }
 
 fn appearance_fit(fit: appearance_profiles::Fit) -> BackgroundFit {
@@ -294,7 +309,7 @@ struct Locker {
     scheduler: IdleScheduler,
     warning_active: bool,
     warning_commit: bool,
-    warning_ipc: Arc<Mutex<WarningIpcState>>,
+    lock_ipc: Arc<Mutex<LockIpcState>>,
     warning_backgrounds: std::collections::HashSet<OutputId>,
 }
 
@@ -378,11 +393,15 @@ fn handle_login_event(event: LoginEvent, grace: &mut Option<Grace>) -> LoginActi
 
 impl Locker {
     fn new(
-        cli: Cli,
+        mut cli: Cli,
         config: Config,
         grace_secs: u64,
-        warning_ipc: Arc<Mutex<WarningIpcState>>,
+        lock_ipc: Arc<Mutex<LockIpcState>>,
     ) -> Result<Self, String> {
+        let user = cli
+            .user
+            .take()
+            .ok_or("user not resolved before Locker::new")?;
         let warning_active = config.lock.warning.duration_ms > 0;
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
@@ -404,7 +423,7 @@ impl Locker {
             })
             .unwrap_or_default();
         let (background_tx, background_rx) = mpsc::channel();
-        let appearance_bundle = appearance_profiles::PreparedBundle::load_published(&cli.user)
+        let appearance_bundle = appearance_profiles::PreparedBundle::load_published(&user)
             .unwrap_or_else(|error| {
                 eprintln!("vigil-lock: prepared appearance bundle: {error}");
                 None
@@ -414,7 +433,7 @@ impl Locker {
             theme,
             entries: Vec::new(),
             panel: 0,
-            user: cli.user,
+            user,
             looks: Looks {
                 cli_background: cli.background.clone(),
                 fallback_background: std::env::var_os("WALLPAPER_PATH")
@@ -465,7 +484,7 @@ impl Locker {
             scheduler: IdleScheduler::default(),
             warning_active,
             warning_commit: false,
-            warning_ipc,
+            lock_ipc,
             warning_backgrounds: std::collections::HashSet::new(),
         };
         if let Some(login) = &locker.login {
@@ -480,6 +499,14 @@ impl Locker {
     }
 
     fn start_attempt(&mut self) {
+        // Auth belongs on a HELD lock (issue #36): a denied locker that
+        // opens a PAM conversation logs a failed auth on every hypridle
+        // re-fire. locked() flips ipc.locked before its start_attempt call,
+        // so this holds on both call sites (grant and post-failure retry).
+        debug_assert!(
+            self.lock_ipc.lock().expect("lock IPC poisoned").locked,
+            "PAM conversation must not start before the compositor grants the lock"
+        );
         let tx = self.auth_tx.clone();
         let waker = self.event_waker.clone();
         self.attempt = Some(PamAttempt::start(&self.user, move |event| {
@@ -638,10 +665,26 @@ impl Locker {
 
     /// Single exit path: clear the logind hint, then release the screen.
     fn unlock_now(&mut self) {
+        // Unlock must never wait on PAM. Grace and loginctl unlocks can fire
+        // while a conversation is mid-flight (or a module is wedged outside
+        // it — pam_fprintd waiting on a finger), and the teardown drop of a
+        // joining attempt was exactly issue #49's immortal-locker hang.
+        if let Some(attempt) = &mut self.attempt {
+            attempt.detach();
+        }
         if let Some(login) = &self.login {
             login.set_locked_hint(false);
         }
         self.unlocked = true;
+        // Belt and braces: teardown after this point should be milliseconds
+        // (roundtrip + drops). If anything else wedges — a stuck D-Bus
+        // connection, a slow thread drop — the locker must still die rather
+        // than survive the session (issue #49). The screen is already
+        // released when this fires, so _exit is safe.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(5));
+            unsafe { libc::_exit(0) };
+        });
     }
 
     fn pump_backgrounds(&mut self) {
@@ -702,7 +745,7 @@ impl LockSession for Locker {
         metrics: Arc<Metrics>,
     ) {
         self.platform.set_runtime(wake.clone(), dirty, metrics);
-        self.warning_ipc.lock().expect("warning IPC poisoned").waker = Some(wake.clone());
+        self.lock_ipc.lock().expect("warning IPC poisoned").waker = Some(wake.clone());
         *self.event_waker.lock().expect("event waker poisoned") = Some(wake.clone());
         self.background_waker = Some(Arc::new(move || {
             wake.wake();
@@ -821,6 +864,12 @@ impl LockSession for Locker {
         }
     }
 
+    fn force_repaint(&mut self, id: OutputId) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.window.request_present();
+        }
+    }
+
     fn output_gone(&mut self, id: OutputId) {
         if let Some(e) = self.entries.iter().find(|e| e.id == id) {
             eprintln!("vigil-lock: output {} gone", e.connector);
@@ -875,7 +924,7 @@ impl LockSession for Locker {
 
     fn warning_commit_requested(&mut self) -> bool {
         let ipc_commit = {
-            let mut ipc = self.warning_ipc.lock().expect("warning IPC poisoned");
+            let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
             std::mem::take(&mut ipc.commit_requested)
         };
         std::mem::take(&mut self.warning_commit) || ipc_commit
@@ -896,7 +945,7 @@ impl LockSession for Locker {
         eprintln!("vigil-lock: session locked");
         self.warning_active = false;
         let joiners = {
-            let mut ipc = self.warning_ipc.lock().expect("warning IPC poisoned");
+            let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
             ipc.locked = true;
             std::mem::take(&mut ipc.joiners)
         };
@@ -1038,41 +1087,59 @@ fn daemon_child_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
-struct WarningSocket {
+struct LockIpcSocket {
     path: PathBuf,
 }
 
 #[derive(Default)]
-struct WarningIpcState {
+struct LockIpcState {
     locked: bool,
     commit_requested: bool,
     joiners: Vec<UnixStream>,
     waker: Option<WakeHandle>,
 }
 
-impl Drop for WarningSocket {
+impl Drop for LockIpcSocket {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
-fn warning_socket_path() -> Option<PathBuf> {
+/// The singleton name: one locker per user runtime dir per compositor.
+/// Keyed by WAYLAND_DISPLAY so nested/test compositors never collide with
+/// the real session's locker.
+fn lock_instance_name() -> String {
+    let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+    let display = std::path::Path::new(&display)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wayland-0".into());
+    format!("vigil-lock-{display}")
+}
+
+fn lock_socket_path() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .map(|path| path.join("vigil-lock-warning.sock"))
+        .map(|path| path.join(format!("{}.sock", lock_instance_name())))
 }
 
 /// Join an already-running warning. Success means the compositor has
 /// confirmed session-lock, not merely that the commit request was accepted.
-fn join_warning() -> Result<bool, String> {
-    let Some(path) = warning_socket_path() else {
+fn join_lock() -> Result<bool, String> {
+    let Some(path) = lock_socket_path() else {
         return Ok(false);
     };
-    join_warning_at(&path)
+    join_lock_at(&path)
 }
 
-fn join_warning_at(path: &std::path::Path) -> Result<bool, String> {
+/// How long a joiner waits for the owner to confirm the lock. A commit
+/// request forces an in-flight warning to commit immediately, so a healthy
+/// owner answers within scene-build time; a hung owner must not hang every
+/// subsequent lock attempt with it (issue #50 interaction with #49).
+const JOIN_LOCKED_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn join_lock_at(path: &std::path::Path) -> Result<bool, String> {
     let mut stream = match UnixStream::connect(path) {
         Ok(stream) => stream,
         Err(error)
@@ -1083,41 +1150,45 @@ fn join_warning_at(path: &std::path::Path) -> Result<bool, String> {
         {
             return Ok(false);
         }
-        Err(error) => return Err(format!("join warning {}: {error}", path.display())),
+        Err(error) => return Err(format!("join lock {}: {error}", path.display())),
     };
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(JOIN_LOCKED_TIMEOUT));
     stream
         .write_all(b"commit\n")
-        .map_err(|error| format!("request warning commit: {error}"))?;
+        .map_err(|error| format!("request lock commit: {error}"))?;
     let mut response = [0_u8; 7];
     stream
         .read_exact(&mut response)
-        .map_err(|error| format!("wait for warning lock: {error}"))?;
+        .map_err(|error| format!("wait for lock confirmation: {error}"))?;
     Ok(response == *b"locked\n")
 }
 
-fn start_warning_ipc() -> Result<(WarningSocket, Arc<Mutex<WarningIpcState>>), String> {
-    let path = warning_socket_path().ok_or("XDG_RUNTIME_DIR is unset")?;
-    start_warning_ipc_at(path)
+fn start_lock_ipc() -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String> {
+    let path = lock_socket_path().ok_or("XDG_RUNTIME_DIR is unset")?;
+    start_lock_ipc_at(path)
 }
 
-fn start_warning_ipc_at(
-    path: PathBuf,
-) -> Result<(WarningSocket, Arc<Mutex<WarningIpcState>>), String> {
+fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String> {
     use std::os::unix::fs::PermissionsExt;
-    if path.exists() {
-        if UnixStream::connect(&path).is_ok() {
-            return Err(format!(
-                "warning socket {} is already active",
-                path.display()
-            ));
+    // Callers hold the hypr-singleton flock, so any existing socket file is
+    // a leftover from a dead owner (std::process::exit skips Drop): bind
+    // first, and only unlink + retry when the address is genuinely in use.
+    // The old probe-then-unlink order let two racing starts both unlink and
+    // both bind, stacking lockers (issue #50 TOCTOU).
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("clear stale socket {}: {error}", path.display()))?;
+            UnixListener::bind(&path)
+                .map_err(|error| format!("bind lock socket {}: {error}", path.display()))?
         }
-        let _ = std::fs::remove_file(&path);
-    }
-    let listener = UnixListener::bind(&path)
-        .map_err(|error| format!("bind warning socket {}: {error}", path.display()))?;
+        Err(error) => return Err(format!("bind lock socket {}: {error}", path.display())),
+    };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("secure warning socket {}: {error}", path.display()))?;
-    let state = Arc::new(Mutex::new(WarningIpcState::default()));
+        .map_err(|error| format!("secure lock socket {}: {error}", path.display()))?;
+    let state = Arc::new(Mutex::new(LockIpcState::default()));
     let server_state = state.clone();
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
@@ -1139,7 +1210,7 @@ fn start_warning_ipc_at(
             }
         }
     });
-    Ok((WarningSocket { path }, state))
+    Ok((LockIpcSocket { path }, state))
 }
 
 fn signal_ready_fd(ready_fd: Option<i32>) {
@@ -1169,41 +1240,61 @@ fn main() {
         eprintln!("vigil-lock: {error}");
         std::process::exit(2);
     }
-    match join_warning() {
-        Ok(true) => {
-            signal_ready_fd(cli.ready_fd.take());
-            std::process::exit(0);
-        }
-        Ok(false) => {}
-        Err(error) => eprintln!("vigil-lock: {error}; starting a new lock"),
-    }
     let mut warning = config.lock.warning.clone();
     cli.theme = cli.theme.or(config.look.theme.clone());
     let grace_secs = cli.grace.unwrap_or(config.lock.grace_secs);
-    let (warning_socket, warning_ipc) = if warning.duration_ms > 0 {
-        match start_warning_ipc() {
-            Ok((guard, state)) => (Some(guard), state),
-            Err(error) => {
-                if let Ok(true) = join_warning() {
-                    signal_ready_fd(cli.ready_fd.take());
-                    std::process::exit(0);
+    // Singleton guard (issue #50): exactly one locker per seat. flock
+    // ownership is kernel-released on any death — SIGKILL and Drop-skipping
+    // exits included — so only a LIVE owner blocks us; the socket is the
+    // join RPC (commit / locked). Concurrent invocations either defer to
+    // the owner (waiting for compositor-confirmed lock) or refuse to stack.
+    let (_singleton, lock_ipc_socket, lock_ipc) =
+        match hypr_singleton::try_acquire(&lock_instance_name()) {
+            Ok(Some(guard)) => match start_lock_ipc() {
+                Ok((socket, state)) => (guard, Some(socket), state),
+                Err(error) => {
+                    // Owned but not joinable: still safe to lock (the flock
+                    // alone prevents stacking), but a cancelable warning
+                    // whose join contract can't be honored must not run.
+                    eprintln!("vigil-lock: lock IPC unavailable: {error}; locking immediately");
+                    warning.duration_ms = 0;
+                    (guard, None, Arc::new(Mutex::new(LockIpcState::default())))
                 }
-                eprintln!("vigil-lock: warning IPC unavailable: {error}; locking immediately");
-                warning.duration_ms = 0;
-                (None, Arc::new(Mutex::new(WarningIpcState::default())))
+            },
+            Ok(None) => {
+                // Another live locker owns the seat. Ask it to commit and
+                // succeed only once the compositor confirms the lock. Retry
+                // briefly: the owner binds its socket just after taking the
+                // flock, so a joiner can land in that window.
+                for _ in 0..20 {
+                    match join_lock() {
+                        Ok(true) => {
+                            signal_ready_fd(cli.ready_fd.take());
+                            std::process::exit(0);
+                        }
+                        Ok(false) => std::thread::sleep(Duration::from_millis(100)),
+                        Err(error) => {
+                            eprintln!("vigil-lock: {error}");
+                            break;
+                        }
+                    }
+                }
+                eprintln!("vigil-lock: another locker owns the seat; refusing to stack");
+                std::process::exit(2);
             }
-        }
-    } else {
-        (None, Arc::new(Mutex::new(WarningIpcState::default())))
-    };
-    let locker = match Locker::new(cli, config, grace_secs, warning_ipc) {
+            Err(error) => {
+                eprintln!("vigil-lock: {error}");
+                std::process::exit(2);
+            }
+        };
+    let locker = match Locker::new(cli, config, grace_secs, lock_ipc) {
         Ok(locker) => locker,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
             std::process::exit(1);
         }
     };
-    let _warning_socket = warning_socket;
+    let _lock_ipc_socket = lock_ipc_socket;
     match vigil_wayland::run_with_warning(locker, warning) {
         Ok(LockOutcome::Unlocked) => std::process::exit(0),
         Ok(LockOutcome::Denied) => {
@@ -1236,6 +1327,38 @@ mod tests {
     fn daemonize_remains_a_compatibility_alias() {
         let cli = parse_cli_from(["--daemonize".to_owned()]).unwrap();
         assert!(cli.wait);
+    }
+
+    #[test]
+    fn parsing_never_resolves_the_user_from_the_environment() {
+        // parse_cli_from must stay pure: package CI runs with USER/LOGNAME
+        // unset, and these tests must not depend on builder identity.
+        let cli = parse_cli_from(["--wait".to_owned()]).unwrap();
+        assert!(cli.user.is_none());
+    }
+
+    #[test]
+    fn explicit_user_wins_over_environment() {
+        let user = resolve_user(
+            Some("alice".into()),
+            Some("bob".into()),
+            Some("carol".into()),
+        );
+        assert_eq!(user.unwrap(), "alice");
+    }
+
+    #[test]
+    fn environment_resolution_prefers_user_over_logname() {
+        let user = resolve_user(None, Some("bob".into()), Some("carol".into()));
+        assert_eq!(user.unwrap(), "bob");
+        let user = resolve_user(None, None, Some("carol".into()));
+        assert_eq!(user.unwrap(), "carol");
+    }
+
+    #[test]
+    fn user_resolution_fails_closed_without_any_source() {
+        let error = resolve_user(None, None, None).unwrap_err();
+        assert!(error.contains("pass --user"), "{error}");
     }
 
     #[test]
@@ -1404,8 +1527,8 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("unnamed")
         ));
-        let (guard, state) = start_warning_ipc_at(path.clone()).unwrap();
-        let join = std::thread::spawn(move || join_warning_at(&path).unwrap());
+        let (guard, state) = start_lock_ipc_at(path.clone()).unwrap();
+        let join = std::thread::spawn(move || join_lock_at(&path).unwrap());
 
         for _ in 0..200 {
             if state.lock().unwrap().commit_requested {
@@ -1423,6 +1546,22 @@ mod tests {
             stream.write_all(b"locked\n").unwrap();
         }
         assert!(join.join().unwrap());
+        drop(guard);
+    }
+
+    #[test]
+    fn stale_socket_from_a_dead_owner_is_reclaimed() {
+        // std::process::exit skips Drop, so a killed owner always leaves its
+        // socket file behind. Under the singleton flock that leftover is
+        // provably dead: bind must reclaim it instead of refusing to start.
+        let path = std::env::temp_dir().join(format!(
+            "vigil-lock-ipc-stale-test-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        drop(UnixListener::bind(&path).unwrap()); // dead owner's leftover file
+        let (guard, _state) = start_lock_ipc_at(path.clone()).unwrap();
+        assert!(UnixStream::connect(&path).is_ok());
         drop(guard);
     }
 }
