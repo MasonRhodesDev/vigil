@@ -1719,10 +1719,10 @@ fn run() -> Result<i32, String> {
                 // frames, a greeter that paints once and then ignores the
                 // user forever. route() leaves self.panel on the output
                 // under the cursor/keyboard, so mark that one explicitly.
-                if had_events {
-                    if let Some(entry) = app.entries.get(app.panel) {
-                        app.dirty.mark(entry.id);
-                    }
+                if had_events
+                    && let Some(entry) = app.entries.get(app.panel)
+                {
+                    app.dirty.mark(entry.id);
                 }
                 Ok(PostAction::Continue)
             },
