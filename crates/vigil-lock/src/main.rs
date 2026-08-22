@@ -551,6 +551,13 @@ impl Locker {
                     self.unlock_now();
                     return;
                 }
+                AuthEvent::Done(Err(_)) if self.unlocked => {
+                    // A detached conversation (grace / loginctl unlock)
+                    // finishing late is not an auth failure: starting
+                    // another PAM transaction here opened a conversation
+                    // nobody answers — a logged failure per unlock, and a
+                    // pam_faillock strike against the user.
+                }
                 AuthEvent::Done(Err(message)) => {
                     self.snapshot.error = message.clone();
                     self.snapshot.busy = false;
@@ -1253,45 +1260,61 @@ fn main() {
     // exits included — so only a LIVE owner blocks us; the socket is the
     // join RPC (commit / locked). Concurrent invocations either defer to
     // the owner (waiting for compositor-confirmed lock) or refuse to stack.
-    let (_singleton, lock_ipc_socket, lock_ipc) =
+    let (_singleton, lock_ipc_socket, lock_ipc) = loop {
         match hypr_singleton::try_acquire(&lock_instance_name()) {
             Ok(Some(guard)) => match start_lock_ipc() {
-                Ok((socket, state)) => (guard, Some(socket), state),
+                Ok((socket, state)) => break (guard, Some(socket), state),
                 Err(error) => {
                     // Owned but not joinable: still safe to lock (the flock
                     // alone prevents stacking), but a cancelable warning
                     // whose join contract can't be honored must not run.
                     eprintln!("vigil-lock: lock IPC unavailable: {error}; locking immediately");
                     warning.duration_ms = 0;
-                    (guard, None, Arc::new(Mutex::new(LockIpcState::default())))
+                    break (guard, None, Arc::new(Mutex::new(LockIpcState::default())));
                 }
             },
             Ok(None) => {
                 // Another live locker owns the seat. Ask it to commit and
                 // succeed only once the compositor confirms the lock. Retry
-                // briefly: the owner binds its socket just after taking the
-                // flock, so a joiner can land in that window.
-                for _ in 0..20 {
+                // briefly (the owner binds its socket just after taking the
+                // flock) and re-try ownership each round: if the owner dies
+                // mid-join its stale socket refuses connections while the
+                // flock is free, and refusing to stack would leave the
+                // session unlocked.
+                let mut attempts = 0;
+                loop {
                     match join_lock() {
                         Ok(true) => {
                             signal_ready_fd(cli.ready_fd.take());
                             std::process::exit(0);
                         }
-                        Ok(false) => std::thread::sleep(Duration::from_millis(100)),
-                        Err(error) => {
-                            eprintln!("vigil-lock: {error}");
-                            break;
-                        }
+                        Ok(false) => {}
+                        Err(error) => eprintln!("vigil-lock: {error}"),
+                    }
+                    attempts += 1;
+                    if attempts >= 20 {
+                        eprintln!(
+                            "vigil-lock: another locker owns the seat but never confirmed the lock; refusing to stack"
+                        );
+                        std::process::exit(2);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                    if matches!(
+                        hypr_singleton::try_acquire(&lock_instance_name()),
+                        Ok(Some(_))
+                    ) {
+                        // Owner gone; take over from the top of the loop.
+                        break;
                     }
                 }
-                eprintln!("vigil-lock: another locker owns the seat; refusing to stack");
-                std::process::exit(2);
+                continue;
             }
             Err(error) => {
                 eprintln!("vigil-lock: {error}");
                 std::process::exit(2);
             }
-        };
+        }
+    };
     let locker = match Locker::new(cli, config, grace_secs, lock_ipc) {
         Ok(locker) => locker,
         Err(e) => {
