@@ -1301,10 +1301,12 @@ impl App {
             return;
         }
         let mut dead = Vec::new();
+        // `dirty` is advisory (see vigil-wayland: the software adapter cannot
+        // intercept Slint's request_redraw, so gating on it froze animations
+        // and input on metal). Offer every entry a frame; render_if_needed
+        // is the real gate and is a no-op for a clean scene.
+        let _ = dirty;
         for (i, entry) in self.entries.iter_mut().enumerate() {
-            if !dirty.contains(&entry.id) {
-                continue;
-            }
             let Entry {
                 presenter,
                 window,
@@ -1719,9 +1721,7 @@ fn run() -> Result<i32, String> {
                 // frames, a greeter that paints once and then ignores the
                 // user forever. route() leaves self.panel on the output
                 // under the cursor/keyboard, so mark that one explicitly.
-                if had_events
-                    && let Some(entry) = app.entries.get(app.panel)
-                {
+                if had_events && let Some(entry) = app.entries.get(app.panel) {
                     app.dirty.mark(entry.id);
                 }
                 Ok(PostAction::Continue)

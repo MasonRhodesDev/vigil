@@ -655,13 +655,16 @@ impl<S: LockSession> App<S> {
             self.finish_unlock();
             return;
         }
-        for id in self.dirty.take_all() {
-            let mut indices: Vec<_> = self
-                .entries
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, entry)| (entry.id == id).then_some(idx))
-                .collect();
+        // The DirtySet is advisory, not the render gate. The software adapter
+        // cannot intercept Slint's request_redraw (the slint::Window belongs to
+        // the inner MinimalSoftwareWindow, so core never calls the tracking
+        // wrapper), which left animations and input-driven changes unpresented
+        // on metal. Every configured surface is offered a present each tick;
+        // render_if_needed is a no-op for a clean scene and present() then
+        // commits nothing.
+        let _ = self.dirty.take_all();
+        {
+            let mut indices: Vec<usize> = (0..self.entries.len()).collect();
             // During handoff both surfaces deliberately share one output ID
             // and one retained OutputWindow. Render the fresh lock surface
             // first; otherwise the warning surface consumes the one pending
