@@ -1710,7 +1710,20 @@ fn run() -> Result<i32, String> {
                 if std::env::var_os("VIGIL_DEBUG_FRAMES").is_some() && !events.is_empty() {
                     eprintln!("vigil: input ready: {} event(s)", events.len());
                 }
+                let had_events = !events.is_empty();
                 app.route(events);
+                // Input must unpause the render loop. The GL path bridges
+                // Slint redraw requests into the dirty set via
+                // set_redraw_handle, but the software path has no reliable
+                // bridge — observed on metal: 49k input callbacks, zero
+                // frames, a greeter that paints once and then ignores the
+                // user forever. route() leaves self.panel on the output
+                // under the cursor/keyboard, so mark that one explicitly.
+                if had_events {
+                    if let Some(entry) = app.entries.get(app.panel) {
+                        app.dirty.mark(entry.id);
+                    }
+                }
                 Ok(PostAction::Continue)
             },
         )
