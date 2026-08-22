@@ -153,6 +153,12 @@ export component DefaultTheme inherits Window {
                     single-line: true;
                     input-type: root.prompt-is-secret && !root.reveal
                         ? InputType.password : InputType.text;
+                    // The platform pins cursor_flash_cycle to zero (no
+                    // animation clock on an hours-idle prompt), which pins
+                    // Slint's cursor bar permanently solid. Next to masked
+                    // bullets it reads as furniture; flush against a
+                    // revealed password it reads as a stray trailing "|".
+                    text-cursor-width: root.prompt-is-secret && root.reveal ? 0px : 1px;
                     accepted => {
                         root.submit(self.text);
                         self.text = "";

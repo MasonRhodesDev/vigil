@@ -104,6 +104,52 @@ fn default_theme_state_matrix() {
     assert!(scene.render(), "typing must dirty the scene");
     assert_ne!(field_before, sample(&scene), "password bullets must appear");
 
+    // --- reveal: toggling shows text, and an EMPTY revealed field is empty
+    // (regression for the stray solid caret bar: cursor_flash_cycle is
+    // pinned to zero, so with a nonzero text-cursor-width Slint draws a
+    // permanent "|" beside — or alone instead of — the revealed password) ---
+    let masked = sample(&scene);
+    let click_reveal = |scene: &mut Scene| {
+        scene.window.dispatch(InputEvent::PointerAbsolute {
+            x: 780.0,
+            y: FIELD_Y as f64,
+        });
+        scene.window.dispatch(InputEvent::PointerButton {
+            button: 0x110, // BTN_LEFT
+            pressed: true,
+        });
+        scene.window.dispatch(InputEvent::PointerButton {
+            button: 0x110,
+            pressed: false,
+        });
+    };
+    click_reveal(&mut scene);
+    assert!(scene.render(), "reveal toggle must dirty the scene");
+    assert_ne!(masked, sample(&scene), "revealed text must replace bullets");
+    for _ in 0..4 {
+        scene.window.dispatch(InputEvent::Key {
+            keysym: 0xff08, // BackSpace
+            utf8: None,
+            pressed: true,
+        });
+        scene.window.dispatch(InputEvent::Key {
+            keysym: 0xff08,
+            utf8: None,
+            pressed: false,
+        });
+    }
+    assert!(scene.render(), "clearing the field must dirty the scene");
+    // 475..740 stays inside the text area: the reveal toggle occupies the
+    // field's right 56px and would break uniformity legitimately.
+    let dense: Vec<(u8, u8, u8)> = (475..740).map(|x| scene.px(x, FIELD_Y)).collect();
+    assert!(
+        dense.windows(2).all(|pair| pair[0] == pair[1]),
+        "an empty revealed field must show nothing — a lone caret bar breaks row uniformity"
+    );
+    // Restore the masked state for the assertions that follow.
+    click_reveal(&mut scene);
+    assert!(scene.render());
+
     // --- error state: reddish content appears in the card ---
     scene.window.show_error("Wrong password");
     assert!(scene.render());
