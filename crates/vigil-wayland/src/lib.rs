@@ -575,6 +575,40 @@ impl<S: LockSession> App<S> {
                 self.dirty.mark(id);
             }
         }
+        // Build deferred scenes in one batch: every output whose configure
+        // landed since the last tick already holds a solid placeholder, so
+        // the themed content appears on all of them together (issue #37).
+        for (id, is_lock) in std::mem::take(&mut self.pending_scenes) {
+            let Some(idx) = self.entries.iter().position(|entry| {
+                entry.id == id
+                    && entry.configured
+                    && matches!(entry.role, SurfaceRole::Lock { .. }) == is_lock
+            }) else {
+                continue;
+            };
+            let info = self.output_info(idx);
+            if !is_lock {
+                if self.scene_ids.insert(id) {
+                    self.session.warning_output_ready(id, &info);
+                } else {
+                    self.session.output_resized(id, &info);
+                }
+            } else if self.scene_ids.insert(id) {
+                self.session.output_ready(id, &info);
+            } else {
+                self.session.output_rebound(id, &info);
+            }
+            // The placeholder marked the surface committed, so the coming
+            // present is not forced: guarantee the fresh scene paints.
+            self.session.force_repaint(id);
+            self.dirty.mark(id);
+        }
+        self.session.tick();
+        // Sample the warning only after session.tick() has pumped async
+        // results: wallpaper readiness is session state, and reading it
+        // before the pump left the timeline waiting on a wallpaper that
+        // had already arrived — with no further wakeups scheduled, the
+        // warning never committed and the session never locked.
         if let Some(timeline) = self.warning.as_mut() {
             let elapsed = self.warning_started.elapsed();
             if self.lock.is_none() {
@@ -617,35 +651,6 @@ impl<S: LockSession> App<S> {
                 self.warning = None;
             }
         }
-        // Build deferred scenes in one batch: every output whose configure
-        // landed since the last tick already holds a solid placeholder, so
-        // the themed content appears on all of them together (issue #37).
-        for (id, is_lock) in std::mem::take(&mut self.pending_scenes) {
-            let Some(idx) = self.entries.iter().position(|entry| {
-                entry.id == id
-                    && entry.configured
-                    && matches!(entry.role, SurfaceRole::Lock { .. }) == is_lock
-            }) else {
-                continue;
-            };
-            let info = self.output_info(idx);
-            if !is_lock {
-                if self.scene_ids.insert(id) {
-                    self.session.warning_output_ready(id, &info);
-                } else {
-                    self.session.output_resized(id, &info);
-                }
-            } else if self.scene_ids.insert(id) {
-                self.session.output_ready(id, &info);
-            } else {
-                self.session.output_rebound(id, &info);
-            }
-            // The placeholder marked the surface committed, so the coming
-            // present is not forced: guarantee the fresh scene paints.
-            self.session.force_repaint(id);
-            self.dirty.mark(id);
-        }
-        self.session.tick();
         if self.session.wants_unlock() {
             self.finish_unlock();
             return;

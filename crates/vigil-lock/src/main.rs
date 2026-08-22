@@ -1060,6 +1060,11 @@ fn detach_and_wait_for_lock() -> ! {
             });
         }
         let mut child = command.spawn().map_err(|e| format!("spawn locker: {e}"))?;
+        // Command still holds its copy of the child's stdout socketpair end;
+        // if it lives past read_exact, a child that dies before the ready
+        // byte never produces EOF and --wait hangs forever (hypridle's
+        // before_sleep_cmd would wait on a crashed locker).
+        drop(command);
         let mut byte = [0u8; 1];
         match parent_end.read_exact(&mut byte) {
             Ok(()) => Ok(0),
