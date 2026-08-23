@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.3.1
+Version:        0.3.2
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -119,6 +119,9 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Sat Aug 22 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.2-1
+- singleton-guard resolves xdg-paths from crates.io; allow the desktop-commons git source in deny.toml.
+
 * Sat Aug 22 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.1-1
 - Depend on xdg-paths 0.2.0, slint-idle-runtime 0.2.0, and singleton-guard from desktop-commons (renamed crates).
 - Nested lock-readiness harness: errexit-safe probe and S1 diagnostics.

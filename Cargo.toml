@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "GPL-3.0-only"
 publish = false
@@ -24,7 +24,7 @@ smithay-drm-extras = { version = "0.1", default-features = false }
 slint = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "software-renderer-systemfonts"] }
 slint-interpreter = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2"] }
 slint-idle-runtime = { git = "https://github.com/MasonRhodesDev/slint-idle-runtime", tag = "v0.2.0" }
-singleton-guard = { git = "https://github.com/MasonRhodesDev/desktop-commons", rev = "315d5de" }
+singleton-guard = { git = "https://github.com/MasonRhodesDev/desktop-commons", rev = "43229f9" }
 greetd_ipc = { version = "0.10", features = ["sync-codec"] }
 xkbcommon = "0.9"
 calloop = "0.14"
