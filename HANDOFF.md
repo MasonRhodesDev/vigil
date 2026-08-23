@@ -1,4 +1,4 @@
-# vigil — session handoff (2026-08-12)
+# vigil — session handoff (2026-08-23)
 
 Working notes for whoever picks this up next. Authoritative sources:
 [DESIGN.md](DESIGN.md) for architecture, GitHub issues for the backlog.
@@ -10,7 +10,15 @@ vigil is **in production on this machine**: it is the greeter (greetd
 runs `/usr/bin/vigil`) and the lockscreen (hypridle's `lock_cmd` and
 `before_sleep_cmd` run `vigil-lock --daemonize`). Both ship as packages
 — COPR `solaris765/vigil` and the `[mason]` pacman repo — built by CI
-from tags. `v0.2.1` is the current release and what is installed.
+from tags. **`v0.3.2` is the current release** (2026-08-23; ci, Package,
+Security, Release all green at 6924216). The Arch reference machine
+still has `0.2.16` installed — `pacman -Syu vigil` before any metal
+check below, otherwise you are validating the old locker.
+
+0.3 is the capture-free lock: one ARGB overlay per output, frost via
+the compositor background-effect protocol (tint-only fallback), explicit
+`--wait` readiness, singleton guard, join semantics, and the nested sway
+suite gating Release (issue #47 is the umbrella).
 
 Founded 2026-08-03; greeter and lock both went live 2026-08-05.
 
@@ -60,38 +68,33 @@ What makes it work:
   detectors — codex's gate runs (long dep compiles in its own process
   group) look identical to a wedge and false-alarm constantly.
 
-## Open issues (4)
+## Open issues (18, triaged 2026-08-23)
 
-Umbrella: **#20**. Nothing is blocked on anything else anymore.
+Umbrella: **#20** (roadmap), **#47** (0.3 release). Closed this session
+with evidence: #48 (package CI), #36 (PAM before lock), #44 (nested
+suite). Full triage is in the issue comments; the shape:
 
-- **#26 GL rotation** — code SHIPPED (b0691fa) + metal direction fix:
-  Hyprland T=3 is upright here; vigil had 1↔3 backwards in both
-  `scene_to_panel` and `plane_transform`. Always build the VT binary
-  with `--features gl` or you silently fall back to software (4K rotate
-  + vblank gate = unusable cursor). Re-verify upright + cursor on VT.
-- **#27 multi-GPU GL** — pure metal validation; the same dock session
-  should also eyeball the #25 cursor arrow (QEMU keeps cursor planes
-  out of screendump) and walk the #6/#7/#26 checklists.
-- **#29 deployment drift** — CLOSED and RELEASED: greetd_game_mode
-  v0.2.0 is published (COPR + [mason]; the release run passed with the
-  new extra-repos CI input in packaging-workflows). Migration steps are
-  on the issue — pacman -Syu game-mode, game-mode setup (answer mason
-  at the autologin prompt), install the staged vigil.toml with
-  banner_file.
-- **#6 hotplug**, **#7 suspend/resume** — the VM-coverable halves are
-  done: `tests/hotplug/run.sh` PCI-unplugs a GPU under the greeter (and
-  found + fixed the ENODEV zombie-output bug), and the VT round trip
-  pixel-asserts the display-loss recovery machinery. What remains on
-  both is a metal checklist (see the issue comments): dock plug/unplug
-  and a real `systemctl suspend` at the greeter. The VM can do neither
-  — virtio-gpu connectors are immutable, QEMU display devices refuse
-  hotplug (bochs-display is the exception the harness uses), and
-  vhost-user-fs wedges every suspend flavor.
-Closed since 08-05: #10 (login1, closed 08-06 — the 08-05 handoff
-listed it stale), #14/#15/#16 (theme track), #17 (GL presenter),
-#18 (banner), #19 (vendor), #21–#24 (greeter spec + EDID/transform),
-#28 (e2e frame assertions), #25 (GL cursor on a DRM cursor plane —
-atomic-then-hotspot cap order matters; see plane_probe.rs).
+- **Fixed in 0.3.x, awaiting a metal confirm** — #49 (locker exits on
+  unlock), #50 (singleton guard), #37 (all outputs lock together),
+  #38 (reveal caret), #35 (hotplug while locked, FALLBACK round). Each
+  carries a one-paragraph recipe in its latest comment; run them in
+  one desk session after upgrading to 0.3.2, then close.
+- **Metal gates for 0.3** — #46 (acceptance matrix) and #40
+  (mixed-scale handoff): the checklist is `tests/metal/checklist.md`.
+  #47 closes when those two do.
+- **Greeter metal** — #27 multi-GPU GL docked, #7 real suspend at the
+  greeter, #6 dock plug/unplug at the greeter. All three are proven
+  VM-impossible (see their threads); pair them with the #46 session.
+- **#51** nested S1 flake on CI sway 1.9 only (locally sway 1.12 is
+  clean). Diagnostics landed (6243b41/b36a134); the next failure will
+  say whether the locker dies post-readiness or sway 1.9 double-grants.
+  Re-run the job if Release trips on it.
+- **#52 animated frost on manual lock** — zero-latitude spec posted on
+  the issue (2026-08-23). The only new engineering work that isn't
+  metal-blocked; implement next.
+- **Simulator track** (no blockers): #43 shared controllers is the
+  foundation, then #42 failure controls, #41 multi-output presets,
+  #45 deterministic scenarios + visual regression.
 
 ## Landmines (learned the hard way, all real)
 
@@ -125,7 +128,21 @@ atomic-then-hotspot cap order matters; see plane_probe.rs).
   substitute **all** placeholders (`packaging/substitute.sh` semantics)
   or you silently break unrelated keybinds.
 
-## Session notes (2026-08-12, Arch reference machine)
+## Session notes
+
+### 2026-08-23
+- v0.3.0 → 0.3.2 were cut in one night: 0.3.0/0.3.1 Release runs failed
+  on the S1 flake (#51) and a Security-audit trip, 0.3.2 went green on
+  every workflow. Don't read the red runs on f23ef4b/b36a134 as code
+  regressions.
+- `singleton-guard` now lives in desktop-commons (6924216); vigil only
+  consumes it. The nested suite's `wait_free` relies on the
+  kernel releasing the flock on death — leftover files are fine.
+- HANDOFF "Open issues" had rotted to the 08-12 view while 30 commits
+  landed; when closing an issue from here, `gh issue close` in the same
+  step as the push or it drifts again.
+
+### 2026-08-12 (Arch reference machine)
 
 - **No codex on this machine** (a stale binary with dead auth sits on
   PATH — ignore it). Implementation is Claude Fable directly, per
@@ -143,6 +160,14 @@ atomic-then-hotspot cap order matters; see plane_probe.rs).
 
 ## Testing
 
+- `tests/nested/run.sh` — headless sway (no ext-background-effect, so
+  tint tier) runs vigil-lock with `WAYLAND_DEBUG=1`; `check_trace.py`
+  asserts locked-before-ready, join, cancel, two-output handoff, no
+  capture bind, hotplug, clean teardown. Opt-in locally (needs `sway`,
+  `wtype`), **gates Release in CI**. Every scenario runs under
+  `timeout`: a hang is the failure.
+- `tests/metal/checklist.md` — the 0.3 gate that sway cannot cover
+  (#46/#40). Recovery is `loginctl unlock-session` from SSH/another VT.
 - `tests/e2e/run.sh` — full greeter-spec login in QEMU (two virtio-gpu
   cards, username stage, VT round trip, mouse-driven session picker,
   wrong-then-right password). The main safety net; run it for anything
