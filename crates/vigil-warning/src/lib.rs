@@ -33,11 +33,30 @@ pub struct ElementSample {
 
 pub const DEFAULT_SELECTORS: [&str; 5] = ["clock", "user_selector", "password", "status", "power"];
 
-/// Frame period of every ramp this crate animates. Samples are continuous,
-/// so consumers that diff progress must pace *propagation* by this period
-/// (vigil-wayland issue #53); it is exported so that floor and this schedule
-/// cannot drift apart.
+/// Frame period of every ramp this crate animates. Animated values are
+/// quantized to this grid inside `sample()`/`element_samples()`, so a
+/// consumer may sample at any rate — event-loop wakes included — and a
+/// value-diff dedupes to at most one scene update per frame (issue #53:
+/// buffer-release wakes otherwise self-sustain a commit-per-render-time
+/// loop). Phase transitions, commit deadlines, and `next_frame` use real
+/// elapsed time and are never delayed by the grid.
 pub const FRAME_INTERVAL_MS: u64 = 33;
+
+/// Floor `elapsed` to the frame grid (value computation only).
+fn quantize(elapsed: Duration) -> Duration {
+    Duration::from_millis(elapsed.as_millis() as u64 / FRAME_INTERVAL_MS * FRAME_INTERVAL_MS)
+}
+
+/// Eased ramp progress on the frame grid. Completion is judged on real
+/// time, so the terminal value is exact even when the deadline is off-grid
+/// (a floored grid alone would leave 0.99-style values at completion).
+fn graded(raw: Duration, duration: Duration, easing: WarningEasing) -> f32 {
+    if raw >= duration {
+        1.0
+    } else {
+        ease(ratio(quantize(raw), duration), easing)
+    }
+}
 
 pub struct Timeline {
     config: LockWarning,
@@ -186,10 +205,14 @@ impl Timeline {
         } else {
             scheduled_wallpaper_start
         };
-        let frost = ease(ratio(elapsed, frost_duration), self.config.easing);
+        // Values on the frame grid, phases on real time: identical values
+        // inside one frame make any-rate sampling idempotent for consumers
+        // that diff progress, while commits and holds stay punctual.
+        let frost = graded(elapsed, frost_duration, self.config.easing);
         let wallpaper = if self.wallpaper_ready {
-            ease(
-                ratio(elapsed.saturating_sub(wallpaper_start), wallpaper_duration),
+            graded(
+                elapsed.saturating_sub(wallpaper_start),
+                wallpaper_duration,
                 self.config.easing,
             )
         } else {
@@ -304,11 +327,9 @@ impl Timeline {
                     } else if kind == WarningAnimation::None || duration_ms == 0 {
                         1.0
                     } else {
-                        ease(
-                            ratio(
-                                now.saturating_sub(start),
-                                Duration::from_millis(duration_ms),
-                            ),
+                        graded(
+                            now.saturating_sub(start),
+                            Duration::from_millis(duration_ms),
                             self.config.easing,
                         )
                     }
@@ -402,10 +423,11 @@ impl Reveal {
             };
         };
         let elapsed = now.saturating_sub(start);
-        let wallpaper = 1.0 - ease(ratio(elapsed, self.wallpaper_out), self.easing);
+        let wallpaper = 1.0 - graded(elapsed, self.wallpaper_out, self.easing);
         let frost = 1.0
-            - ease(
-                ratio(elapsed.saturating_sub(self.wallpaper_out), self.frost_out),
+            - graded(
+                elapsed.saturating_sub(self.wallpaper_out),
+                self.frost_out,
                 self.easing,
             );
         let done = elapsed >= self.wallpaper_out + self.frost_out;
@@ -413,7 +435,7 @@ impl Reveal {
             frost,
             wallpaper,
             done,
-            next_frame: (!done).then(|| Duration::from_millis(33)),
+            next_frame: (!done).then(|| Duration::from_millis(FRAME_INTERVAL_MS)),
         }
     }
 }
@@ -675,21 +697,49 @@ mod tests {
         );
         reveal.start(Duration::from_secs(1));
         reveal.start(Duration::from_secs(9)); // idempotent
-        let middle = reveal.sample(Duration::from_millis(1_125));
-        assert!((middle.wallpaper - 0.5).abs() < 1e-6);
+        // Grid-aligned offsets (multiples of the 33 ms frame period).
+        let middle = reveal.sample(Duration::from_millis(1_000 + 4 * FRAME_INTERVAL_MS));
+        assert!((middle.wallpaper - (1.0 - 132.0 / 250.0)).abs() < 1e-6);
         assert_eq!(middle.frost, 1.0);
         assert_eq!(
             middle.next_frame,
             Some(Duration::from_millis(FRAME_INTERVAL_MS))
         );
-        let frost = reveal.sample(Duration::from_millis(1_325));
+        let frost = reveal.sample(Duration::from_millis(1_000 + 10 * FRAME_INTERVAL_MS));
         assert_eq!(frost.wallpaper, 0.0);
-        assert!((frost.frost - 0.5).abs() < 1e-6);
+        // Relative elapsed 80 ms floors to the 66 ms grid line.
+        assert!((frost.frost - (1.0 - 66.0 / 150.0)).abs() < 1e-6);
         assert!(!frost.done);
         let end = reveal.sample(Duration::from_millis(1_400));
         assert!(end.done);
         assert_eq!(end.frost, 0.0);
         assert_eq!(end.next_frame, None);
+    }
+
+    #[test]
+    fn sampling_is_idempotent_within_a_frame() {
+        // Any-rate sampling (event-loop wakes) must not manufacture new
+        // values between frames — the contract that fixes issue #53 at the
+        // source instead of in every consumer.
+        let mut timeline = Timeline::new_transition(transition());
+        timeline.start(Duration::ZERO);
+        let a = timeline.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS));
+        let b = timeline.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS + 10));
+        assert_eq!((a.frost, a.wallpaper), (b.frost, b.wallpaper));
+        let c = timeline.sample(Duration::from_millis(3 * FRAME_INTERVAL_MS));
+        assert_ne!((a.frost, a.wallpaper), (c.frost, c.wallpaper));
+
+        let mut reveal = Reveal::new(250, 150, WarningEasing::Linear);
+        reveal.start(Duration::ZERO);
+        let a = reveal.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS));
+        let b = reveal.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS + 10));
+        assert_eq!((a.frost, a.wallpaper), (b.frost, b.wallpaper));
+
+        // Phase timing stays on real time: the transition still commits at
+        // its exact deadline even off-grid.
+        let mut timeline = Timeline::new_transition(transition());
+        timeline.start(Duration::ZERO);
+        assert!(timeline.sample(Duration::from_millis(400)).should_commit);
     }
 
     #[test]

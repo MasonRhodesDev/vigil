@@ -81,22 +81,6 @@ const REVEAL_MAP_DEADLINE: Duration = Duration::from_millis(250);
 /// The reveal fade is cosmetic: whatever state it is in, the process exits
 /// this long after the fade started.
 const REVEAL_HARD_DEADLINE: Duration = Duration::from_millis(2_000);
-/// Minimum spacing between ramp *propagations* (the dirty-marking that
-/// leads to a commit). The event loop wakes faster than the animation clock
-/// — every commit earns a `wl_buffer.release`, and the ramp values are
-/// continuous, so any earlier wake sees a "changed" progress — and without
-/// this floor the ramps self-sustain a commit-per-render-time loop at ~2x
-/// the intended rate (issue #53). Sampling itself is pure math and runs on
-/// every tick, so phase transitions, cancellation, wallpaper readiness, and
-/// join requests are never delayed or swallowed by the floor. Derived from
-/// the timeline's own frame period (minus scheduling jitter) so the two
-/// cannot drift apart.
-const ANIM_PROPAGATE_MIN: Duration = Duration::from_millis(vigil_warning::FRAME_INTERVAL_MS - 5);
-
-/// Whether a fresh ramp value may be propagated to the scene at `now`.
-fn anim_propagate_due(last: Option<Duration>, now: Duration) -> bool {
-    last.is_none_or(|at| now.saturating_sub(at) >= ANIM_PROPAGATE_MIN)
-}
 
 /// What the binary implements: its composition of theme windows and auth.
 pub trait LockSession {
@@ -358,8 +342,6 @@ struct App<S: LockSession + 'static> {
     reveal_started_at: Option<Duration>,
     reveal_wait: Option<Duration>,
     unlock_sent: bool,
-    /// App-clock time of the last warning/reveal propagation (rate floor).
-    anim_propagated_at: Option<Duration>,
 }
 
 impl<S: LockSession> App<S> {
@@ -875,30 +857,22 @@ impl<S: LockSession> App<S> {
                 (Some(left), Some(right)) => Some(left.min(right)),
                 (left, right) => left.or(right),
             };
-            // Values are continuous, so any wake sees "changed" progress;
-            // propagating (and thus committing) is paced by the frame
-            // period while phase handling below stays per-tick (issue #53).
-            if anim_propagate_due(self.anim_propagated_at, elapsed) {
-                let progress = (sample.frost, sample.wallpaper);
-                let elements = timeline.element_samples(elapsed);
-                let mut propagated = false;
-                if self.warning_progress != progress {
-                    self.warning_progress = progress;
-                    self.session
-                        .warning_progress(sample.frost, sample.wallpaper);
-                    for entry in &self.entries {
-                        self.dirty.mark(entry.id);
-                    }
-                    propagated = true;
+            // Ramp values are quantized to the frame grid inside the
+            // timeline, so this diff dedupes buffer-release wakes to at
+            // most one scene update per frame (issue #53).
+            let progress = (sample.frost, sample.wallpaper);
+            let elements = timeline.element_samples(elapsed);
+            if self.warning_progress != progress {
+                self.warning_progress = progress;
+                self.session
+                    .warning_progress(sample.frost, sample.wallpaper);
+                for entry in &self.entries {
+                    self.dirty.mark(entry.id);
                 }
-                if self.warning_elements != elements {
-                    self.session.warning_elements(&elements);
-                    self.warning_elements = elements;
-                    propagated = true;
-                }
-                if propagated {
-                    self.anim_propagated_at = Some(elapsed);
-                }
+            }
+            if self.warning_elements != elements {
+                self.session.warning_elements(&elements);
+                self.warning_elements = elements;
             }
             match sample.phase {
                 WarningPhase::Cancelled => {
@@ -926,15 +900,16 @@ impl<S: LockSession> App<S> {
         // render_if_needed is a no-op for a clean scene and present() then
         // commits nothing.
         let _ = self.dirty.take_all();
-        {
-            let mut indices: Vec<usize> = (0..self.entries.len()).collect();
-            // During handoff both surfaces deliberately share one output ID
-            // and one retained OutputWindow. Render the fresh lock surface
-            // first; otherwise the warning surface consumes the one pending
-            // software frame and the lock surface commits its black fallback.
-            indices.sort_by_key(|idx| present_priority(self.entries[*idx].role.is_lock()));
-            for idx in indices {
-                self.present(idx);
+        // During handoff both surfaces deliberately share one output ID and
+        // one retained OutputWindow. Render the fresh lock surfaces first;
+        // otherwise an overlay consumes the one pending software frame and
+        // the lock surface commits its black fallback. Two index passes: no
+        // per-tick allocation or sort (present() never adds/removes entries).
+        for lock_pass in [0, 1] {
+            for idx in 0..self.entries.len() {
+                if present_priority(self.entries[idx].role.is_lock()) == lock_pass {
+                    self.present(idx);
+                }
             }
         }
         if self.reveal.is_some() && !self.unlock_sent && self.reveal_entries_all_committed() {
@@ -1038,9 +1013,7 @@ impl<S: LockSession> App<S> {
         }
         self.reveal_wait = sample.next_frame;
         let progress = (sample.frost, sample.wallpaper);
-        if self.reveal_progress != progress && anim_propagate_due(self.anim_propagated_at, elapsed)
-        {
-            self.anim_propagated_at = Some(elapsed);
+        if self.reveal_progress != progress {
             self.reveal_progress = progress;
             self.session.reveal_progress(sample.frost, sample.wallpaper);
             for entry in &self.entries {
@@ -1229,7 +1202,6 @@ pub fn run_with_warning<S: LockSession + 'static>(
         reveal_started_at: None,
         reveal_wait: None,
         unlock_sent: false,
-        anim_propagated_at: None,
     };
     eprintln!(
         "vigil-lock: frost opacity lever: {}",
@@ -1713,11 +1685,7 @@ wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpAlph
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ANIM_PROPAGATE_MIN, anim_propagate_due, initial_scale120, pixel_frost, present_priority,
-        surface_role_is_warning,
-    };
-    use std::time::Duration;
+    use super::{initial_scale120, pixel_frost, present_priority, surface_role_is_warning};
 
     #[test]
     fn hotplug_after_lock_creates_a_lock_surface_not_a_warning() {
@@ -1742,30 +1710,6 @@ mod tests {
         // Warning and reveal overlays share the lock surface's OutputWindow;
         // the lock surface must consume the pending frame first.
         assert!(present_priority(true) < present_priority(false));
-    }
-
-    #[test]
-    fn ramp_propagation_has_a_rate_floor() {
-        // Buffer-release wakeups arrive faster than the animation clock;
-        // without the floor every wake re-dirties the scene (issue #53).
-        // Only propagation is floored — sampling and phase handling run on
-        // every tick, so cancel/commit/readiness are never swallowed.
-        assert!(anim_propagate_due(None, Duration::ZERO));
-        let last = Some(Duration::from_millis(100));
-        assert!(!anim_propagate_due(last, Duration::from_millis(100)));
-        assert!(!anim_propagate_due(
-            last,
-            Duration::from_millis(100) + ANIM_PROPAGATE_MIN - Duration::from_millis(1)
-        ));
-        assert!(anim_propagate_due(
-            last,
-            Duration::from_millis(100) + ANIM_PROPAGATE_MIN
-        ));
-        // The floor must sit strictly under the timeline's frame period or
-        // every second frame would be dropped.
-        assert!(ANIM_PROPAGATE_MIN < Duration::from_millis(vigil_warning::FRAME_INTERVAL_MS));
-        // A clock hiccup backwards never panics and simply holds.
-        assert!(!anim_propagate_due(last, Duration::from_millis(50)));
     }
 
     #[test]
