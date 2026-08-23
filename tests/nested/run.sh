@@ -109,7 +109,19 @@ echo "S1: readiness — locked event precedes --wait success"
 [ "$(probe_state)" = 0 ] || fail "S1: fresh session reports locked"
 WAYLAND_DEBUG=1 timeout 30 "$VLOCK" --wait --no-warn --grace 300 2>"$WORK/s1.trace" && rc=0 || rc=$?
 [ "$rc" = 0 ] || { grep -v '^\[' "$WORK/s1.trace" | tail -5; fail "S1: --wait exited $rc"; }
-[ "$(probe_state)" = 10 ] || fail "S1: probe says unlocked after --wait returned 0"
+s1_probe=$(probe_state)
+[ "$s1_probe" = 10 ] || {
+    # Diagnostics: is the locker still alive, did it panic, what did sway say.
+    echo "S1 diag: probe exit=$s1_probe (0=unlocked, 10=locked, 2=probe error)"
+    echo "S1 diag: locker holds singleton: $(flock -n "$LOCKFILE" true 2>/dev/null && echo no || echo yes)"
+    echo "S1 diag: non-protocol lines from the locker:"
+    grep -v '^\[' "$WORK/s1.trace" | tail -20
+    echo "S1 diag: last protocol lines:"
+    grep '^\[' "$WORK/s1.trace" | tail -12
+    echo "S1 diag: sway log tail:"
+    tail -15 "$WORK/sway.log"
+    fail "S1: probe says unlocked after --wait returned 0"
+}
 python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked || fail "S1: trace check"
 tap
 teardown_check S1
