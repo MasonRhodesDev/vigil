@@ -33,6 +33,12 @@ pub struct ElementSample {
 
 pub const DEFAULT_SELECTORS: [&str; 5] = ["clock", "user_selector", "password", "status", "power"];
 
+/// Frame period of every ramp this crate animates. Samples are continuous,
+/// so consumers that diff progress must pace *propagation* by this period
+/// (vigil-wayland issue #53); it is exported so that floor and this schedule
+/// cannot drift apart.
+pub const FRAME_INTERVAL_MS: u64 = 33;
+
 pub struct Timeline {
     config: LockWarning,
     phase: Phase,
@@ -206,7 +212,7 @@ impl Timeline {
             && (elapsed < frost_duration
                 || (self.wallpaper_ready && elapsed >= wallpaper_start && elapsed < commit_at));
         let next_frame = if animating {
-            Some(Duration::from_millis(33))
+            Some(Duration::from_millis(FRAME_INTERVAL_MS))
         } else if self.phase == Phase::Running && self.wallpaper_ready && elapsed < wallpaper_start
         {
             Some(wallpaper_start - elapsed)
@@ -332,7 +338,7 @@ impl Timeline {
                     && element.progress < 1.0
                     && element.kind != WarningAnimation::None
                 {
-                    Some(Duration::from_millis(33))
+                    Some(Duration::from_millis(FRAME_INTERVAL_MS))
                 } else {
                     None
                 }
@@ -672,7 +678,10 @@ mod tests {
         let middle = reveal.sample(Duration::from_millis(1_125));
         assert!((middle.wallpaper - 0.5).abs() < 1e-6);
         assert_eq!(middle.frost, 1.0);
-        assert_eq!(middle.next_frame, Some(Duration::from_millis(33)));
+        assert_eq!(
+            middle.next_frame,
+            Some(Duration::from_millis(FRAME_INTERVAL_MS))
+        );
         let frost = reveal.sample(Duration::from_millis(1_325));
         assert_eq!(frost.wallpaper, 0.0);
         assert!((frost.frost - 0.5).abs() < 1e-6);
