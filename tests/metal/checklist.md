@@ -51,3 +51,28 @@ Topology: three outputs including one fractional-scale (eDP 2560x1600@1.25).
 
 Record results in #46/#40 and close them; then tag v0.3.0 (release CI re-runs
 the nested suite as `nested-gate` before packaging).
+
+## #52 — frost transition on manual lock / reveal on unlock (gates v0.4.0)
+
+Hyprland with `decoration:blur:enabled = true` (the reference machines).
+`journalctl --user -t vigil-lock` must show `frost opacity lever:
+hyprland-surface-v1 (blur strength follows)`.
+
+- [ ] SUPER+L: blur + tint ramp in together (~150 ms), wallpaper fades in
+      (~250 ms), card appears after `locked`; all outputs together (#37);
+      no black frame, no desktop reveal.
+- [ ] Correct password: card vanishes, wallpaper dissolves into the blurred
+      desktop, blur + tint clear together; pointer and keyboard usable
+      immediately after (the overlay is input-transparent); `pgrep
+      vigil-lock` empty within 1 s.
+- [ ] Wrong password, then correct: same as above.
+- [ ] Grace unlock (`--grace 5`, key within the window): reveal runs too.
+- [ ] Lid close / `systemctl suspend`: `session locked` logged before
+      `Sleeping`; a mouse nudge during the ramp does NOT cancel; resume shows
+      the locked card.
+- [ ] `vigil-lock --wait --immediate`: the old instant lock/unlock.
+- [ ] Hotplug during the 400 ms ramp (dock button): locks, never exits 3.
+- [ ] `decoration:blur:enabled = false` (hyprctl keyword): tint-only ramp,
+      still locks and unlocks cleanly.
+- [ ] Idle warning (`--warn 10`) still cancels on input and now ramps blur.
+

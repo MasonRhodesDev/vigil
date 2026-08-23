@@ -16,3 +16,5 @@ smithay-client-toolkit.workspace = true
 calloop-wayland-source.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
+wayland-scanner.workspace = true
+wayland-backend.workspace = true

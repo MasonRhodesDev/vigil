@@ -89,9 +89,18 @@ suite). Full triage is in the issue comments; the shape:
   clean). Diagnostics landed (6243b41/b36a134); the next failure will
   say whether the locker dies post-readiness or sway 1.9 double-grants.
   Re-run the job if Release trips on it.
-- **#52 animated frost on manual lock** — zero-latitude spec posted on
-  the issue (2026-08-23). The only new engineering work that isn't
-  metal-blocked; implement next.
+- **#52 animated frost on manual lock** — IMPLEMENTED on main
+  (2026-08-23), nested S1–S9 green; stays open for the metal checklist
+  (`tests/metal/checklist.md` "#52") which gates tagging **0.4.0**.
+  Key facts: blur strength IS animatable on Hyprland —
+  `hyprland_surface_v1.set_opacity` multiplies the blur pass
+  (`ElementRenderer.cpp`, `overallA`) regardless of
+  `decoration:blur:ignore_opacity` (true by default, so
+  `wp_alpha_modifier_v1` alone does NOT drive blur on stock Hyprland).
+  Vendored XML + `wayland-scanner` bindings in
+  `crates/vigil-wayland/src/hyprland_surface.rs`. ADR 0004 amended in
+  desktop-commons. hypr-DE `lock-cmd.sh`/`hypridle.conf` comments still
+  say "immediate" — reword on the next hypr-DE sweep (no behaviour change).
 - **Simulator track** (no blockers): #43 shared controllers is the
   foundation, then #42 failure controls, #41 multi-output presets,
   #45 deterministic scenarios + visual regression.

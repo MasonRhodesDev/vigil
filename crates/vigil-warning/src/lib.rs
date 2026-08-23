@@ -43,10 +43,23 @@ pub struct Timeline {
     motion: f64,
     wallpaper_ready: bool,
     wallpaper_ready_at: Option<Duration>,
+    /// False for the manual-lock transition (issue #52): input is ignored,
+    /// hotplug commits, and the wallpaper never holds the commit.
+    cancelable: bool,
 }
 
 impl Timeline {
     pub fn new(config: LockWarning) -> Self {
+        Self::with_cancelable(config, true)
+    }
+
+    /// A frost-in ramp for a manual or before-sleep lock: the warning's
+    /// keyframes, but nothing cancels it and nothing waits on it.
+    pub fn new_transition(config: LockWarning) -> Self {
+        Self::with_cancelable(config, false)
+    }
+
+    fn with_cancelable(config: LockWarning, cancelable: bool) -> Self {
         Self {
             config,
             phase: Phase::Mapped,
@@ -57,7 +70,12 @@ impl Timeline {
             motion: 0.0,
             wallpaper_ready: true,
             wallpaper_ready_at: None,
+            cancelable,
         }
+    }
+
+    pub fn cancelable(&self) -> bool {
+        self.cancelable
     }
 
     pub fn start(&mut self, now: Duration) {
@@ -81,8 +99,14 @@ impl Timeline {
         self.locked_at = Some(now);
     }
 
+    /// Output topology changed before commitment. A cancelable warning
+    /// cancels rather than risk partial coverage; a transition commits now.
     pub fn hotplug(&mut self) {
-        self.cancel();
+        if self.cancelable {
+            self.cancel();
+        } else {
+            self.request_commit();
+        }
     }
 
     pub fn set_wallpaper_ready(&mut self, ready: bool, now: Duration) {
@@ -95,7 +119,7 @@ impl Timeline {
     }
 
     pub fn input(&mut self, event: &InputEvent) {
-        if !matches!(self.phase, Phase::Mapped | Phase::Running) {
+        if !self.cancelable || !matches!(self.phase, Phase::Mapped | Phase::Running) {
             return;
         }
         match event {
@@ -148,11 +172,14 @@ impl Timeline {
         let frost_duration = Duration::from_millis(self.config.frost_in_ms);
         let wallpaper_duration = Duration::from_millis(self.config.wallpaper_in_ms);
         let scheduled_wallpaper_start = total.saturating_sub(wallpaper_duration);
-        let wallpaper_start = self
-            .wallpaper_ready_at
-            .map_or(scheduled_wallpaper_start, |ready| {
-                ready.max(scheduled_wallpaper_start)
-            });
+        let wallpaper_start = if self.cancelable {
+            self.wallpaper_ready_at
+                .map_or(scheduled_wallpaper_start, |ready| {
+                    ready.max(scheduled_wallpaper_start)
+                })
+        } else {
+            scheduled_wallpaper_start
+        };
         let frost = ease(ratio(elapsed, frost_duration), self.config.easing);
         let wallpaper = if self.wallpaper_ready {
             ease(
@@ -164,7 +191,10 @@ impl Timeline {
         };
 
         let commit_at = wallpaper_start + wallpaper_duration;
-        if self.phase == Phase::Running && elapsed >= commit_at && self.wallpaper_ready {
+        if self.phase == Phase::Running
+            && elapsed >= commit_at
+            && (self.wallpaper_ready || !self.cancelable)
+        {
             self.phase = Phase::CommitReady;
         }
         let should_commit = self.phase == Phase::CommitReady && !self.commit_emitted;
@@ -180,6 +210,10 @@ impl Timeline {
         } else if self.phase == Phase::Running && self.wallpaper_ready && elapsed < wallpaper_start
         {
             Some(wallpaper_start - elapsed)
+        } else if self.phase == Phase::Running && !self.cancelable {
+            // A transition commits on schedule whether or not the wallpaper
+            // ever arrives: always wake for the commit.
+            Some((commit_at.saturating_sub(elapsed)).max(Duration::from_millis(1)))
         } else {
             None
         };
@@ -213,25 +247,15 @@ impl Timeline {
             WarningKeyframe::FrostEnd => {
                 Some(start + Duration::from_millis(self.config.frost_in_ms))
             }
-            WarningKeyframe::WallpaperStart => Some(
-                start
-                    + self.wallpaper_ready_at.map_or_else(
-                        || {
-                            Duration::from_millis(
-                                self.config
-                                    .duration_ms
-                                    .saturating_sub(self.config.wallpaper_in_ms),
-                            )
-                        },
-                        |ready| {
-                            ready.max(Duration::from_millis(
-                                self.config
-                                    .duration_ms
-                                    .saturating_sub(self.config.wallpaper_in_ms),
-                            ))
-                        },
-                    ),
-            ),
+            WarningKeyframe::WallpaperStart => {
+                let scheduled = Duration::from_millis(
+                    self.config
+                        .duration_ms
+                        .saturating_sub(self.config.wallpaper_in_ms),
+                );
+                let ready = self.wallpaper_ready_at.filter(|_| self.cancelable);
+                Some(start + ready.map_or(scheduled, |ready| ready.max(scheduled)))
+            }
             WarningKeyframe::WallpaperSolid => {
                 Some(start + Duration::from_millis(self.config.duration_ms))
             }
@@ -317,8 +341,73 @@ impl Timeline {
     }
 
     fn cancel(&mut self) {
-        if matches!(self.phase, Phase::Mapped | Phase::Running) {
+        if self.cancelable && matches!(self.phase, Phase::Mapped | Phase::Running) {
             self.phase = Phase::Cancelled;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RevealSample {
+    pub frost: f32,
+    pub wallpaper: f32,
+    pub done: bool,
+    pub next_frame: Option<Duration>,
+}
+
+/// Post-unlock fade (issue #52): the wallpaper dissolves into the frosted
+/// desktop, then the frost clears. Same `(frost, wallpaper)` contract as the
+/// warning's [`Sample`], consumed by the same overlay compositing.
+pub struct Reveal {
+    wallpaper_out: Duration,
+    frost_out: Duration,
+    easing: WarningEasing,
+    start: Option<Duration>,
+}
+
+impl Reveal {
+    pub fn new(wallpaper_out_ms: u64, frost_out_ms: u64, easing: WarningEasing) -> Self {
+        Self {
+            wallpaper_out: Duration::from_millis(wallpaper_out_ms),
+            frost_out: Duration::from_millis(frost_out_ms),
+            easing,
+            start: None,
+        }
+    }
+
+    /// Idempotent: the first call fixes the origin.
+    pub fn start(&mut self, now: Duration) {
+        if self.start.is_none() {
+            self.start = Some(now);
+        }
+    }
+
+    pub fn started(&self) -> bool {
+        self.start.is_some()
+    }
+
+    pub fn sample(&self, now: Duration) -> RevealSample {
+        let Some(start) = self.start else {
+            return RevealSample {
+                frost: 1.0,
+                wallpaper: 1.0,
+                done: false,
+                next_frame: None,
+            };
+        };
+        let elapsed = now.saturating_sub(start);
+        let wallpaper = 1.0 - ease(ratio(elapsed, self.wallpaper_out), self.easing);
+        let frost = 1.0
+            - ease(
+                ratio(elapsed.saturating_sub(self.wallpaper_out), self.frost_out),
+                self.easing,
+            );
+        let done = elapsed >= self.wallpaper_out + self.frost_out;
+        RevealSample {
+            frost,
+            wallpaper,
+            done,
+            next_frame: (!done).then(|| Duration::from_millis(33)),
         }
     }
 }
@@ -494,5 +583,112 @@ mod tests {
 
         timeline.set_wallpaper_ready(false, Duration::from_secs(2));
         assert_eq!(timeline.sample(Duration::from_secs(2)).next_frame, None);
+    }
+
+    fn transition() -> LockWarning {
+        vigil_config::LockTransition::default()
+            .as_warning(0.35, vigil_config::WarningGui::default())
+    }
+
+    #[test]
+    fn transition_ignores_input_and_commits_on_schedule() {
+        let key = InputEvent::Key {
+            keysym: 1,
+            utf8: None,
+            pressed: true,
+        };
+        let mut timeline = Timeline::new_transition(transition());
+        assert!(!timeline.cancelable());
+        timeline.start(Duration::ZERO);
+        timeline.input(&key);
+        timeline.input(&InputEvent::PointerMotion { dx: 500.0, dy: 0.0 });
+        assert_eq!(
+            timeline.sample(Duration::from_millis(100)).phase,
+            Phase::Running
+        );
+        let commit = timeline.sample(Duration::from_millis(400));
+        assert!(commit.should_commit);
+        assert_eq!(commit.frost, 1.0);
+        assert_eq!(commit.wallpaper, 1.0);
+        assert!(!timeline.sample(Duration::from_millis(401)).should_commit);
+    }
+
+    #[test]
+    fn transition_hotplug_commits_instead_of_cancelling() {
+        let mut timeline = Timeline::new_transition(transition());
+        timeline.start(Duration::ZERO);
+        timeline.hotplug();
+        let sample = timeline.sample(Duration::from_millis(50));
+        assert_eq!(sample.phase, Phase::Committing);
+        assert!(sample.should_commit);
+    }
+
+    #[test]
+    fn transition_does_not_wait_for_wallpaper() {
+        let mut timeline = Timeline::new_transition(transition());
+        timeline.start(Duration::ZERO);
+        timeline.set_wallpaper_ready(false, Duration::ZERO);
+        let held = timeline.sample(Duration::from_millis(200));
+        assert_eq!(held.phase, Phase::Running);
+        assert_eq!(held.wallpaper, 0.0);
+        assert_eq!(held.next_frame, Some(Duration::from_millis(200)));
+        let commit = timeline.sample(Duration::from_millis(400));
+        assert!(commit.should_commit);
+        assert_eq!(commit.wallpaper, 1.0);
+        assert_eq!(
+            timeline.keyframe_time(WarningKeyframe::WallpaperStart),
+            Some(Duration::from_millis(150))
+        );
+    }
+
+    #[test]
+    fn transition_keeps_cancelable_warning_semantics() {
+        let key = InputEvent::Key {
+            keysym: 1,
+            utf8: None,
+            pressed: true,
+        };
+        let mut warning = Timeline::new(config());
+        assert!(warning.cancelable());
+        warning.start(Duration::ZERO);
+        warning.input(&key);
+        assert_eq!(warning.sample(Duration::ZERO).phase, Phase::Cancelled);
+    }
+
+    #[test]
+    fn reveal_fades_wallpaper_then_frost_and_goes_quiet() {
+        let mut reveal = Reveal::new(250, 150, WarningEasing::Linear);
+        assert_eq!(
+            reveal.sample(Duration::from_secs(5)),
+            RevealSample {
+                frost: 1.0,
+                wallpaper: 1.0,
+                done: false,
+                next_frame: None
+            }
+        );
+        reveal.start(Duration::from_secs(1));
+        reveal.start(Duration::from_secs(9)); // idempotent
+        let middle = reveal.sample(Duration::from_millis(1_125));
+        assert!((middle.wallpaper - 0.5).abs() < 1e-6);
+        assert_eq!(middle.frost, 1.0);
+        assert_eq!(middle.next_frame, Some(Duration::from_millis(33)));
+        let frost = reveal.sample(Duration::from_millis(1_325));
+        assert_eq!(frost.wallpaper, 0.0);
+        assert!((frost.frost - 0.5).abs() < 1e-6);
+        assert!(!frost.done);
+        let end = reveal.sample(Duration::from_millis(1_400));
+        assert!(end.done);
+        assert_eq!(end.frost, 0.0);
+        assert_eq!(end.next_frame, None);
+    }
+
+    #[test]
+    fn zero_length_reveal_is_done_immediately() {
+        let mut reveal = Reveal::new(0, 0, WarningEasing::EaseOut);
+        reveal.start(Duration::ZERO);
+        let sample = reveal.sample(Duration::ZERO);
+        assert!(sample.done);
+        assert_eq!(sample.next_frame, None);
     }
 }

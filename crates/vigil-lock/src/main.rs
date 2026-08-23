@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
-use vigil_config::Config;
+use vigil_config::{Config, LockTransition};
 use vigil_core::{
     AppearanceEvent, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget, InputEvent,
     LoginEvent, OutputId, OutputInfo, UiMessage,
@@ -40,6 +40,9 @@ struct Cli {
     /// inhibitor is not released until the screen is already secured.
     wait: bool,
     warning_ms: Option<u64>,
+    /// Skip the frost transition on lock and the reveal on unlock
+    /// (`[lock.transition]`): today's instant commit, for scripts and tests.
+    immediate: bool,
 }
 
 fn clock_interval(format: &str) -> Duration {
@@ -74,6 +77,7 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
         ready_fd: None,
         wait: false,
         warning_ms: None,
+        immediate: false,
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -105,10 +109,30 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
                 cli.warning_ms = Some((seconds.max(0.0) * 1000.0).round() as u64);
             }
             "--no-warn" => cli.warning_ms = Some(0),
+            "--immediate" => cli.immediate = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
     Ok(cli)
+}
+
+/// Fold the flags that override `vigil.toml` into the loaded config.
+/// `--warn`/`--no-warn` set the cancelable warning; `--immediate` removes
+/// the non-cancelable transition, and every ramp is clamped so a bad config
+/// delays a lock but never prevents it.
+fn apply_cli_to_config(cli: &Cli, config: &mut Config) {
+    if let Some(duration_ms) = cli.warning_ms {
+        config.lock.warning.duration_ms = duration_ms;
+    }
+    if cli.immediate {
+        config.lock.transition = LockTransition::immediate();
+    }
+    if config.lock.transition.clamp() {
+        eprintln!(
+            "vigil-lock: lock.transition ramps clamped to {} ms",
+            LockTransition::MAX_RAMP_MS
+        );
+    }
 }
 
 /// The user to authenticate: an explicit `--user` wins; otherwise the
@@ -402,7 +426,10 @@ impl Locker {
             .user
             .take()
             .ok_or("user not resolved before Locker::new")?;
-        let warning_active = config.lock.warning.duration_ms > 0;
+        // Either pre-lock overlay phase: out-of-band lock requests (logind,
+        // sleep, a joining locker) must commit it instead of queueing.
+        let warning_active =
+            config.lock.warning.duration_ms > 0 || config.lock.transition.ramps_in();
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
         let clock_format = config.look.clock_format.clone();
@@ -898,6 +925,11 @@ impl LockSession for Locker {
     }
 
     fn input(&mut self, event: InputEvent) {
+        if self.unlocked {
+            // Reveal fade in progress: the session is released and nothing
+            // here may re-enter unlock_now or feed PAM.
+            return;
+        }
         if let Some(grace) = &self.grace
             && grace.dismisses(&event, Instant::now(), std::time::SystemTime::now())
         {
@@ -1245,14 +1277,13 @@ fn main() {
         detach_and_wait_for_lock();
     }
     let mut config = Config::load_layered(cli.config.as_deref());
-    if let Some(duration_ms) = cli.warning_ms {
-        config.lock.warning.duration_ms = duration_ms;
-    }
+    apply_cli_to_config(&cli, &mut config);
     if let Err(error) = config.validate_warning() {
         eprintln!("vigil-lock: {error}");
         std::process::exit(2);
     }
     let mut warning = config.lock.warning.clone();
+    let transition = config.lock.transition.clone();
     cli.theme = cli.theme.or(config.look.theme.clone());
     let grace_secs = cli.grace.unwrap_or(config.lock.grace_secs);
     // Singleton guard (issue #50): exactly one locker per seat. flock
@@ -1323,7 +1354,7 @@ fn main() {
         }
     };
     let _lock_ipc_socket = lock_ipc_socket;
-    match vigil_wayland::run_with_warning(locker, warning) {
+    match vigil_wayland::run_with_warning(locker, warning, transition) {
         Ok(LockOutcome::Unlocked) => std::process::exit(0),
         Ok(LockOutcome::Denied) => {
             eprintln!("vigil-lock: lock denied (another locker running?)");
@@ -1387,6 +1418,36 @@ mod tests {
     fn user_resolution_fails_closed_without_any_source() {
         let error = resolve_user(None, None, None).unwrap_err();
         assert!(error.contains("pass --user"), "{error}");
+    }
+
+    #[test]
+    fn immediate_flag_disables_both_ramps() {
+        let cli = parse_cli_from(["--no-warn".to_owned(), "--immediate".to_owned()]).unwrap();
+        assert!(cli.immediate);
+        let mut config = Config::default();
+        apply_cli_to_config(&cli, &mut config);
+        assert_eq!(config.lock.warning.duration_ms, 0);
+        assert!(!config.lock.transition.ramps_in());
+        assert!(!config.lock.transition.reveals());
+
+        let cli = parse_cli_from(["--no-warn".to_owned()]).unwrap();
+        let mut config = Config::default();
+        config.lock.transition.frost_in_ms = 5_000;
+        apply_cli_to_config(&cli, &mut config);
+        assert!(config.lock.transition.ramps_in());
+        assert_eq!(config.lock.transition.in_ms(), LockTransition::MAX_RAMP_MS);
+    }
+
+    #[test]
+    fn immediate_is_forwarded_to_detached_child() {
+        assert_eq!(
+            daemon_child_args([
+                "--wait".to_owned(),
+                "--no-warn".to_owned(),
+                "--immediate".to_owned(),
+            ]),
+            ["--no-warn", "--immediate"]
+        );
     }
 
     #[test]

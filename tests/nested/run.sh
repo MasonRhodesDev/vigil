@@ -106,6 +106,11 @@ teardown_check() {
 }
 
 echo "S1: readiness — locked event precedes --wait success"
+# Default path since issue #52: a short non-cancelable frost transition
+# (warning-role overlay) before the lock, a reveal overlay after unlock. The
+# trace is checked after teardown so it also covers the reveal. Note: a
+# compositor may decline to configure a layer surface while locked; the
+# --reveal check allows the bounded-deadline unlock in that case.
 [ "$(probe_state)" = 0 ] || fail "S1: fresh session reports locked"
 WAYLAND_DEBUG=1 timeout 30 "$VLOCK" --wait --no-warn --grace 300 2>"$WORK/s1.trace" && rc=0 || rc=$?
 [ "$rc" = 0 ] || { grep -v '^\[' "$WORK/s1.trace" | tail -5; fail "S1: --wait exited $rc"; }
@@ -122,9 +127,9 @@ s1_probe=$(probe_state)
     tail -15 "$WORK/sway.log"
     fail "S1: probe says unlocked after --wait returned 0"
 }
-python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked || fail "S1: trace check"
 tap
 teardown_check S1
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --reveal || fail "S1: trace check"
 pass "S1"
 
 echo "S2: second locker joins the in-flight warning"
@@ -192,6 +197,32 @@ sleep 1
 tap
 teardown_check S7b
 pass "S7b"
+
+echo "S8: --immediate is the pre-0.4 path: no overlay on lock or unlock"
+timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --wait --no-warn --immediate --grace 300 2>"$WORK/s8.trace" || fail "S8: lock failed"
+[ "$(probe_state)" = 10 ] || fail "S8: session not locked"
+tap
+teardown_check S8
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s8.trace" --expect locked --no-layer || fail "S8: trace check"
+pass "S8"
+
+echo "S9: hotplug during the transition commits instead of cancelling"
+timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --wait --no-warn --grace 300 2>"$WORK/s9.trace" &
+A=$!
+# Race the 400 ms ramp; whichever side of the commit the new output lands
+# on, the locker must end up locked (never exit 3) with both outputs covered.
+sleep 0.15
+sm create_output >/dev/null
+wait $A && rc=0 || rc=$?
+[ "$rc" = 0 ] || fail "S9: expected a lock (exit 0) despite hotplug, got $rc"
+[ "$(probe_state)" = 10 ] || fail "S9: session not locked"
+sleep 1
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s9.trace" --expect locked --outputs 2 || fail "S9: trace check"
+sm output HEADLESS-2 unplug >/dev/null 2>&1 || true
+sleep 1
+tap
+teardown_check S9
+pass "S9"
 
 echo "S5: no capture global was bound in any scenario"
 for t in "$WORK"/s*.trace; do

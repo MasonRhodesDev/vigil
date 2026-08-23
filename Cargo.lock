@@ -5199,8 +5199,10 @@ dependencies = [
  "vigil-config",
  "vigil-core",
  "vigil-warning",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols",
+ "wayland-scanner",
 ]
 
 [[package]]

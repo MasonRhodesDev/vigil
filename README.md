@@ -109,8 +109,14 @@ when its contract changes.
 confirmed that the session is locked (`--daemonize` remains a compatibility
 alias). `vigil-lock --warn 10` presents a cancelable, capture-free idle warning before
 locking. It requests `ext-background-effect-v1` blur when available and uses a
-tint-only fallback otherwise. `--no-warn`, manual lock, and suspend paths lock
-immediately. Activity before commitment exits 3.
+tint-only fallback otherwise. Activity before commitment exits 3. `--no-warn`,
+manual lock, and suspend paths run a short **non-cancelable** frost transition
+instead (`[lock.transition]`, default 400 ms; input is ignored and hotplug
+commits) and never exit 3; unlock fades the wallpaper out over the frosted
+desktop. `--immediate` skips both ramps. On Hyprland the blur strength follows
+the ramp via `hyprland-surface-v1` opacity (`wp-alpha-modifier-v1` where a
+compositor ties blur to surface alpha); elsewhere the tint ramps over a fixed
+blur.
 
 ## Monitor layout
 

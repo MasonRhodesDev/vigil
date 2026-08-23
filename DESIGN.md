@@ -515,7 +515,14 @@ vigil-lock (calloop, mirrors the greeter binary's wiring)
 ├─ vigil-wayland ── smithay-client-toolkit (pinned) glue:
 │   ├─ Warning: ARGB layer-shell surface per output + standard staging
 │   │   ext-background-effect-v1 blur; tint-only fallback; no capture
-│   │   protocol; opaque handoff retained until lock buffers commit
+│   │   protocol; opaque handoff retained until lock buffers commit.
+│   │   Two timelines: the cancelable idle warning and the short
+│   │   non-cancelable manual/before-sleep transition (#52). Frost =
+│   │   whole-surface opacity (hyprland-surface-v1 → wp-alpha-modifier-v1,
+│   │   ramps Hyprland's blur strength) else per-pixel tint
+│   ├─ Reveal: post-auth ARGB overlay per output, mapped opaque while
+│   │   still locked, pointer-transparent + keyboard None, fades after
+│   │   unlock_and_destroy, bounded (250 ms map wait, 2 s hard deadline)
 │   ├─ SessionLockState: lock → per-output lock surfaces (created on lock
 │   │   AND on output hotplug), configure/ack, unlock → roundtrip → exit
 │   ├─ WlShmPresenter: THIRD Presenter impl — SlotPool buffer mapped as

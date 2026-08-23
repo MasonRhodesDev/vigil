@@ -146,6 +146,7 @@ pub struct Lock {
     /// auth (0 = disabled). Never survives suspend (dual-clock deadline).
     pub grace_secs: u64,
     pub warning: LockWarning,
+    pub transition: LockTransition,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -171,6 +172,99 @@ impl Default for LockWarning {
             cancel_on_motion_px: 8.0,
             gui: WarningGui::default(),
         }
+    }
+}
+
+/// The short, non-cancelable frost ramp around a manual or before-sleep
+/// lock (issue #52). The idle warning is the cancelable, long form of the
+/// same overlay; this one ignores input, commits on hotplug, and never waits
+/// on the wallpaper. Zero durations restore the instant commit.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LockTransition {
+    /// Lock: tint ramps in over this, then the wallpaper.
+    pub frost_in_ms: u64,
+    pub wallpaper_in_ms: u64,
+    /// Unlock: the wallpaper fades out over this, then the tint.
+    pub wallpaper_out_ms: u64,
+    pub frost_out_ms: u64,
+    pub easing: WarningEasing,
+}
+
+impl Default for LockTransition {
+    fn default() -> Self {
+        Self {
+            frost_in_ms: 150,
+            wallpaper_in_ms: 250,
+            wallpaper_out_ms: 250,
+            frost_out_ms: 150,
+            easing: WarningEasing::EaseOut,
+        }
+    }
+}
+
+impl LockTransition {
+    /// Each ramp is bounded so a misconfiguration can delay, never prevent,
+    /// the secure commit or the unlock.
+    pub const MAX_RAMP_MS: u64 = 2_000;
+
+    pub fn immediate() -> Self {
+        Self {
+            frost_in_ms: 0,
+            wallpaper_in_ms: 0,
+            wallpaper_out_ms: 0,
+            frost_out_ms: 0,
+            ..Self::default()
+        }
+    }
+
+    pub fn in_ms(&self) -> u64 {
+        self.frost_in_ms + self.wallpaper_in_ms
+    }
+
+    pub fn out_ms(&self) -> u64 {
+        self.wallpaper_out_ms + self.frost_out_ms
+    }
+
+    pub fn ramps_in(&self) -> bool {
+        self.in_ms() > 0
+    }
+
+    pub fn reveals(&self) -> bool {
+        self.out_ms() > 0
+    }
+
+    /// The non-cancelable timeline for the frost-in ramp, sharing the tint
+    /// alpha and the post-lock GUI animation with the idle warning so both
+    /// lock paths look identical once locked.
+    pub fn as_warning(&self, frost_alpha: f32, gui: WarningGui) -> LockWarning {
+        LockWarning {
+            duration_ms: self.in_ms(),
+            frost_in_ms: self.frost_in_ms,
+            frost_alpha,
+            wallpaper_in_ms: self.wallpaper_in_ms,
+            easing: self.easing,
+            cancel_on_motion_px: f64::INFINITY,
+            gui,
+        }
+    }
+
+    /// Clamp each ramp to [`Self::MAX_RAMP_MS`], scaling its halves
+    /// proportionally. Returns whether anything changed. Never an error: a
+    /// bad config must still lock.
+    pub fn clamp(&mut self) -> bool {
+        fn clamp_pair(first: &mut u64, second: &mut u64) -> bool {
+            let total = *first + *second;
+            if total <= LockTransition::MAX_RAMP_MS {
+                return false;
+            }
+            *first = *first * LockTransition::MAX_RAMP_MS / total;
+            *second = LockTransition::MAX_RAMP_MS - *first;
+            true
+        }
+        let changed_in = clamp_pair(&mut self.frost_in_ms, &mut self.wallpaper_in_ms);
+        let changed_out = clamp_pair(&mut self.wallpaper_out_ms, &mut self.frost_out_ms);
+        changed_in || changed_out
     }
 }
 
@@ -522,6 +616,61 @@ kind = "none"
         assert_eq!(warning.gui.element[0].selector, "clock");
         assert_eq!(warning.gui.element[0].start, WarningKeyframe::Painted);
         assert_eq!(warning.gui.element[0].kind, WarningAnimation::None);
+    }
+
+    #[test]
+    fn parses_lock_transition() {
+        let config = parse(
+            r#"
+[lock.transition]
+frost_in_ms = 100
+wallpaper_in_ms = 200
+wallpaper_out_ms = 300
+frost_out_ms = 50
+easing = "linear"
+"#,
+        )
+        .unwrap();
+        let transition = config.lock.transition;
+        assert_eq!(transition.frost_in_ms, 100);
+        assert_eq!(transition.wallpaper_in_ms, 200);
+        assert_eq!(transition.wallpaper_out_ms, 300);
+        assert_eq!(transition.frost_out_ms, 50);
+        assert_eq!(transition.easing, WarningEasing::Linear);
+        let warning = transition.as_warning(0.5, WarningGui::default());
+        assert_eq!(warning.duration_ms, 300);
+        assert_eq!(warning.frost_alpha, 0.5);
+        assert_eq!(warning.easing, WarningEasing::Linear);
+    }
+
+    #[test]
+    fn transition_defaults_are_short() {
+        let transition = LockTransition::default();
+        assert_eq!(transition.in_ms(), 400);
+        assert_eq!(transition.out_ms(), 400);
+        assert!(transition.ramps_in() && transition.reveals());
+        assert_eq!(parse("").unwrap().lock.transition, transition);
+    }
+
+    #[test]
+    fn transition_clamps_each_ramp_to_max() {
+        let mut transition = LockTransition {
+            frost_in_ms: 3_000,
+            wallpaper_in_ms: 3_000,
+            ..LockTransition::default()
+        };
+        assert!(transition.clamp());
+        assert_eq!(transition.in_ms(), LockTransition::MAX_RAMP_MS);
+        assert_eq!(transition.frost_in_ms, 1_000);
+        assert_eq!(transition.out_ms(), 400);
+        assert!(!LockTransition::default().clone().clamp());
+    }
+
+    #[test]
+    fn immediate_has_no_ramps() {
+        let transition = LockTransition::immediate();
+        assert!(!transition.ramps_in() && !transition.reveals());
+        assert_eq!(transition.easing, LockTransition::default().easing);
     }
 
     #[test]
