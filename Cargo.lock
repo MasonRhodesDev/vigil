@@ -1658,28 +1658,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2b57d35d5a9d1fe4892d499fca8fb64f331cf0a2618ca38b1fc32fdfef9f6ed"
 
 [[package]]
-name = "hypr-paths"
-version = "0.1.0"
-source = "git+https://github.com/MasonRhodesDev/hypr-commons?rev=42bdc63283e50b9a1c55d00bd4d25a8f55863233#42bdc63283e50b9a1c55d00bd4d25a8f55863233"
-
-[[package]]
-name = "hypr-singleton"
-version = "0.1.0"
-source = "git+https://github.com/MasonRhodesDev/hypr-commons?rev=42bdc63283e50b9a1c55d00bd4d25a8f55863233#42bdc63283e50b9a1c55d00bd4d25a8f55863233"
-dependencies = [
- "hypr-paths 0.1.0 (git+https://github.com/MasonRhodesDev/hypr-commons?rev=42bdc63283e50b9a1c55d00bd4d25a8f55863233)",
- "libc",
-]
-
-[[package]]
-name = "hypr-slint-runtime"
-version = "0.1.0"
-source = "git+https://github.com/MasonRhodesDev/hypr-slint-runtime?tag=v0.1.0#2c18ead7ea713ba20cfcc9871e7eada23f12fdf9"
-dependencies = [
- "slint",
-]
-
-[[package]]
 name = "i-slint-backend-linuxkms"
 version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2549,7 +2527,7 @@ dependencies = [
  "anyhow",
  "appearance-profiles 0.1.0",
  "dirs",
- "hypr-paths 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "hypr-paths",
  "palette",
  "serde",
  "serde_json",
@@ -4038,6 +4016,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "singleton-guard"
+version = "0.1.0"
+source = "git+https://github.com/MasonRhodesDev/desktop-commons?rev=315d5de#315d5de2b54fd5fd7c0604cdbdc9b84d0222481a"
+dependencies = [
+ "libc",
+ "xdg-paths 0.2.0 (git+https://github.com/MasonRhodesDev/desktop-commons?rev=315d5de)",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4116,6 +4103,14 @@ dependencies = [
  "slint-macros",
  "unicode-segmentation",
  "vtable",
+]
+
+[[package]]
+name = "slint-idle-runtime"
+version = "0.2.0"
+source = "git+https://github.com/MasonRhodesDev/slint-idle-runtime?tag=v0.2.0#4e97514c6eb1687eac40a4b6f382201ccac69a18"
+dependencies = [
+ "slint",
 ]
 
 [[package]]
@@ -5002,9 +4997,9 @@ version = "0.3.0"
 dependencies = [
  "appearance-profiles 0.2.0",
  "calloop 0.14.4",
- "hypr-slint-runtime",
  "image",
  "monitor-profiles",
+ "slint-idle-runtime",
  "slint-kit",
  "vigil-auth",
  "vigil-config",
@@ -5032,9 +5027,9 @@ dependencies = [
 name = "vigil-config"
 version = "0.3.0"
 dependencies = [
- "hypr-paths 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "toml 0.9.12+spec-1.1.0",
+ "xdg-paths 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -5050,9 +5045,9 @@ version = "0.3.0"
 dependencies = [
  "drm",
  "gbm",
- "hypr-slint-runtime",
  "image",
  "slint",
+ "slint-idle-runtime",
  "slint-interpreter",
  "smithay",
  "vigil-core",
@@ -5073,11 +5068,11 @@ name = "vigil-lock"
 version = "0.3.0"
 dependencies = [
  "appearance-profiles 0.2.0",
- "hypr-singleton",
- "hypr-slint-runtime",
  "image",
  "libc",
  "monitor-profiles",
+ "singleton-guard",
+ "slint-idle-runtime",
  "vigil-config",
  "vigil-core",
  "vigil-login",
@@ -5177,9 +5172,9 @@ name = "vigil-ui"
 version = "0.3.0"
 dependencies = [
  "bytemuck",
- "hypr-slint-runtime",
  "image",
  "slint",
+ "slint-idle-runtime",
  "slint-interpreter",
  "slint-kit",
  "vigil-config",
@@ -5199,7 +5194,7 @@ name = "vigil-wayland"
 version = "0.3.0"
 dependencies = [
  "calloop-wayland-source 0.4.1",
- "hypr-slint-runtime",
+ "slint-idle-runtime",
  "smithay-client-toolkit 0.21.1",
  "vigil-config",
  "vigil-core",
@@ -5928,6 +5923,17 @@ name = "xcursor"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
+
+[[package]]
+name = "xdg-paths"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86bfd0671d6ceb9f3d5049ceaa7ec29b00d36cf26aceae18e4c9f553d7da780a"
+
+[[package]]
+name = "xdg-paths"
+version = "0.2.0"
+source = "git+https://github.com/MasonRhodesDev/desktop-commons?rev=315d5de#315d5de2b54fd5fd7c0604cdbdc9b84d0222481a"
 
 [[package]]
 name = "xkbcommon"

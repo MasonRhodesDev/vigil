@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hypr_slint_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
+use slint_idle_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use image::{DynamicImage, RgbaImage, imageops};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType, TargetPixel,

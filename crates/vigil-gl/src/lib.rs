@@ -404,7 +404,7 @@ pub struct GlWindow {
     /// it a GL greeter would redraw and flip forever on an idle login
     /// screen; the software path gets the same signal from `draw_if_needed`.
     needs_redraw: std::cell::Cell<bool>,
-    redraw: std::cell::RefCell<Option<hypr_slint_runtime::RedrawHandle<vigil_core::OutputId>>>,
+    redraw: std::cell::RefCell<Option<slint_idle_runtime::RedrawHandle<vigil_core::OutputId>>>,
     /// Present when rendering on-screen; absent for a context-only window,
     /// which can compile and instantiate a scene but not produce pixels.
     gbm: Option<GbmWindow>,
@@ -452,7 +452,7 @@ impl GlWindow {
 
     pub fn set_redraw_handle(
         &self,
-        redraw: hypr_slint_runtime::RedrawHandle<vigil_core::OutputId>,
+        redraw: slint_idle_runtime::RedrawHandle<vigil_core::OutputId>,
     ) {
         redraw.request_redraw();
         *self.redraw.borrow_mut() = Some(redraw);

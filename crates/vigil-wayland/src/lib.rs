@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use calloop_wayland_source::WaylandSource;
-use hypr_slint_runtime::{DirtySet, Metrics, WaitDecision, WakeHandle};
+use slint_idle_runtime::{DirtySet, Metrics, WaitDecision, WakeHandle};
 use smithay_client_toolkit::{
     background_effect::{BackgroundEffectHandler, BackgroundEffectState},
     compositor::{CompositorHandler, CompositorState},

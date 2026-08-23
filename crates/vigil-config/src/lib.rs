@@ -296,7 +296,7 @@ impl Config {
         if let Some(path) = path {
             return load_file(path).unwrap_or_default();
         }
-        let user_path = hypr_paths::ConfigDirs::from_env()
+        let user_path = xdg_paths::ConfigDirs::from_env()
             .ok()
             .map(|dirs| dirs.config_dir("vigil").join("config.toml"));
         if let Some(path) = user_path

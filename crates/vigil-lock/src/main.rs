@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-use hypr_slint_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
+use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use vigil_config::Config;
 use vigil_core::{
     AppearanceEvent, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget, InputEvent,
@@ -1183,7 +1183,7 @@ fn start_lock_ipc() -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String>
 
 fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String> {
     use std::os::unix::fs::PermissionsExt;
-    // Callers hold the hypr-singleton flock, so any existing socket file is
+    // Callers hold the singleton-guard flock, so any existing socket file is
     // a leftover from a dead owner (std::process::exit skips Drop): bind
     // first, and only unlink + retry when the address is genuinely in use.
     // The old probe-then-unlink order let two racing starts both unlink and
@@ -1261,7 +1261,7 @@ fn main() {
     // join RPC (commit / locked). Concurrent invocations either defer to
     // the owner (waiting for compositor-confirmed lock) or refuse to stack.
     let (_singleton, lock_ipc_socket, lock_ipc) = loop {
-        match hypr_singleton::try_acquire(&lock_instance_name()) {
+        match singleton_guard::try_acquire(&lock_instance_name()) {
             Ok(Some(guard)) => match start_lock_ipc() {
                 Ok((socket, state)) => break (guard, Some(socket), state),
                 Err(error) => {
@@ -1300,7 +1300,7 @@ fn main() {
                     }
                     std::thread::sleep(Duration::from_millis(100));
                     if matches!(
-                        hypr_singleton::try_acquire(&lock_instance_name()),
+                        singleton_guard::try_acquire(&lock_instance_name()),
                         Ok(Some(_))
                     ) {
                         // Owner gone; take over from the top of the loop.

@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-hypr-slint-runtime.workspace = true
+slint-idle-runtime.workspace = true
 vigil-core.workspace = true
 # Not the workspace slint entry: enabling renderer-femtovg there would unify
 # the feature onto every crate in the graph, and the shipped greeter is

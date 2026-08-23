@@ -23,8 +23,8 @@ smithay = { version = "0.7.0", default-features = false }
 smithay-drm-extras = { version = "0.1", default-features = false }
 slint = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "software-renderer-systemfonts"] }
 slint-interpreter = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2"] }
-hypr-slint-runtime = { git = "https://github.com/MasonRhodesDev/hypr-slint-runtime", tag = "v0.1.0" }
-hypr-singleton = { git = "https://github.com/MasonRhodesDev/hypr-commons", rev = "42bdc63283e50b9a1c55d00bd4d25a8f55863233" }
+slint-idle-runtime = { git = "https://github.com/MasonRhodesDev/slint-idle-runtime", tag = "v0.2.0" }
+singleton-guard = { git = "https://github.com/MasonRhodesDev/desktop-commons", rev = "315d5de" }
 greetd_ipc = { version = "0.10", features = ["sync-codec"] }
 xkbcommon = "0.9"
 calloop = "0.14"
@@ -39,7 +39,7 @@ vigil-login = { path = "crates/vigil-login" }
 # and must not gain one (the in-house `tokio` precedent does not apply here).
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 slint-kit = { git = "https://github.com/MasonRhodesDev/slint-kit", rev = "ccd7397c3da83ff835d6295d6ec3841fc32c8bac", default-features = false }
-hypr-paths = "0.1.0"
+xdg-paths = "0.2.0"
 libc = "0.2"
 winit = "0.30"
 softbuffer = "0.4"
