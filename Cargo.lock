@@ -5040,6 +5040,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vigil-flow"
+version = "0.3.2"
+dependencies = [
+ "vigil-config",
+ "vigil-core",
+ "vigil-warning",
+]
+
+[[package]]
 name = "vigil-gl"
 version = "0.3.2"
 dependencies = [

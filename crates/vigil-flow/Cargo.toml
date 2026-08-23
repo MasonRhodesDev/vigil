@@ -1,0 +1,13 @@
+[package]
+name = "vigil-flow"
+description = "Pure lock-lifecycle controller shared by vigil-lock, tests, and the simulator"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+vigil-config.workspace = true
+vigil-warning = { path = "../vigil-warning" }
