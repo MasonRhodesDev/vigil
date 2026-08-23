@@ -9,7 +9,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use slint_idle_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use image::{DynamicImage, RgbaImage, imageops};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType, TargetPixel,
@@ -21,6 +20,7 @@ use slint::{
     Color, ComponentHandle, Image, LogicalPosition, PhysicalSize, Rgba8Pixel, SharedPixelBuffer,
     WindowSize,
 };
+use slint_idle_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use slint_interpreter::{ComponentInstance, Value};
 use slint_kit::TokenSet;
 use vigil_core::{

@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
-use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use monitor_profiles::{ConnectedOutput, Profile, ResolvedOutput};
+use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use vigil_auth::AuthMachine;
 use vigil_config::Config;
 use vigil_core::{

@@ -86,9 +86,9 @@ wait_held() {
         sleep 0.1
     done
 }
+# errexit-safe: the probe exits 10 on purpose; || keeps set -e from aborting.
 probe_state() {
-    "$PROBE" >/dev/null 2>&1
-    echo $?
+    "$PROBE" >/dev/null 2>&1 && echo 0 || echo $?
 }
 # The headless seat reports capabilities(0): swaymsg cursor injection goes
 # nowhere. wtype attaches a zwp_virtual_keyboard, which gives the seat a
