@@ -74,11 +74,14 @@ Umbrella: **#20** (roadmap), **#47** (0.3 release). Closed this session
 with evidence: #48 (package CI), #36 (PAM before lock), #44 (nested
 suite). Full triage is in the issue comments; the shape:
 
-- **Fixed in 0.3.x, awaiting a metal confirm** — #49 (locker exits on
-  unlock), #50 (singleton guard), #37 (all outputs lock together),
-  #38 (reveal caret), #35 (hotplug while locked, FALLBACK round). Each
-  carries a one-paragraph recipe in its latest comment; run them in
-  one desk session after upgrading to 0.3.2, then close.
+- **VM-validated and CLOSED 2026-08-23** (vmkit, hypr-de VM, real
+  Hyprland 0.56.2, main build): #49 (exits on unlock), #50 (singleton +
+  4 ms join, no PAM noise), #38 (reveal shows no caret/pipe). Still
+  awaiting metal (multi-output/GPU/suspend, recipes on the issues):
+  #37 (outputs lock together), #35 (FALLBACK hotplug round).
+- **#53** (new): overlay ramps present at ~57 fps instead of the 33 ms
+  timeline cadence — 2× CPU during ramps, starves software GL; fix
+  sketch on the issue (dedupe unchanged Slint property sets).
 - **Metal gates for 0.3** — #46 (acceptance matrix) and #40
   (mixed-scale handoff): the checklist is `tests/metal/checklist.md`.
   #47 closes when those two do.
@@ -101,6 +104,11 @@ suite). Full triage is in the issue comments; the shape:
   `crates/vigil-wayland/src/hyprland_surface.rs`. ADR 0004 amended in
   desktop-commons. hypr-DE `lock-cmd.sh`/`hypridle.conf` comments still
   say "immediate" — reword on the next hypr-DE sweep (no behaviour change).
+  **VM-validated 2026-08-23** (vmkit + hypr-de VM, real Hyprland): blur
+  ramps with the lever, reveal restores the desktop pixel-exact, logind
+  path end-to-end, locked idle frame-quiet, `--immediate` clean; full
+  report on the issue. Metal remainder: multi-output feel (#37/#40/#35),
+  suspend, hardware GL. Filed #53 (ramp present cadence) from it.
 - **Simulator track** (no blockers): #43 shared controllers is the
   foundation, then #42 failure controls, #41 multi-output presets,
   #45 deterministic scenarios + visual regression.
