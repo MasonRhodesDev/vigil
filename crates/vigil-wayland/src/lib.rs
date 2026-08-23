@@ -81,6 +81,17 @@ const REVEAL_MAP_DEADLINE: Duration = Duration::from_millis(250);
 /// The reveal fade is cosmetic: whatever state it is in, the process exits
 /// this long after the fade started.
 const REVEAL_HARD_DEADLINE: Duration = Duration::from_millis(2_000);
+/// Minimum spacing between ramp samples. The event loop wakes faster than
+/// the 33 ms animation clock (every commit earns a `wl_buffer.release`,
+/// and the ramp values are continuous, so any earlier wake would see a
+/// "changed" progress) — without this floor the ramps self-sustain a
+/// commit-per-render-time loop at ~2x the intended rate (issue #53).
+const ANIM_SAMPLE_MIN: Duration = Duration::from_millis(30);
+
+/// Whether a ramp is due for a fresh sample at `now`.
+fn anim_sample_due(last: Option<Duration>, now: Duration) -> bool {
+    last.is_none_or(|at| now.saturating_sub(at) >= ANIM_SAMPLE_MIN)
+}
 
 /// What the binary implements: its composition of theme windows and auth.
 pub trait LockSession {
@@ -342,6 +353,8 @@ struct App<S: LockSession + 'static> {
     reveal_started_at: Option<Duration>,
     reveal_wait: Option<Duration>,
     unlock_sent: bool,
+    /// App-clock time of the last warning/reveal sample (rate floor).
+    anim_sampled_at: Option<Duration>,
 }
 
 impl<S: LockSession> App<S> {
@@ -844,8 +857,13 @@ impl<S: LockSession> App<S> {
         // before the pump left the timeline waiting on a wallpaper that
         // had already arrived — with no further wakeups scheduled, the
         // warning never committed and the session never locked.
-        if let Some(timeline) = self.warning.as_mut() {
-            let elapsed = self.warning_started.elapsed();
+        let anim_elapsed = self.warning_started.elapsed();
+        let anim_due = anim_sample_due(self.anim_sampled_at, anim_elapsed);
+        if let Some(timeline) = self.warning.as_mut()
+            && anim_due
+        {
+            self.anim_sampled_at = Some(anim_elapsed);
+            let elapsed = anim_elapsed;
             if self.lock.is_none() {
                 timeline.set_wallpaper_ready(self.session.warning_wallpaper_ready(), elapsed);
                 if self.session.warning_commit_requested() {
@@ -998,6 +1016,12 @@ impl<S: LockSession> App<S> {
         let Some(reveal) = self.reveal.as_ref() else {
             return true;
         };
+        if !anim_sample_due(self.anim_sampled_at, elapsed) {
+            // A stale reveal_wait re-arms the dispatch timeout; the fade is
+            // sampled again once the 30 ms floor passes (issue #53).
+            return false;
+        }
+        self.anim_sampled_at = Some(elapsed);
         let sample = reveal.sample(elapsed);
         let overdue = self
             .reveal_started_at
@@ -1198,6 +1222,7 @@ pub fn run_with_warning<S: LockSession + 'static>(
         reveal_started_at: None,
         reveal_wait: None,
         unlock_sent: false,
+        anim_sampled_at: None,
     };
     eprintln!(
         "vigil-lock: frost opacity lever: {}",
@@ -1681,7 +1706,11 @@ wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpAlph
 
 #[cfg(test)]
 mod tests {
-    use super::{initial_scale120, pixel_frost, present_priority, surface_role_is_warning};
+    use super::{
+        ANIM_SAMPLE_MIN, anim_sample_due, initial_scale120, pixel_frost, present_priority,
+        surface_role_is_warning,
+    };
+    use std::time::Duration;
 
     #[test]
     fn hotplug_after_lock_creates_a_lock_surface_not_a_warning() {
@@ -1706,6 +1735,25 @@ mod tests {
         // Warning and reveal overlays share the lock surface's OutputWindow;
         // the lock surface must consume the pending frame first.
         assert!(present_priority(true) < present_priority(false));
+    }
+
+    #[test]
+    fn ramp_samples_have_a_rate_floor() {
+        // Buffer-release wakeups arrive faster than the animation clock;
+        // without the floor every wake re-dirties the scene (issue #53).
+        assert!(anim_sample_due(None, Duration::ZERO));
+        let last = Some(Duration::from_millis(100));
+        assert!(!anim_sample_due(last, Duration::from_millis(100)));
+        assert!(!anim_sample_due(
+            last,
+            Duration::from_millis(100) + ANIM_SAMPLE_MIN - Duration::from_millis(1)
+        ));
+        assert!(anim_sample_due(
+            last,
+            Duration::from_millis(100) + ANIM_SAMPLE_MIN
+        ));
+        // A clock hiccup backwards never panics and simply holds.
+        assert!(!anim_sample_due(last, Duration::from_millis(50)));
     }
 
     #[test]
