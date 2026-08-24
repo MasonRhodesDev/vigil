@@ -171,6 +171,12 @@ pub struct LockFlow {
     /// App-clock time the reveal overlays were requested.
     reveal_entered: Option<Duration>,
     reveal_started: Option<Duration>,
+    /// Sleep was announced: no grace window may be armed for the rest of
+    /// this run, including one whose lock confirmation lands after resume.
+    grace_forbidden: bool,
+    /// logind asked to unlock before the lock was confirmed; honored the
+    /// moment it is (an edge-triggered order must not be dropped).
+    unlock_latched: bool,
     /// Earliest next wakeup computed by the last step.
     wait: Option<Duration>,
 }
@@ -211,12 +217,18 @@ impl LockFlow {
             elements: Vec::new(),
             reveal_entered: None,
             reveal_started: None,
+            grace_forbidden: false,
+            unlock_latched: false,
             wait: None,
         };
         let mut cmds = Vec::new();
         if let Some(timeline) = flow.timeline.as_mut() {
             timeline.start(now.elapsed);
             cmds.push(FlowCmd::ShowPanel(false));
+            // Prime the first frame and, critically, `wait`: an adapter that
+            // sleeps until next_wake() would otherwise block forever with no
+            // timer armed and the ramp never sampled.
+            flow.advance(now, &mut cmds);
         } else {
             cmds.push(FlowCmd::RequestSessionLock);
         }
@@ -235,6 +247,12 @@ impl LockFlow {
 
     pub fn step(&mut self, now: Now, event: FlowEvent) -> Vec<FlowCmd> {
         let mut cmds = Vec::new();
+        if matches!(self.phase, FlowPhase::Done(_)) {
+            // Terminal: a second teardown event (denial *and* invalidation
+            // from one compositor teardown) must not re-run finish and
+            // emit a conflicting Exit.
+            return cmds;
+        }
         match event {
             FlowEvent::Input(input) => self.on_input(now, input, &mut cmds),
             FlowEvent::PointerEnter { x, y } => {
@@ -280,17 +298,29 @@ impl LockFlow {
                     if let Some(timeline) = self.timeline.as_mut() {
                         timeline.locked(now.elapsed);
                     }
-                    if self.grace_secs > 0 {
+                    if self.grace_secs > 0 && !self.grace_forbidden {
                         self.grace = Some(Grace::new(now.mono, now.wall, self.grace_secs));
                     }
                     cmds.push(FlowCmd::ShowPanel(true));
                     cmds.push(FlowCmd::SignalReady);
                     cmds.push(FlowCmd::SetLockedHint(true));
                     cmds.push(FlowCmd::StartAuth);
+                    if self.unlock_latched {
+                        self.unlock_authorized(now, &mut cmds);
+                    }
                 }
             }
             FlowEvent::LockDenied => self.finish(LockOutcome::Denied, &mut cmds),
-            FlowEvent::LockInvalidated => self.finish(LockOutcome::Invalidated, &mut cmds),
+            FlowEvent::LockInvalidated => match self.phase {
+                // Past authorization the lock is already released (or about
+                // to be) and the run succeeded: a late `finished` must not
+                // turn an authenticated unlock into a failure outcome.
+                FlowPhase::RevealPending | FlowPhase::Revealing => {
+                    cmds.push(FlowCmd::DestroyRevealOverlays);
+                    self.finish(LockOutcome::Unlocked, &mut cmds);
+                }
+                _ => self.finish(LockOutcome::Invalidated, &mut cmds),
+            },
             FlowEvent::RevealOverlaysMapped => {
                 if self.phase == FlowPhase::RevealPending {
                     self.release_and_start_reveal(now, &mut cmds);
@@ -309,13 +339,17 @@ impl LockFlow {
                     cmds.push(FlowCmd::StartAuth);
                 }
             }
-            FlowEvent::LogindUnlock => {
-                if self.phase == FlowPhase::Locked {
-                    self.unlock_authorized(now, &mut cmds);
-                }
-            }
+            FlowEvent::LogindUnlock => match self.phase {
+                FlowPhase::Locked => self.unlock_authorized(now, &mut cmds),
+                // An authoritative unlock racing the ramp or the commit is
+                // edge-triggered: latch it so confirmation releases at once
+                // instead of leaving the session locked against orders.
+                FlowPhase::PreLock | FlowPhase::Committing => self.unlock_latched = true,
+                _ => {}
+            },
             FlowEvent::PrepareForSleep(true) => {
                 self.grace = None;
+                self.grace_forbidden = true;
                 if self.phase == FlowPhase::PreLock
                     && let Some(timeline) = self.timeline.as_mut()
                 {
@@ -734,6 +768,74 @@ mod tests {
             "{cmds:?}"
         );
         assert_eq!(flow.phase(), FlowPhase::Locked);
+    }
+
+    #[test]
+    fn sleep_forbids_a_grace_window_armed_after_resume() {
+        // The lock-before-sleep guarantee: a confirmation that lands after
+        // resume must not arm a fresh grace anchored at wake time, or a
+        // keypress unlocks the machine without authentication.
+        let lock = Lock {
+            grace_secs: 5,
+            ..manual_lock()
+        };
+        let (mut flow, _) = LockFlow::new(at(0), &lock, Some(0));
+        flow.step(at(100), FlowEvent::PrepareForSleep(true));
+        flow.step(at(400), FlowEvent::Tick);
+        flow.step(at(410), FlowEvent::LockConfirmed);
+        assert_eq!(flow.phase(), FlowPhase::Locked);
+        let cmds = flow.step(at(500), FlowEvent::Input(key()));
+        assert!(
+            cmds.iter()
+                .any(|cmd| matches!(cmd, FlowCmd::DispatchInput(_))),
+            "keypress must reach PAM, not dismiss a grace window: {cmds:?}"
+        );
+        assert!(!has(&cmds, &FlowCmd::DetachAuth));
+    }
+
+    #[test]
+    fn logind_unlock_racing_the_ramp_is_honored_at_confirmation() {
+        let (mut flow, _) = LockFlow::new(at(0), &manual_lock(), Some(0));
+        flow.step(at(100), FlowEvent::LogindUnlock);
+        assert_eq!(flow.phase(), FlowPhase::PreLock);
+        flow.step(at(400), FlowEvent::Tick);
+        let cmds = flow.step(at(410), FlowEvent::LockConfirmed);
+        assert!(has(&cmds, &FlowCmd::CreateRevealOverlays), "{cmds:?}");
+        assert_eq!(flow.phase(), FlowPhase::RevealPending);
+    }
+
+    #[test]
+    fn late_invalidation_after_authorization_still_exits_unlocked() {
+        let mut flow = locked_flow(&manual_lock());
+        flow.step(at(500), FlowEvent::AuthOk);
+        flow.step(at(520), FlowEvent::RevealOverlaysMapped);
+        assert_eq!(flow.phase(), FlowPhase::Revealing);
+        let cmds = flow.step(at(530), FlowEvent::LockInvalidated);
+        assert!(has(&cmds, &FlowCmd::DestroyRevealOverlays));
+        assert!(
+            has(&cmds, &FlowCmd::Exit(LockOutcome::Unlocked)),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_flow_ignores_further_events() {
+        let (mut flow, _) = LockFlow::new(at(0), &manual_lock(), Some(0));
+        flow.step(at(400), FlowEvent::Tick);
+        let first = flow.step(at(410), FlowEvent::LockDenied);
+        assert!(has(&first, &FlowCmd::Exit(LockOutcome::Denied)));
+        let second = flow.step(at(420), FlowEvent::LockInvalidated);
+        assert!(second.is_empty(), "{second:?}");
+        assert_eq!(flow.phase(), FlowPhase::Done(LockOutcome::Denied));
+    }
+
+    #[test]
+    fn construction_arms_a_wake_for_the_ramp() {
+        // An adapter that sleeps until next_wake() must never block with no
+        // deadline armed, or the ramp never samples and the lock never
+        // commits.
+        let (flow, _) = LockFlow::new(at(0), &manual_lock(), Some(0));
+        assert!(flow.next_wake().is_some());
     }
 
     #[test]
