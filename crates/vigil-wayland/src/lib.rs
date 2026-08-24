@@ -303,7 +303,8 @@ struct App<S: LockSession + 'static> {
     started: std::time::Instant,
     /// Latest overlay compositing values from the controller. Only one
     /// overlay generation animates at a time (warning surfaces are retired
-    /// before reveal surfaces exist), so one value serves both.
+    /// before reveal surfaces exist), so one value serves both; an overlay
+    /// still mapped after its ramp ended holds the final value.
     overlay_progress: (f32, f32),
     frost_alpha: f32,
     /// Pre-lock overlays should exist (a ramp is running and cleanup has
@@ -312,14 +313,28 @@ struct App<S: LockSession + 'static> {
     scene_ids: BTreeSet<OutputId>,
     initial_outputs_added: bool,
     unlock_sent: bool,
+    /// Controller events raised inside protocol callbacks. Drained at the
+    /// top of the next tick so no callback creates surfaces or tears the
+    /// lock down mid-dispatch — the same rule presentation follows, and the
+    /// ordering the pre-controller code had (callbacks set flags; begin_lock
+    /// and the unlock ran from tick).
+    protocol_events: Vec<FlowEvent>,
 }
 
 impl<S: LockSession> App<S> {
     fn deliver_input(&mut self, event: InputEvent) {
         // The controller decides whether input cancels a warning, dismisses
-        // grace, or reaches the UI (FlowCmd::DispatchInput).
-        let cmds = self.flow.step(self.now(), FlowEvent::Input(event));
-        self.run(cmds);
+        // grace, or reaches the UI (FlowCmd::DispatchInput). Deferred: a
+        // grace dismissal releases the session lock, which must not run
+        // inside a wl_keyboard callback.
+        self.raise(FlowEvent::Input(event));
+    }
+
+    /// Raise a controller event from a protocol callback (deferred, see
+    /// [`App::protocol_events`]).
+    fn raise(&mut self, event: FlowEvent) {
+        self.protocol_events.push(event);
+        self.wake.wake();
     }
 
     fn now(&self) -> Now {
@@ -851,7 +866,10 @@ impl<S: LockSession> App<S> {
         // it: readiness read before the pump left the timeline waiting on a
         // wallpaper that had already arrived, and with no wakeup scheduled
         // the warning never committed and the session never locked.
-        let events = self.session.poll_events();
+        let events: Vec<FlowEvent> = std::mem::take(&mut self.protocol_events)
+            .into_iter()
+            .chain(self.session.poll_events())
+            .collect();
         for event in events {
             let cmds = self.flow.step(self.now(), event);
             self.run(cmds);
@@ -1058,6 +1076,7 @@ pub fn run_with_lock<S: LockSession + 'static>(
         scene_ids: BTreeSet::new(),
         initial_outputs_added: false,
         unlock_sent: false,
+        protocol_events: Vec::new(),
     };
     eprintln!(
         "vigil-lock: frost opacity lever: {}",
@@ -1122,8 +1141,7 @@ pub fn run_with_lock<S: LockSession + 'static>(
 impl<S: LockSession> SessionLockHandler for App<S> {
     fn locked(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
         self.got_locked = true;
-        let cmds = self.flow.step(self.now(), FlowEvent::LockConfirmed);
-        self.run(cmds);
+        self.raise(FlowEvent::LockConfirmed);
         for entry in &self.entries {
             if entry.role.is_lock() {
                 self.dirty.mark(entry.id);
@@ -1133,13 +1151,11 @@ impl<S: LockSession> SessionLockHandler for App<S> {
 
     fn finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
         self.lock = None;
-        let event = if self.got_locked {
+        self.raise(if self.got_locked {
             FlowEvent::LockInvalidated
         } else {
             FlowEvent::LockDenied
-        };
-        let cmds = self.flow.step(self.now(), event);
-        self.run(cmds);
+        });
     }
 
     fn configure(
@@ -1177,8 +1193,7 @@ impl<S: LockSession> LayerShellHandler for App<S> {
         self.entries.remove(idx);
         // A cancelable warning ends here; a transition must still lock.
         // The controller knows which it is running.
-        let cmds = self.flow.step(self.now(), FlowEvent::OverlayClosed);
-        self.run(cmds);
+        self.raise(FlowEvent::OverlayClosed);
     }
 
     fn configure(
@@ -1317,14 +1332,10 @@ impl<S: LockSession> PointerHandler for App<S> {
             match event.kind {
                 PointerEventKind::Enter { .. } => {
                     self.session.focus_output(id);
-                    let cmds = self.flow.step(
-                        self.now(),
-                        FlowEvent::PointerEnter {
-                            x: event.position.0 * scale,
-                            y: event.position.1 * scale,
-                        },
-                    );
-                    self.run(cmds);
+                    self.raise(FlowEvent::PointerEnter {
+                        x: event.position.0 * scale,
+                        y: event.position.1 * scale,
+                    });
                 }
                 PointerEventKind::Motion { .. } => {
                     self.deliver_input(InputEvent::PointerAbsolute {
@@ -1453,8 +1464,7 @@ impl<S: LockSession> OutputHandler for App<S> {
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         let genuinely_new = !self.entries.iter().any(|entry| entry.output == output);
         if self.initial_outputs_added && genuinely_new {
-            let cmds = self.flow.step(self.now(), FlowEvent::OutputAdded);
-            self.run(cmds);
+            self.raise(FlowEvent::OutputAdded);
         }
         self.add_output(qh, output);
     }
@@ -1465,8 +1475,10 @@ impl<S: LockSession> OutputHandler for App<S> {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        let cmds = self.flow.step(self.now(), FlowEvent::OutputGone);
-        self.run(cmds);
+        // Deferred: a transition commits on topology change, and
+        // begin_lock must not create lock surfaces for an output sctk has
+        // not finished removing.
+        self.raise(FlowEvent::OutputGone);
         if let Some(id) = self
             .entries
             .iter()

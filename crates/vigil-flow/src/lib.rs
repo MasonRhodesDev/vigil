@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use vigil_config::{Lock, LockTransition};
 use vigil_core::InputEvent;
-pub use vigil_warning::ElementSample;
+pub use vigil_warning::{ElementSample, WALLPAPER_READY_DEFAULT};
 use vigil_warning::{Phase as RampPhase, Reveal, Timeline};
 
 /// Before releasing the session lock, wait this long for the reveal
@@ -302,12 +302,19 @@ impl LockFlow {
                     if self.grace_secs > 0 && !self.grace_forbidden {
                         self.grace = Some(Grace::new(now.mono, now.wall, self.grace_secs));
                     }
-                    cmds.push(FlowCmd::ShowPanel(true));
+                    // Readiness is owed either way — a --wait caller and a
+                    // joining locker are both blocked on it.
                     cmds.push(FlowCmd::SignalReady);
-                    cmds.push(FlowCmd::SetLockedHint(true));
-                    cmds.push(FlowCmd::StartAuth);
                     if self.unlock_latched {
+                        // An unlock was ordered before the lock was granted:
+                        // do not show the card or open a PAM conversation we
+                        // would abandon microseconds later (issue #36's
+                        // pattern), just release.
                         self.unlock_authorized(now, &mut cmds);
+                    } else {
+                        cmds.push(FlowCmd::ShowPanel(true));
+                        cmds.push(FlowCmd::SetLockedHint(true));
+                        cmds.push(FlowCmd::StartAuth);
                     }
                 }
             }
@@ -769,6 +776,21 @@ mod tests {
             "{cmds:?}"
         );
         assert_eq!(flow.phase(), FlowPhase::Locked);
+    }
+
+    #[test]
+    fn a_latched_unlock_never_opens_a_pam_conversation() {
+        // loginctl unlock racing the ramp: releasing is the whole point, so
+        // showing the card and starting an auth we abandon microseconds
+        // later is pure churn (and issue #36's failed-conversation pattern).
+        let (mut flow, _) = LockFlow::new(at(0), &manual_lock(), Some(0));
+        flow.step(at(100), FlowEvent::LogindUnlock);
+        flow.step(at(400), FlowEvent::Tick);
+        let cmds = flow.step(at(410), FlowEvent::LockConfirmed);
+        assert!(has(&cmds, &FlowCmd::SignalReady), "readiness is still owed");
+        assert!(!has(&cmds, &FlowCmd::StartAuth), "{cmds:?}");
+        assert!(!has(&cmds, &FlowCmd::ShowPanel(true)), "{cmds:?}");
+        assert!(has(&cmds, &FlowCmd::CreateRevealOverlays));
     }
 
     #[test]

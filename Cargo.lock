@@ -5209,7 +5209,6 @@ dependencies = [
  "vigil-config",
  "vigil-core",
  "vigil-flow",
- "vigil-warning",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",

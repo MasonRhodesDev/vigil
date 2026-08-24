@@ -327,6 +327,10 @@ struct Locker {
     /// Controller events produced by the async pumps this tick.
     pending: Vec<FlowEvent>,
     /// Last wallpaper readiness reported to the controller (edge-triggered).
+    /// Seeded to `Timeline`'s own default (`true`) so a first poll that finds
+    /// assets outstanding actually reports the change — seeded `false`, the
+    /// two agreed by accident and the commit was never held for a slow
+    /// wallpaper.
     wallpaper_ready: bool,
     /// Auth state to replay onto scenes rebuilt mid-lock (resume/resize
     /// recreates outputs; a fresh theme instance starts blank).
@@ -336,7 +340,6 @@ struct Locker {
     background_waker: Option<Arc<dyn Fn() + Send + Sync>>,
     event_waker: Arc<Mutex<Option<WakeHandle>>>,
     scheduler: IdleScheduler,
-    warning_active: bool,
     lock_ipc: Arc<Mutex<LockIpcState>>,
     warning_backgrounds: std::collections::HashSet<OutputId>,
 }
@@ -387,8 +390,6 @@ impl Locker {
             .ok_or("user not resolved before Locker::new")?;
         // Either pre-lock overlay phase: out-of-band lock requests (logind,
         // sleep, a joining locker) must commit it instead of queueing.
-        let warning_active =
-            config.lock.warning.duration_ms > 0 || config.lock.transition.ramps_in();
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
         let clock_format = config.look.clock_format.clone();
@@ -453,7 +454,7 @@ impl Locker {
             last_clock: (Instant::now(), clock_text(&clock_format)),
             ready_fd: cli.ready_fd,
             pending: Vec::new(),
-            wallpaper_ready: false,
+            wallpaper_ready: vigil_flow::WALLPAPER_READY_DEFAULT,
             snapshot: {
                 // Show a usable password prompt from the first frame: with
                 // pam_fprintd in the stack the real prompt only arrives
@@ -468,7 +469,6 @@ impl Locker {
             background_waker: None,
             event_waker,
             scheduler: IdleScheduler::default(),
-            warning_active,
             lock_ipc,
             warning_backgrounds: std::collections::HashSet::new(),
         };
@@ -508,7 +508,6 @@ impl Locker {
     /// suspend proceed.
     fn signal_locked(&mut self) {
         eprintln!("vigil-lock: session locked");
-        self.warning_active = false;
         let joiners = {
             let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
             ipc.locked = true;
@@ -569,6 +568,11 @@ impl Locker {
                     // pam_faillock strike against the user.
                 }
                 AuthEvent::Done(Err(message)) => {
+                    // Retire the dead conversation here, not when the
+                    // controller's reply arrives: pump_ui runs later in this
+                    // same tick and would otherwise respond() into it and
+                    // silently lose the submission.
+                    self.attempt = None;
                     // The controller decides the retry (a fresh PAM
                     // transaction per attempt, hyprlock's model).
                     self.pending.push(FlowEvent::AuthErr(message));
