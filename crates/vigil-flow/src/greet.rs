@@ -908,7 +908,9 @@ mod tests {
             cmds.iter().any(|c| matches!(c, GreetCmd::CreateSession(_))),
             "the greeter must be answerable again: {cmds:?}"
         );
-        assert_eq!(flow.next_wake(at(0)).is_none(), false);
+        // The reopened conversation arms its own deadline, so a greetd that
+        // stays silent cannot wedge the retry either.
+        assert!(flow.next_wake(at(0)).is_some());
     }
 
     #[test]
