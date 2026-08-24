@@ -28,6 +28,12 @@ use vigil_core::{PowerAction, UiMessage};
 
 use crate::Now;
 
+/// NOTE this presupposes the adapter treats the greetd socket as an event
+/// source. `AuthMachine::transact` is a blocking round-trip today; an
+/// adapter that keeps it synchronous and synthesises a reply immediately
+/// after each command renders this deadline, [`GreetEvent::Tick`] and
+/// [`GreetFlow::next_wake`] inert, and the hang this prevents comes back.
+///
 /// How long a greetd request may go unanswered before the greeter stops
 /// waiting. `AuthMachine` blocked on the socket, so a hung greetd froze the
 /// process visibly; making the round-trip asynchronous turns that into a
@@ -217,8 +223,11 @@ pub struct GreetFlow {
     /// An auth failure is re-raised *after* the next prompt, or the user
     /// never sees why they are retyping — a fresh prompt clears messages.
     pending_error: Option<String>,
-    /// When the outstanding request was issued, for [`REQUEST_TIMEOUT`].
-    requested_at: Option<Duration>,
+    /// Deadline for the outstanding request, on the injected clock.
+    deadline: Option<Duration>,
+    /// Time until that deadline as of the last step, so `next_wake` reads
+    /// like [`crate::LockFlow::next_wake`] and adapters see one contract.
+    wait: Option<Duration>,
 }
 
 impl GreetFlow {
@@ -239,7 +248,8 @@ impl GreetFlow {
             config,
             session,
             pending_error: None,
-            requested_at: None,
+            deadline: None,
+            wait: None,
         };
         let mut cmds = Vec::new();
         match fixed {
@@ -262,12 +272,12 @@ impl GreetFlow {
         &self.session
     }
 
-    /// Time until the outstanding request must be answered, or `None` when
-    /// nothing is in flight. The consumer arms a timer on this and feeds
-    /// [`GreetEvent::Tick`]; without it a silent greetd is unrecoverable.
-    pub fn next_wake(&self, now: Now) -> Option<Duration> {
-        let at = self.requested_at?;
-        Some(REQUEST_TIMEOUT.saturating_sub(now.elapsed.saturating_sub(at)))
+    /// Time until the outstanding request must be answered, as of the last
+    /// [`Self::step`], or `None` when nothing is in flight. The consumer
+    /// arms a timer on this and feeds [`GreetEvent::Tick`]; without it a
+    /// silent greetd is unrecoverable.
+    pub fn next_wake(&self) -> Option<Duration> {
+        self.wait
     }
 
     pub fn step(&mut self, now: Now, event: GreetEvent) -> Vec<GreetCmd> {
@@ -279,12 +289,12 @@ impl GreetFlow {
         match event {
             GreetEvent::Ui(message) => self.on_ui(now, message, &mut cmds),
             GreetEvent::GreetdReply(reply) => {
-                self.requested_at = None;
+                self.deadline = None;
                 self.on_reply(now, reply, &mut cmds);
             }
             GreetEvent::GreetdLost(error) => {
                 self.pending = Pending::None;
-                self.requested_at = None;
+                self.deadline = None;
                 cmds.push(GreetCmd::SetBusy(false));
                 cmds.push(GreetCmd::Exit(GreetOutcome::Fatal(error)));
                 self.phase = GreetPhase::Complete;
@@ -292,15 +302,18 @@ impl GreetFlow {
             GreetEvent::Tick => {}
         }
         // Any step is a chance to notice the deadline.
-        if let Some(at) = self.requested_at
-            && now.elapsed.saturating_sub(at) >= REQUEST_TIMEOUT
+        if let Some(deadline) = self.deadline
+            && now.elapsed >= deadline
         {
-            self.requested_at = None;
+            self.deadline = None;
             self.pending = Pending::None;
             cmds.push(GreetCmd::SetBusy(false));
             cmds.push(GreetCmd::ShowError("greetd did not respond".into()));
             self.recover(now, &mut cmds);
         }
+        self.wait = self
+            .deadline
+            .map(|deadline| deadline.saturating_sub(now.elapsed));
         cmds
     }
 
@@ -324,7 +337,7 @@ impl GreetFlow {
                 GreetPhase::AwaitingPrompt => {
                     self.pending = Pending::Auth;
                     self.phase = GreetPhase::Busy;
-                    self.requested_at = Some(now.elapsed);
+                    self.deadline = Some(now.elapsed.saturating_add(REQUEST_TIMEOUT));
                     cmds.push(GreetCmd::SetBusy(true));
                     cmds.push(GreetCmd::PostResponse(Some(text)));
                 }
@@ -423,18 +436,18 @@ impl GreetFlow {
                 GreetdReply::Info(text) => {
                     cmds.push(GreetCmd::ShowInfo(text));
                     self.pending = Pending::Auth;
-                    self.requested_at = Some(now.elapsed);
+                    self.deadline = Some(now.elapsed.saturating_add(REQUEST_TIMEOUT));
                     cmds.push(GreetCmd::PostResponse(None));
                 }
                 GreetdReply::Notice(text) => {
                     cmds.push(GreetCmd::ShowError(text));
                     self.pending = Pending::Auth;
-                    self.requested_at = Some(now.elapsed);
+                    self.deadline = Some(now.elapsed.saturating_add(REQUEST_TIMEOUT));
                     cmds.push(GreetCmd::PostResponse(None));
                 }
                 GreetdReply::Success => {
                     self.pending = Pending::Start;
-                    self.requested_at = Some(now.elapsed);
+                    self.deadline = Some(now.elapsed.saturating_add(REQUEST_TIMEOUT));
                     cmds.push(GreetCmd::StartSession {
                         cmd: self.session.cmd.clone(),
                         env: self.session.env.clone(),
@@ -468,7 +481,7 @@ impl GreetFlow {
         cmds.push(GreetCmd::CancelSession);
         self.pending = Pending::CancelThen(user);
         self.phase = GreetPhase::Busy;
-        self.requested_at = Some(now.elapsed);
+        self.deadline = Some(now.elapsed.saturating_add(REQUEST_TIMEOUT));
     }
 
     /// Somewhere to go from Idle: the username stage, or a fresh
@@ -484,7 +497,7 @@ impl GreetFlow {
         self.user = Some(user.clone());
         self.pending = Pending::Auth;
         self.phase = GreetPhase::Busy;
-        self.requested_at = Some(now.elapsed);
+        self.deadline = Some(now.elapsed.saturating_add(REQUEST_TIMEOUT));
         cmds.push(GreetCmd::SetBusy(true));
         cmds.push(GreetCmd::CreateSession(user));
     }
@@ -896,7 +909,7 @@ mod tests {
         // keypress ignored — unless a deadline says otherwise.
         let mut flow = at_prompt(kiosk());
         flow.step(at(0), respond("hunter2"));
-        assert!(flow.next_wake(at(0)).is_some(), "no deadline armed");
+        assert!(flow.next_wake().is_some(), "no deadline armed");
         // Nothing arrives.
         let cmds = flow.step(at(REQUEST_TIMEOUT.as_millis() as u64), GreetEvent::Tick);
         assert!(has(&cmds, &GreetCmd::SetBusy(false)), "{cmds:?}");
@@ -910,7 +923,7 @@ mod tests {
         );
         // The reopened conversation arms its own deadline, so a greetd that
         // stays silent cannot wedge the retry either.
-        assert!(flow.next_wake(at(0)).is_some());
+        assert!(flow.next_wake().is_some());
     }
 
     #[test]
