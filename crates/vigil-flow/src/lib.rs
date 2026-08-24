@@ -17,7 +17,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use vigil_config::{Lock, LockTransition};
 use vigil_core::InputEvent;
-use vigil_warning::{ElementSample, Phase as RampPhase, Reveal, Timeline};
+pub use vigil_warning::ElementSample;
+use vigil_warning::{Phase as RampPhase, Reveal, Timeline};
 
 /// Before releasing the session lock, wait this long for the reveal
 /// overlays' first buffer commit so the desktop is never exposed un-frosted.
@@ -836,6 +837,112 @@ mod tests {
         // commits.
         let (flow, _) = LockFlow::new(at(0), &manual_lock(), Some(0));
         assert!(flow.next_wake().is_some());
+    }
+
+    // Grace-window tests, moved here with the type (they were in
+    // vigil-lock before the extraction).
+    fn grace_key() -> InputEvent {
+        InputEvent::Key {
+            keysym: 'a' as u32,
+            utf8: Some("a".into()),
+            pressed: true,
+        }
+    }
+
+    fn grace(secs: u64) -> Grace {
+        Grace::new(Instant::now(), SystemTime::now(), secs)
+    }
+
+    #[test]
+    fn press_inside_window_dismisses() {
+        assert!(grace(5).dismisses(&grace_key(), Instant::now(), SystemTime::now()));
+        assert!(grace(5).dismisses(
+            &InputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+            },
+            Instant::now(),
+            SystemTime::now(),
+        ));
+    }
+
+    #[test]
+    fn expired_window_never_dismisses() {
+        assert!(!grace(5).dismisses(
+            &grace_key(),
+            Instant::now() + Duration::from_secs(6),
+            SystemTime::now() + Duration::from_secs(6),
+        ));
+    }
+
+    #[test]
+    fn wall_clock_jump_kills_grace() {
+        // Instant freezes across suspend, SystemTime does not: requiring
+        // BOTH is what keeps a pre-suspend grace from surviving resume.
+        assert!(!grace(5).dismisses(
+            &grace_key(),
+            Instant::now(),
+            SystemTime::now() + Duration::from_secs(6),
+        ));
+    }
+
+    #[test]
+    fn motion_and_releases_never_dismiss() {
+        let events = [
+            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
+            InputEvent::PointerAbsolute { x: 0.5, y: 0.5 },
+            InputEvent::Key {
+                keysym: 'a' as u32,
+                utf8: Some("a".into()),
+                pressed: false,
+            },
+            InputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+            },
+        ];
+        for event in events {
+            assert!(!grace(5).dismisses(&event, Instant::now(), SystemTime::now()));
+        }
+    }
+
+    #[test]
+    fn zero_grace_never_dismisses() {
+        assert!(!grace(0).dismisses(&grace_key(), Instant::now(), SystemTime::now()));
+    }
+
+    #[test]
+    fn unlock_signal_releases_without_auth() {
+        let mut flow = locked_flow(&manual_lock());
+        let cmds = flow.step(at(600), FlowEvent::LogindUnlock);
+        assert!(has(&cmds, &FlowCmd::DetachAuth));
+        assert!(has(&cmds, &FlowCmd::SetLockedHint(false)));
+    }
+
+    #[test]
+    fn lock_signal_while_locked_leaves_grace_alone() {
+        let lock = Lock {
+            grace_secs: 5,
+            ..manual_lock()
+        };
+        let mut flow = locked_flow(&lock);
+        flow.step(at(600), FlowEvent::CommitRequested);
+        // Grace survives: a Lock request against a held lock is a no-op.
+        let cmds = flow.step(at(650), FlowEvent::Input(grace_key()));
+        assert!(has(&cmds, &FlowCmd::DetachAuth));
+    }
+
+    #[test]
+    fn resume_leaves_a_running_flow_alone() {
+        let lock = Lock {
+            grace_secs: 5,
+            ..manual_lock()
+        };
+        let mut flow = locked_flow(&lock);
+        flow.step(at(600), FlowEvent::PrepareForSleep(false));
+        let cmds = flow.step(at(650), FlowEvent::Input(grace_key()));
+        assert!(has(&cmds, &FlowCmd::DetachAuth));
+        assert_eq!(flow.phase(), FlowPhase::RevealPending);
     }
 
     #[test]

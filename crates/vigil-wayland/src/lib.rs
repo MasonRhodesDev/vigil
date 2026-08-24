@@ -64,23 +64,14 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
-use vigil_config::{LockTransition, LockWarning};
+use vigil_config::Lock;
 use vigil_core::{FrameTarget, InputEvent, OutputId, OutputInfo};
-use vigil_warning::ElementSample;
-use vigil_warning::{Phase as WarningPhase, Reveal, Timeline};
+pub use vigil_flow::LockOutcome;
+use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now};
 
 mod hyprland_surface;
 use hyprland_surface::hyprland_surface_manager_v1::HyprlandSurfaceManagerV1;
 use hyprland_surface::hyprland_surface_v1::HyprlandSurfaceV1;
-
-/// Before `unlock_and_destroy`, wait this long for the reveal overlays'
-/// first buffer commit so the desktop is never exposed un-frosted. A
-/// compositor that refuses to configure a layer surface while locked falls
-/// through to the plain unlock.
-const REVEAL_MAP_DEADLINE: Duration = Duration::from_millis(250);
-/// The reveal fade is cosmetic: whatever state it is in, the process exits
-/// this long after the fade started.
-const REVEAL_HARD_DEADLINE: Duration = Duration::from_millis(2_000);
 
 /// What the binary implements: its composition of theme windows and auth.
 pub trait LockSession {
@@ -115,47 +106,28 @@ pub trait LockSession {
     fn warning_output_ready(&mut self, id: OutputId, info: &OutputInfo) {
         self.output_ready(id, info);
     }
-    fn warning_progress(&mut self, _frost: f32, _wallpaper: f32) {}
-    fn warning_elements(&mut self, _elements: &[ElementSample]) {}
-    /// Unlock is authorized and the reveal overlay is fading
-    /// (`frost`/`wallpaper` ∈ [0, 1], both falling). The default reuses the
-    /// warning hook: hide the card, keep the wallpaper, present.
-    fn reveal_progress(&mut self, frost: f32, wallpaper: f32) {
-        self.warning_progress(frost, wallpaper);
-    }
-    /// Consume an out-of-band request (second locker, logind, sleep) to skip
-    /// the remaining warning and acquire session-lock now.
-    fn warning_commit_requested(&mut self) -> bool {
-        false
-    }
-    fn warning_wallpaper_ready(&self) -> bool {
-        true
-    }
+    /// Overlay compositing values for this frame (frame-grid quantized by
+    /// the controller, so this is called at most once per frame).
+    fn overlay_progress(&mut self, _frost: f32, _wallpaper: f32) {}
+    fn overlay_elements(&mut self, _elements: &[vigil_flow::ElementSample]) {}
     /// The pointer entered this output (panel-follows-pointer signal).
     fn focus_output(&mut self, id: OutputId);
-    fn input(&mut self, event: InputEvent);
     fn caps_lock(&mut self, on: bool);
-    /// The compositor confirmed the session is locked.
-    fn locked(&mut self);
-    /// ~16ms cadence: drain auth events, clock, Slint timers.
+    /// Drain asynchronous session state (auth, logind, join socket, asset
+    /// readiness) into controller events. Called once per tick, before the
+    /// controller steps.
+    fn poll_events(&mut self) -> Vec<FlowEvent> {
+        Vec::new()
+    }
+    /// Execute one session-side controller command (panel, auth, logind
+    /// hint, readiness signal, UI input). Wayland-side commands never reach
+    /// here — the event loop owns those.
+    fn flow_command(&mut self, _cmd: &FlowCmd) {}
+    /// ~16ms cadence: clock, Slint timers.
     fn tick(&mut self);
     /// Draw this output's scene if dirty; return whether pixels changed.
     fn render(&mut self, id: OutputId, target: FrameTarget<'_>) -> bool;
-    /// Checked after every tick: true once auth succeeded.
-    fn wants_unlock(&self) -> bool;
     fn wait_decision(&self) -> WaitDecision;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockOutcome {
-    /// Auth succeeded; the unlock was round-tripped to the compositor.
-    Unlocked,
-    /// The compositor refused the lock (another locker running?).
-    Denied,
-    /// The compositor invalidated the lock after it was held.
-    Invalidated,
-    /// Input or output topology cancelled the warning before session-lock.
-    Cancelled,
 }
 
 #[derive(Debug)]
@@ -325,33 +297,72 @@ struct App<S: LockSession + 'static> {
     /// outside the protocol callback: (output, is-lock-role). Inline scene
     /// construction serialized the lock reveal across outputs (issue #37).
     pending_scenes: Vec<(OutputId, bool)>,
-    warning: Option<Timeline>,
-    warning_started: std::time::Instant,
-    warning_progress: (f32, f32),
-    warning_elements: Vec<ElementSample>,
-    warning_frost_alpha: f32,
-    warning_wait: Option<Duration>,
+    /// The lifecycle controller: every transition decision lives here, and
+    /// this loop only executes its commands (issue #43).
+    flow: LockFlow,
+    started: std::time::Instant,
+    /// Latest overlay compositing values from the controller. Only one
+    /// overlay generation animates at a time (warning surfaces are retired
+    /// before reveal surfaces exist), so one value serves both.
+    overlay_progress: (f32, f32),
+    frost_alpha: f32,
+    /// Pre-lock overlays should exist (a ramp is running and cleanup has
+    /// not retired them).
+    pre_lock_overlays: bool,
     scene_ids: BTreeSet<OutputId>,
     initial_outputs_added: bool,
-    transition: LockTransition,
-    reveal: Option<Reveal>,
-    reveal_progress: (f32, f32),
-    /// App-clock time at which the reveal overlays were requested; bounds
-    /// the wait for their first commit (`REVEAL_MAP_DEADLINE`).
-    reveal_entered: Option<Duration>,
-    reveal_started_at: Option<Duration>,
-    reveal_wait: Option<Duration>,
     unlock_sent: bool,
 }
 
 impl<S: LockSession> App<S> {
     fn deliver_input(&mut self, event: InputEvent) {
-        if self.lock.is_none()
-            && let Some(warning) = self.warning.as_mut()
-        {
-            warning.input(&event);
-        } else {
-            self.session.input(event);
+        // The controller decides whether input cancels a warning, dismisses
+        // grace, or reaches the UI (FlowCmd::DispatchInput).
+        let cmds = self.flow.step(self.now(), FlowEvent::Input(event));
+        self.run(cmds);
+    }
+
+    fn now(&self) -> Now {
+        Now {
+            elapsed: self.started.elapsed(),
+            mono: std::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        }
+    }
+
+    /// Execute controller commands: Wayland effects here, session effects
+    /// through the [`LockSession`] adapter.
+    fn run(&mut self, cmds: Vec<FlowCmd>) {
+        for cmd in cmds {
+            match cmd {
+                FlowCmd::RequestSessionLock => self.begin_lock(),
+                FlowCmd::OverlayProgress { frost, wallpaper } => {
+                    self.overlay_progress = (frost, wallpaper);
+                    self.session.overlay_progress(frost, wallpaper);
+                    for entry in &self.entries {
+                        self.dirty.mark(entry.id);
+                    }
+                }
+                FlowCmd::OverlayElements(ref elements) => {
+                    self.session.overlay_elements(elements);
+                }
+                FlowCmd::CreateRevealOverlays => {
+                    let outputs: Vec<_> = self
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.role.is_lock())
+                        .map(|entry| entry.output.clone())
+                        .collect();
+                    let qh = self.qh.clone();
+                    for output in outputs {
+                        self.add_reveal(&qh, output);
+                    }
+                }
+                FlowCmd::ReleaseSessionLock => self.send_unlock(),
+                FlowCmd::DestroyRevealOverlays => self.drop_overlays(SurfaceRole::is_reveal),
+                FlowCmd::Exit(outcome) => self.outcome = Some(outcome),
+                ref session_cmd => self.session.flow_command(session_cmd),
+            }
         }
     }
     fn schedule_present_retry(&mut self, id: OutputId) {
@@ -449,7 +460,7 @@ impl<S: LockSession> App<S> {
         }
         // The initial snapshot and later metadata callback can name the same
         // object. Object identity is authoritative even before metadata exists.
-        let adding_warning = surface_role_is_warning(self.warning.is_some(), self.lock.is_some());
+        let adding_warning = surface_role_is_warning(self.pre_lock_overlays, self.lock.is_some());
         if self
             .entries
             .iter()
@@ -694,11 +705,7 @@ impl<S: LockSession> App<S> {
         let id = self.entries[idx].id;
         // Overlay compositing progress by role; None for the opaque lock
         // surface and for a warning overlay whose timeline has retired.
-        let overlay_progress = match self.entries[idx].role {
-            SurfaceRole::Warning(_) => self.warning.is_some().then_some(self.warning_progress),
-            SurfaceRole::Reveal(_) => Some(self.reveal_progress),
-            SurfaceRole::Lock { .. } => None,
-        };
+        let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
         let overlay = !self.entries[idx].role.is_lock();
         let surface_opacity = self.entries[idx].opacity.is_some();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
@@ -759,10 +766,9 @@ impl<S: LockSession> App<S> {
             // at full strength and `frost` drives the surface — and, on
             // Hyprland, the blur strength with it.
             let wallpaper = wallpaper.clamp(0.0, 1.0);
-            let tint_alpha = (pixel_frost(frost, surface_opacity)
-                * self.warning_frost_alpha
-                * (1.0 - wallpaper))
-                .clamp(0.0, 1.0);
+            let tint_alpha =
+                (pixel_frost(frost, surface_opacity) * self.frost_alpha * (1.0 - wallpaper))
+                    .clamp(0.0, 1.0);
             let alpha = wallpaper + tint_alpha;
             for pixel in canvas.as_chunks_mut::<4>().0 {
                 for channel in &mut pixel[..3] {
@@ -841,57 +847,21 @@ impl<S: LockSession> App<S> {
             self.dirty.mark(id);
         }
         self.session.tick();
-        // Sample the warning only after session.tick() has pumped async
-        // results: wallpaper readiness is session state, and reading it
-        // before the pump left the timeline waiting on a wallpaper that
-        // had already arrived — with no further wakeups scheduled, the
-        // warning never committed and the session never locked.
-        if let Some(timeline) = self.warning.as_mut() {
-            let elapsed = self.warning_started.elapsed();
-            if self.lock.is_none() {
-                timeline.set_wallpaper_ready(self.session.warning_wallpaper_ready(), elapsed);
-                if self.session.warning_commit_requested() {
-                    timeline.request_commit();
-                }
-            }
-            let sample = timeline.sample(elapsed);
-            self.warning_wait = match (sample.next_frame, timeline.next_gui_wake(elapsed)) {
-                (Some(left), Some(right)) => Some(left.min(right)),
-                (left, right) => left.or(right),
-            };
-            // Ramp values are quantized to the frame grid inside the
-            // timeline, so this diff dedupes buffer-release wakes to at
-            // most one scene update per frame (issue #53).
-            let progress = (sample.frost, sample.wallpaper);
-            let elements = timeline.element_samples(elapsed);
-            if self.warning_progress != progress {
-                self.warning_progress = progress;
-                self.session
-                    .warning_progress(sample.frost, sample.wallpaper);
-                for entry in &self.entries {
-                    self.dirty.mark(entry.id);
-                }
-            }
-            if self.warning_elements != elements {
-                self.session.warning_elements(&elements);
-                self.warning_elements = elements;
-            }
-            match sample.phase {
-                WarningPhase::Cancelled => {
-                    self.outcome = Some(LockOutcome::Cancelled);
-                    return;
-                }
-                _ if sample.should_commit && self.lock.is_none() => {
-                    self.begin_lock();
-                    return;
-                }
-                _ => {}
-            }
-            if self.got_locked && timeline.gui_complete(elapsed) {
-                self.warning = None;
+        // Drain async session state only after session.tick() has pumped
+        // it: readiness read before the pump left the timeline waiting on a
+        // wallpaper that had already arrived, and with no wakeup scheduled
+        // the warning never committed and the session never locked.
+        let events = self.session.poll_events();
+        for event in events {
+            let cmds = self.flow.step(self.now(), event);
+            self.run(cmds);
+            if self.outcome.is_some() {
+                return;
             }
         }
-        if self.session.wants_unlock() && self.tick_unlock() {
+        let cmds = self.flow.step(self.now(), FlowEvent::Tick);
+        self.run(cmds);
+        if self.outcome.is_some() {
             return;
         }
         // The DirtySet is advisory, not the render gate. The software adapter
@@ -914,10 +884,11 @@ impl<S: LockSession> App<S> {
                 }
             }
         }
-        if self.reveal.is_some() && !self.unlock_sent && self.reveal_entries_all_committed() {
-            // The overlays just mapped: release the lock on the very next
-            // tick instead of the next timer deadline.
-            self.wake.wake();
+        if !self.unlock_sent && self.reveal_entries_all_committed() {
+            // The overlays just mapped: tell the controller so the lock is
+            // released now rather than at the map deadline.
+            let cmds = self.flow.step(self.now(), FlowEvent::RevealOverlaysMapped);
+            self.run(cmds);
         }
         self.cleanup_warning_surfaces();
     }
@@ -947,6 +918,7 @@ impl<S: LockSession> App<S> {
             return;
         }
         self.drop_overlays(SurfaceRole::is_warning);
+        self.pre_lock_overlays = false;
     }
 
     /// Destroy every overlay entry matching `role`, with its protocol objects.
@@ -970,92 +942,6 @@ impl<S: LockSession> App<S> {
         });
     }
 
-    /// Auth succeeded (or grace/logind released us). Returns true when the
-    /// tick must end here: the plain unlock is final, and while the reveal
-    /// overlays are still mapping there is nothing to present yet.
-    fn tick_unlock(&mut self) -> bool {
-        let elapsed = self.warning_started.elapsed();
-        if !self.unlock_sent {
-            if self.reveal.is_none() && self.can_reveal() {
-                self.begin_reveal(elapsed);
-            }
-            if self.reveal.is_none() {
-                self.finish_unlock();
-                return true;
-            }
-            let mapped = self.reveal_entries_all_committed();
-            let expired = self
-                .reveal_entered
-                .is_some_and(|entered| elapsed.saturating_sub(entered) >= REVEAL_MAP_DEADLINE);
-            if !mapped && !expired {
-                return false;
-            }
-            if !mapped {
-                eprintln!(
-                    "vigil-lock: reveal overlays not mapped within {REVEAL_MAP_DEADLINE:?}; unlocking anyway"
-                );
-            }
-            self.send_unlock();
-            self.reveal_started_at = Some(elapsed);
-            if let Some(reveal) = self.reveal.as_mut() {
-                reveal.start(elapsed);
-            }
-        }
-        let Some(reveal) = self.reveal.as_ref() else {
-            return true;
-        };
-        let sample = reveal.sample(elapsed);
-        let overdue = self
-            .reveal_started_at
-            .is_some_and(|started| elapsed.saturating_sub(started) >= REVEAL_HARD_DEADLINE);
-        if sample.done || overdue {
-            self.drop_overlays(SurfaceRole::is_reveal);
-            self.outcome = Some(LockOutcome::Unlocked);
-            return true;
-        }
-        self.reveal_wait = sample.next_frame;
-        let progress = (sample.frost, sample.wallpaper);
-        if self.reveal_progress != progress {
-            self.reveal_progress = progress;
-            self.session.reveal_progress(sample.frost, sample.wallpaper);
-            for entry in &self.entries {
-                if entry.role.is_reveal() {
-                    self.dirty.mark(entry.id);
-                }
-            }
-        }
-        false
-    }
-
-    fn can_reveal(&self) -> bool {
-        self.layer_shell.is_some()
-            && self.got_locked
-            && self.lock.is_some()
-            && self.transition.reveals()
-    }
-
-    fn begin_reveal(&mut self, elapsed: Duration) {
-        self.reveal = Some(Reveal::new(
-            self.transition.wallpaper_out_ms,
-            self.transition.frost_out_ms,
-            self.transition.easing,
-        ));
-        self.reveal_entered = Some(elapsed);
-        self.reveal_progress = (1.0, 1.0);
-        let outputs: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.role.is_lock())
-            .map(|entry| entry.output.clone())
-            .collect();
-        let qh = self.qh.clone();
-        for output in outputs {
-            self.add_reveal(&qh, output);
-        }
-        // Hide the card before the first reveal frame renders.
-        self.session.reveal_progress(1.0, 1.0);
-    }
-
     fn reveal_entries_all_committed(&self) -> bool {
         let mut reveals = self.entries.iter().filter(|entry| entry.role.is_reveal());
         let mut any = false;
@@ -1077,50 +963,25 @@ impl<S: LockSession> App<S> {
         }
         self.unlock_sent = true;
     }
-
-    fn finish_unlock(&mut self) {
-        self.send_unlock();
-        self.outcome = Some(LockOutcome::Unlocked);
-    }
-
-    /// Earliest animation wakeup: warning/transition ramp, reveal fade, or
-    /// the bounded wait for the reveal overlays to map.
-    fn animation_wait(&self) -> Option<Duration> {
-        let mut wait = self
-            .warning
-            .is_some()
-            .then_some(self.warning_wait)
-            .flatten();
-        let mut merge = |candidate: Option<Duration>| {
-            if let Some(candidate) = candidate {
-                wait = Some(wait.map_or(candidate, |current| current.min(candidate)));
-            }
-        };
-        if self.reveal.is_some() {
-            merge(self.reveal_wait);
-            if !self.unlock_sent
-                && let Some(entered) = self.reveal_entered
-            {
-                let waited = self.warning_started.elapsed().saturating_sub(entered);
-                merge(Some(REVEAL_MAP_DEADLINE.saturating_sub(waited)));
-            }
-        }
-        wait
-    }
 }
 
 /// Lock the session immediately and run until unlocked/denied/invalidated.
 pub fn run<S: LockSession + 'static>(session: S) -> Result<LockOutcome, LockError> {
-    run_with_warning(session, LockWarning::default(), LockTransition::immediate())
+    let lock = Lock {
+        transition: vigil_config::LockTransition::immediate(),
+        ..Lock::default()
+    };
+    run_with_lock(session, &lock, Some(0))
 }
 
-/// Present an optional capture-free warning (cancelable, `duration_ms > 0`)
-/// or the short non-cancelable transition before acquiring session-lock,
-/// and the reveal fade after unlock.
-pub fn run_with_warning<S: LockSession + 'static>(
+/// Run the locker under `lock` policy: an optional capture-free warning
+/// (cancelable, `duration_ms > 0`) or the short non-cancelable transition
+/// before acquiring session-lock, and the reveal fade after unlock.
+/// `warning_ms_override` carries `--warn`/`--no-warn`.
+pub fn run_with_lock<S: LockSession + 'static>(
     session: S,
-    warning_config: LockWarning,
-    transition: LockTransition,
+    lock_config: &Lock,
+    warning_ms_override: Option<u64>,
 ) -> Result<LockOutcome, LockError> {
     let conn = Connection::connect_to_env().map_err(err)?;
     let (globals, event_queue) = registry_queue_init(&conn).map_err(err)?;
@@ -1132,32 +993,32 @@ pub fn run_with_warning<S: LockSession + 'static>(
     let dirty = Arc::new(DirtySet::new());
     let metrics = Arc::new(Metrics::new());
 
-    let warning_enabled = warning_config.duration_ms > 0;
-    let warning_frost_alpha = warning_config.frost_alpha.clamp(0.0, 1.0);
-    let gui = warning_config.gui.clone();
-    let mut warning = if warning_enabled {
-        Some(Timeline::new(warning_config))
-    } else if transition.ramps_in() {
-        Some(Timeline::new_transition(
-            transition.as_warning(warning_frost_alpha, gui),
-        ))
-    } else {
-        None
-    };
+    let warning_enabled = warning_ms_override.unwrap_or(lock_config.warning.duration_ms) > 0;
+    let frost_alpha = lock_config.warning.frost_alpha.clamp(0.0, 1.0);
+    let started = std::time::Instant::now();
+    let mut policy = lock_config.clone();
     let layer_shell = match LayerShell::bind(&globals, &qh) {
         Ok(layer_shell) => Some(layer_shell),
         Err(error) if warning_enabled => return Err(err(error)),
         Err(error) => {
-            if warning.is_some() || transition.reveals() {
+            if policy.transition.ramps_in() || policy.transition.reveals() {
                 eprintln!("vigil-lock: layer-shell unavailable ({error}); locking immediately");
             }
-            warning = None;
+            // No overlays are possible: neither ramp nor reveal can run.
+            policy.transition = vigil_config::LockTransition::immediate();
             None
         }
     };
-    if let Some(timeline) = warning.as_mut() {
-        timeline.start(Duration::ZERO);
-    }
+    let (flow, boot_cmds) = LockFlow::new(
+        Now {
+            elapsed: Duration::ZERO,
+            mono: started,
+            wall: std::time::SystemTime::now(),
+        },
+        &policy,
+        warning_ms_override,
+    );
+    let pre_lock_overlays = flow.phase() == vigil_flow::FlowPhase::PreLock;
     let compositor_proxy: wl_compositor::WlCompositor =
         globals.bind(&qh, 1..=6, ()).map_err(err)?;
     let mut app = App {
@@ -1189,20 +1050,13 @@ pub fn run_with_warning<S: LockSession + 'static>(
         qh: qh.clone(),
         present_retry: BTreeMap::new(),
         pending_scenes: Vec::new(),
-        warning,
-        warning_started: std::time::Instant::now(),
-        warning_progress: (0.0, 0.0),
-        warning_elements: Vec::new(),
-        warning_frost_alpha,
-        warning_wait: None,
+        flow,
+        started,
+        overlay_progress: (0.0, 0.0),
+        frost_alpha,
+        pre_lock_overlays,
         scene_ids: BTreeSet::new(),
         initial_outputs_added: false,
-        transition,
-        reveal: None,
-        reveal_progress: (1.0, 1.0),
-        reveal_entered: None,
-        reveal_started_at: None,
-        reveal_wait: None,
         unlock_sent: false,
     };
     eprintln!(
@@ -1216,12 +1070,11 @@ pub fn run_with_warning<S: LockSession + 'static>(
         }
     );
 
-    if app.warning.is_none() {
-        app.lock = Some(
-            app.lock_state
-                .lock(&qh)
-                .map_err(|e| LockError(format!("ext-session-lock-v1 unavailable: {e}")))?,
-        );
+    // The controller's opening commands (hide the panel for a ramp, or take
+    // the session lock at once on the immediate path).
+    app.run(boot_cmds);
+    if let Some(error) = app.error.take() {
+        return Err(error);
     }
 
     // Outputs known now; later arrivals come via OutputHandler::new_output.
@@ -1241,7 +1094,7 @@ pub fn run_with_warning<S: LockSession + 'static>(
             WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
             WaitDecision::Indefinite => None,
         };
-        if let Some(animation) = app.animation_wait() {
+        if let Some(animation) = app.flow.next_wake() {
             timeout = Some(timeout.map_or(animation, |current| current.min(animation)));
         }
         if let Some(retry) = app
@@ -1269,10 +1122,8 @@ pub fn run_with_warning<S: LockSession + 'static>(
 impl<S: LockSession> SessionLockHandler for App<S> {
     fn locked(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
         self.got_locked = true;
-        if let Some(warning) = self.warning.as_mut() {
-            warning.locked(self.warning_started.elapsed());
-        }
-        self.session.locked();
+        let cmds = self.flow.step(self.now(), FlowEvent::LockConfirmed);
+        self.run(cmds);
         for entry in &self.entries {
             if entry.role.is_lock() {
                 self.dirty.mark(entry.id);
@@ -1282,11 +1133,13 @@ impl<S: LockSession> SessionLockHandler for App<S> {
 
     fn finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
         self.lock = None;
-        self.outcome = Some(if self.got_locked {
-            LockOutcome::Invalidated
+        let event = if self.got_locked {
+            FlowEvent::LockInvalidated
         } else {
-            LockOutcome::Denied
-        });
+            FlowEvent::LockDenied
+        };
+        let cmds = self.flow.step(self.now(), event);
+        self.run(cmds);
     }
 
     fn configure(
@@ -1320,21 +1173,12 @@ impl<S: LockSession> LayerShellHandler for App<S> {
             self.entries.remove(idx);
             return;
         }
-        match self.warning.as_mut() {
-            // A transition must still lock: treat the lost overlay as a
-            // topology change and commit now.
-            Some(timeline) if !timeline.cancelable() => {
-                eprintln!(
-                    "vigil-lock: warning surface {id:?} closed during transition; committing"
-                );
-                timeline.request_commit();
-                self.entries.remove(idx);
-            }
-            _ => {
-                eprintln!("vigil-lock: warning surface {id:?} closed");
-                self.outcome = Some(LockOutcome::Cancelled);
-            }
-        }
+        eprintln!("vigil-lock: warning surface {id:?} closed");
+        self.entries.remove(idx);
+        // A cancelable warning ends here; a transition must still lock.
+        // The controller knows which it is running.
+        let cmds = self.flow.step(self.now(), FlowEvent::OverlayClosed);
+        self.run(cmds);
     }
 
     fn configure(
@@ -1473,11 +1317,14 @@ impl<S: LockSession> PointerHandler for App<S> {
             match event.kind {
                 PointerEventKind::Enter { .. } => {
                     self.session.focus_output(id);
-                    if self.lock.is_none()
-                        && let Some(warning) = self.warning.as_mut()
-                    {
-                        warning.pointer_enter(event.position.0 * scale, event.position.1 * scale);
-                    }
+                    let cmds = self.flow.step(
+                        self.now(),
+                        FlowEvent::PointerEnter {
+                            x: event.position.0 * scale,
+                            y: event.position.1 * scale,
+                        },
+                    );
+                    self.run(cmds);
                 }
                 PointerEventKind::Motion { .. } => {
                     self.deliver_input(InputEvent::PointerAbsolute {
@@ -1605,12 +1452,9 @@ impl<S: LockSession> OutputHandler for App<S> {
     }
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         let genuinely_new = !self.entries.iter().any(|entry| entry.output == output);
-        if self.initial_outputs_added
-            && self.lock.is_none()
-            && genuinely_new
-            && let Some(warning) = self.warning.as_mut()
-        {
-            warning.hotplug();
+        if self.initial_outputs_added && genuinely_new {
+            let cmds = self.flow.step(self.now(), FlowEvent::OutputAdded);
+            self.run(cmds);
         }
         self.add_output(qh, output);
     }
@@ -1621,11 +1465,8 @@ impl<S: LockSession> OutputHandler for App<S> {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        if self.lock.is_none()
-            && let Some(warning) = self.warning.as_mut()
-        {
-            warning.hotplug();
-        }
+        let cmds = self.flow.step(self.now(), FlowEvent::OutputGone);
+        self.run(cmds);
         if let Some(id) = self
             .entries
             .iter()

@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use vigil_config::{Config, LockTransition};
 use vigil_core::{
-    AppearanceEvent, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget, InputEvent,
-    LoginEvent, OutputId, OutputInfo, UiMessage,
+    AppearanceEvent, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget, LoginEvent,
+    OutputId, OutputInfo, UiMessage,
 };
+use vigil_flow::{FlowCmd, FlowEvent};
 use vigil_login::{AppearanceWatcher, LoginSession};
 use vigil_pam::PamAttempt;
 use vigil_theme::Theme;
 use vigil_ui::{Looks, OutputWindow, UiSnapshot, VigilPlatform, apply_kit_tokens_from_disk};
-use vigil_warning::ElementSample;
 use vigil_wayland::{LockOutcome, LockSession};
 
 struct Cli {
@@ -123,6 +123,9 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
 fn apply_cli_to_config(cli: &Cli, config: &mut Config) {
     if let Some(duration_ms) = cli.warning_ms {
         config.lock.warning.duration_ms = duration_ms;
+    }
+    if let Some(grace_secs) = cli.grace {
+        config.lock.grace_secs = grace_secs;
     }
     if cli.immediate {
         config.lock.transition = LockTransition::immediate();
@@ -321,8 +324,10 @@ struct Locker {
     unlocked: bool,
     last_clock: (Instant, String),
     ready_fd: Option<i32>,
-    grace_secs: u64,
-    grace: Option<Grace>,
+    /// Controller events produced by the async pumps this tick.
+    pending: Vec<FlowEvent>,
+    /// Last wallpaper readiness reported to the controller (edge-triggered).
+    wallpaper_ready: bool,
     /// Auth state to replay onto scenes rebuilt mid-lock (resume/resize
     /// recreates outputs; a fresh theme instance starts blank).
     snapshot: UiSnapshot,
@@ -332,7 +337,6 @@ struct Locker {
     event_waker: Arc<Mutex<Option<WakeHandle>>>,
     scheduler: IdleScheduler,
     warning_active: bool,
-    warning_commit: bool,
     lock_ipc: Arc<Mutex<LockIpcState>>,
     warning_backgrounds: std::collections::HashSet<OutputId>,
 }
@@ -355,63 +359,19 @@ fn forwarded_channel<T: Send + 'static>(
     (source_tx, app_rx)
 }
 
-/// Grace window: unlock without auth shortly after locking. Two deadlines
-/// on two clocks: Instant freezes during suspend while SystemTime does
-/// not, so requiring BOTH keeps a pre-suspend grace from surviving into
-/// the resume — the lock-before-sleep guarantee stays intact without
-/// logind integration.
-struct Grace {
-    deadline_mono: Instant,
-    deadline_wall: std::time::SystemTime,
-}
-
-impl Grace {
-    fn new(secs: u64) -> Self {
-        let secs = Duration::from_secs(secs);
-        Self {
-            deadline_mono: Instant::now() + secs,
-            deadline_wall: std::time::SystemTime::now() + secs,
-        }
-    }
-
-    /// Presses dismiss; motion and releases never do.
-    fn dismisses(
-        &self,
-        event: &InputEvent,
-        now_mono: Instant,
-        now_wall: std::time::SystemTime,
-    ) -> bool {
-        let live = now_mono < self.deadline_mono && now_wall < self.deadline_wall;
-        live && matches!(
-            event,
-            InputEvent::Key { pressed: true, .. } | InputEvent::PointerButton { pressed: true, .. }
-        )
-    }
-}
-
-/// What a [`LoginEvent`] means for the locker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoginAction {
-    /// Release the screen without authentication.
-    Unlock,
-    Ignore,
-}
-
 /// logind event → locker action. `Unlock` is honored without auth on
 /// purpose: logind only accepts `UnlockSession` from root or the session's
 /// own user, it is the escape hatch every locker implements, and a working
 /// `loginctl unlock-session` is worth having when a locker misbehaves.
-fn handle_login_event(event: LoginEvent, grace: &mut Option<Grace>) -> LoginAction {
+/// Translate a logind signal into a controller event. The grace window is
+/// the controller's (a grace must never survive a suspend, #9 residual —
+/// `PrepareForSleep(true)` bans one for the rest of the run).
+fn login_flow_event(event: LoginEvent) -> Option<FlowEvent> {
     match event {
-        LoginEvent::Unlock => LoginAction::Unlock,
-        // We ARE the locker; the session is already locked.
-        LoginEvent::Lock => LoginAction::Ignore,
-        LoginEvent::PrepareForSleep(true) => {
-            // A grace window must never survive a suspend (#9 residual).
-            *grace = None;
-            LoginAction::Ignore
-        }
-        LoginEvent::PrepareForSleep(false) => LoginAction::Ignore,
+        LoginEvent::Unlock => Some(FlowEvent::LogindUnlock),
+        // We ARE the locker; a Lock request while running means "commit now".
+        LoginEvent::Lock => Some(FlowEvent::CommitRequested),
+        LoginEvent::PrepareForSleep(sleeping) => Some(FlowEvent::PrepareForSleep(sleeping)),
     }
 }
 
@@ -419,7 +379,6 @@ impl Locker {
     fn new(
         mut cli: Cli,
         config: Config,
-        grace_secs: u64,
         lock_ipc: Arc<Mutex<LockIpcState>>,
     ) -> Result<Self, String> {
         let user = cli
@@ -493,8 +452,8 @@ impl Locker {
             unlocked: false,
             last_clock: (Instant::now(), clock_text(&clock_format)),
             ready_fd: cli.ready_fd,
-            grace_secs,
-            grace: None,
+            pending: Vec::new(),
+            wallpaper_ready: false,
             snapshot: {
                 // Show a usable password prompt from the first frame: with
                 // pam_fprintd in the stack the real prompt only arrives
@@ -510,7 +469,6 @@ impl Locker {
             event_waker,
             scheduler: IdleScheduler::default(),
             warning_active,
-            warning_commit: false,
             lock_ipc,
             warning_backgrounds: std::collections::HashSet::new(),
         };
@@ -544,6 +502,31 @@ impl Locker {
         }));
     }
 
+    /// Executor for [`FlowCmd::SignalReady`]: the compositor holds the lock
+    /// from this moment — it will never reveal the session again without
+    /// unlock_and_destroy, even if we have not painted yet. Safe to let a
+    /// suspend proceed.
+    fn signal_locked(&mut self) {
+        eprintln!("vigil-lock: session locked");
+        self.warning_active = false;
+        let joiners = {
+            let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
+            ipc.locked = true;
+            std::mem::take(&mut ipc.joiners)
+        };
+        for mut joiner in joiners {
+            let _ = joiner.write_all(b"locked\n");
+        }
+        if let Some(fd) = self.ready_fd.take() {
+            use std::io::Write;
+            use std::os::fd::FromRawFd;
+            let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
+            let _ = ready.write_all(b"1");
+            // Dropping closes the fd; a --wait parent unblocks on
+            // either the byte or the EOF.
+        }
+    }
+
     fn apply_panel(&mut self) {
         for (i, e) in self.entries.iter_mut().enumerate() {
             e.window.set_panel_visible(i == self.panel);
@@ -575,7 +558,7 @@ impl Locker {
                     self.each_window(|w| w.show_error(&text));
                 }
                 AuthEvent::Done(Ok(())) => {
-                    self.unlock_now();
+                    self.pending.push(FlowEvent::AuthOk);
                     return;
                 }
                 AuthEvent::Done(Err(_)) if self.unlocked => {
@@ -586,15 +569,9 @@ impl Locker {
                     // pam_faillock strike against the user.
                 }
                 AuthEvent::Done(Err(message)) => {
-                    self.snapshot.error = message.clone();
-                    self.snapshot.busy = false;
-                    self.each_window(|w| {
-                        w.show_error(&message);
-                        w.set_busy(false);
-                    });
-                    // A fresh PAM transaction per attempt (hyprlock's model):
-                    // the new conversation re-prompts.
-                    self.start_attempt();
+                    // The controller decides the retry (a fresh PAM
+                    // transaction per attempt, hyprlock's model).
+                    self.pending.push(FlowEvent::AuthErr(message));
                 }
             }
         }
@@ -630,13 +607,8 @@ impl Locker {
 
     fn pump_login(&mut self) {
         while let Ok(event) = self.login_rx.try_recv() {
-            if self.warning_active
-                && matches!(event, LoginEvent::Lock | LoginEvent::PrepareForSleep(true))
-            {
-                self.warning_commit = true;
-            }
-            if handle_login_event(event, &mut self.grace) == LoginAction::Unlock {
-                self.unlock_now();
+            if let Some(event) = login_flow_event(event) {
+                self.pending.push(event);
             }
         }
     }
@@ -697,17 +669,15 @@ impl Locker {
         self.each_window(|w| apply_kit_tokens_from_disk(w, mode));
     }
 
-    /// Single exit path: clear the logind hint, then release the screen.
-    fn unlock_now(&mut self) {
+    /// Executor for [`FlowCmd::DetachAuth`]: stop caring about PAM and arm
+    /// the teardown watchdog. The controller drives the release itself.
+    fn detach_auth(&mut self) {
         // Unlock must never wait on PAM. Grace and loginctl unlocks can fire
         // while a conversation is mid-flight (or a module is wedged outside
         // it — pam_fprintd waiting on a finger), and the teardown drop of a
         // joining attempt was exactly issue #49's immortal-locker hang.
         if let Some(attempt) = &mut self.attempt {
             attempt.detach();
-        }
-        if let Some(login) = &self.login {
-            login.set_locked_hint(false);
         }
         self.unlocked = true;
         // Belt and braces: teardown after this point should be milliseconds
@@ -924,28 +894,9 @@ impl LockSession for Locker {
         }
     }
 
-    fn input(&mut self, event: InputEvent) {
-        if self.unlocked {
-            // Reveal fade in progress: the session is released and nothing
-            // here may re-enter unlock_now or feed PAM.
-            return;
-        }
-        if let Some(grace) = &self.grace
-            && grace.dismisses(&event, Instant::now(), std::time::SystemTime::now())
-        {
-            // Dismissed inside the grace window: unlock and swallow the
-            // event so the keystroke never reaches a PAM response.
-            self.unlock_now();
-            return;
-        }
-        if let Some(e) = self.entries.get_mut(self.panel) {
-            e.window.dispatch(event);
-        }
-    }
-
-    fn warning_progress(&mut self, _frost: f32, _wallpaper: f32) {
+    fn overlay_progress(&mut self, _frost: f32, _wallpaper: f32) {
         // Surface opacity and compositor frost are owned by vigil-wayland.
-        // The lock scene contributes only its wallpaper during this phase.
+        // The lock scene contributes only its wallpaper during a ramp.
         self.each_window(|window| {
             window.set_panel_visible(false);
             window.set_cursor_visible(false);
@@ -953,7 +904,7 @@ impl LockSession for Locker {
         });
     }
 
-    fn warning_elements(&mut self, elements: &[ElementSample]) {
+    fn overlay_elements(&mut self, elements: &[vigil_flow::ElementSample]) {
         self.each_window(|window| {
             for element in elements {
                 window.set_warning_element(&element.selector, element.progress);
@@ -961,58 +912,70 @@ impl LockSession for Locker {
         });
     }
 
-    fn warning_commit_requested(&mut self) -> bool {
+    fn poll_events(&mut self) -> Vec<FlowEvent> {
+        let mut events = std::mem::take(&mut self.pending);
         let ipc_commit = {
             let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
             std::mem::take(&mut ipc.commit_requested)
         };
-        std::mem::take(&mut self.warning_commit) || ipc_commit
+        if ipc_commit {
+            events.push(FlowEvent::CommitRequested);
+        }
+        // Edge-triggered: the controller holds the commit while assets are
+        // outstanding, so it only needs the transitions.
+        let ready = !self.entries.is_empty() && self.warning_backgrounds.is_empty();
+        if ready != self.wallpaper_ready {
+            self.wallpaper_ready = ready;
+            events.push(FlowEvent::WallpaperReady(ready));
+        }
+        events
     }
 
-    fn warning_wallpaper_ready(&self) -> bool {
-        !self.entries.is_empty() && self.warning_backgrounds.is_empty()
+    fn flow_command(&mut self, cmd: &FlowCmd) {
+        match cmd {
+            FlowCmd::ShowPanel(true) => self.apply_panel(),
+            FlowCmd::ShowPanel(false) => self.each_window(|window| {
+                window.set_panel_visible(false);
+                window.set_cursor_visible(false);
+                window.request_present();
+            }),
+            FlowCmd::DispatchInput(event) => {
+                if let Some(entry) = self.entries.get_mut(self.panel) {
+                    entry.window.dispatch(event.clone());
+                }
+            }
+            FlowCmd::StartAuth => {
+                if self.attempt.is_none() {
+                    self.start_attempt();
+                }
+            }
+            FlowCmd::ShowAuthError(message) => {
+                self.snapshot.error = message.clone();
+                self.snapshot.busy = false;
+                let message = message.clone();
+                self.each_window(move |window| {
+                    window.show_error(&message);
+                    window.set_busy(false);
+                });
+                // The controller pairs this with StartAuth: a fresh PAM
+                // transaction per attempt re-prompts.
+                self.attempt = None;
+            }
+            FlowCmd::DetachAuth => self.detach_auth(),
+            FlowCmd::SetLockedHint(on) => {
+                if let Some(login) = &self.login {
+                    login.set_locked_hint(*on);
+                }
+            }
+            FlowCmd::SignalReady => self.signal_locked(),
+            _ => {}
+        }
     }
 
     fn caps_lock(&mut self, on: bool) {
         if self.caps_lock != on {
             self.caps_lock = on;
             self.each_window(|w| w.set_caps_lock(on));
-        }
-    }
-
-    fn locked(&mut self) {
-        eprintln!("vigil-lock: session locked");
-        self.warning_active = false;
-        let joiners = {
-            let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
-            ipc.locked = true;
-            std::mem::take(&mut ipc.joiners)
-        };
-        for mut joiner in joiners {
-            let _ = joiner.write_all(b"locked\n");
-        }
-        self.apply_panel();
-        // Readiness: the compositor holds the lock from this moment — it
-        // will never reveal the session again without unlock_and_destroy,
-        // even if we have not painted yet. Safe to let a suspend proceed.
-        if let Some(fd) = self.ready_fd.take() {
-            use std::io::Write;
-            use std::os::fd::FromRawFd;
-            let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
-            let _ = ready.write_all(b"1");
-            // Dropping closes the fd; a --wait parent unblocks on
-            // either the byte or the EOF.
-        }
-        if self.grace_secs > 0 {
-            self.grace = Some(Grace::new(self.grace_secs));
-        }
-        if let Some(login) = &self.login {
-            login.set_locked_hint(true);
-        }
-        // Auth belongs on a held lock. Starting PAM in main() made every
-        // denied second locker (hypridle re-lock) log a failed conversation.
-        if self.attempt.is_none() {
-            self.start_attempt();
         }
     }
 
@@ -1038,10 +1001,6 @@ impl LockSession for Locker {
             .find(|e| e.id == id)
             .map(|e| e.window.render_if_needed(target))
             .unwrap_or(false)
-    }
-
-    fn wants_unlock(&self) -> bool {
-        self.unlocked
     }
 
     fn wait_decision(&self) -> WaitDecision {
@@ -1282,10 +1241,10 @@ fn main() {
         eprintln!("vigil-lock: {error}");
         std::process::exit(2);
     }
-    let mut warning = config.lock.warning.clone();
-    let transition = config.lock.transition.clone();
+    // `apply_cli_to_config` already folded --warn/--no-warn/--immediate in,
+    // so the policy the controller runs is exactly the resolved config.
+    let mut lock_policy = config.lock.clone();
     cli.theme = cli.theme.or(config.look.theme.clone());
-    let grace_secs = cli.grace.unwrap_or(config.lock.grace_secs);
     // Singleton guard (issue #50): exactly one locker per seat. flock
     // ownership is kernel-released on any death — SIGKILL and Drop-skipping
     // exits included — so only a LIVE owner blocks us; the socket is the
@@ -1300,7 +1259,7 @@ fn main() {
                     // alone prevents stacking), but a cancelable warning
                     // whose join contract can't be honored must not run.
                     eprintln!("vigil-lock: lock IPC unavailable: {error}; locking immediately");
-                    warning.duration_ms = 0;
+                    lock_policy.warning.duration_ms = 0;
                     break (guard, None, Arc::new(Mutex::new(LockIpcState::default())));
                 }
             },
@@ -1346,7 +1305,7 @@ fn main() {
             }
         }
     };
-    let locker = match Locker::new(cli, config, grace_secs, lock_ipc) {
+    let locker = match Locker::new(cli, config, lock_ipc) {
         Ok(locker) => locker,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
@@ -1354,7 +1313,7 @@ fn main() {
         }
     };
     let _lock_ipc_socket = lock_ipc_socket;
-    match vigil_wayland::run_with_warning(locker, warning, transition) {
+    match vigil_wayland::run_with_lock(locker, &lock_policy, None) {
         Ok(LockOutcome::Unlocked) => std::process::exit(0),
         Ok(LockOutcome::Denied) => {
             eprintln!("vigil-lock: lock denied (another locker running?)");
@@ -1462,115 +1421,6 @@ mod tests {
             ["--warn", "10"]
         );
     }
-    use std::time::SystemTime;
-
-    fn key() -> InputEvent {
-        InputEvent::Key {
-            keysym: 'a' as u32,
-            utf8: Some("a".into()),
-            pressed: true,
-        }
-    }
-
-    #[test]
-    fn press_inside_window_dismisses() {
-        assert!(Grace::new(5).dismisses(&key(), Instant::now(), SystemTime::now()));
-        assert!(Grace::new(5).dismisses(
-            &InputEvent::PointerButton {
-                button: 0x110,
-                pressed: true,
-            },
-            Instant::now(),
-            SystemTime::now(),
-        ));
-    }
-
-    #[test]
-    fn expired_window_never_dismisses() {
-        assert!(!Grace::new(5).dismisses(
-            &key(),
-            Instant::now() + Duration::from_secs(6),
-            SystemTime::now() + Duration::from_secs(6),
-        ));
-    }
-
-    #[test]
-    fn wall_clock_jump_kills_grace() {
-        assert!(!Grace::new(5).dismisses(
-            &key(),
-            Instant::now(),
-            SystemTime::now() + Duration::from_secs(6),
-        ));
-    }
-
-    #[test]
-    fn motion_and_releases_never_dismiss() {
-        let events = [
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerAbsolute { x: 0.5, y: 0.5 },
-            InputEvent::Key {
-                keysym: 'a' as u32,
-                utf8: Some("a".into()),
-                pressed: false,
-            },
-            InputEvent::PointerButton {
-                button: 0x110,
-                pressed: false,
-            },
-        ];
-        for event in events {
-            assert!(!Grace::new(5).dismisses(&event, Instant::now(), SystemTime::now()));
-        }
-    }
-
-    #[test]
-    fn zero_grace_never_dismisses() {
-        assert!(!Grace::new(0).dismisses(&key(), Instant::now(), SystemTime::now()));
-    }
-
-    #[test]
-    fn unlock_signal_releases_without_auth() {
-        assert_eq!(
-            handle_login_event(LoginEvent::Unlock, &mut None),
-            LoginAction::Unlock
-        );
-    }
-
-    #[test]
-    fn lock_signal_is_a_noop_while_locked() {
-        let mut grace = Some(Grace::new(5));
-        assert_eq!(
-            handle_login_event(LoginEvent::Lock, &mut grace),
-            LoginAction::Ignore
-        );
-        assert!(grace.is_some());
-    }
-
-    #[test]
-    fn sleep_invalidates_grace() {
-        let mut grace = Some(Grace::new(60));
-        assert_eq!(
-            handle_login_event(LoginEvent::PrepareForSleep(true), &mut grace),
-            LoginAction::Ignore
-        );
-        assert!(grace.is_none());
-    }
-
-    #[test]
-    fn resume_leaves_grace_alone() {
-        let mut grace = Some(Grace::new(60));
-        handle_login_event(LoginEvent::PrepareForSleep(false), &mut grace);
-        assert!(grace.is_some());
-    }
-
-    #[test]
-    fn invalidated_grace_never_dismisses() {
-        let mut grace = Some(Grace::new(60));
-        handle_login_event(LoginEvent::PrepareForSleep(true), &mut grace);
-        assert!(grace.is_none());
-        assert!(!Grace::new(0).dismisses(&key(), Instant::now(), SystemTime::now()));
-    }
-
     #[test]
     fn background_worker_wakes_and_reuses_rendered_pixels() {
         let path = std::env::temp_dir().join(format!(
