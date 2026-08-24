@@ -33,6 +33,44 @@ pub struct ElementSample {
 
 pub const DEFAULT_SELECTORS: [&str; 5] = ["clock", "user_selector", "password", "status", "power"];
 
+/// Frame period of every ramp this crate animates. Animated values are
+/// quantized to this grid inside `sample()`/`element_samples()`, so a
+/// consumer may sample at any rate — event-loop wakes included — and a
+/// value-diff dedupes to at most one scene update per frame (issue #53:
+/// buffer-release wakes otherwise self-sustain a commit-per-render-time
+/// loop). Phase transitions, commit deadlines, and `next_frame` use real
+/// elapsed time and are never delayed by the grid.
+pub const FRAME_INTERVAL_MS: u64 = 33;
+
+/// Floor `elapsed` to the frame grid (value computation only).
+fn quantize(elapsed: Duration) -> Duration {
+    Duration::from_millis(elapsed.as_millis() as u64 / FRAME_INTERVAL_MS * FRAME_INTERVAL_MS)
+}
+
+/// Eased ramp progress for a ramp starting at `start`, sampled on the
+/// timeline's single frame grid: `now` is the real clock (completion is
+/// judged on it, so the terminal value is exact even when the deadline is
+/// off-grid) and `grid` is `quantize(now)` for the *whole* timeline.
+///
+/// Every ramp must share one grid. Flooring each ramp's own relative
+/// elapsed instead gives each a grid anchored at its own start, and two
+/// overlapping ramps then change value at two different phase offsets
+/// inside the same frame — two scene updates and two commits per frame,
+/// which is the storm issue #53 exists to stop.
+fn graded(
+    now: Duration,
+    grid: Duration,
+    start: Duration,
+    duration: Duration,
+    easing: WarningEasing,
+) -> f32 {
+    if now.saturating_sub(start) >= duration {
+        1.0
+    } else {
+        ease(ratio(grid.saturating_sub(start), duration), easing)
+    }
+}
+
 pub struct Timeline {
     config: LockWarning,
     phase: Phase,
@@ -180,10 +218,23 @@ impl Timeline {
         } else {
             scheduled_wallpaper_start
         };
-        let frost = ease(ratio(elapsed, frost_duration), self.config.easing);
+        // Values on the frame grid, phases on real time: identical values
+        // inside one frame make any-rate sampling idempotent for consumers
+        // that diff progress, while commits and holds stay punctual.
+        let grid = quantize(elapsed);
+        let frost = graded(
+            elapsed,
+            grid,
+            Duration::ZERO,
+            frost_duration,
+            self.config.easing,
+        );
         let wallpaper = if self.wallpaper_ready {
-            ease(
-                ratio(elapsed.saturating_sub(wallpaper_start), wallpaper_duration),
+            graded(
+                elapsed,
+                grid,
+                wallpaper_start,
+                wallpaper_duration,
                 self.config.easing,
             )
         } else {
@@ -206,7 +257,7 @@ impl Timeline {
             && (elapsed < frost_duration
                 || (self.wallpaper_ready && elapsed >= wallpaper_start && elapsed < commit_at));
         let next_frame = if animating {
-            Some(Duration::from_millis(33))
+            Some(Duration::from_millis(FRAME_INTERVAL_MS))
         } else if self.phase == Phase::Running && self.wallpaper_ready && elapsed < wallpaper_start
         {
             Some(wallpaper_start - elapsed)
@@ -298,11 +349,14 @@ impl Timeline {
                     } else if kind == WarningAnimation::None || duration_ms == 0 {
                         1.0
                     } else {
-                        ease(
-                            ratio(
-                                now.saturating_sub(start),
-                                Duration::from_millis(duration_ms),
-                            ),
+                        // Same single grid: per-selector `offset_ms` would
+                        // otherwise give each element its own phase and
+                        // multiply the per-frame scene updates.
+                        graded(
+                            now,
+                            quantize(now),
+                            start,
+                            Duration::from_millis(duration_ms),
                             self.config.easing,
                         )
                     }
@@ -332,7 +386,7 @@ impl Timeline {
                     && element.progress < 1.0
                     && element.kind != WarningAnimation::None
                 {
-                    Some(Duration::from_millis(33))
+                    Some(Duration::from_millis(FRAME_INTERVAL_MS))
                 } else {
                     None
                 }
@@ -396,10 +450,21 @@ impl Reveal {
             };
         };
         let elapsed = now.saturating_sub(start);
-        let wallpaper = 1.0 - ease(ratio(elapsed, self.wallpaper_out), self.easing);
+        let grid = quantize(elapsed);
+        let wallpaper = 1.0
+            - graded(
+                elapsed,
+                grid,
+                Duration::ZERO,
+                self.wallpaper_out,
+                self.easing,
+            );
         let frost = 1.0
-            - ease(
-                ratio(elapsed.saturating_sub(self.wallpaper_out), self.frost_out),
+            - graded(
+                elapsed,
+                grid,
+                self.wallpaper_out,
+                self.frost_out,
                 self.easing,
             );
         let done = elapsed >= self.wallpaper_out + self.frost_out;
@@ -407,7 +472,7 @@ impl Reveal {
             frost,
             wallpaper,
             done,
-            next_frame: (!done).then(|| Duration::from_millis(33)),
+            next_frame: (!done).then(|| Duration::from_millis(FRAME_INTERVAL_MS)),
         }
     }
 }
@@ -669,18 +734,82 @@ mod tests {
         );
         reveal.start(Duration::from_secs(1));
         reveal.start(Duration::from_secs(9)); // idempotent
-        let middle = reveal.sample(Duration::from_millis(1_125));
-        assert!((middle.wallpaper - 0.5).abs() < 1e-6);
+        // Grid-aligned offsets (multiples of the 33 ms frame period).
+        let middle = reveal.sample(Duration::from_millis(1_000 + 4 * FRAME_INTERVAL_MS));
+        assert!((middle.wallpaper - (1.0 - 132.0 / 250.0)).abs() < 1e-6);
         assert_eq!(middle.frost, 1.0);
-        assert_eq!(middle.next_frame, Some(Duration::from_millis(33)));
-        let frost = reveal.sample(Duration::from_millis(1_325));
+        assert_eq!(
+            middle.next_frame,
+            Some(Duration::from_millis(FRAME_INTERVAL_MS))
+        );
+        let frost = reveal.sample(Duration::from_millis(1_000 + 10 * FRAME_INTERVAL_MS));
         assert_eq!(frost.wallpaper, 0.0);
-        assert!((frost.frost - 0.5).abs() < 1e-6);
+        // One grid for the whole fade: at the on-grid sample 330 ms the
+        // frost half has run 330-250 = 80 ms exactly.
+        assert!((frost.frost - (1.0 - 80.0 / 150.0)).abs() < 1e-6);
         assert!(!frost.done);
         let end = reveal.sample(Duration::from_millis(1_400));
         assert!(end.done);
         assert_eq!(end.frost, 0.0);
         assert_eq!(end.next_frame, None);
+    }
+
+    #[test]
+    fn sampling_is_idempotent_within_a_frame() {
+        // Any-rate sampling (event-loop wakes) must not manufacture new
+        // values between frames — the contract that fixes issue #53 at the
+        // source instead of in every consumer.
+        let mut timeline = Timeline::new_transition(transition());
+        timeline.start(Duration::ZERO);
+        let a = timeline.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS));
+        let b = timeline.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS + 10));
+        assert_eq!((a.frost, a.wallpaper), (b.frost, b.wallpaper));
+        let c = timeline.sample(Duration::from_millis(3 * FRAME_INTERVAL_MS));
+        assert_ne!((a.frost, a.wallpaper), (c.frost, c.wallpaper));
+
+        let mut reveal = Reveal::new(250, 150, WarningEasing::Linear);
+        reveal.start(Duration::ZERO);
+        let a = reveal.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS));
+        let b = reveal.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS + 10));
+        assert_eq!((a.frost, a.wallpaper), (b.frost, b.wallpaper));
+
+        // Phase timing stays on real time: the transition still commits at
+        // its exact deadline even off-grid.
+        let mut timeline = Timeline::new_transition(transition());
+        timeline.start(Duration::ZERO);
+        assert!(timeline.sample(Duration::from_millis(400)).should_commit);
+    }
+
+    #[test]
+    fn overlapping_ramps_share_one_frame_grid() {
+        // frost_in + wallpaper_in > duration makes both ramps animate at
+        // once. Each ramp flooring its own relative elapsed would put their
+        // value changes at two phase offsets per frame — two scene updates
+        // and two commits, the storm issue #53 exists to stop.
+        let mut timeline = Timeline::new(LockWarning {
+            duration_ms: 2_000,
+            frost_in_ms: 1_500,
+            wallpaper_in_ms: 1_500,
+            ..LockWarning::default()
+        });
+        timeline.start(Duration::ZERO);
+        let mut changes = 0;
+        let mut last = None;
+        // Walk the overlap window (wallpaper_start = 500) one ms at a time.
+        for ms in 500..1_500 {
+            let sample = timeline.sample(Duration::from_millis(ms));
+            let value = (sample.frost, sample.wallpaper);
+            if last != Some(value) {
+                changes += 1;
+                last = Some(value);
+            }
+        }
+        // 1000 ms at one change per 33 ms frame, inclusive of the first.
+        let frames = 1_000 / FRAME_INTERVAL_MS + 1;
+        assert!(
+            changes <= frames,
+            "{changes} value changes over the overlap, expected at most {frames}"
+        );
     }
 
     #[test]

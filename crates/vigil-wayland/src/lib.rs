@@ -747,6 +747,10 @@ impl<S: LockSession> App<S> {
                 },
             );
         }
+        if !drew && !force {
+            self.present_retry.remove(&id);
+            return;
+        }
         if let Some((frost, wallpaper)) = overlay_progress {
             // wl_shm ARGB8888 is premultiplied. Fade the rendered lock
             // wallpaper in (or out) over a neutral frost tint while the
@@ -769,11 +773,9 @@ impl<S: LockSession> App<S> {
                 pixel[3] = (alpha * 255.0).round() as u8;
             }
         }
+        // Captured after the overlay blend: the full-buffer premultiply is
+        // the cost this diagnostic exists to surface on slow compositors.
         let render_elapsed = render_started.elapsed();
-        if !drew && !force {
-            self.present_retry.remove(&id);
-            return;
-        }
         if drew {
             self.metrics.record_render();
         }
@@ -857,6 +859,9 @@ impl<S: LockSession> App<S> {
                 (Some(left), Some(right)) => Some(left.min(right)),
                 (left, right) => left.or(right),
             };
+            // Ramp values are quantized to the frame grid inside the
+            // timeline, so this diff dedupes buffer-release wakes to at
+            // most one scene update per frame (issue #53).
             let progress = (sample.frost, sample.wallpaper);
             let elements = timeline.element_samples(elapsed);
             if self.warning_progress != progress {
@@ -897,15 +902,16 @@ impl<S: LockSession> App<S> {
         // render_if_needed is a no-op for a clean scene and present() then
         // commits nothing.
         let _ = self.dirty.take_all();
-        {
-            let mut indices: Vec<usize> = (0..self.entries.len()).collect();
-            // During handoff both surfaces deliberately share one output ID
-            // and one retained OutputWindow. Render the fresh lock surface
-            // first; otherwise the warning surface consumes the one pending
-            // software frame and the lock surface commits its black fallback.
-            indices.sort_by_key(|idx| present_priority(self.entries[*idx].role.is_lock()));
-            for idx in indices {
-                self.present(idx);
+        // During handoff both surfaces deliberately share one output ID and
+        // one retained OutputWindow. Render the fresh lock surfaces first;
+        // otherwise an overlay consumes the one pending software frame and
+        // the lock surface commits its black fallback. Two index passes: no
+        // per-tick allocation or sort (present() never adds/removes entries).
+        for lock_pass in [0, 1] {
+            for idx in 0..self.entries.len() {
+                if present_priority(self.entries[idx].role.is_lock()) == lock_pass {
+                    self.present(idx);
+                }
             }
         }
         if self.reveal.is_some() && !self.unlock_sent && self.reveal_entries_all_committed() {
