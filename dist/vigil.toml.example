@@ -93,8 +93,10 @@
 #easing = "ease_out"
 #cancel_on_motion_px = 8.0
 # How long past its scheduled commit the warning may wait for the wallpaper
-# before locking anyway with whatever the scene has. A wedged asset pipeline
-# must not leave the machine unlocked; 0 waits forever (pre-0.4 behaviour).
+# before locking anyway with whatever the scene has: a wedged asset pipeline
+# must not leave the machine unlocked. Clamped to 30000. NOTE the sense of
+# 0 here is the opposite of the other duration keys — it DISABLES the cap
+# and waits forever, leaving the screen unlocked until the asset arrives.
 #wallpaper_hold_max_ms = 5000
 
 [lock.warning.gui]

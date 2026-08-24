@@ -21,6 +21,10 @@ pub struct Sample {
     pub frost: f32,
     pub wallpaper: f32,
     pub should_commit: bool,
+    /// This commit was forced by the wallpaper hold cap rather than reached
+    /// normally: the asset never arrived and locking beat waiting. Set on
+    /// the sample that forces it, so the caller can journal it once.
+    pub forced_commit: bool,
     pub next_frame: Option<Duration>,
 }
 
@@ -87,6 +91,8 @@ pub struct Timeline {
     motion: f64,
     wallpaper_ready: bool,
     wallpaper_ready_at: Option<Duration>,
+    /// The wallpaper hold cap has already forced a commit; report it once.
+    hold_expired: bool,
     /// False for the manual-lock transition (issue #52): input is ignored,
     /// hotplug commits, and the wallpaper never holds the commit.
     cancelable: bool,
@@ -114,6 +120,7 @@ impl Timeline {
             motion: 0.0,
             wallpaper_ready: WALLPAPER_READY_DEFAULT,
             wallpaper_ready_at: None,
+            hold_expired: false,
             cancelable,
         }
     }
@@ -199,6 +206,7 @@ impl Timeline {
                 frost: 0.0,
                 wallpaper: 0.0,
                 should_commit: false,
+                forced_commit: false,
                 next_frame: None,
             };
         }
@@ -208,6 +216,7 @@ impl Timeline {
                 frost: 0.0,
                 wallpaper: 0.0,
                 should_commit: false,
+                forced_commit: false,
                 next_frame: None,
             };
         };
@@ -248,11 +257,26 @@ impl Timeline {
         };
 
         let commit_at = wallpaper_start + wallpaper_duration;
+        // The hold cap lives here, beside the commit time it is relative to:
+        // computing it anywhere else duplicates this arithmetic, and every
+        // copy is a chance to disagree with it (issue #56).
+        let hold_deadline = (self.cancelable && self.config.wallpaper_hold_max_ms > 0)
+            .then(|| commit_at + Duration::from_millis(self.config.wallpaper_hold_max_ms));
+        let mut forced_commit = false;
         if self.phase == Phase::Running
             && elapsed >= commit_at
             && (self.wallpaper_ready || !self.cancelable)
         {
             self.phase = Phase::CommitReady;
+        } else if self.phase == Phase::Running
+            && !self.wallpaper_ready
+            && hold_deadline.is_some_and(|deadline| elapsed >= deadline)
+        {
+            // A wedged asset pipeline must not leave the machine unlocked:
+            // lock with whatever the scene has.
+            self.phase = Phase::CommitReady;
+            forced_commit = !self.hold_expired;
+            self.hold_expired = true;
         }
         let should_commit = self.phase == Phase::CommitReady && !self.commit_emitted;
         if should_commit {
@@ -267,6 +291,16 @@ impl Timeline {
         } else if self.phase == Phase::Running && self.wallpaper_ready && elapsed < wallpaper_start
         {
             Some(wallpaper_start - elapsed)
+        } else if self.phase == Phase::Running
+            && let Some(deadline) = hold_deadline
+            && !self.wallpaper_ready
+        {
+            // Nothing else arms a wake while the commit is held.
+            Some(
+                deadline
+                    .saturating_sub(elapsed)
+                    .max(Duration::from_millis(1)),
+            )
         } else if self.phase == Phase::Running && !self.cancelable {
             // A transition commits on schedule whether or not the wallpaper
             // ever arrives: always wake for the commit.
@@ -293,6 +327,7 @@ impl Timeline {
                 wallpaper
             },
             should_commit,
+            forced_commit,
             next_frame,
         }
     }
@@ -652,8 +687,24 @@ mod tests {
         assert_eq!(held.wallpaper, 0.0);
         assert_eq!(held.next_frame, Some(Duration::from_millis(6_500)));
 
+        // Holding for an absent wallpaper is static too — but it is NOT
+        // wake-less: the hold cap is the only thing that will ever move
+        // this warning along, so it arms its own deadline. A `None` here
+        // is issue #56, not a quiet idle.
         timeline.set_wallpaper_ready(false, Duration::from_secs(2));
-        assert_eq!(timeline.sample(Duration::from_secs(2)).next_frame, None);
+        let held = timeline.sample(Duration::from_secs(2));
+        assert_eq!(held.next_frame, Some(Duration::from_millis(13_000)));
+        assert!(!held.should_commit);
+
+        // With the cap disabled the old wake-less hold is what the operator
+        // explicitly asked for.
+        let mut forever = Timeline::new(LockWarning {
+            wallpaper_hold_max_ms: 0,
+            ..config()
+        });
+        forever.start(Duration::ZERO);
+        forever.set_wallpaper_ready(false, Duration::ZERO);
+        assert_eq!(forever.sample(Duration::from_secs(2)).next_frame, None);
     }
 
     fn transition() -> LockWarning {
@@ -758,6 +809,118 @@ mod tests {
         assert!(end.done);
         assert_eq!(end.frost, 0.0);
         assert_eq!(end.next_frame, None);
+    }
+
+    #[test]
+    fn the_hold_cap_is_measured_from_the_scheduled_commit() {
+        // The claim under test: the cap starts at commit_at, NOT at t0.
+        // Without the boundary assertions below, a deadline measured from
+        // t0 (which would lock a 30 s warning 25 s early) still passes.
+        let mut timeline = Timeline::new(LockWarning {
+            duration_ms: 3_000,
+            wallpaper_in_ms: 1_500,
+            wallpaper_hold_max_ms: 5_000,
+            ..LockWarning::default()
+        });
+        timeline.start(Duration::ZERO);
+        timeline.set_wallpaper_ready(false, Duration::ZERO);
+        // commit_at = 3000, so the cap is due at exactly 8000.
+        let held = timeline.sample(Duration::from_millis(7_999));
+        assert!(!held.should_commit, "fired early");
+        assert!(!held.forced_commit);
+        assert_eq!(
+            held.next_frame,
+            Some(Duration::from_millis(1)),
+            "the cap must arm its own wake — nothing else does while held"
+        );
+        let forced = timeline.sample(Duration::from_millis(8_000));
+        assert!(forced.should_commit);
+        assert!(
+            forced.forced_commit,
+            "the caller must be able to journal it"
+        );
+        // Reported once only.
+        let mut after = Timeline::new(LockWarning {
+            duration_ms: 3_000,
+            wallpaper_in_ms: 1_500,
+            wallpaper_hold_max_ms: 5_000,
+            ..LockWarning::default()
+        });
+        after.start(Duration::ZERO);
+        after.set_wallpaper_ready(false, Duration::ZERO);
+        after.sample(Duration::from_millis(8_000));
+        assert!(!after.sample(Duration::from_millis(8_100)).forced_commit);
+    }
+
+    #[test]
+    fn a_fade_longer_than_its_warning_is_not_cut_short() {
+        // commit_at is max(duration, wallpaper_in), so a cap derived from
+        // duration alone fires during a perfectly healthy run.
+        let mut timeline = Timeline::new(LockWarning {
+            duration_ms: 2_000,
+            wallpaper_in_ms: 10_000,
+            wallpaper_hold_max_ms: 5_000,
+            ..LockWarning::default()
+        });
+        timeline.start(Duration::ZERO);
+        let healthy = timeline.sample(Duration::from_millis(7_000));
+        assert!(!healthy.should_commit, "cut a healthy fade short");
+        assert!(!healthy.forced_commit);
+        assert!(timeline.sample(Duration::from_millis(10_000)).should_commit);
+    }
+
+    #[test]
+    fn a_late_wallpaper_still_gets_its_full_fade() {
+        // ADR 0004: late assets extend the warning. Once one arrives the
+        // cap must stand down rather than truncate the fade.
+        let mut timeline = Timeline::new(LockWarning {
+            duration_ms: 3_000,
+            wallpaper_in_ms: 1_500,
+            wallpaper_hold_max_ms: 5_000,
+            ..LockWarning::default()
+        });
+        timeline.start(Duration::ZERO);
+        timeline.set_wallpaper_ready(false, Duration::ZERO);
+        timeline.set_wallpaper_ready(true, Duration::from_millis(7_500));
+        let past_naive_deadline = timeline.sample(Duration::from_millis(8_000));
+        assert!(!past_naive_deadline.should_commit);
+        assert!(
+            !past_naive_deadline.forced_commit,
+            "the wallpaper did arrive"
+        );
+        assert!(timeline.sample(Duration::from_millis(9_000)).should_commit);
+    }
+
+    #[test]
+    fn a_zero_cap_waits_forever_as_before() {
+        let mut timeline = Timeline::new(LockWarning {
+            duration_ms: 3_000,
+            wallpaper_hold_max_ms: 0,
+            ..LockWarning::default()
+        });
+        timeline.start(Duration::ZERO);
+        timeline.set_wallpaper_ready(false, Duration::ZERO);
+        let held = timeline.sample(Duration::from_secs(600));
+        assert!(!held.should_commit);
+        assert_eq!(held.next_frame, None);
+    }
+
+    #[test]
+    fn the_transition_ignores_the_hold_cap() {
+        // A non-cancelable transition never waits on the wallpaper, so the
+        // cap must never be what commits it.
+        let mut timeline = Timeline::new_transition(LockWarning {
+            duration_ms: 400,
+            frost_in_ms: 150,
+            wallpaper_in_ms: 250,
+            wallpaper_hold_max_ms: 5_000,
+            ..LockWarning::default()
+        });
+        timeline.start(Duration::ZERO);
+        timeline.set_wallpaper_ready(false, Duration::ZERO);
+        let commit = timeline.sample(Duration::from_millis(400));
+        assert!(commit.should_commit, "the transition commits on schedule");
+        assert!(!commit.forced_commit);
     }
 
     #[test]

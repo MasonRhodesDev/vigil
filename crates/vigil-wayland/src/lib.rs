@@ -375,6 +375,11 @@ impl<S: LockSession> App<S> {
                 }
                 FlowCmd::ReleaseSessionLock => self.send_unlock(),
                 FlowCmd::DestroyRevealOverlays => self.drop_overlays(SurfaceRole::is_reveal),
+                // Diagnostics belong to the loop, not the adapter: routed
+                // through the session it is silently dropped by every
+                // implementation that does not override flow_command —
+                // exactly the silence the variant exists to prevent.
+                FlowCmd::Journal(note) => eprintln!("vigil-lock: {note}"),
                 FlowCmd::Exit(outcome) => self.outcome = Some(outcome),
                 ref session_cmd => self.session.flow_command(session_cmd),
             }

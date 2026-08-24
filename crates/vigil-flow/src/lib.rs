@@ -138,12 +138,32 @@ pub enum FlowCmd {
     /// `unlock_and_destroy` + roundtrip.
     ReleaseSessionLock,
     DestroyRevealOverlays,
-    /// Note-worthy degradation the adapter should journal. Rare and
-    /// one-shot: a silent fallback is how these stay invisible.
-    Journal(&'static str),
+    /// A degradation worth journaling. Typed rather than prose: the
+    /// controller stays free of presentation policy, tests can assert
+    /// *which* degradation, and the note can carry its own numbers.
+    Journal(FlowNote),
     /// Terminal: the process should exit with this outcome after executing
     /// prior commands.
     Exit(LockOutcome),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowNote {
+    /// The wallpaper never arrived, so the warning locked with the scene
+    /// as-is this long after its scheduled commit.
+    WallpaperHoldExpired { after_ms: u64 },
+}
+
+impl std::fmt::Display for FlowNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WallpaperHoldExpired { after_ms } => write!(
+                f,
+                "wallpaper never became ready {after_ms} ms past the scheduled commit; \
+                 locking with the scene as-is"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,15 +192,10 @@ pub struct LockFlow {
     /// Last values pushed to overlays; commands are emitted only on change.
     progress: (f32, f32),
     elements: Vec<ElementSample>,
-    /// Elapsed time past which a cancelable warning stops waiting for the
-    /// wallpaper and commits anyway (issue #56). `None` disables the cap.
-    wallpaper_hold_deadline: Option<Duration>,
-    /// The cap has already fired; do not journal it twice.
-    wallpaper_hold_expired: bool,
-    /// Readiness as last reported by the adapter. The cap exists for a
-    /// wallpaper that never arrives, so it must never fire while one is
-    /// present — a long fade legitimately commits after the deadline.
-    wallpaper_ready: bool,
+    /// How long past its scheduled commit a held warning waits before
+    /// locking anyway; owned by `Timeline`, kept here only to label the
+    /// journal note it produces.
+    wallpaper_hold_max_ms: u64,
     /// App-clock time the reveal overlays were requested.
     reveal_entered: Option<Duration>,
     reveal_started: Option<Duration>,
@@ -206,20 +221,7 @@ impl LockFlow {
         }
         let transition = lock.transition.clone();
         let cancelable = warning.duration_ms > 0;
-        // Measured from the warning's scheduled commit, not from when the
-        // asset went missing: capping from the latter would cut a long
-        // warning short (issue #56). A held warning commits at
-        // `saturating(duration - wallpaper_in) + wallpaper_in`, i.e.
-        // max(duration, wallpaper_in) — deriving it from `duration` alone
-        // would fire the cap early whenever the fade is longer than the
-        // warning. Saturating throughout: a bad config must still lock.
-        let wallpaper_hold_deadline =
-            (cancelable && warning.wallpaper_hold_max_ms > 0).then(|| {
-                let scheduled_commit = warning.duration_ms.max(warning.wallpaper_in_ms);
-                now.elapsed.saturating_add(Duration::from_millis(
-                    scheduled_commit.saturating_add(warning.wallpaper_hold_max_ms),
-                ))
-            });
+        let warning_hold_max_ms = warning.wallpaper_hold_max_ms;
         let timeline = if cancelable {
             Some(Timeline::new(warning))
         } else if transition.ramps_in() {
@@ -242,9 +244,7 @@ impl LockFlow {
             grace: None,
             progress: (0.0, 0.0),
             elements: Vec::new(),
-            wallpaper_hold_deadline,
-            wallpaper_hold_expired: false,
-            wallpaper_ready: vigil_warning::WALLPAPER_READY_DEFAULT,
+            wallpaper_hold_max_ms: warning_hold_max_ms,
             reveal_entered: None,
             reveal_started: None,
             grace_forbidden: false,
@@ -300,7 +300,6 @@ impl LockFlow {
                 }
             }
             FlowEvent::WallpaperReady(ready) => {
-                self.wallpaper_ready = ready;
                 if let Some(timeline) = self.timeline.as_mut() {
                     timeline.set_wallpaper_ready(ready, now.elapsed);
                 }
@@ -410,29 +409,6 @@ impl LockFlow {
     fn advance(&mut self, now: Now, cmds: &mut Vec<FlowCmd>) {
         match self.phase {
             FlowPhase::PreLock | FlowPhase::Committing | FlowPhase::Locked => {
-                // A wedged asset pipeline must not leave the machine
-                // unlocked: past the cap the warning commits with whatever
-                // the scene has (issue #56). Done before sampling so the
-                // commit lands in this pass rather than a tick later.
-                let mut hold_wake = None;
-                let mut journal_forced_commit = false;
-                if self.phase == FlowPhase::PreLock
-                    && !self.wallpaper_ready
-                    && let Some(deadline) = self.wallpaper_hold_deadline
-                {
-                    if now.elapsed >= deadline {
-                        if !self.wallpaper_hold_expired {
-                            self.wallpaper_hold_expired = true;
-                            journal_forced_commit = true;
-                            if let Some(timeline) = self.timeline.as_mut() {
-                                timeline.request_commit();
-                            }
-                        }
-                    } else {
-                        // Nothing else arms a wake while the commit is held.
-                        hold_wake = Some(deadline - now.elapsed);
-                    }
-                }
                 let Some((sample, gui_wake, elements, gui_done)) =
                     self.timeline.as_mut().map(|timeline| {
                         (
@@ -463,13 +439,10 @@ impl LockFlow {
                     self.elements = elements.clone();
                     cmds.push(FlowCmd::OverlayElements(elements));
                 }
-                // Only once the sample confirms the ramp is still alive:
-                // input arriving in this same step cancels it, and claiming
-                // a degraded lock we did not take would be a lie in the log.
-                if journal_forced_commit && sample.phase != RampPhase::Cancelled {
-                    cmds.push(FlowCmd::Journal(
-                        "wallpaper never became ready; locking with the scene as-is",
-                    ));
+                if sample.forced_commit {
+                    cmds.push(FlowCmd::Journal(FlowNote::WallpaperHoldExpired {
+                        after_ms: self.wallpaper_hold_max_ms,
+                    }));
                 }
                 match sample.phase {
                     RampPhase::Cancelled => {
@@ -480,14 +453,6 @@ impl LockFlow {
                         cmds.push(FlowCmd::RequestSessionLock);
                     }
                     _ => {}
-                }
-                // Merged only after the match: a commit landing in this
-                // same pass (join socket, logind) leaves PreLock, and the
-                // hold deadline is meaningless once it has.
-                if self.phase == FlowPhase::PreLock
-                    && let Some(hold) = hold_wake
-                {
-                    self.wait = Some(self.wait.map_or(hold, |w| w.min(hold)));
                 }
                 if self.phase == FlowPhase::Locked && gui_done {
                     self.timeline = None;
@@ -881,6 +846,28 @@ mod tests {
             None,
             "the hold deadline is meaningless once committed"
         );
+    }
+
+    #[test]
+    fn the_warn_override_moves_the_cap_with_it() {
+        // --warn N rewrites duration_ms before the timeline is built, so
+        // the cap must follow it rather than the config's value.
+        let lock = Lock {
+            warning: LockWarning {
+                duration_ms: 3_000,
+                wallpaper_in_ms: 1_500,
+                wallpaper_hold_max_ms: 5_000,
+                ..warning_lock(3_000).warning
+            },
+            ..Lock::default()
+        };
+        let (mut flow, _) = LockFlow::new(at(0), &lock, Some(20_000));
+        flow.step(at(0), FlowEvent::WallpaperReady(false));
+        // The un-overridden deadline (8000) must not fire.
+        let cmds = flow.step(at(8_000), FlowEvent::Tick);
+        assert!(!has(&cmds, &FlowCmd::RequestSessionLock), "{cmds:?}");
+        let cmds = flow.step(at(25_000), FlowEvent::Tick);
+        assert!(has(&cmds, &FlowCmd::RequestSessionLock));
     }
 
     #[test]

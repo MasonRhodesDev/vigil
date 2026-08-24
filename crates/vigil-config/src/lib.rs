@@ -167,6 +167,29 @@ pub struct LockWarning {
     pub gui: WarningGui,
 }
 
+impl LockWarning {
+    /// Upper bound on [`Self::wallpaper_hold_max_ms`]. The knob exists to
+    /// bound how long the machine may sit unlocked waiting for an asset, so
+    /// leaving it unbounded reintroduces the very problem it fixes — a
+    /// fat-fingered value is indistinguishable in effect from "wait
+    /// forever" but gives no signal. `0` stays an explicit, documented
+    /// opt-out; anything else is clamped and logged, mirroring
+    /// [`LockTransition::clamp`].
+    pub const MAX_WALLPAPER_HOLD_MS: u64 = 30_000;
+
+    /// Clamp the wallpaper hold. Returns whether anything changed. Never an
+    /// error: a bad config must still lock.
+    pub fn clamp(&mut self) -> bool {
+        if self.wallpaper_hold_max_ms == 0
+            || self.wallpaper_hold_max_ms <= Self::MAX_WALLPAPER_HOLD_MS
+        {
+            return false;
+        }
+        self.wallpaper_hold_max_ms = Self::MAX_WALLPAPER_HOLD_MS;
+        true
+    }
+}
+
 impl Default for LockWarning {
     fn default() -> Self {
         Self {
@@ -605,6 +628,7 @@ frost_alpha = 0.4
 wallpaper_in_ms = 1200
 easing = "ease_in_out"
 cancel_on_motion_px = 9.5
+wallpaper_hold_max_ms = 2000
 
 [lock.warning.gui]
 start = "locked"
@@ -621,7 +645,14 @@ kind = "none"
         .unwrap();
         let warning = config.lock.warning;
         assert_eq!(warning.duration_ms, 10_000);
-        assert_eq!(warning.wallpaper_hold_max_ms, 5_000);
+        // Parsed from the fixture above, not the Default impl: a key
+        // whose TOML spelling drifts from the field must fail here.
+        assert_eq!(warning.wallpaper_hold_max_ms, 2_000);
+        assert_eq!(
+            parse("").unwrap().lock.warning.wallpaper_hold_max_ms,
+            5_000,
+            "the default still applies when the key is absent"
+        );
         assert_eq!(warning.easing, WarningEasing::EaseInOut);
         assert_eq!(warning.gui.element.len(), 1);
         assert_eq!(warning.gui.element[0].selector, "clock");
@@ -661,6 +692,29 @@ easing = "linear"
         assert_eq!(transition.out_ms(), 400);
         assert!(transition.ramps_in() && transition.reveals());
         assert_eq!(parse("").unwrap().lock.transition, transition);
+    }
+
+    #[test]
+    fn the_wallpaper_hold_is_clamped() {
+        // The knob exists to bound how long the machine sits unlocked, so
+        // leaving it unbounded reintroduces the problem it fixes.
+        let mut warning = LockWarning {
+            wallpaper_hold_max_ms: u64::MAX,
+            ..LockWarning::default()
+        };
+        assert!(warning.clamp());
+        assert_eq!(
+            warning.wallpaper_hold_max_ms,
+            LockWarning::MAX_WALLPAPER_HOLD_MS
+        );
+        // The documented opt-out survives, and a sane value is untouched.
+        let mut forever = LockWarning {
+            wallpaper_hold_max_ms: 0,
+            ..LockWarning::default()
+        };
+        assert!(!forever.clamp());
+        assert_eq!(forever.wallpaper_hold_max_ms, 0);
+        assert!(!LockWarning::default().clamp());
     }
 
     #[test]
