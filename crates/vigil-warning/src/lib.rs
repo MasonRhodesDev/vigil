@@ -42,6 +42,12 @@ pub const DEFAULT_SELECTORS: [&str; 5] = ["clock", "user_selector", "password", 
 /// elapsed time and are never delayed by the grid.
 pub const FRAME_INTERVAL_MS: u64 = 33;
 
+/// What a freshly constructed [`Timeline`] believes about wallpaper
+/// readiness. Adapters that report readiness edge-triggered must seed their
+/// cache from this, or the first genuine change is never reported and the
+/// commit is not held for a slow asset.
+pub const WALLPAPER_READY_DEFAULT: bool = true;
+
 /// Floor `elapsed` to the frame grid (value computation only).
 fn quantize(elapsed: Duration) -> Duration {
     Duration::from_millis(elapsed.as_millis() as u64 / FRAME_INTERVAL_MS * FRAME_INTERVAL_MS)
@@ -106,7 +112,7 @@ impl Timeline {
             commit_emitted: false,
             pointer: None,
             motion: 0.0,
-            wallpaper_ready: true,
+            wallpaper_ready: WALLPAPER_READY_DEFAULT,
             wallpaper_ready_at: None,
             cancelable,
         }

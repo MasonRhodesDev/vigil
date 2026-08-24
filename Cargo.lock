@@ -5040,6 +5040,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vigil-flow"
+version = "0.3.2"
+dependencies = [
+ "vigil-config",
+ "vigil-core",
+ "vigil-warning",
+]
+
+[[package]]
 name = "vigil-gl"
 version = "0.3.2"
 dependencies = [
@@ -5075,6 +5084,7 @@ dependencies = [
  "slint-idle-runtime",
  "vigil-config",
  "vigil-core",
+ "vigil-flow",
  "vigil-login",
  "vigil-pam",
  "vigil-theme",
@@ -5198,7 +5208,7 @@ dependencies = [
  "smithay-client-toolkit 0.21.1",
  "vigil-config",
  "vigil-core",
- "vigil-warning",
+ "vigil-flow",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
