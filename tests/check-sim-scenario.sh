@@ -20,6 +20,6 @@ jq -e '.mode == "Lock" and .warning_phase == null' \
     "$work/warning-commit.first.json" >/dev/null
 jq -e '.mode == "Login"' "$work/warning-cancel.first.json" >/dev/null
 jq -e '.mode == "Login"' "$work/warning-hotplug.first.json" >/dev/null
-jq -e '.mode == "Warning" and .warning_phase == "Running"' \
+jq -e '.mode == "Warning" and .warning_phase == "PreLock"' \
     "$work/tint-only.first.json" >/dev/null
 echo "vigil-sim scenario is deterministic"

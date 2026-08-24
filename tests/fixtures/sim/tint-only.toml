@@ -2,4 +2,4 @@ mode = "warning"
 at_ms = 3000
 commands = ["blur off"]
 expect_mode = "Warning"
-expect_phase = "Running"
+expect_phase = "PreLock"

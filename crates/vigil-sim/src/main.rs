@@ -18,10 +18,9 @@ use font8x8::{BASIC_FONTS, UnicodeFonts};
 use serde::Deserialize;
 use softbuffer::{Context, Surface};
 use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
+use vigil_flow::{FlowCmd, FlowEvent, FlowPhase, LockFlow, LockOutcome, Now};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
-use vigil_warning::Phase;
-use vigil_warning::Timeline;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -139,14 +138,21 @@ struct Simulator {
     started: Instant,
     last_tick: Instant,
     sim_now: Duration,
-    warning: Option<Timeline>,
+    /// The production lock controller, driven against fake capabilities.
+    /// The simulator owns no transition logic of its own (issue #43).
+    warning: Option<LockFlow>,
     paused: bool,
     blur_enabled: bool,
     desktop_sharp: Arc<Vec<u8>>,
     desktop_blurred: Arc<Vec<u8>>,
     lock_wallpaper: Arc<Vec<u8>>,
     warning_wait: Option<Duration>,
-    warning_phase: Option<Phase>,
+    warning_phase: Option<FlowPhase>,
+    /// Overlay compositing values as last reported by the controller.
+    warning_progress: (f32, f32),
+    warning_elements: Vec<vigil_flow::ElementSample>,
+    warning_panel: bool,
+    warning_power: bool,
     state_file: Option<std::path::PathBuf>,
     accept_warning_input: bool,
     warning_pointer_origin: Option<PhysicalPosition<f64>>,
@@ -241,6 +247,10 @@ impl Simulator {
             lock_wallpaper,
             warning_wait: None,
             warning_phase: None,
+            warning_progress: (0.0, 0.0),
+            warning_elements: Vec::new(),
+            warning_panel: false,
+            warning_power: false,
             state_file,
             accept_warning_input: false,
             warning_pointer_origin: None,
@@ -326,15 +336,22 @@ impl Simulator {
                 scene.set_sessions(&[]);
                 scene.show_info("SIMULATED WARNING — press any key to cancel");
                 scene.set_status_banner("Frost stage (simulated compositor blur)");
-                let config = vigil_config::LockWarning {
-                    duration_ms: 10_000,
+                let policy = vigil_config::Lock {
+                    warning: vigil_config::LockWarning {
+                        duration_ms: 10_000,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
-                let mut warning = Timeline::new(config);
-                warning.start(Duration::ZERO);
+                let (flow, boot) = LockFlow::new(Now::at(Duration::ZERO), &policy, None);
                 self.last_tick = Instant::now();
-                self.warning = Some(warning);
-                self.warning_phase = Some(Phase::Mapped);
+                self.warning = Some(flow);
+                self.warning_phase = self.warning.as_ref().map(LockFlow::phase);
+                self.warning_progress = (0.0, 0.0);
+                self.warning_elements = Vec::new();
+                self.warning_panel = false;
+                self.warning_power = false;
+                self.run_flow(boot);
                 self.accept_warning_input = false;
                 self.warning_pointer_origin = None;
                 self.warning_visual_key = None;
@@ -364,9 +381,10 @@ impl Simulator {
             && !self.paused
             && !self.drawer_open
             && self.accept_warning_input
-            && let Some(warning) = self.warning.as_mut()
+            && self.warning.is_some()
         {
-            warning.input(&event);
+            let cmds = self.step_flow(FlowEvent::Input(event.clone()));
+            self.run_flow(cmds);
         }
         if let Some(scene) = self.scene.as_mut() {
             scene.dispatch(event);
@@ -464,60 +482,104 @@ impl Simulator {
             self.sim_now += now.saturating_duration_since(self.last_tick);
         }
         self.last_tick = now;
-        let Some(timeline) = self.warning.as_mut() else {
+        if self.warning.is_none() {
             return;
-        };
-        let sample = timeline.sample(self.sim_now);
-        let elements = timeline.element_samples(self.sim_now);
+        }
+        // The controller decides; the simulator only renders and reacts.
+        let cmds = self.step_flow(FlowEvent::Tick);
+        self.run_flow(cmds);
+        if self.mode != Mode::Warning {
+            return;
+        }
         let visual_key = (self.sim_now.as_millis(), self.blur_enabled);
-        let visual_changed = self.warning_visual_key != Some(visual_key);
+        if self.warning_visual_key == Some(visual_key) {
+            return;
+        }
         self.warning_visual_key = Some(visual_key);
-        self.warning_phase = Some(sample.phase);
         self.write_state();
-        self.warning_wait = sample.next_frame;
-        if visual_changed && let Some(scene) = self.scene.as_mut() {
-            let panel_visible = elements.iter().any(|element| {
-                matches!(element.selector.as_str(), "user_selector" | "password")
-                    && element.progress > 0.001
-            });
-            let power_visible = elements
-                .iter()
-                .any(|element| element.selector == "power" && element.progress > 0.001);
-            scene.set_panel_visible(panel_visible);
-            scene.set_power_visible(power_visible);
-            let frost = if self.blur_enabled { sample.frost } else { 0.0 };
+        let (frost, wallpaper) = self.warning_progress;
+        let elements = self.warning_elements.clone();
+        let (panel, power) = (self.warning_panel, self.warning_power);
+        if let Some(scene) = self.scene.as_mut() {
+            scene.set_panel_visible(panel);
+            scene.set_power_visible(power);
             let frame = blend_warning_frame(
                 &self.desktop_sharp,
                 &self.desktop_blurred,
                 &self.lock_wallpaper,
-                frost,
-                sample.wallpaper,
+                if self.blur_enabled { frost } else { 0.0 },
+                wallpaper,
             );
             scene.set_background(frame, WIDTH, HEIGHT);
             // The production frost plane is supplied by the compositor. The
             // simulator models that plane in pixels, so disable the old tint
             // placeholder rather than stacking it over the preview.
             scene.set_warning_progress(0.0, 0.0);
-            for element in elements {
+            for element in &elements {
                 scene.set_warning_element(&element.selector, element.progress);
             }
             scene.set_status_banner(&format!(
                 "Warning {:.1}s · frost {:.0}% · wallpaper {:.0}%",
                 self.sim_now.as_secs_f32(),
-                sample.frost * 100.0,
-                sample.wallpaper * 100.0
+                frost * 100.0,
+                wallpaper * 100.0
             ));
         }
-        if visual_changed && let Some(window) = self.window.as_ref() {
+        if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
-        if sample.phase == Phase::Cancelled {
-            self.record("warning: cancelled");
-            self.select_mode(Mode::Login);
-            return;
-        }
-        if sample.should_commit {
-            self.select_mode(Mode::Lock);
+    }
+
+    /// Advance the controller with one event at the simulated clock.
+    fn step_flow(&mut self, event: FlowEvent) -> Vec<FlowCmd> {
+        let sim_now = self.sim_now;
+        let cmds = self
+            .warning
+            .as_mut()
+            .map(|flow| flow.step(Now::at(sim_now), event))
+            .unwrap_or_default();
+        self.warning_phase = self.warning.as_ref().map(LockFlow::phase);
+        cmds
+    }
+
+    /// Execute controller commands against the simulator's fakes. The
+    /// privileged ones are deliberately absent: `vigil-sim` links no PAM,
+    /// logind, or session-lock code, so there is nothing here that could
+    /// acquire a real lock (issue #43 acceptance).
+    fn run_flow(&mut self, cmds: Vec<FlowCmd>) {
+        for cmd in cmds {
+            match cmd {
+                FlowCmd::OverlayProgress { frost, wallpaper } => {
+                    self.warning_progress = (frost, wallpaper);
+                    self.warning_visual_key = None;
+                }
+                FlowCmd::OverlayElements(elements) => {
+                    self.warning_power = elements
+                        .iter()
+                        .any(|e| e.selector == "power" && e.progress > 0.001);
+                    self.warning_elements = elements;
+                    self.warning_visual_key = None;
+                }
+                FlowCmd::ShowPanel(visible) => {
+                    self.warning_panel = visible;
+                    self.warning_visual_key = None;
+                }
+                FlowCmd::Journal(note) => self.record(format!("flow: {note}")),
+                FlowCmd::RequestSessionLock => {
+                    // The fake compositor always grants, immediately.
+                    self.record("warning: committed");
+                    let cmds = self.step_flow(FlowEvent::LockConfirmed);
+                    self.select_mode(Mode::Lock);
+                    self.run_flow(cmds);
+                }
+                FlowCmd::Exit(LockOutcome::Cancelled) => {
+                    self.record("warning: cancelled");
+                    self.select_mode(Mode::Login);
+                }
+                // Auth, readiness, logind hints and the reveal have no
+                // meaning in a windowed preview with no session to lock.
+                _ => {}
+            }
         }
     }
 
@@ -554,23 +616,20 @@ impl Simulator {
             self.sim_now += Duration::from_secs(1);
             self.record("warning: advance 1s");
         } else if (442..474).contains(&y) {
-            if let Some(warning) = self.warning.as_mut() {
-                warning.request_commit();
-            }
+            let cmds = self.step_flow(FlowEvent::CommitRequested);
+            self.run_flow(cmds);
             self.trace.borrow_mut().push("warning: commit".into());
         } else if (484..516).contains(&y) {
-            if let Some(warning) = self.warning.as_mut() {
-                warning.input(&InputEvent::Key {
-                    keysym: 1,
-                    utf8: None,
-                    pressed: true,
-                });
-            }
+            let cmds = self.step_flow(FlowEvent::Input(InputEvent::Key {
+                keysym: 1,
+                utf8: None,
+                pressed: true,
+            }));
+            self.run_flow(cmds);
             self.trace.borrow_mut().push("warning: cancel".into());
         } else if (526..558).contains(&y) {
-            if let Some(warning) = self.warning.as_mut() {
-                warning.hotplug();
-            }
+            let cmds = self.step_flow(FlowEvent::OutputAdded);
+            self.run_flow(cmds);
             self.trace.borrow_mut().push("warning: hotplug".into());
         } else if (568..600).contains(&y) {
             self.blur_enabled = !self.blur_enabled;
@@ -628,25 +687,22 @@ impl Simulator {
                 self.record(format!("warning: advance {ms}ms (socket)"));
             }
             ControlCommand::Commit if self.mode == Mode::Warning => {
-                if let Some(warning) = self.warning.as_mut() {
-                    warning.request_commit();
-                }
+                let cmds = self.step_flow(FlowEvent::CommitRequested);
+                self.run_flow(cmds);
                 self.record("warning: commit (socket)");
             }
             ControlCommand::Cancel if self.mode == Mode::Warning => {
-                if let Some(warning) = self.warning.as_mut() {
-                    warning.input(&InputEvent::Key {
-                        keysym: 1,
-                        utf8: None,
-                        pressed: true,
-                    });
-                }
+                let cmds = self.step_flow(FlowEvent::Input(InputEvent::Key {
+                    keysym: 1,
+                    utf8: None,
+                    pressed: true,
+                }));
+                self.run_flow(cmds);
                 self.record("warning: cancel (socket)");
             }
             ControlCommand::Hotplug if self.mode == Mode::Warning => {
-                if let Some(warning) = self.warning.as_mut() {
-                    warning.hotplug();
-                }
+                let cmds = self.step_flow(FlowEvent::OutputAdded);
+                self.run_flow(cmds);
                 self.record("warning: hotplug (socket)");
             }
             ControlCommand::Blur(value) if self.mode == Mode::Warning => {
