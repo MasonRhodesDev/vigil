@@ -76,8 +76,17 @@ suite). Full triage is in the issue comments; the shape:
 
 - **MERGED 2026-08-23**: #53 (PR #54), #43 PR A (PR #55) and #56 (PR #57,
   the wallpaper hold is now bounded — a wedged asset renderer used to
-  leave the machine unlocked indefinitely). #58 open for #43 PR C
-  (vigil-sim drives the real controller), which unblocks #41/#42/#45.
+  leave the machine unlocked indefinitely). #43 PR C merged (#58: vigil-sim
+  drives the real controller) with its safety gate split out ahead of it
+  (#60: the gate was a denylist that passed with pam-client, vigil-auth
+  and vigil-login linked in). #43 has one unmet criterion — a shared
+  *login* controller — which should be struck, not built:
+  vigil-auth::AuthMachine already is it, and the greeter/locker flows do
+  not merge. #41/#42/#45 are unblocked.
+  Complex PRs are split into a stack now, with independent seams
+  extracted at the FIRST review round: #58 was only 314 insertions and
+  still drew 21 findings across three angles, and two rounds of my own
+  fixes introduced regressions caught only by the next round.
   Reviews are now three Agent-tool sub-agents in parallel with distinct
   angles, NOT `/code-review` — its orchestrator kept dying on account
   limits mid-run. On #57 that found ten real defects including a root
