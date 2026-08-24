@@ -52,7 +52,9 @@ pub const FRAME_INTERVAL_MS: u64 = 33;
 /// commit is not held for a slow asset.
 pub const WALLPAPER_READY_DEFAULT: bool = true;
 
-/// Floor `elapsed` to the frame grid (value computation only).
+/// Floor a duration to the frame grid. Private and never called directly
+/// from a ramp: the grid belongs to the timeline, and a ramp that derives
+/// its own picks a different origin — see [`Timeline::grid`].
 fn quantize(elapsed: Duration) -> Duration {
     Duration::from_millis(elapsed.as_millis() as u64 / FRAME_INTERVAL_MS * FRAME_INTERVAL_MS)
 }
@@ -237,6 +239,12 @@ impl Timeline {
         // inside one frame make any-rate sampling idempotent for consumers
         // that diff progress, while commits and holds stay punctual.
         let grid = quantize(elapsed);
+        debug_assert_eq!(
+            self.grid(now)
+                .map(|absolute| absolute.saturating_sub(start)),
+            Some(grid),
+            "the overlay grid and Timeline::grid disagree"
+        );
         let frost = graded(
             elapsed,
             grid,
@@ -356,7 +364,19 @@ impl Timeline {
         }
     }
 
+    /// The one frame grid for this timeline at `now`, in the same absolute
+    /// terms the caller passes in. Every ramp — overlay and GUI element —
+    /// must derive its value from this, or two ramps land on grids offset
+    /// by the timeline's start and the scene changes twice per frame
+    /// (issue #53's mechanism, one layer up).
+    fn grid(&self, now: Duration) -> Option<Duration> {
+        let start = self.start?;
+        Some(start + quantize(now.saturating_sub(start)))
+    }
+
     pub fn element_samples(&self, now: Duration) -> Vec<ElementSample> {
+        // Before the timeline starts there is no grid; nothing animates.
+        let grid = self.grid(now).unwrap_or(now);
         DEFAULT_SELECTORS
             .iter()
             .map(|selector| {
@@ -395,7 +415,7 @@ impl Timeline {
                         // multiply the per-frame scene updates.
                         graded(
                             now,
-                            quantize(now),
+                            grid,
                             start,
                             Duration::from_millis(duration_ms),
                             self.config.easing,
@@ -921,6 +941,52 @@ mod tests {
         let commit = timeline.sample(Duration::from_millis(400));
         assert!(commit.should_commit, "the transition commits on schedule");
         assert!(!commit.forced_commit);
+    }
+
+    #[test]
+    fn every_ramp_shares_one_grid_even_off_grid_and_with_gui_elements() {
+        // The overlay ramps quantize timeline-RELATIVE elapsed; the GUI
+        // element ramps quantized ABSOLUTE now. Whenever the timeline's
+        // start is not a multiple of the frame period — 32 times out of 33
+        // — those are two grids, and the scene changes at two phase offsets
+        // per frame. That is the storm issue #53 exists to stop, one layer
+        // up, and it survived the fix for the overlay ramps.
+        let mut config = LockWarning {
+            duration_ms: 2_000,
+            frost_in_ms: 1_500,
+            wallpaper_in_ms: 1_500,
+            ..LockWarning::default()
+        };
+        // A pre-lock keyframe, so element progress moves while the overlay
+        // ramps do. The shipped default starts at Locked, which is why this
+        // stayed invisible.
+        config.gui.start = WarningKeyframe::FrostStart;
+        config.gui.duration_ms = 2_000;
+        let start = Duration::from_millis(17); // deliberately off-grid
+        let mut timeline = Timeline::new(config);
+        timeline.start(start);
+
+        let mut changes = 0;
+        let mut last = None;
+        for ms in 0..1_000 {
+            let now = start + Duration::from_millis(ms);
+            let sample = timeline.sample(now);
+            let elements: Vec<u32> = timeline
+                .element_samples(now)
+                .iter()
+                .map(|e| e.progress.to_bits())
+                .collect();
+            let value = (sample.frost.to_bits(), sample.wallpaper.to_bits(), elements);
+            if last.as_ref() != Some(&value) {
+                changes += 1;
+                last = Some(value);
+            }
+        }
+        let frames = 1_000 / FRAME_INTERVAL_MS + 1;
+        assert!(
+            changes <= frames,
+            "{changes} scene changes over 1000 ms, expected at most {frames} —              the element grid is not the timeline's grid"
+        );
     }
 
     #[test]
