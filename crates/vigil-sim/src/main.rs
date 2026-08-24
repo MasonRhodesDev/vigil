@@ -372,7 +372,18 @@ impl Simulator {
                     grace_secs: 0,
                     ..Default::default()
                 };
-                let (flow, boot) = LockFlow::new(self.flow_now(), &policy, None);
+                // Origin zero, sampled at sim_now: building it at
+                // flow_now() would start the ramp *at* --at-ms N, so every
+                // keyframe rendered as t=0 and the seek did nothing.
+                let (flow, boot) = LockFlow::new(
+                    Now {
+                        elapsed: Duration::ZERO,
+                        mono: self.epoch_mono,
+                        wall: self.epoch_wall,
+                    },
+                    &policy,
+                    None,
+                );
                 self.last_tick = Instant::now();
                 self.warning = Some(flow);
                 self.warning_phase = self.warning.as_ref().map(LockFlow::phase);
@@ -664,13 +675,20 @@ impl Simulator {
             }
         }
         if let Some(mode) = pending_mode {
+            // The fake compositor grants immediately — stepped BEFORE
+            // select_mode, which drops the controller on the way out of
+            // Warning. Stepping after left the flow dead in Committing and
+            // ShowPanel(true) unexecuted, so `panel_visible` reported false
+            // while the Lock scene plainly showed the card.
+            let confirmed = if mode == Mode::Lock {
+                self.step_flow(FlowEvent::LockConfirmed)
+            } else {
+                Vec::new()
+            };
             self.select_mode(mode);
-            if mode == Mode::Lock {
-                // The fake compositor grants immediately. Bounded at one
-                // more batch: LockConfirmed never yields RequestSessionLock.
-                let confirmed = self.step_flow(FlowEvent::LockConfirmed);
-                self.run_flow(confirmed);
-            }
+            // Bounded at one more batch: LockConfirmed never yields
+            // RequestSessionLock.
+            self.run_flow(confirmed);
         }
     }
 
@@ -1231,6 +1249,11 @@ struct ScenarioFixture {
     commands: Vec<String>,
     expect_mode: Option<String>,
     expect_phase: Option<String>,
+    /// Pin the ramp itself. `expect_phase` collapses every pre-lock state
+    /// into "prelock", so without these a fixture passes identically at
+    /// 0 ms and 9999 ms — which is how a broken `at_ms` seek went unnoticed.
+    expect_frost: Option<f32>,
+    expect_wallpaper: Option<f32>,
 }
 
 #[derive(serde::Serialize)]
@@ -1238,6 +1261,11 @@ struct ScenarioResult {
     mode: String,
     warning_phase: Option<String>,
     time_ms: u128,
+    /// Overlay compositing values behind the frame. A phase label cannot
+    /// explain a frame-hash diff; these can.
+    frost: f32,
+    wallpaper: f32,
+    panel_visible: bool,
     frame_hash: String,
     trace: Vec<String>,
 }
@@ -1288,9 +1316,26 @@ fn run_scenario(platform: VigilPlatform, path: &std::path::Path) -> Result<(), S
     {
         return Err(format!("expected phase {expected:?}, got {phase:?}"));
     }
+    for (label, expected, actual) in [
+        ("frost", fixture.expect_frost, simulator.warning_progress.0),
+        (
+            "wallpaper",
+            fixture.expect_wallpaper,
+            simulator.warning_progress.1,
+        ),
+    ] {
+        if let Some(expected) = expected
+            && (expected - actual).abs() > 0.001
+        {
+            return Err(format!("expected {label} {expected:.3}, got {actual:.3}"));
+        }
+    }
     let result = ScenarioResult {
         mode,
         warning_phase: phase,
+        frost: simulator.warning_progress.0,
+        wallpaper: simulator.warning_progress.1,
+        panel_visible: simulator.warning_panel,
         time_ms: simulator.sim_now.as_millis(),
         frame_hash: frame_hash(&simulator.pixels),
         trace: simulator.trace.borrow().clone(),
