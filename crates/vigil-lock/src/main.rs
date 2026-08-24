@@ -972,6 +972,7 @@ impl LockSession for Locker {
                 }
             }
             FlowCmd::SignalReady => self.signal_locked(),
+            FlowCmd::Journal(note) => eprintln!("vigil-lock: {note}"),
             _ => {}
         }
     }

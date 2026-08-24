@@ -158,6 +158,12 @@ pub struct LockWarning {
     pub wallpaper_in_ms: u64,
     pub easing: WarningEasing,
     pub cancel_on_motion_px: f64,
+    /// How long past its scheduled commit a cancelable warning may be held
+    /// waiting for the wallpaper before it locks anyway (0 = wait forever,
+    /// the pre-0.4 behaviour). A wedged asset pipeline must not leave the
+    /// machine unlocked (issue #56); a lock with a plain background beats
+    /// an unlocked screen.
+    pub wallpaper_hold_max_ms: u64,
     pub gui: WarningGui,
 }
 
@@ -170,6 +176,7 @@ impl Default for LockWarning {
             wallpaper_in_ms: 1_500,
             easing: WarningEasing::EaseOut,
             cancel_on_motion_px: 8.0,
+            wallpaper_hold_max_ms: 5_000,
             gui: WarningGui::default(),
         }
     }
@@ -245,6 +252,9 @@ impl LockTransition {
             wallpaper_in_ms: self.wallpaper_in_ms,
             easing: self.easing,
             cancel_on_motion_px: f64::INFINITY,
+            // The transition never waits on the wallpaper, so a hold cap is
+            // meaningless for it.
+            wallpaper_hold_max_ms: 0,
             gui,
         }
     }
@@ -611,6 +621,7 @@ kind = "none"
         .unwrap();
         let warning = config.lock.warning;
         assert_eq!(warning.duration_ms, 10_000);
+        assert_eq!(warning.wallpaper_hold_max_ms, 5_000);
         assert_eq!(warning.easing, WarningEasing::EaseInOut);
         assert_eq!(warning.gui.element.len(), 1);
         assert_eq!(warning.gui.element[0].selector, "clock");

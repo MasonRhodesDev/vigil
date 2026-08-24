@@ -138,6 +138,9 @@ pub enum FlowCmd {
     /// `unlock_and_destroy` + roundtrip.
     ReleaseSessionLock,
     DestroyRevealOverlays,
+    /// Note-worthy degradation the adapter should journal. Rare and
+    /// one-shot: a silent fallback is how these stay invisible.
+    Journal(&'static str),
     /// Terminal: the process should exit with this outcome after executing
     /// prior commands.
     Exit(LockOutcome),
@@ -169,6 +172,11 @@ pub struct LockFlow {
     /// Last values pushed to overlays; commands are emitted only on change.
     progress: (f32, f32),
     elements: Vec<ElementSample>,
+    /// Elapsed time past which a cancelable warning stops waiting for the
+    /// wallpaper and commits anyway (issue #56). `None` disables the cap.
+    wallpaper_hold_deadline: Option<Duration>,
+    /// The cap has already fired; do not journal it twice.
+    wallpaper_hold_expired: bool,
     /// App-clock time the reveal overlays were requested.
     reveal_entered: Option<Duration>,
     reveal_started: Option<Duration>,
@@ -194,6 +202,11 @@ impl LockFlow {
         }
         let transition = lock.transition.clone();
         let cancelable = warning.duration_ms > 0;
+        // Measured from the warning's scheduled commit, not from when the
+        // asset went missing: capping from the latter would cut a long
+        // warning short (issue #56).
+        let wallpaper_hold_deadline = (cancelable && warning.wallpaper_hold_max_ms > 0)
+            .then(|| Duration::from_millis(warning.duration_ms + warning.wallpaper_hold_max_ms));
         let timeline = if cancelable {
             Some(Timeline::new(warning))
         } else if transition.ramps_in() {
@@ -216,6 +229,8 @@ impl LockFlow {
             grace: None,
             progress: (0.0, 0.0),
             elements: Vec::new(),
+            wallpaper_hold_deadline,
+            wallpaper_hold_expired: false,
             reveal_entered: None,
             reveal_started: None,
             grace_forbidden: false,
@@ -380,6 +395,29 @@ impl LockFlow {
     fn advance(&mut self, now: Now, cmds: &mut Vec<FlowCmd>) {
         match self.phase {
             FlowPhase::PreLock | FlowPhase::Committing | FlowPhase::Locked => {
+                // A wedged asset pipeline must not leave the machine
+                // unlocked: past the cap the warning commits with whatever
+                // the scene has (issue #56). Done before sampling so the
+                // commit lands in this pass rather than a tick later.
+                let mut hold_wake = None;
+                if self.phase == FlowPhase::PreLock
+                    && let Some(deadline) = self.wallpaper_hold_deadline
+                {
+                    if now.elapsed >= deadline {
+                        if !self.wallpaper_hold_expired {
+                            self.wallpaper_hold_expired = true;
+                            cmds.push(FlowCmd::Journal(
+                                "wallpaper never became ready; locking with the scene as-is",
+                            ));
+                            if let Some(timeline) = self.timeline.as_mut() {
+                                timeline.request_commit();
+                            }
+                        }
+                    } else {
+                        // Nothing else arms a wake while the commit is held.
+                        hold_wake = Some(deadline - now.elapsed);
+                    }
+                }
                 let Some((sample, gui_wake, elements, gui_done)) =
                     self.timeline.as_mut().map(|timeline| {
                         (
@@ -397,6 +435,9 @@ impl LockFlow {
                     (Some(left), Some(right)) => Some(left.min(right)),
                     (left, right) => left.or(right),
                 };
+                if let Some(hold) = hold_wake {
+                    self.wait = Some(self.wait.map_or(hold, |w| w.min(hold)));
+                }
                 let progress = (sample.frost, sample.wallpaper);
                 if self.progress != progress {
                     self.progress = progress;
@@ -668,6 +709,63 @@ mod tests {
         assert!(flow.next_wake().is_some(), "{cmds:?}");
         let cmds = flow.step(at(2_505 + 1_500), FlowEvent::Tick);
         assert!(has(&cmds, &FlowCmd::RequestSessionLock));
+    }
+
+    #[test]
+    fn a_wedged_wallpaper_still_locks_by_the_cap() {
+        // A renderer that never reports ready must not leave the machine
+        // unlocked (issue #56).
+        let lock = Lock {
+            warning: LockWarning {
+                duration_ms: 3_000,
+                wallpaper_hold_max_ms: 5_000,
+                ..warning_lock(3_000).warning
+            },
+            ..Lock::default()
+        };
+        let (mut flow, _) = LockFlow::new(at(0), &lock, None);
+        flow.step(at(0), FlowEvent::WallpaperReady(false));
+        // Past its scheduled commit, still held, still awake for the cap.
+        let cmds = flow.step(at(3_500), FlowEvent::Tick);
+        assert!(!has(&cmds, &FlowCmd::RequestSessionLock));
+        assert!(flow.next_wake().is_some(), "the cap must arm a wake");
+        assert_eq!(flow.phase(), FlowPhase::PreLock);
+        // At the cap it locks with whatever the scene has, and says so.
+        let cmds = flow.step(at(8_000), FlowEvent::Tick);
+        assert!(has(&cmds, &FlowCmd::RequestSessionLock), "{cmds:?}");
+        assert!(
+            cmds.iter().any(|cmd| matches!(cmd, FlowCmd::Journal(_))),
+            "the degradation must not be silent: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_ready_wallpaper_is_unaffected_by_the_cap() {
+        // The cap must never cut a healthy warning short.
+        let lock = warning_lock(3_000);
+        let (mut flow, _) = LockFlow::new(at(0), &lock, None);
+        let cmds = flow.step(at(2_999), FlowEvent::Tick);
+        assert!(!has(&cmds, &FlowCmd::RequestSessionLock));
+        let cmds = flow.step(at(3_000), FlowEvent::Tick);
+        assert!(has(&cmds, &FlowCmd::RequestSessionLock));
+        assert!(!cmds.iter().any(|cmd| matches!(cmd, FlowCmd::Journal(_))));
+    }
+
+    #[test]
+    fn a_zero_cap_waits_forever_as_before() {
+        let lock = Lock {
+            warning: LockWarning {
+                duration_ms: 3_000,
+                wallpaper_hold_max_ms: 0,
+                ..warning_lock(3_000).warning
+            },
+            ..Lock::default()
+        };
+        let (mut flow, _) = LockFlow::new(at(0), &lock, None);
+        flow.step(at(0), FlowEvent::WallpaperReady(false));
+        let cmds = flow.step(at(60_000), FlowEvent::Tick);
+        assert!(!has(&cmds, &FlowCmd::RequestSessionLock));
+        assert_eq!(flow.phase(), FlowPhase::PreLock);
     }
 
     #[test]
