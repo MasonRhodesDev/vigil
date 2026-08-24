@@ -747,7 +747,6 @@ impl<S: LockSession> App<S> {
                 },
             );
         }
-        let render_elapsed = render_started.elapsed();
         if !drew && !force {
             self.present_retry.remove(&id);
             return;
@@ -774,6 +773,9 @@ impl<S: LockSession> App<S> {
                 pixel[3] = (alpha * 255.0).round() as u8;
             }
         }
+        // Captured after the overlay blend: the full-buffer premultiply is
+        // the cost this diagnostic exists to surface on slow compositors.
+        let render_elapsed = render_started.elapsed();
         if drew {
             self.metrics.record_render();
         }

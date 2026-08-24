@@ -47,14 +47,27 @@ fn quantize(elapsed: Duration) -> Duration {
     Duration::from_millis(elapsed.as_millis() as u64 / FRAME_INTERVAL_MS * FRAME_INTERVAL_MS)
 }
 
-/// Eased ramp progress on the frame grid. Completion is judged on real
-/// time, so the terminal value is exact even when the deadline is off-grid
-/// (a floored grid alone would leave 0.99-style values at completion).
-fn graded(raw: Duration, duration: Duration, easing: WarningEasing) -> f32 {
-    if raw >= duration {
+/// Eased ramp progress for a ramp starting at `start`, sampled on the
+/// timeline's single frame grid: `now` is the real clock (completion is
+/// judged on it, so the terminal value is exact even when the deadline is
+/// off-grid) and `grid` is `quantize(now)` for the *whole* timeline.
+///
+/// Every ramp must share one grid. Flooring each ramp's own relative
+/// elapsed instead gives each a grid anchored at its own start, and two
+/// overlapping ramps then change value at two different phase offsets
+/// inside the same frame — two scene updates and two commits per frame,
+/// which is the storm issue #53 exists to stop.
+fn graded(
+    now: Duration,
+    grid: Duration,
+    start: Duration,
+    duration: Duration,
+    easing: WarningEasing,
+) -> f32 {
+    if now.saturating_sub(start) >= duration {
         1.0
     } else {
-        ease(ratio(quantize(raw), duration), easing)
+        ease(ratio(grid.saturating_sub(start), duration), easing)
     }
 }
 
@@ -208,10 +221,19 @@ impl Timeline {
         // Values on the frame grid, phases on real time: identical values
         // inside one frame make any-rate sampling idempotent for consumers
         // that diff progress, while commits and holds stay punctual.
-        let frost = graded(elapsed, frost_duration, self.config.easing);
+        let grid = quantize(elapsed);
+        let frost = graded(
+            elapsed,
+            grid,
+            Duration::ZERO,
+            frost_duration,
+            self.config.easing,
+        );
         let wallpaper = if self.wallpaper_ready {
             graded(
-                elapsed.saturating_sub(wallpaper_start),
+                elapsed,
+                grid,
+                wallpaper_start,
                 wallpaper_duration,
                 self.config.easing,
             )
@@ -327,8 +349,13 @@ impl Timeline {
                     } else if kind == WarningAnimation::None || duration_ms == 0 {
                         1.0
                     } else {
+                        // Same single grid: per-selector `offset_ms` would
+                        // otherwise give each element its own phase and
+                        // multiply the per-frame scene updates.
                         graded(
-                            now.saturating_sub(start),
+                            now,
+                            quantize(now),
+                            start,
                             Duration::from_millis(duration_ms),
                             self.config.easing,
                         )
@@ -423,10 +450,20 @@ impl Reveal {
             };
         };
         let elapsed = now.saturating_sub(start);
-        let wallpaper = 1.0 - graded(elapsed, self.wallpaper_out, self.easing);
+        let grid = quantize(elapsed);
+        let wallpaper = 1.0
+            - graded(
+                elapsed,
+                grid,
+                Duration::ZERO,
+                self.wallpaper_out,
+                self.easing,
+            );
         let frost = 1.0
             - graded(
-                elapsed.saturating_sub(self.wallpaper_out),
+                elapsed,
+                grid,
+                self.wallpaper_out,
                 self.frost_out,
                 self.easing,
             );
@@ -707,8 +744,9 @@ mod tests {
         );
         let frost = reveal.sample(Duration::from_millis(1_000 + 10 * FRAME_INTERVAL_MS));
         assert_eq!(frost.wallpaper, 0.0);
-        // Relative elapsed 80 ms floors to the 66 ms grid line.
-        assert!((frost.frost - (1.0 - 66.0 / 150.0)).abs() < 1e-6);
+        // One grid for the whole fade: at the on-grid sample 330 ms the
+        // frost half has run 330-250 = 80 ms exactly.
+        assert!((frost.frost - (1.0 - 80.0 / 150.0)).abs() < 1e-6);
         assert!(!frost.done);
         let end = reveal.sample(Duration::from_millis(1_400));
         assert!(end.done);
@@ -740,6 +778,38 @@ mod tests {
         let mut timeline = Timeline::new_transition(transition());
         timeline.start(Duration::ZERO);
         assert!(timeline.sample(Duration::from_millis(400)).should_commit);
+    }
+
+    #[test]
+    fn overlapping_ramps_share_one_frame_grid() {
+        // frost_in + wallpaper_in > duration makes both ramps animate at
+        // once. Each ramp flooring its own relative elapsed would put their
+        // value changes at two phase offsets per frame — two scene updates
+        // and two commits, the storm issue #53 exists to stop.
+        let mut timeline = Timeline::new(LockWarning {
+            duration_ms: 2_000,
+            frost_in_ms: 1_500,
+            wallpaper_in_ms: 1_500,
+            ..LockWarning::default()
+        });
+        timeline.start(Duration::ZERO);
+        let mut changes = 0;
+        let mut last = None;
+        // Walk the overlap window (wallpaper_start = 500) one ms at a time.
+        for ms in 500..1_500 {
+            let sample = timeline.sample(Duration::from_millis(ms));
+            let value = (sample.frost, sample.wallpaper);
+            if last != Some(value) {
+                changes += 1;
+                last = Some(value);
+            }
+        }
+        // 1000 ms at one change per 33 ms frame, inclusive of the first.
+        let frames = 1_000 / FRAME_INTERVAL_MS + 1;
+        assert!(
+            changes <= frames,
+            "{changes} value changes over the overlap, expected at most {frames}"
+        );
     }
 
     #[test]
