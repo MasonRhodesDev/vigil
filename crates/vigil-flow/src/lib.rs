@@ -450,9 +450,7 @@ impl LockFlow {
                     (Some(left), Some(right)) => Some(left.min(right)),
                     (left, right) => left.or(right),
                 };
-                if let Some(hold) = hold_wake {
-                    self.wait = Some(self.wait.map_or(hold, |w| w.min(hold)));
-                }
+
                 let progress = (sample.frost, sample.wallpaper);
                 if self.progress != progress {
                     self.progress = progress;
@@ -482,6 +480,14 @@ impl LockFlow {
                         cmds.push(FlowCmd::RequestSessionLock);
                     }
                     _ => {}
+                }
+                // Merged only after the match: a commit landing in this
+                // same pass (join socket, logind) leaves PreLock, and the
+                // hold deadline is meaningless once it has.
+                if self.phase == FlowPhase::PreLock
+                    && let Some(hold) = hold_wake
+                {
+                    self.wait = Some(self.wait.map_or(hold, |w| w.min(hold)));
                 }
                 if self.phase == FlowPhase::Locked && gui_done {
                     self.timeline = None;
@@ -836,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn an_absurd_config_still_locks_rather_than_overflowing() {
+    fn an_absurd_config_neither_panics_nor_instant_commits() {
         let lock = Lock {
             warning: LockWarning {
                 duration_ms: u64::MAX,
@@ -847,10 +853,34 @@ mod tests {
         };
         let (mut flow, _) = LockFlow::new(at(0), &lock, None);
         flow.step(at(0), FlowEvent::WallpaperReady(false));
-        // Must not panic in debug nor wrap to a near-zero deadline in
-        // release and force-commit every warning instantly.
+        // Must not panic in debug, nor wrap to a near-zero deadline in
+        // release and force-commit instantly. A u64::MAX warning is
+        // effectively infinite, so not committing is the correct outcome —
+        // the operator asked for that.
         let cmds = flow.step(at(10_000), FlowEvent::Tick);
         assert!(!has(&cmds, &FlowCmd::RequestSessionLock), "{cmds:?}");
+    }
+
+    #[test]
+    fn an_early_commit_disarms_the_hold_wake() {
+        let lock = Lock {
+            warning: LockWarning {
+                duration_ms: 10_000,
+                wallpaper_hold_max_ms: 5_000,
+                ..warning_lock(10_000).warning
+            },
+            ..Lock::default()
+        };
+        let (mut flow, _) = LockFlow::new(at(0), &lock, None);
+        flow.step(at(0), FlowEvent::WallpaperReady(false));
+        let cmds = flow.step(at(5_000), FlowEvent::CommitRequested);
+        assert!(has(&cmds, &FlowCmd::RequestSessionLock));
+        assert_eq!(flow.phase(), FlowPhase::Committing);
+        assert_eq!(
+            flow.next_wake(),
+            None,
+            "the hold deadline is meaningless once committed"
+        );
     }
 
     #[test]
