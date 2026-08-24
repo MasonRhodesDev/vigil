@@ -497,11 +497,12 @@ Runtime deps of the vigil binary: libseat, libinput, libxkbcommon
 
 The same product, second surface: a screen locker that renders the same
 `theme.slint` and drives the same contract — so login and lock are one
-visual identity. The two do **not** share an authentication path: the
-greeter talks to greetd, the locker talks to PAM directly, and each has
-its own controller in `vigil-flow` (`GreetFlow`, `LockFlow`, issues #61 and
-#43). `AuthUi` remains the greeter's UI fan-out seam, not a shared auth
-seam. Each binary is
+visual identity. `AuthUi` remains the shared **UI fan-out** seam —
+`vigil-ui` implements it and both binaries drive it (see §12's wiring
+below). What they do not share is the authentication path or the stage
+controller: the greeter talks to greetd, the locker talks to PAM
+directly, and each has its own controller in `vigil-flow` (`GreetFlow`,
+`LockFlow`, issues #61 and #43). Each binary is
 independently usable (the locker runs under any ext-session-lock compositor
 regardless of which greeter logged you in; the greeter needs no locker), but
 the intended UX is the pair.

@@ -256,6 +256,13 @@ impl GreetFlow {
             Some(user) => flow.create_session(now, user, &mut cmds),
             None => flow.prompt_username(&mut cmds),
         }
+        // Prime `wait`, as LockFlow::new does: the autologin path arms a
+        // deadline here, and an adapter that sleeps until next_wake() would
+        // otherwise arm no timer, never send a Tick, and never recompute —
+        // wedging on the very hang REQUEST_TIMEOUT exists to prevent.
+        flow.wait = flow
+            .deadline
+            .map(|deadline| deadline.saturating_sub(now.elapsed));
         (flow, cmds)
     }
 
@@ -899,6 +906,21 @@ mod tests {
         let (mut flow, _) = GreetFlow::new(at(0), config());
         // At the username stage greetd has not been contacted.
         assert!(flow.step(at(0), ok()).is_empty());
+    }
+
+    #[test]
+    fn construction_arms_a_wake_for_an_autologin_request() {
+        // The fixed-user path issues create_session from new(), so a
+        // consumer that arms its timer from next_wake() must get one
+        // before the first step — otherwise no Tick ever arrives.
+        let (flow, _) = GreetFlow::new(at(0), kiosk());
+        assert!(
+            flow.next_wake().is_some(),
+            "no deadline armed at construction"
+        );
+        // The username stage contacts nobody, so nothing to wait for.
+        let (flow, _) = GreetFlow::new(at(0), config());
+        assert!(flow.next_wake().is_none());
     }
 
     #[test]
