@@ -18,7 +18,7 @@ use font8x8::{BASIC_FONTS, UnicodeFonts};
 use serde::Deserialize;
 use softbuffer::{Context, Surface};
 use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
-use vigil_flow::{FlowCmd, FlowEvent, FlowPhase, LockFlow, LockOutcome, Now};
+use vigil_flow::{FlowCmd, FlowEvent, FlowPhase, LockFlow, Now};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
 use winit::application::ApplicationHandler;
@@ -341,6 +341,12 @@ impl Simulator {
                         duration_ms: 10_000,
                         ..Default::default()
                     },
+                    // Grace is the one controller feature keyed to the real
+                    // monotonic and wall clocks rather than the simulated
+                    // one; leaving it on would make scenario runs
+                    // wall-clock dependent and flake the byte-comparison in
+                    // check-sim-scenario.sh.
+                    grace_secs: 0,
                     ..Default::default()
                 };
                 let (flow, boot) = LockFlow::new(Now::at(Duration::ZERO), &policy, None);
@@ -377,14 +383,19 @@ impl Simulator {
 
     fn dispatch(&mut self, event: InputEvent) {
         self.trace.borrow_mut().push(format!("input: {event:?}"));
+        // While the controller is live it decides what reaches the UI:
+        // input it consumes (a cancelling keypress) comes back as nothing,
+        // input it does not comes back as FlowCmd::DispatchInput. Dispatching
+        // unconditionally as well is the double-dispatch production avoids.
         if self.mode == Mode::Warning
             && !self.paused
             && !self.drawer_open
             && self.accept_warning_input
             && self.warning.is_some()
         {
-            let cmds = self.step_flow(FlowEvent::Input(event.clone()));
+            let cmds = self.step_flow(FlowEvent::Input(event));
             self.run_flow(cmds);
+            return;
         }
         if let Some(scene) = self.scene.as_mut() {
             scene.dispatch(event);
@@ -572,13 +583,40 @@ impl Simulator {
                     self.select_mode(Mode::Lock);
                     self.run_flow(cmds);
                 }
-                FlowCmd::Exit(LockOutcome::Cancelled) => {
-                    self.record("warning: cancelled");
+                FlowCmd::Exit(outcome) => {
+                    // Every terminal outcome returns the preview to Login.
+                    // Denied/Invalidated are unreachable until the fake
+                    // compositor can refuse (see the note on
+                    // RequestSessionLock), but dropping them silently is
+                    // how a controller change goes unnoticed here.
+                    self.record(format!("flow: exit {outcome:?}"));
                     self.select_mode(Mode::Login);
                 }
-                // Auth, readiness, logind hints and the reveal have no
-                // meaning in a windowed preview with no session to lock.
-                _ => {}
+                FlowCmd::DispatchInput(event) => {
+                    // Input the controller did NOT consume. Anything it did
+                    // consume (a cancelling keypress) must not also reach
+                    // the UI — that is the double-dispatch production
+                    // avoids.
+                    if let Some(scene) = self.scene.as_mut() {
+                        scene.dispatch(event);
+                    }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                // Deliberately inert: vigil-sim links no PAM, logind or
+                // session-lock code, so these have nothing to act on. Listed
+                // rather than caught by `_` so a NEW privileged command
+                // fails to compile here and a human decides, instead of
+                // being silently swallowed into a green scenario baseline.
+                FlowCmd::StartAuth
+                | FlowCmd::ShowAuthError(_)
+                | FlowCmd::DetachAuth
+                | FlowCmd::SetLockedHint(_)
+                | FlowCmd::SignalReady
+                | FlowCmd::CreateRevealOverlays
+                | FlowCmd::ReleaseSessionLock
+                | FlowCmd::DestroyRevealOverlays => {}
             }
         }
     }
