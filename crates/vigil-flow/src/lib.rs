@@ -15,6 +15,9 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
+pub mod greet;
+pub use greet::{GreetCmd, GreetEvent, GreetFlow, GreetPhase, GreetdReply, SessionChoice};
+
 use vigil_config::{Lock, LockTransition};
 use vigil_core::InputEvent;
 pub use vigil_warning::{ElementSample, WALLPAPER_READY_DEFAULT};
