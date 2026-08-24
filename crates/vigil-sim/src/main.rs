@@ -18,10 +18,9 @@ use font8x8::{BASIC_FONTS, UnicodeFonts};
 use serde::Deserialize;
 use softbuffer::{Context, Surface};
 use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
+use vigil_flow::{FlowCmd, FlowEvent, FlowPhase, LockFlow, Now};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
-use vigil_warning::Phase;
-use vigil_warning::Timeline;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -139,14 +138,25 @@ struct Simulator {
     started: Instant,
     last_tick: Instant,
     sim_now: Duration,
-    warning: Option<Timeline>,
+    /// The production lock controller, driven against fake capabilities.
+    /// The simulator owns no transition logic of its own (issue #43).
+    warning: Option<LockFlow>,
     paused: bool,
     blur_enabled: bool,
     desktop_sharp: Arc<Vec<u8>>,
     desktop_blurred: Arc<Vec<u8>>,
     lock_wallpaper: Arc<Vec<u8>>,
     warning_wait: Option<Duration>,
-    warning_phase: Option<Phase>,
+    /// Fixed origins so the controller's monotonic and wall clocks are
+    /// derived from the simulated clock rather than read live.
+    epoch_mono: Instant,
+    epoch_wall: std::time::SystemTime,
+    warning_phase: Option<FlowPhase>,
+    /// Overlay compositing values as last reported by the controller.
+    warning_progress: (f32, f32),
+    warning_elements: Vec<vigil_flow::ElementSample>,
+    warning_panel: bool,
+    warning_power: bool,
     state_file: Option<std::path::PathBuf>,
     accept_warning_input: bool,
     warning_pointer_origin: Option<PhysicalPosition<f64>>,
@@ -240,7 +250,13 @@ impl Simulator {
             desktop_blurred,
             lock_wallpaper,
             warning_wait: None,
+            epoch_mono: Instant::now(),
+            epoch_wall: std::time::SystemTime::now(),
             warning_phase: None,
+            warning_progress: (0.0, 0.0),
+            warning_elements: Vec::new(),
+            warning_panel: false,
+            warning_power: false,
             state_file,
             accept_warning_input: false,
             warning_pointer_origin: None,
@@ -258,16 +274,33 @@ impl Simulator {
         self.write_state();
     }
 
+    /// Stable, machine-readable phase labels. `{phase:?}` on a tuple
+    /// variant yields `Done(Cancelled)`, and fixtures compare this string
+    /// exactly — parenthesised Debug output is a poor contract.
+    fn phase_label(phase: FlowPhase) -> String {
+        match phase {
+            FlowPhase::PreLock => "prelock".into(),
+            FlowPhase::Committing => "committing".into(),
+            FlowPhase::Locked => "locked".into(),
+            FlowPhase::RevealPending => "reveal_pending".into(),
+            FlowPhase::Revealing => "revealing".into(),
+            FlowPhase::Done(outcome) => format!("done:{}", format!("{outcome:?}").to_lowercase()),
+        }
+    }
+
     fn write_state(&self) {
         let Some(path) = self.state_file.as_ref() else {
             return;
         };
-        let phase = self.warning_phase.map(|phase| format!("{phase:?}"));
+        let phase = self.warning_phase.map(Self::phase_label);
         let body = format!(
-            "{{\n  \"mode\": \"{:?}\",\n  \"warning_phase\": {},\n  \"time_ms\": {},\n  \"paused\": {},\n  \"blur_enabled\": {},\n  \"drawer_open\": {}\n}}\n",
+            "{{\n  \"mode\": \"{:?}\",\n  \"warning_phase\": {},\n  \"time_ms\": {},\n  \"frost\": {:.4},\n  \"wallpaper\": {:.4},\n  \"panel_visible\": {},\n  \"paused\": {},\n  \"blur_enabled\": {},\n  \"drawer_open\": {}\n}}\n",
             self.mode,
             phase.map_or_else(|| "null".into(), |value| format!("\"{value}\"")),
             self.sim_now.as_millis(),
+            self.warning_progress.0,
+            self.warning_progress.1,
+            self.warning_panel,
             self.paused,
             self.blur_enabled,
             self.drawer_open
@@ -326,15 +359,39 @@ impl Simulator {
                 scene.set_sessions(&[]);
                 scene.show_info("SIMULATED WARNING — press any key to cancel");
                 scene.set_status_banner("Frost stage (simulated compositor blur)");
-                let config = vigil_config::LockWarning {
-                    duration_ms: 10_000,
+                let policy = vigil_config::Lock {
+                    warning: vigil_config::LockWarning {
+                        duration_ms: 10_000,
+                        ..Default::default()
+                    },
+                    // Grace is the one controller feature keyed to the real
+                    // monotonic and wall clocks rather than the simulated
+                    // one; leaving it on would make scenario runs
+                    // wall-clock dependent and flake the byte-comparison in
+                    // check-sim-scenario.sh.
+                    grace_secs: 0,
                     ..Default::default()
                 };
-                let mut warning = Timeline::new(config);
-                warning.start(Duration::ZERO);
+                // Origin zero, sampled at sim_now: building it at
+                // flow_now() would start the ramp *at* --at-ms N, so every
+                // keyframe rendered as t=0 and the seek did nothing.
+                let (flow, boot) = LockFlow::new(
+                    Now {
+                        elapsed: Duration::ZERO,
+                        mono: self.epoch_mono,
+                        wall: self.epoch_wall,
+                    },
+                    &policy,
+                    None,
+                );
                 self.last_tick = Instant::now();
-                self.warning = Some(warning);
-                self.warning_phase = Some(Phase::Mapped);
+                self.warning = Some(flow);
+                self.warning_phase = self.warning.as_ref().map(LockFlow::phase);
+                self.warning_progress = (0.0, 0.0);
+                self.warning_elements = Vec::new();
+                self.warning_panel = false;
+                self.warning_power = false;
+                self.run_flow(boot);
                 self.accept_warning_input = false;
                 self.warning_pointer_origin = None;
                 self.warning_visual_key = None;
@@ -360,13 +417,19 @@ impl Simulator {
 
     fn dispatch(&mut self, event: InputEvent) {
         self.trace.borrow_mut().push(format!("input: {event:?}"));
+        // While the controller is live it decides what reaches the UI:
+        // input it consumes (a cancelling keypress) comes back as nothing,
+        // input it does not comes back as FlowCmd::DispatchInput. Dispatching
+        // unconditionally as well is the double-dispatch production avoids.
         if self.mode == Mode::Warning
             && !self.paused
             && !self.drawer_open
             && self.accept_warning_input
-            && let Some(warning) = self.warning.as_mut()
+            && self.warning.is_some()
         {
-            warning.input(&event);
+            let cmds = self.step_flow(FlowEvent::Input(event));
+            self.run_flow(cmds);
+            return;
         }
         if let Some(scene) = self.scene.as_mut() {
             scene.dispatch(event);
@@ -464,60 +527,168 @@ impl Simulator {
             self.sim_now += now.saturating_duration_since(self.last_tick);
         }
         self.last_tick = now;
-        let Some(timeline) = self.warning.as_mut() else {
+        if self.warning.is_none() {
             return;
-        };
-        let sample = timeline.sample(self.sim_now);
-        let elements = timeline.element_samples(self.sim_now);
-        let visual_key = (self.sim_now.as_millis(), self.blur_enabled);
-        let visual_changed = self.warning_visual_key != Some(visual_key);
-        self.warning_visual_key = Some(visual_key);
-        self.warning_phase = Some(sample.phase);
+        }
+        // The controller decides; the simulator only renders and reacts.
+        let cmds = self.step_flow(FlowEvent::Tick);
+        self.run_flow(cmds);
+        // Written before the render short-circuit: the state file is a
+        // machine surface and must not depend on a *visual* key.
         self.write_state();
-        self.warning_wait = sample.next_frame;
-        if visual_changed && let Some(scene) = self.scene.as_mut() {
-            let panel_visible = elements.iter().any(|element| {
-                matches!(element.selector.as_str(), "user_selector" | "password")
-                    && element.progress > 0.001
-            });
-            let power_visible = elements
-                .iter()
-                .any(|element| element.selector == "power" && element.progress > 0.001);
-            scene.set_panel_visible(panel_visible);
-            scene.set_power_visible(power_visible);
-            let frost = if self.blur_enabled { sample.frost } else { 0.0 };
+        if self.mode != Mode::Warning {
+            return;
+        }
+        let visual_key = (self.sim_now.as_millis(), self.blur_enabled);
+        if self.warning_visual_key == Some(visual_key) {
+            return;
+        }
+        self.warning_visual_key = Some(visual_key);
+        let (frost, wallpaper) = self.warning_progress;
+        let elements = self.warning_elements.clone();
+        let (panel, power) = (self.warning_panel, self.warning_power);
+        if let Some(scene) = self.scene.as_mut() {
+            scene.set_panel_visible(panel);
+            scene.set_power_visible(power);
             let frame = blend_warning_frame(
                 &self.desktop_sharp,
                 &self.desktop_blurred,
                 &self.lock_wallpaper,
-                frost,
-                sample.wallpaper,
+                if self.blur_enabled { frost } else { 0.0 },
+                wallpaper,
             );
             scene.set_background(frame, WIDTH, HEIGHT);
             // The production frost plane is supplied by the compositor. The
             // simulator models that plane in pixels, so disable the old tint
             // placeholder rather than stacking it over the preview.
             scene.set_warning_progress(0.0, 0.0);
-            for element in elements {
+            for element in &elements {
                 scene.set_warning_element(&element.selector, element.progress);
             }
             scene.set_status_banner(&format!(
                 "Warning {:.1}s · frost {:.0}% · wallpaper {:.0}%",
                 self.sim_now.as_secs_f32(),
-                sample.frost * 100.0,
-                sample.wallpaper * 100.0
+                frost * 100.0,
+                wallpaper * 100.0
             ));
         }
-        if visual_changed && let Some(window) = self.window.as_ref() {
+        if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
-        if sample.phase == Phase::Cancelled {
-            self.record("warning: cancelled");
-            self.select_mode(Mode::Login);
-            return;
+    }
+
+    /// Advance the controller with one event at the simulated clock.
+    fn step_flow(&mut self, event: FlowEvent) -> Vec<FlowCmd> {
+        let now = self.flow_now();
+        let cmds = self
+            .warning
+            .as_mut()
+            .map(|flow| flow.step(now, event))
+            .unwrap_or_default();
+        self.warning_phase = self.warning.as_ref().map(LockFlow::phase);
+        // The controller owns the frame schedule; without this the sim is
+        // paced by whatever incidental events the host compositor happens
+        // to deliver.
+        self.warning_wait = self.warning.as_ref().and_then(LockFlow::next_wake);
+        cmds
+    }
+
+    /// All three of the controller's clocks derived from the simulated one.
+    /// `Now::at` fills `mono`/`wall` from the real clocks, which would make
+    /// anything keyed to them (the grace window) nondeterministic in a
+    /// scenario run that byte-compares two passes.
+    fn flow_now(&self) -> Now {
+        Now {
+            elapsed: self.sim_now,
+            mono: self.epoch_mono + self.sim_now,
+            wall: self.epoch_wall + self.sim_now,
         }
-        if sample.should_commit {
-            self.select_mode(Mode::Lock);
+    }
+
+    /// Execute controller commands against the simulator's fakes. The
+    /// privileged ones are deliberately absent: `vigil-sim` links no PAM,
+    /// logind, or session-lock code, so there is nothing here that could
+    /// acquire a real lock (issue #43 acceptance).
+    fn run_flow(&mut self, cmds: Vec<FlowCmd>) {
+        // Mode changes rebuild the Slint scene, so they are applied after
+        // the batch rather than from inside it: `select_mode` re-entered
+        // mid-iteration would apply the remaining commands against a scene
+        // that did not exist when they were produced.
+        let mut pending_mode = None;
+        for cmd in cmds {
+            match cmd {
+                FlowCmd::OverlayProgress { frost, wallpaper } => {
+                    self.warning_progress = (frost, wallpaper);
+                    self.warning_visual_key = None;
+                }
+                FlowCmd::OverlayElements(elements) => {
+                    self.warning_power = elements
+                        .iter()
+                        .any(|e| e.selector == "power" && e.progress > 0.001);
+                    self.warning_elements = elements;
+                    self.warning_visual_key = None;
+                }
+                FlowCmd::ShowPanel(visible) => {
+                    self.warning_panel = visible;
+                    self.warning_visual_key = None;
+                }
+                // {note:?} not {note}: the trace is a test surface, and the
+                // typed note exists so a test can assert which degradation.
+                FlowCmd::Journal(note) => self.record(format!("flow: {note:?}")),
+                FlowCmd::RequestSessionLock => {
+                    self.record("flow: committed");
+                    pending_mode = Some(Mode::Lock);
+                }
+                FlowCmd::Exit(outcome) => {
+                    // Every terminal outcome returns the preview to Login.
+                    // Denied/Invalidated are unreachable until the fake
+                    // compositor can refuse, but dropping them silently is
+                    // how a controller change goes unnoticed here.
+                    self.record(format!("flow: exit {outcome:?}"));
+                    pending_mode = Some(Mode::Login);
+                }
+                FlowCmd::DispatchInput(event) => {
+                    // Input the controller did NOT consume. Anything it did
+                    // consume (a cancelling keypress) must not also reach
+                    // the UI — that is the double-dispatch production
+                    // avoids.
+                    if let Some(scene) = self.scene.as_mut() {
+                        scene.dispatch(event);
+                    }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                // Deliberately inert: vigil-sim links no PAM, logind or
+                // session-lock code, so these have nothing to act on. Listed
+                // rather than caught by `_` so a NEW privileged command
+                // fails to compile here and a human decides, instead of
+                // being silently swallowed into a green scenario baseline.
+                FlowCmd::StartAuth
+                | FlowCmd::ShowAuthError(_)
+                | FlowCmd::DetachAuth
+                | FlowCmd::SetLockedHint(_)
+                | FlowCmd::SignalReady
+                | FlowCmd::CreateRevealOverlays
+                | FlowCmd::ReleaseSessionLock
+                | FlowCmd::DestroyRevealOverlays => {}
+            }
+        }
+        if let Some(mode) = pending_mode {
+            // The fake compositor grants immediately — stepped BEFORE
+            // select_mode, which drops the controller on the way out of
+            // Warning. Stepping after left the flow dead in Committing and
+            // ShowPanel(true) unexecuted, so `panel_visible` reported false
+            // while the Lock scene plainly showed the card.
+            let confirmed = if mode == Mode::Lock {
+                self.step_flow(FlowEvent::LockConfirmed)
+            } else {
+                Vec::new()
+            };
+            self.select_mode(mode);
+            // Bounded at one more batch: LockConfirmed never yields
+            // RequestSessionLock.
+            self.run_flow(confirmed);
         }
     }
 
@@ -526,6 +697,9 @@ impl Simulator {
             self.sim_now = Duration::ZERO;
             self.last_tick = Instant::now();
         } else {
+            // The controller does not outlive its mode: left alive, a
+            // drawer button would step it from Login or Lock.
+            self.warning = None;
             self.warning_phase = None;
         }
         self.mode = mode;
@@ -553,25 +727,22 @@ impl Simulator {
         } else if (400..432).contains(&y) {
             self.sim_now += Duration::from_secs(1);
             self.record("warning: advance 1s");
-        } else if (442..474).contains(&y) {
-            if let Some(warning) = self.warning.as_mut() {
-                warning.request_commit();
-            }
+        } else if (442..474).contains(&y) && self.mode == Mode::Warning {
             self.trace.borrow_mut().push("warning: commit".into());
-        } else if (484..516).contains(&y) {
-            if let Some(warning) = self.warning.as_mut() {
-                warning.input(&InputEvent::Key {
-                    keysym: 1,
-                    utf8: None,
-                    pressed: true,
-                });
-            }
+            let cmds = self.step_flow(FlowEvent::CommitRequested);
+            self.run_flow(cmds);
+        } else if (484..516).contains(&y) && self.mode == Mode::Warning {
             self.trace.borrow_mut().push("warning: cancel".into());
-        } else if (526..558).contains(&y) {
-            if let Some(warning) = self.warning.as_mut() {
-                warning.hotplug();
-            }
+            let cmds = self.step_flow(FlowEvent::Input(InputEvent::Key {
+                keysym: 1,
+                utf8: None,
+                pressed: true,
+            }));
+            self.run_flow(cmds);
+        } else if (526..558).contains(&y) && self.mode == Mode::Warning {
             self.trace.borrow_mut().push("warning: hotplug".into());
+            let cmds = self.step_flow(FlowEvent::OutputAdded);
+            self.run_flow(cmds);
         } else if (568..600).contains(&y) {
             self.blur_enabled = !self.blur_enabled;
             self.trace.borrow_mut().push("warning: toggle blur".into());
@@ -628,26 +799,23 @@ impl Simulator {
                 self.record(format!("warning: advance {ms}ms (socket)"));
             }
             ControlCommand::Commit if self.mode == Mode::Warning => {
-                if let Some(warning) = self.warning.as_mut() {
-                    warning.request_commit();
-                }
                 self.record("warning: commit (socket)");
+                let cmds = self.step_flow(FlowEvent::CommitRequested);
+                self.run_flow(cmds);
             }
             ControlCommand::Cancel if self.mode == Mode::Warning => {
-                if let Some(warning) = self.warning.as_mut() {
-                    warning.input(&InputEvent::Key {
-                        keysym: 1,
-                        utf8: None,
-                        pressed: true,
-                    });
-                }
                 self.record("warning: cancel (socket)");
+                let cmds = self.step_flow(FlowEvent::Input(InputEvent::Key {
+                    keysym: 1,
+                    utf8: None,
+                    pressed: true,
+                }));
+                self.run_flow(cmds);
             }
             ControlCommand::Hotplug if self.mode == Mode::Warning => {
-                if let Some(warning) = self.warning.as_mut() {
-                    warning.hotplug();
-                }
                 self.record("warning: hotplug (socket)");
+                let cmds = self.step_flow(FlowEvent::OutputAdded);
+                self.run_flow(cmds);
             }
             ControlCommand::Blur(value) if self.mode == Mode::Warning => {
                 self.blur_enabled = value.unwrap_or(!self.blur_enabled);
@@ -1081,6 +1249,11 @@ struct ScenarioFixture {
     commands: Vec<String>,
     expect_mode: Option<String>,
     expect_phase: Option<String>,
+    /// Pin the ramp itself. `expect_phase` collapses every pre-lock state
+    /// into "prelock", so without these a fixture passes identically at
+    /// 0 ms and 9999 ms — which is how a broken `at_ms` seek went unnoticed.
+    expect_frost: Option<f32>,
+    expect_wallpaper: Option<f32>,
 }
 
 #[derive(serde::Serialize)]
@@ -1088,6 +1261,11 @@ struct ScenarioResult {
     mode: String,
     warning_phase: Option<String>,
     time_ms: u128,
+    /// Overlay compositing values behind the frame. A phase label cannot
+    /// explain a frame-hash diff; these can.
+    frost: f32,
+    wallpaper: f32,
+    panel_visible: bool,
     frame_hash: String,
     trace: Vec<String>,
 }
@@ -1127,7 +1305,7 @@ fn run_scenario(platform: VigilPlatform, path: &std::path::Path) -> Result<(), S
         render_scenario_frame(&mut simulator)?;
     }
     let mode = format!("{:?}", simulator.mode);
-    let phase = simulator.warning_phase.map(|value| format!("{value:?}"));
+    let phase = simulator.warning_phase.map(Simulator::phase_label);
     if let Some(expected) = fixture.expect_mode.as_deref()
         && !mode.eq_ignore_ascii_case(expected)
     {
@@ -1138,9 +1316,26 @@ fn run_scenario(platform: VigilPlatform, path: &std::path::Path) -> Result<(), S
     {
         return Err(format!("expected phase {expected:?}, got {phase:?}"));
     }
+    for (label, expected, actual) in [
+        ("frost", fixture.expect_frost, simulator.warning_progress.0),
+        (
+            "wallpaper",
+            fixture.expect_wallpaper,
+            simulator.warning_progress.1,
+        ),
+    ] {
+        if let Some(expected) = expected
+            && (expected - actual).abs() > 0.001
+        {
+            return Err(format!("expected {label} {expected:.3}, got {actual:.3}"));
+        }
+    }
     let result = ScenarioResult {
         mode,
         warning_phase: phase,
+        frost: simulator.warning_progress.0,
+        wallpaper: simulator.warning_progress.1,
+        panel_visible: simulator.warning_panel,
         time_ms: simulator.sim_now.as_millis(),
         frame_hash: frame_hash(&simulator.pixels),
         trace: simulator.trace.borrow().clone(),

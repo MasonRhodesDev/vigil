@@ -2,4 +2,8 @@ mode = "warning"
 at_ms = 3000
 commands = ["blur off"]
 expect_mode = "Warning"
-expect_phase = "Running"
+expect_phase = "prelock"
+# frost_in_ms is 1500, so by 3000 ms the frost ramp is complete. A seek
+# that silently did nothing would report 0.0 here (issue: --at-ms).
+expect_frost = 1.0
+expect_wallpaper = 0.0
