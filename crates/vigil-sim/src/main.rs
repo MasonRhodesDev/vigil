@@ -147,6 +147,10 @@ struct Simulator {
     desktop_blurred: Arc<Vec<u8>>,
     lock_wallpaper: Arc<Vec<u8>>,
     warning_wait: Option<Duration>,
+    /// Fixed origins so the controller's monotonic and wall clocks are
+    /// derived from the simulated clock rather than read live.
+    epoch_mono: Instant,
+    epoch_wall: std::time::SystemTime,
     warning_phase: Option<FlowPhase>,
     /// Overlay compositing values as last reported by the controller.
     warning_progress: (f32, f32),
@@ -246,6 +250,8 @@ impl Simulator {
             desktop_blurred,
             lock_wallpaper,
             warning_wait: None,
+            epoch_mono: Instant::now(),
+            epoch_wall: std::time::SystemTime::now(),
             warning_phase: None,
             warning_progress: (0.0, 0.0),
             warning_elements: Vec::new(),
@@ -268,16 +274,33 @@ impl Simulator {
         self.write_state();
     }
 
+    /// Stable, machine-readable phase labels. `{phase:?}` on a tuple
+    /// variant yields `Done(Cancelled)`, and fixtures compare this string
+    /// exactly — parenthesised Debug output is a poor contract.
+    fn phase_label(phase: FlowPhase) -> String {
+        match phase {
+            FlowPhase::PreLock => "prelock".into(),
+            FlowPhase::Committing => "committing".into(),
+            FlowPhase::Locked => "locked".into(),
+            FlowPhase::RevealPending => "reveal_pending".into(),
+            FlowPhase::Revealing => "revealing".into(),
+            FlowPhase::Done(outcome) => format!("done:{}", format!("{outcome:?}").to_lowercase()),
+        }
+    }
+
     fn write_state(&self) {
         let Some(path) = self.state_file.as_ref() else {
             return;
         };
-        let phase = self.warning_phase.map(|phase| format!("{phase:?}"));
+        let phase = self.warning_phase.map(Self::phase_label);
         let body = format!(
-            "{{\n  \"mode\": \"{:?}\",\n  \"warning_phase\": {},\n  \"time_ms\": {},\n  \"paused\": {},\n  \"blur_enabled\": {},\n  \"drawer_open\": {}\n}}\n",
+            "{{\n  \"mode\": \"{:?}\",\n  \"warning_phase\": {},\n  \"time_ms\": {},\n  \"frost\": {:.4},\n  \"wallpaper\": {:.4},\n  \"panel_visible\": {},\n  \"paused\": {},\n  \"blur_enabled\": {},\n  \"drawer_open\": {}\n}}\n",
             self.mode,
             phase.map_or_else(|| "null".into(), |value| format!("\"{value}\"")),
             self.sim_now.as_millis(),
+            self.warning_progress.0,
+            self.warning_progress.1,
+            self.warning_panel,
             self.paused,
             self.blur_enabled,
             self.drawer_open
@@ -349,7 +372,7 @@ impl Simulator {
                     grace_secs: 0,
                     ..Default::default()
                 };
-                let (flow, boot) = LockFlow::new(Now::at(Duration::ZERO), &policy, None);
+                let (flow, boot) = LockFlow::new(self.flow_now(), &policy, None);
                 self.last_tick = Instant::now();
                 self.warning = Some(flow);
                 self.warning_phase = self.warning.as_ref().map(LockFlow::phase);
@@ -499,6 +522,9 @@ impl Simulator {
         // The controller decides; the simulator only renders and reacts.
         let cmds = self.step_flow(FlowEvent::Tick);
         self.run_flow(cmds);
+        // Written before the render short-circuit: the state file is a
+        // machine surface and must not depend on a *visual* key.
+        self.write_state();
         if self.mode != Mode::Warning {
             return;
         }
@@ -507,7 +533,6 @@ impl Simulator {
             return;
         }
         self.warning_visual_key = Some(visual_key);
-        self.write_state();
         let (frost, wallpaper) = self.warning_progress;
         let elements = self.warning_elements.clone();
         let (panel, power) = (self.warning_panel, self.warning_power);
@@ -543,14 +568,30 @@ impl Simulator {
 
     /// Advance the controller with one event at the simulated clock.
     fn step_flow(&mut self, event: FlowEvent) -> Vec<FlowCmd> {
-        let sim_now = self.sim_now;
+        let now = self.flow_now();
         let cmds = self
             .warning
             .as_mut()
-            .map(|flow| flow.step(Now::at(sim_now), event))
+            .map(|flow| flow.step(now, event))
             .unwrap_or_default();
         self.warning_phase = self.warning.as_ref().map(LockFlow::phase);
+        // The controller owns the frame schedule; without this the sim is
+        // paced by whatever incidental events the host compositor happens
+        // to deliver.
+        self.warning_wait = self.warning.as_ref().and_then(LockFlow::next_wake);
         cmds
+    }
+
+    /// All three of the controller's clocks derived from the simulated one.
+    /// `Now::at` fills `mono`/`wall` from the real clocks, which would make
+    /// anything keyed to them (the grace window) nondeterministic in a
+    /// scenario run that byte-compares two passes.
+    fn flow_now(&self) -> Now {
+        Now {
+            elapsed: self.sim_now,
+            mono: self.epoch_mono + self.sim_now,
+            wall: self.epoch_wall + self.sim_now,
+        }
     }
 
     /// Execute controller commands against the simulator's fakes. The
@@ -558,6 +599,11 @@ impl Simulator {
     /// logind, or session-lock code, so there is nothing here that could
     /// acquire a real lock (issue #43 acceptance).
     fn run_flow(&mut self, cmds: Vec<FlowCmd>) {
+        // Mode changes rebuild the Slint scene, so they are applied after
+        // the batch rather than from inside it: `select_mode` re-entered
+        // mid-iteration would apply the remaining commands against a scene
+        // that did not exist when they were produced.
+        let mut pending_mode = None;
         for cmd in cmds {
             match cmd {
                 FlowCmd::OverlayProgress { frost, wallpaper } => {
@@ -575,22 +621,20 @@ impl Simulator {
                     self.warning_panel = visible;
                     self.warning_visual_key = None;
                 }
-                FlowCmd::Journal(note) => self.record(format!("flow: {note}")),
+                // {note:?} not {note}: the trace is a test surface, and the
+                // typed note exists so a test can assert which degradation.
+                FlowCmd::Journal(note) => self.record(format!("flow: {note:?}")),
                 FlowCmd::RequestSessionLock => {
-                    // The fake compositor always grants, immediately.
-                    self.record("warning: committed");
-                    let cmds = self.step_flow(FlowEvent::LockConfirmed);
-                    self.select_mode(Mode::Lock);
-                    self.run_flow(cmds);
+                    self.record("flow: committed");
+                    pending_mode = Some(Mode::Lock);
                 }
                 FlowCmd::Exit(outcome) => {
                     // Every terminal outcome returns the preview to Login.
                     // Denied/Invalidated are unreachable until the fake
-                    // compositor can refuse (see the note on
-                    // RequestSessionLock), but dropping them silently is
+                    // compositor can refuse, but dropping them silently is
                     // how a controller change goes unnoticed here.
                     self.record(format!("flow: exit {outcome:?}"));
-                    self.select_mode(Mode::Login);
+                    pending_mode = Some(Mode::Login);
                 }
                 FlowCmd::DispatchInput(event) => {
                     // Input the controller did NOT consume. Anything it did
@@ -619,6 +663,15 @@ impl Simulator {
                 | FlowCmd::DestroyRevealOverlays => {}
             }
         }
+        if let Some(mode) = pending_mode {
+            self.select_mode(mode);
+            if mode == Mode::Lock {
+                // The fake compositor grants immediately. Bounded at one
+                // more batch: LockConfirmed never yields RequestSessionLock.
+                let confirmed = self.step_flow(FlowEvent::LockConfirmed);
+                self.run_flow(confirmed);
+            }
+        }
     }
 
     fn select_mode(&mut self, mode: Mode) {
@@ -626,6 +679,9 @@ impl Simulator {
             self.sim_now = Duration::ZERO;
             self.last_tick = Instant::now();
         } else {
+            // The controller does not outlive its mode: left alive, a
+            // drawer button would step it from Login or Lock.
+            self.warning = None;
             self.warning_phase = None;
         }
         self.mode = mode;
@@ -653,22 +709,22 @@ impl Simulator {
         } else if (400..432).contains(&y) {
             self.sim_now += Duration::from_secs(1);
             self.record("warning: advance 1s");
-        } else if (442..474).contains(&y) {
+        } else if (442..474).contains(&y) && self.mode == Mode::Warning {
+            self.trace.borrow_mut().push("warning: commit".into());
             let cmds = self.step_flow(FlowEvent::CommitRequested);
             self.run_flow(cmds);
-            self.trace.borrow_mut().push("warning: commit".into());
-        } else if (484..516).contains(&y) {
+        } else if (484..516).contains(&y) && self.mode == Mode::Warning {
+            self.trace.borrow_mut().push("warning: cancel".into());
             let cmds = self.step_flow(FlowEvent::Input(InputEvent::Key {
                 keysym: 1,
                 utf8: None,
                 pressed: true,
             }));
             self.run_flow(cmds);
-            self.trace.borrow_mut().push("warning: cancel".into());
-        } else if (526..558).contains(&y) {
+        } else if (526..558).contains(&y) && self.mode == Mode::Warning {
+            self.trace.borrow_mut().push("warning: hotplug".into());
             let cmds = self.step_flow(FlowEvent::OutputAdded);
             self.run_flow(cmds);
-            self.trace.borrow_mut().push("warning: hotplug".into());
         } else if (568..600).contains(&y) {
             self.blur_enabled = !self.blur_enabled;
             self.trace.borrow_mut().push("warning: toggle blur".into());
@@ -725,23 +781,23 @@ impl Simulator {
                 self.record(format!("warning: advance {ms}ms (socket)"));
             }
             ControlCommand::Commit if self.mode == Mode::Warning => {
+                self.record("warning: commit (socket)");
                 let cmds = self.step_flow(FlowEvent::CommitRequested);
                 self.run_flow(cmds);
-                self.record("warning: commit (socket)");
             }
             ControlCommand::Cancel if self.mode == Mode::Warning => {
+                self.record("warning: cancel (socket)");
                 let cmds = self.step_flow(FlowEvent::Input(InputEvent::Key {
                     keysym: 1,
                     utf8: None,
                     pressed: true,
                 }));
                 self.run_flow(cmds);
-                self.record("warning: cancel (socket)");
             }
             ControlCommand::Hotplug if self.mode == Mode::Warning => {
+                self.record("warning: hotplug (socket)");
                 let cmds = self.step_flow(FlowEvent::OutputAdded);
                 self.run_flow(cmds);
-                self.record("warning: hotplug (socket)");
             }
             ControlCommand::Blur(value) if self.mode == Mode::Warning => {
                 self.blur_enabled = value.unwrap_or(!self.blur_enabled);
@@ -1221,7 +1277,7 @@ fn run_scenario(platform: VigilPlatform, path: &std::path::Path) -> Result<(), S
         render_scenario_frame(&mut simulator)?;
     }
     let mode = format!("{:?}", simulator.mode);
-    let phase = simulator.warning_phase.map(|value| format!("{value:?}"));
+    let phase = simulator.warning_phase.map(Simulator::phase_label);
     if let Some(expected) = fixture.expect_mode.as_deref()
         && !mode.eq_ignore_ascii_case(expected)
     {

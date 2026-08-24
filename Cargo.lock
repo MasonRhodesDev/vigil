@@ -5164,7 +5164,6 @@ dependencies = [
  "vigil-flow",
  "vigil-theme",
  "vigil-ui",
- "vigil-warning",
  "winit",
 ]
 
