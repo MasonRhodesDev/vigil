@@ -74,7 +74,15 @@ Umbrella: **#20** (roadmap), **#47** (0.3 release). Closed this session
 with evidence: #48 (package CI), #36 (PAM before lock), #44 (nested
 suite). Full triage is in the issue comments; the shape:
 
-- **MERGED 2026-08-23**: #53 (PR #54, ramp values quantized to one frame
+- **MERGED 2026-08-23**: #53 (PR #54), #43 PR A (PR #55) and #56 (PR #57,
+  the wallpaper hold is now bounded — a wedged asset renderer used to
+  leave the machine unlocked indefinitely). #58 open for #43 PR C
+  (vigil-sim drives the real controller), which unblocks #41/#42/#45.
+  Reviews are now three Agent-tool sub-agents in parallel with distinct
+  angles, NOT `/code-review` — its orchestrator kept dying on account
+  limits mid-run. On #57 that found ten real defects including a root
+  cause three reviewers hit independently. Details below cover #53/#55:
+- (2026-08-23): #53 (PR #54, ramp values quantized to one frame
   grid) and #43 PR A (PR #55, `vigil-flow` — the lock lifecycle is now a
   pure events-in/commands-out controller; vigil-wayland and vigil-lock only
   translate). #57 open for #56. Each PR was reviewed twice: the first pass
