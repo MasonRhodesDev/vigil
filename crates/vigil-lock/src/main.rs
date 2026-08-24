@@ -130,6 +130,12 @@ fn apply_cli_to_config(cli: &Cli, config: &mut Config) {
     if cli.immediate {
         config.lock.transition = LockTransition::immediate();
     }
+    if config.lock.warning.clamp() {
+        eprintln!(
+            "vigil-lock: lock.warning.wallpaper_hold_max_ms clamped to {} ms",
+            vigil_config::LockWarning::MAX_WALLPAPER_HOLD_MS
+        );
+    }
     if config.lock.transition.clamp() {
         eprintln!(
             "vigil-lock: lock.transition ramps clamped to {} ms",
