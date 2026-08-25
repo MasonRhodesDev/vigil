@@ -1013,6 +1013,14 @@ impl LockSession for Locker {
             .unwrap_or(false)
     }
 
+    fn scene_needs_present(&mut self, id: OutputId) -> bool {
+        self.entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .map(|e| e.window.scene_needs_present())
+            .unwrap_or(false)
+    }
+
     fn wait_decision(&self) -> WaitDecision {
         let slint = self
             .scheduler

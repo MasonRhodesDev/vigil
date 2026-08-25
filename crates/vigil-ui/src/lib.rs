@@ -544,6 +544,15 @@ impl OutputWindow {
         self.render(CoreCanvas::Cpu(target))
     }
 
+    /// Whether this window owes a present, without needing a buffer to
+    /// answer. Draws the scene into the backend's shadow, so a following
+    /// `render_if_needed` only copies out. See `RenderBackend::
+    /// scene_needs_present` for why a presenter must be able to ask.
+    pub fn scene_needs_present(&mut self) -> bool {
+        let view = self.view();
+        self.backend.scene_needs_present(&view)
+    }
+
     fn pointer_position(&self) -> LogicalPosition {
         LogicalPosition::new(
             (self.pointer_x / f64::from(self.scale)) as f32,
@@ -1006,7 +1015,50 @@ pub fn duration_until_next_timer_update() -> Option<Duration> {
     slint::platform::duration_until_next_timer_update()
 }
 
+impl SoftwareBackend {
+    /// Partial-repaint the scene into the persistent shadow and report
+    /// whether a present is owed.
+    ///
+    /// This needs no target, which is the whole point: a presenter can ask
+    /// "is there anything to show?" without first acquiring a `wl_buffer`.
+    /// Acquiring one and dropping it un-attached on a clean scene is what
+    /// span the locked-idle loop -- the compositor answers every
+    /// `wl_buffer.destroy` with `delete_id`, which wakes the event loop,
+    /// which churns another buffer (#65).
+    ///
+    /// Dirtiness cannot be predicted without doing this: Slint sets it
+    /// *during* the render (`draw_if_needed` reports whether it drew), and
+    /// core calls `request_redraw` on the inner window rather than any
+    /// wrapper we could observe -- which is why the DirtySet is only
+    /// advisory.
+    fn draw_into_shadow(&mut self, view: &SceneView) -> bool {
+        // Slint partial-repaints into the persistent shadow (ReusedBuffer
+        // contract: same buffer, contents preserved between renders).
+        let shadow_stride = view.scene_size.0 as usize;
+        let native_background = self.native_background.clone();
+        if self.adapter.draw_if_needed(|renderer| {
+            if let Some(background) = &native_background {
+                renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+                let overlay = bytemuck::cast_slice_mut::<u8, Argb8888>(&mut self.native_overlay);
+                renderer.render(overlay, shadow_stride);
+                composite_native_background(background, overlay, &mut self.shadow);
+            } else {
+                renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+                let shadow_pixels = bytemuck::cast_slice_mut::<u8, Xrgb8888>(&mut self.shadow);
+                renderer.render(shadow_pixels, shadow_stride);
+            }
+        }) {
+            self.needs_present = true;
+        }
+        self.needs_present
+    }
+}
+
 impl RenderBackend for SoftwareBackend {
+    fn scene_needs_present(&mut self, view: &SceneView) -> bool {
+        self.draw_into_shadow(view)
+    }
+
     fn request_present(&mut self) {
         self.needs_present = true;
     }
@@ -1065,24 +1117,7 @@ impl RenderBackend for SoftwareBackend {
             }
             return false;
         }
-        // Slint partial-repaints into the persistent shadow (ReusedBuffer
-        // contract: same buffer, contents preserved between renders).
-        let shadow_stride = scene_w as usize;
-        let native_background = self.native_background.clone();
-        if self.adapter.draw_if_needed(|renderer| {
-            if let Some(background) = &native_background {
-                renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
-                let overlay = bytemuck::cast_slice_mut::<u8, Argb8888>(&mut self.native_overlay);
-                renderer.render(overlay, shadow_stride);
-                composite_native_background(background, overlay, &mut self.shadow);
-            } else {
-                renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
-                let shadow_pixels = bytemuck::cast_slice_mut::<u8, Xrgb8888>(&mut self.shadow);
-                renderer.render(shadow_pixels, shadow_stride);
-            }
-        }) {
-            self.needs_present = true;
-        }
+        self.draw_into_shadow(view);
         if !self.needs_present {
             return false;
         }
@@ -1456,6 +1491,21 @@ mod tests {
         );
         // A static visible frame does not re-arm itself.
         assert!(dirty.take_all().is_empty());
+
+        // ...and reports that it owes nothing, WITHOUT a target. A presenter
+        // must be able to ask before acquiring a buffer: acquiring one and
+        // dropping it un-attached on a clean scene makes the compositor
+        // reply delete_id, which wakes the loop, which acquires another
+        // (#65). A probe that just says "true" restores that loop.
+        assert!(
+            !window.scene_needs_present(),
+            "a settled scene must not ask to be presented"
+        );
+        window.request_present();
+        assert!(
+            window.scene_needs_present(),
+            "a scene asked to repaint must still report it owes a present"
+        );
 
         let source = r#"
             export component Native inherits Window {

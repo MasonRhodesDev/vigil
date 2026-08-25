@@ -127,6 +127,15 @@ pub trait LockSession {
     fn tick(&mut self);
     /// Draw this output's scene if dirty; return whether pixels changed.
     fn render(&mut self, id: OutputId, target: FrameTarget<'_>) -> bool;
+    /// Whether this output owes a present, answered without a buffer.
+    ///
+    /// The presenter asks this *before* acquiring one: a buffer acquired
+    /// and dropped un-attached on a clean scene makes the compositor reply
+    /// `delete_id`, which wakes the loop, which acquires another (#65).
+    /// Conservative default: unknown means present.
+    fn scene_needs_present(&mut self, _id: OutputId) -> bool {
+        true
+    }
     fn wait_decision(&self) -> WaitDecision;
 }
 
@@ -733,6 +742,20 @@ impl<S: LockSession> App<S> {
             self.schedule_present_retry(id);
             return;
         };
+        // Probe before acquiring. A buffer taken and dropped un-attached on
+        // a clean scene is not free: the compositor answers every
+        // `wl_buffer.destroy` with `delete_id`, which makes the Wayland fd
+        // readable, which defeats the timeout the loop just armed, which
+        // brings us straight back here for another buffer. Measured at 24k
+        // iterations/s against Hyprland with nothing ever drawn, and at one
+        // per timeout against wlroots -- which does not reply eagerly, so
+        // the nested suite could never see it (#65).
+        //
+        // A forced present still acquires: an output that has not committed
+        // yet must get a frame even over a quiescent scene (#35/#37).
+        if !force && !self.session.scene_needs_present(id) {
+            return;
+        }
         self.metrics.record_buffer_acquire();
         let stride = w as usize * 4;
         let format = if overlay {

@@ -209,6 +209,22 @@ pub trait RenderBackend {
     /// drawn -- a frame that draws nothing is not presented.
     fn render(&mut self, view: &SceneView, canvas: Canvas<'_>) -> bool;
 
+    /// Whether a present is owed, answered *without* a canvas.
+    ///
+    /// Presenters must be able to ask "is there anything to show?" before
+    /// acquiring a buffer: acquiring one and dropping it un-attached on a
+    /// clean scene makes the compositor answer each `wl_buffer.destroy`
+    /// with `delete_id`, which wakes the event loop, which acquires
+    /// another -- a closed loop that burns both processes with nothing
+    /// drawn (vigil#65).
+    ///
+    /// The default is conservative: a backend that cannot answer cheaply
+    /// says `true`. Over-presenting costs frames; skipping a present that
+    /// was owed is a black screen.
+    fn scene_needs_present(&mut self, _view: &SceneView) -> bool {
+        true
+    }
+
     /// Force the next frame to present even if the scene is unchanged.
     fn request_present(&mut self);
 

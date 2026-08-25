@@ -538,8 +538,13 @@ vigil-lock (calloop, mirrors the greeter binary's wiring)
 │   │   AND on output hotplug), configure/ack, unlock → roundtrip → exit
 │   ├─ WlShmPresenter: THIRD Presenter impl — SlotPool buffer mapped as
 │   │   FrameTarget (wl_shm XRGB8888 is byte-identical to the dumb-buffer
-│   │   layout; OutputWindow::render_if_needed works unchanged), commit
-│   │   gated on drew exactly like the DRM path
+│   │   layout; OutputWindow::render_if_needed works unchanged). Buffer
+│   │   ACQUISITION and commit are both gated on drew: the scene is probed
+│   │   via scene_needs_present (a shadow repaint, no target) before a
+│   │   buffer exists, so a clean wake costs no protocol traffic. A buffer
+│   │   acquired and dropped un-attached is a create+destroy the compositor
+│   │   answers with delete_id, which wakes the loop that acquired it
+│   │   (desktop-commons ADR 0007, #65). Forced presents still acquire.
 │   └─ seat glue: sctk keyboard (compositor keymap + sctk's calloop key
 │       repeat) + pointer → vigil_core::InputEvent; pointer-enter picks the
 │       panel output (replaces the greeter's layout::Row)
