@@ -754,6 +754,11 @@ impl<S: LockSession> App<S> {
         // A forced present still acquires: an output that has not committed
         // yet must get a frame even over a quiescent scene (#35/#37).
         if !force && !self.session.scene_needs_present(id) {
+            // Nothing owed, so no attempt is outstanding. Clearing here
+            // keeps the retry map's invariant positional-proof: a stale
+            // past-deadline entry clamps the loop timeout to zero and
+            // spins, which is the same family of bug as #65 itself.
+            self.present_retry.remove(&id);
             return;
         }
         self.metrics.record_buffer_acquire();
