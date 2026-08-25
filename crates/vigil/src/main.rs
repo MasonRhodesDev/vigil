@@ -1303,8 +1303,9 @@ impl App {
         let mut dead = Vec::new();
         // `dirty` is advisory (see vigil-wayland: the software adapter cannot
         // intercept Slint's request_redraw, so gating on it froze animations
-        // and input on metal). Offer every entry a frame; render_if_needed
-        // is the real gate and is a no-op for a clean scene.
+        // and input on metal). Every entry is offered a frame, but the scene
+        // is probed first (ADR 0007) so a clean output costs a shadow
+        // repaint instead of a buffer map that is then discarded.
         let _ = dirty;
         for (i, entry) in self.entries.iter_mut().enumerate() {
             let Entry {
@@ -1314,6 +1315,18 @@ impl App {
                 ..
             } = entry;
             let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
+            // Probe before asking the presenter for a frame. On DRM that
+            // costs a dumb-buffer map (ioctl + mmap) or a GBM surface
+            // round; on a clean scene the draw closure would then return
+            // false and all of it is thrown away. The lock binary had the
+            // same shape against Wayland, where the discarded buffer's
+            // destroy is answered with delete_id and wakes the loop that
+            // acquired it -- desktop-commons ADR 0007. There is no
+            // compositor here to reply, so this is waste rather than a
+            // spin, but the rule is the same for every presenter.
+            if !window.scene_needs_present() {
+                continue;
+            }
             self.metrics.record_buffer_acquire();
             match presenter.with_frame(&mut |canvas| {
                 // Either canvas: the window knows which backend it has, and
