@@ -300,10 +300,13 @@ impl LockFlow {
         self.wait
     }
 
-    /// Whether the lock is settled: locked, with every ramp retired. The
-    /// executor may then block until an external event arrives, and the
-    /// invariant `settled() => next_wake().is_none()` is what keeps a
-    /// locked-idle session from costing anything (#65).
+    /// Whether the lock is settled: locked, with every ramp retired.
+    ///
+    /// Names the invariant `settled() => next_wake().is_none()`, which is
+    /// what lets the executor block until an external event arrives. No
+    /// production caller consumes it yet -- the executor blocks off
+    /// `next_wake()` directly -- so it exists to make the invariant
+    /// assertable rather than implied.
     pub fn settled(&self) -> bool {
         self.phase == FlowPhase::Locked && self.timeline.is_none()
     }
