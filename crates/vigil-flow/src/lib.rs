@@ -1,3 +1,22 @@
+//! Pure product controllers for vigil's two surfaces.
+//!
+//! **Admission rule for anything added here:** a controller in this crate
+//! is pure — events in, commands out, no I/O, and every clock injected.
+//! It may name a protocol's vocabulary (`LockConfirmed`, `GreetdReply`)
+//! but must never take a host-effect or protocol *dependency*: no PAM, no
+//! logind, no greetd codec, no Wayland. That is what lets `vigil-sim` link
+//! this crate and preview production behaviour without being able to reach
+//! a real session lock or a real authentication (ADR 0004), and it is
+//! enforced by `tests/check-sim-safety.sh` — this comment is the reason
+//! that gate exists.
+//!
+//! [`LockFlow`] is the locker's lifecycle (issue #43); [`greet::GreetFlow`]
+//! is the greeter's login stages (issue #61). They deliberately do not
+//! share a machine — greetd versus PAM-direct, exec a session versus
+//! release a lock — only this contract and the [`Now`] clock.
+//!
+//! ---
+//!
 //! Pure lock-lifecycle controller (issue #43).
 //!
 //! `LockFlow` owns every transition the locker makes — warning/transition
@@ -14,6 +33,12 @@
 //! [`FlowCmd::OverlayProgress`] per frame.
 
 use std::time::{Duration, Instant, SystemTime};
+
+pub mod greet;
+pub use greet::{
+    GreetCmd, GreetConfig, GreetEvent, GreetFlow, GreetOutcome, GreetPhase, GreetdReply,
+    SessionChoice, USERNAME_PROMPT,
+};
 
 use vigil_config::{Lock, LockTransition};
 use vigil_core::InputEvent;

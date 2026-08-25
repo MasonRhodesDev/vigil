@@ -1,6 +1,6 @@
 [package]
 name = "vigil-flow"
-description = "Pure lock-lifecycle controller shared by vigil-lock, tests, and the simulator"
+description = "Pure product controllers (lock and greet): events in, commands out, no I/O, injected clocks"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true

@@ -222,9 +222,15 @@ vigil/
 │  ├─ vigil-present-dumb/     # DumbBufferPresenter (SoftwareRenderer → dumb buffer)
 │  ├─ vigil-present-gl/       # GbmGlPresenter — M3 slice, crate reserved from day 1
 │  ├─ vigil-input/            # libinput + xkbcommon; repeat/compose → InputEvent
-│  ├─ vigil-auth/             # greetd_ipc state machine; drives AuthUi
+│  ├─ vigil-auth/             # greetd_ipc adapter; performs the socket I/O
+│  ├─ vigil-flow/             # pure product controllers (LockFlow, GreetFlow):
+│  │                          #   events in, commands out, no I/O, injected clock
+│  ├─ vigil-warning/          # pure pre-lock warning timeline consumed by vigil-flow
+│  ├─ vigil-pam/              # PAM conversation worker for the locker
+│  ├─ vigil-wayland/          # ext-session-lock-v1 + layer-shell client for the locker
 │  ├─ vigil-theme/            # contract validation, interpreter loader, compiled-in default
 │  ├─ vigil-ui/               # Slint Platform glue, per-output windows, backgrounds, cursor
+│  ├─ vigil-sim/              # windowed simulator; drives the real controllers, no host effects
 │  └─ vigil/                  # the binary: calloop wiring only
 ├─ themes/default/            # .slint sources for the compiled-in theme
 ├─ tests/                     # cross-crate integration: golden images + fake-greetd e2e
@@ -490,8 +496,13 @@ Runtime deps of the vigil binary: libseat, libinput, libxkbcommon
 ## 12. vigil-lock — the session lockscreen
 
 The same product, second surface: a screen locker that renders the same
-`theme.slint`, drives the same contract, and authenticates through the same
-`AuthUi` seam — so login and lock are one visual identity. Each binary is
+`theme.slint` and drives the same contract — so login and lock are one
+visual identity. `AuthUi` remains the shared **UI fan-out** seam —
+`vigil-ui` implements it and both binaries drive it (see §12's wiring
+below). What they do not share is the authentication path or the stage
+controller: the greeter talks to greetd, the locker talks to PAM
+directly, and each has its own controller in `vigil-flow` (`GreetFlow`,
+`LockFlow`, issues #61 and #43). Each binary is
 independently usable (the locker runs under any ext-session-lock compositor
 regardless of which greeter logged you in; the greeter needs no locker), but
 the intended UX is the pair.
