@@ -1040,14 +1040,34 @@ impl LockSession for Locker {
     }
 }
 
+/// Format the current local time, in process.
+///
+/// This used to fork `/usr/bin/date`. Once a minute for the life of a lock
+/// (and once a second for a format carrying `%S`) that is a fork, an exec,
+/// a dynamic link and a page-fault storm to format a short string -- inside
+/// the one process that must keep working when the session is under
+/// pressure. glibc's strftime is what `date` was calling anyway, so the
+/// output is identical for every format a user can write.
 fn clock_text(format: &str) -> String {
-    std::process::Command::new("date")
-        .arg(format!("+{format}"))
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+    let Ok(fmt) = std::ffi::CString::new(format) else {
+        // A NUL in the format: no valid strftime call exists.
+        return String::new();
+    };
+    // SAFETY: localtime_r writes into our own `tm`; strftime writes at most
+    // `buf.len()` bytes into `buf`. Both pointers are valid for the call.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return String::new();
+        }
+        let mut buf = vec![0_u8; 256];
+        // 0 means "did not fit" as well as "empty result"; either way there
+        // is nothing to show, which is what the old `date` failure did too.
+        let written = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), fmt.as_ptr(), &tm);
+        buf.truncate(written);
+        String::from_utf8(buf).unwrap_or_default()
+    }
 }
 
 /// The blocking half of `--wait`: spawn the real locker as a child
@@ -1357,6 +1377,37 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clock_text_matches_what_date_would_have_printed() {
+        // The fork this replaced called glibc strftime; so do we. Compare
+        // against `date` itself for the formats a user can configure,
+        // retrying once across a tick boundary before believing a mismatch.
+        for format in ["%H:%M", "%Y-%m-%d", "%A", "%I:%M %p"] {
+            let mine = super::clock_text(format);
+            let theirs = std::process::Command::new("date")
+                .arg(format!("+{format}"))
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if mine != theirs {
+                // A minute may have rolled between the two reads.
+                assert_eq!(super::clock_text(format), theirs, "format {format}");
+            }
+            assert!(!mine.is_empty(), "format {format} produced nothing");
+        }
+    }
+
+    #[test]
+    fn clock_text_survives_a_hostile_format() {
+        assert_eq!(super::clock_text("with\0nul"), "");
+        // A format that produces nothing is not a crash.
+        let _ = super::clock_text("");
+        // Longer than the buffer: truncation is reported as empty, never UB.
+        let _ = super::clock_text(&"%Y".repeat(300));
+    }
+
     use super::*;
 
     #[test]
