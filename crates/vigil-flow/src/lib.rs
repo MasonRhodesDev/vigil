@@ -300,6 +300,17 @@ impl LockFlow {
         self.wait
     }
 
+    /// Whether the lock is settled: locked, with every ramp retired.
+    ///
+    /// Names the invariant `settled() => next_wake().is_none()`, which is
+    /// what lets the executor block until an external event arrives. No
+    /// production caller consumes it yet -- the executor blocks off
+    /// `next_wake()` directly -- so it exists to make the invariant
+    /// assertable rather than implied.
+    pub fn settled(&self) -> bool {
+        self.phase == FlowPhase::Locked && self.timeline.is_none()
+    }
+
     pub fn step(&mut self, now: Now, event: FlowEvent) -> Vec<FlowCmd> {
         let mut cmds = Vec::new();
         if matches!(self.phase, FlowPhase::Done(_)) {
@@ -672,6 +683,45 @@ mod tests {
         assert!(has(&cmds, &FlowCmd::SignalReady));
         assert_eq!(flow.phase(), FlowPhase::Locked);
         flow
+    }
+
+    // These two pin `settled() => next_wake().is_none()`. The invariant
+    // holds structurally today (a retired timeline early-returns with no
+    // wait), so neither test is red against current main and neither dies
+    // to a mutation of the redundant clear in `advance()`. They are here so
+    // that a future edit which arms a wake in the settled state -- the
+    // shape of #65 -- cannot land silently.
+    #[test]
+    fn a_settled_lock_arms_no_wake_and_does_no_work() {
+        let (mut flow, _) = LockFlow::new(at(0), &warning_lock(3_000), None);
+        flow.step(at(3_000), FlowEvent::LockConfirmed);
+        // Past every GUI ramp.
+        flow.step(at(10_000), FlowEvent::Tick);
+        assert!(flow.settled(), "phase={:?}", flow.phase());
+        assert_eq!(flow.next_wake(), None);
+        for minute in 1..=10 {
+            let cmds = flow.step(at(10_000 + minute * 60_000), FlowEvent::Tick);
+            assert!(
+                cmds.is_empty(),
+                "a settled lock produced work at minute {minute}: {cmds:?}"
+            );
+            assert_eq!(flow.next_wake(), None, "re-armed a wake at minute {minute}");
+        }
+    }
+
+    #[test]
+    fn settled_implies_no_wake_on_every_path_into_locked() {
+        for (label, lock, warn) in [
+            ("manual", manual_lock(), None),
+            ("warned", warning_lock(3_000), None),
+            ("no-warn override", warning_lock(3_000), Some(0)),
+        ] {
+            let (mut flow, _) = LockFlow::new(at(0), &lock, warn);
+            flow.step(at(3_000), FlowEvent::LockConfirmed);
+            flow.step(at(30_000), FlowEvent::Tick);
+            assert!(flow.settled(), "{label}: phase={:?}", flow.phase());
+            assert_eq!(flow.next_wake(), None, "{label} armed a wake when settled");
+        }
     }
 
     #[test]

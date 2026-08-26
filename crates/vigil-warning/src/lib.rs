@@ -403,25 +403,36 @@ impl Timeline {
                         )
                     },
                 );
-                let progress = self.keyframe_time(start).map_or(0.0, |keyframe| {
-                    let start = keyframe + Duration::from_millis(offset_ms);
-                    if now < start {
-                        0.0
-                    } else if kind == WarningAnimation::None || duration_ms == 0 {
-                        1.0
-                    } else {
-                        // Same single grid: per-selector `offset_ms` would
-                        // otherwise give each element its own phase and
-                        // multiply the per-frame scene updates.
-                        graded(
-                            now,
-                            grid,
-                            start,
-                            Duration::from_millis(duration_ms),
-                            self.config.easing,
-                        )
-                    }
-                });
+                // A start that can *never* resolve is not an animation that
+                // has yet to begin -- it is an element with no start at all.
+                // Pinning it at 0.0 left it invisible for the life of the
+                // lock and kept `next_gui_wake` returning a frame period
+                // for ever, which is a 30 Hz wake in a settled locked
+                // session (#65). A keyframe that merely has not resolved
+                // *yet* (`Locked` before the lock lands) still holds at 0.0.
+                let unreachable_start = start == WarningKeyframe::None;
+                let progress = self.keyframe_time(start).map_or(
+                    if unreachable_start { 1.0 } else { 0.0 },
+                    |keyframe| {
+                        let start = keyframe + Duration::from_millis(offset_ms);
+                        if now < start {
+                            0.0
+                        } else if kind == WarningAnimation::None || duration_ms == 0 {
+                            1.0
+                        } else {
+                            // Same single grid: per-selector `offset_ms` would
+                            // otherwise give each element its own phase and
+                            // multiply the per-frame scene updates.
+                            graded(
+                                now,
+                                grid,
+                                start,
+                                Duration::from_millis(duration_ms),
+                                self.config.easing,
+                            )
+                        }
+                    },
+                );
                 ElementSample {
                     selector: (*selector).into(),
                     progress,
@@ -617,6 +628,40 @@ mod tests {
         hotplug.start(Duration::ZERO);
         hotplug.hotplug();
         assert_eq!(hotplug.sample(Duration::ZERO).phase, Phase::Cancelled);
+    }
+
+    #[test]
+    fn a_start_keyframe_that_never_resolves_settles_instead_of_waking_for_ever() {
+        // `start = none` names no keyframe, so the animation can never
+        // begin. Pinning it at progress 0.0 left the element invisible for
+        // the whole lock AND kept next_gui_wake returning a frame period --
+        // a permanent 30 Hz wake in a settled locked session (#65). This is
+        // reachable from config: WarningElement::default() pairs
+        // `start: None` with `kind: None`, so a theme that sets `kind` and
+        // omits `start` lands here.
+        let mut cfg = config();
+        cfg.gui.element = vec![vigil_config::WarningElement {
+            selector: "power".into(),
+            start: WarningKeyframe::None,
+            offset_ms: 0,
+            duration_ms: 300,
+            kind: WarningAnimation::Fade,
+        }];
+        let mut timeline = Timeline::new(cfg);
+        timeline.start(Duration::ZERO);
+        timeline.locked(Duration::from_secs(1));
+        let late = Duration::from_secs(600);
+        let power = timeline
+            .element_samples(late)
+            .into_iter()
+            .find(|e| e.selector.as_str() == "power")
+            .expect("power element");
+        assert!(
+            power.progress >= 1.0,
+            "an animation that can never start must render settled, not invisible"
+        );
+        assert!(timeline.gui_complete(late));
+        assert_eq!(timeline.next_gui_wake(late), None);
     }
 
     #[test]
