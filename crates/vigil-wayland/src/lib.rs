@@ -330,6 +330,27 @@ struct App<S: LockSession + 'static> {
     protocol_events: Vec<FlowEvent>,
 }
 
+/// Soonest present-retry deadline among outputs that still exist.
+///
+/// Retries are keyed by output, and an entry whose output has gone (or
+/// which can no longer be painted) must not steer the loop: its deadline
+/// is already in the past, `saturating_duration_since` yields zero, and
+/// `dispatch(Some(ZERO))` returns instantly on every iteration -- a spin
+/// with no work, the same family as the buffer churn in #65. Deriving the
+/// answer from live outputs makes a stale entry harmless rather than
+/// relying on every removal path remembering to prune (#70).
+fn soonest_retry(
+    retries: &BTreeMap<OutputId, (std::time::Instant, u32)>,
+    live: impl Fn(OutputId) -> bool,
+    now: std::time::Instant,
+) -> Option<Duration> {
+    retries
+        .iter()
+        .filter(|(id, _)| live(**id))
+        .map(|(_, (deadline, _))| deadline.saturating_duration_since(now))
+        .min()
+}
+
 impl<S: LockSession> App<S> {
     fn deliver_input(&mut self, event: InputEvent) {
         // The controller decides whether input cancels a warning, dismisses
@@ -726,7 +747,10 @@ impl<S: LockSession> App<S> {
             return;
         }
         if self.unlock_sent && self.entries[idx].role.is_lock() {
-            // Released server-side by unlock_and_destroy; nothing to paint.
+            // Released server-side by unlock_and_destroy; nothing to paint,
+            // and any retry we owed it is moot.
+            let id = self.entries[idx].id;
+            self.present_retry.remove(&id);
             return;
         }
         let (w, h) = self.entries[idx].px;
@@ -1149,12 +1173,15 @@ pub fn run_with_lock<S: LockSession + 'static>(
         if let Some(animation) = app.flow.next_wake() {
             timeout = Some(timeout.map_or(animation, |current| current.min(animation)));
         }
-        if let Some(retry) = app
-            .present_retry
-            .values()
-            .map(|(deadline, _)| deadline.saturating_duration_since(std::time::Instant::now()))
-            .min()
-        {
+        if let Some(retry) = soonest_retry(
+            &app.present_retry,
+            |id| {
+                app.entries
+                    .iter()
+                    .any(|e| e.id == id && !(app.unlock_sent && e.role.is_lock()))
+            },
+            std::time::Instant::now(),
+        ) {
             timeout = Some(timeout.map_or(retry, |current| current.min(retry)));
         }
         event_loop.dispatch(timeout, &mut app).map_err(err)?;
@@ -1529,6 +1556,7 @@ impl<S: LockSession> OutputHandler for App<S> {
             }
             self.entries.retain(|entry| entry.output != output);
             self.scene_ids.remove(&id);
+            self.present_retry.remove(&id);
             self.session.output_gone(id);
         }
     }
@@ -1573,6 +1601,46 @@ wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpAlph
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_retry_for_a_departed_output_cannot_steer_the_loop() {
+        // The hazard (#70): a retry outlives its output, its deadline is
+        // for ever in the past, the loop's timeout becomes ZERO and
+        // dispatch returns instantly on every iteration -- a spin with no
+        // work, the same shape as the buffer churn in #65.
+        let now = Instant::now();
+        let mut retries = super::BTreeMap::new();
+        retries.insert(super::OutputId(1), (now - Duration::from_secs(60), 3_u32));
+        assert_eq!(
+            super::soonest_retry(&retries, |_| false, now),
+            None,
+            "a retry with no live output must not be considered"
+        );
+        assert_eq!(
+            super::soonest_retry(&retries, |_| true, now),
+            Some(Duration::ZERO),
+            "a live output past its deadline is due now"
+        );
+    }
+
+    #[test]
+    fn the_soonest_live_deadline_wins() {
+        let now = Instant::now();
+        let mut retries = super::BTreeMap::new();
+        retries.insert(super::OutputId(1), (now + Duration::from_millis(800), 0));
+        retries.insert(super::OutputId(2), (now + Duration::from_millis(200), 0));
+        assert_eq!(
+            super::soonest_retry(&retries, |_| true, now),
+            Some(Duration::from_millis(200))
+        );
+        // ...but only among the live ones.
+        assert_eq!(
+            super::soonest_retry(&retries, |id| id == super::OutputId(1), now),
+            Some(Duration::from_millis(800))
+        );
+    }
+
     use super::{initial_scale120, pixel_frost, present_priority, surface_role_is_warning};
 
     #[test]
