@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.3.2
+Version:        0.3.3
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -119,6 +119,20 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Tue Aug 26 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.3-1
+- A locked, idle session no longer burns CPU. present() acquired a wl_shm
+  buffer before testing whether the scene was dirty and dropped it
+  un-attached when it was not; the compositor answers every
+  wl_buffer.destroy with delete_id, which wakes the event loop, which
+  acquires another. Measured on mason-desktop at 38% of a core on average
+  and 70% at peak while locked, with Hyprland paying another 24%, and
+  nothing ever drawn. Presenters now ask whether an output owes a present
+  before acquiring anything (desktop-commons ADR 0007); the greeter's own
+  loop does the same.
+- An element whose start keyframe can never resolve settles instead of
+  rendering invisible for the whole lock while requesting a frame every
+  33ms.
+
 * Sat Aug 22 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.2-1
 - singleton-guard resolves xdg-paths from crates.io; allow the desktop-commons git source in deny.toml.
 
