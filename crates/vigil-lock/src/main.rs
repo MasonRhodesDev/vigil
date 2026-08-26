@@ -1013,6 +1013,20 @@ impl LockSession for Locker {
             .unwrap_or(false)
     }
 
+    fn scene_needs_present(&mut self, id: OutputId) -> bool {
+        // `false` for an unknown output deliberately contradicts the
+        // trait's conservative default: it is correct only because
+        // `render` above answers `false` for the same unknown output, so
+        // the probe stays a strict over-approximation of "render would
+        // draw". Change one and you must change the other, or an output
+        // can be skipped while a render would have painted it.
+        self.entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .map(|e| e.window.scene_needs_present())
+            .unwrap_or(false)
+    }
+
     fn wait_decision(&self) -> WaitDecision {
         let slint = self
             .scheduler
