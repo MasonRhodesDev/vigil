@@ -42,7 +42,7 @@ use smithay_client_toolkit::{
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
-use span_lines::{Detail, Span, Trace};
+
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
     globals::registry_queue_init,
@@ -323,12 +323,23 @@ struct App<S: LockSession + 'static> {
     scene_ids: BTreeSet<OutputId>,
     initial_outputs_added: bool,
     unlock_sent: bool,
-    /// Root span for the whole lock, ended with its outcome by
-    /// `run_with_lock`. `None` only when tracing is off.
-    root_span: Option<Span>,
+    /// The lock's root span, kept so phases can be parented to it
+    /// explicitly. A phase is created from inside `tick`, where the current
+    /// span is whichever `loop.iteration` is running, so without this the
+    /// tree would hang phases off arbitrary wakes.
+    root_span: tracing::Span,
     /// Span covering the phase the controller is currently in. Replaced -
     /// and so emitted - on every `FlowCmd::PhaseChanged`.
-    phase_span: Option<Span>,
+    ///
+    /// Held but deliberately *not* entered. Entering it would put it on the
+    /// thread's span stack, and the stack must unwind in order: a phase is
+    /// swapped from inside `tick`, which runs inside an entered
+    /// `loop.iteration`, so exiting the phase there would exit out of
+    /// order. That silently cost every `flow.phase` record at frames
+    /// detail while leaving them intact at session detail, where no
+    /// `loop.iteration` span exists to be inside of. Children are given
+    /// this span as an explicit parent instead.
+    phase_span: Option<tracing::Span>,
     /// Controller events raised inside protocol callbacks. Drained at the
     /// top of the next tick so no callback creates surfaces or tears the
     /// lock down mid-dispatch — the same rule presentation follows, and the
@@ -400,19 +411,27 @@ impl<S: LockSession> App<S> {
                 // session it would reach a `flow_command` that most
                 // implementations do not override, and be dropped.
                 FlowCmd::PhaseChanged { from, to } => {
-                    if let Some(root) = self.root_span.as_ref() {
-                        root.event(
-                            "flow.transition",
-                            &[("from", &from.to_string()), ("to", &to.to_string())],
-                        );
-                    }
-                    // Assigning drops the outgoing span, which emits it, so
-                    // a phase's duration closes at the transition rather
-                    // than whenever the field is next touched.
-                    self.phase_span = self
-                        .root_span
-                        .as_ref()
-                        .map(|root| root.child("flow.phase").attr("phase", to));
+                    // Parented at the outgoing phase, so the transition's
+                    // timestamp falls inside the interval of the phase it
+                    // leaves rather than the one it enters.
+                    let phase = self.phase_span.as_ref().and_then(tracing::Span::id);
+                    tracing::event!(
+                        name: "flow.transition",
+                        target: "vigil",
+                        parent: phase,
+                        tracing::Level::INFO,
+                        from = %from,
+                        to = %to
+                    );
+                    // Dropping the outgoing span is what emits it, so a
+                    // phase's duration closes at the transition rather than
+                    // whenever the field is next touched.
+                    self.phase_span = Some(tracing::info_span!(
+                        target: "vigil",
+                        parent: self.root_span.id(),
+                        "flow.phase",
+                        phase = %to
+                    ));
                 }
                 FlowCmd::Exit(outcome) => self.outcome = Some(outcome),
                 // Listed, not caught by a wildcard. A `_ =>` arm here would
@@ -805,11 +824,13 @@ impl<S: LockSession> App<S> {
         // when `present` returns, on every path including the early ones,
         // so a failed buffer acquisition still reads as a frame that cost
         // time.
-        let _frame = self.root_span.as_ref().map(|root| {
-            root.frame_child("frame.present")
-                .attr("output", id.0)
-                .attr("forced", force)
-        });
+        let _frame = tracing::debug_span!(
+            target: "vigil",
+            "frame.present",
+            output = id.0,
+            forced = force
+        )
+        .entered();
         let stride = w as usize * 4;
         let format = if overlay {
             wl_shm::Format::Argb8888
@@ -1082,14 +1103,21 @@ pub fn run_with_lock<S: LockSession + 'static>(
     lock_config: &Lock,
     warning_ms_override: Option<u64>,
 ) -> Result<LockOutcome, LockError> {
-    // Adopts TRACEPARENT when the caller set one, so a lock that starts in
-    // lock-cmd.sh and ends here is one trace.
-    let trace = Trace::from_env();
-    let root_span = (trace.detail() != Detail::Off).then(|| {
-        trace
-            .span("lock.session")
-            .attr("version", env!("CARGO_PKG_VERSION"))
-    });
+    // The root of the whole lock. Entered for the duration of this
+    // function, so every span and event below becomes its descendant
+    // without a parent being threaded through the executor.
+    //
+    // `outcome` is declared Empty and recorded at the end: a span's fields
+    // are fixed at creation, and the outcome is the one attribute that
+    // cannot be known then.
+    let root = tracing::info_span!(
+        target: "vigil",
+        "lock.session",
+        version = env!("CARGO_PKG_VERSION"),
+        outcome = tracing::field::Empty,
+        error = tracing::field::Empty
+    );
+    let _root = root.clone().entered();
 
     let conn = Connection::connect_to_env().map_err(err)?;
     let (globals, event_queue) = registry_queue_init(&conn).map_err(err)?;
@@ -1131,9 +1159,12 @@ pub fn run_with_lock<S: LockSession + 'static>(
     // transition into it - so open its span here or the first phase of every
     // lock is missing from the trace, and the frames before the first
     // transition sit inside no phase at all.
-    let phase_span = root_span
-        .as_ref()
-        .map(|root| root.child("flow.phase").attr("phase", flow.phase()));
+    let phase_span = Some(tracing::info_span!(
+        target: "vigil",
+        parent: root.id(),
+        "flow.phase",
+        phase = %flow.phase()
+    ));
     let compositor_proxy: wl_compositor::WlCompositor =
         globals.bind(&qh, 1..=6, ()).map_err(err)?;
     let mut app = App {
@@ -1173,7 +1204,7 @@ pub fn run_with_lock<S: LockSession + 'static>(
         scene_ids: BTreeSet::new(),
         initial_outputs_added: false,
         unlock_sent: false,
-        root_span,
+        root_span: root.clone(),
         phase_span,
         protocol_events: Vec::new(),
     };
@@ -1227,10 +1258,7 @@ pub fn run_with_lock<S: LockSession + 'static>(
         // transition relative to the loop that produced it: every
         // frame.present sits inside the loop.iteration that drove it, and a
         // flow.transition's t_us falls inside exactly one of them.
-        let _iteration = app
-            .root_span
-            .as_ref()
-            .map(|root| root.frame_child("loop.iteration"));
+        let _iteration = tracing::debug_span!(target: "vigil", "loop.iteration").entered();
         event_loop.dispatch(timeout, &mut app).map_err(err)?;
         app.wake.acknowledge();
         app.metrics.record_wake();
@@ -1246,15 +1274,10 @@ pub fn run_with_lock<S: LockSession + 'static>(
         (None, Some(outcome)) => Ok(outcome),
         (None, None) => unreachable!(),
     };
-    if let Some(root) = app.root_span.take() {
-        // end(), not drop: vigil-lock leaves through std::process::exit on
-        // every terminal path, and a span waiting on Drop would be lost on
-        // exactly the outcomes worth recording.
-        match &result {
-            Ok(outcome) => root.attr("outcome", format!("{outcome:?}")).end(),
-            Err(error) => root.attr("error", error.to_string()).end(),
-        }
-    }
+    match &result {
+        Ok(outcome) => root.record("outcome", tracing::field::debug(outcome)),
+        Err(error) => root.record("error", tracing::field::display(error)),
+    };
     result
 }
 

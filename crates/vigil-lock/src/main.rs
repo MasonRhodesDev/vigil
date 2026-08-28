@@ -1100,10 +1100,10 @@ fn detach_and_wait_for_lock() -> ! {
         }
     })();
     match result {
-        Ok(code) => std::process::exit(code),
+        Ok(code) => span_lines::exit(code),
         Err(e) => {
             eprintln!("vigil-lock: wait: {e}");
-            std::process::exit(1);
+            span_lines::exit(1);
         }
     }
 }
@@ -1249,11 +1249,26 @@ fn signal_ready_fd(ready_fd: Option<i32>) {
 }
 
 fn main() {
+    // Before anything else, so no span is opened without somewhere to go.
+    // `install` rather than `layer`: it registers the layer with
+    // `span_lines::exit`, which is what closes whatever is still open on
+    // the terminal paths below - none of which unwind.
+    //
+    // The allowlist is "vigil" and nothing else. Installing a subscriber
+    // makes this process collect every instrumented crate in its tree, and
+    // zbus and calloop are in that tree carrying D-Bus paths and error
+    // strings into a journal readable by adm.
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    tracing_subscriber::registry()
+        .with(span_lines::tracing_layer::install(&["vigil"]))
+        .init();
+
     let mut cli = match parse_cli() {
         Ok(cli) => cli,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
-            std::process::exit(2);
+            span_lines::exit(2);
         }
     };
     if cli.wait {
@@ -1263,7 +1278,7 @@ fn main() {
     apply_cli_to_config(&cli, &mut config);
     if let Err(error) = config.validate_warning() {
         eprintln!("vigil-lock: {error}");
-        std::process::exit(2);
+        span_lines::exit(2);
     }
     // `apply_cli_to_config` already folded --warn/--no-warn/--immediate in,
     // so the policy the controller runs is exactly the resolved config.
@@ -1300,7 +1315,7 @@ fn main() {
                     match join_lock() {
                         Ok(true) => {
                             signal_ready_fd(cli.ready_fd.take());
-                            std::process::exit(0);
+                            span_lines::exit(0);
                         }
                         Ok(false) => {}
                         Err(error) => eprintln!("vigil-lock: {error}"),
@@ -1310,7 +1325,7 @@ fn main() {
                         eprintln!(
                             "vigil-lock: another locker owns the seat but never confirmed the lock; refusing to stack"
                         );
-                        std::process::exit(2);
+                        span_lines::exit(2);
                     }
                     std::thread::sleep(Duration::from_millis(100));
                     if matches!(
@@ -1325,7 +1340,7 @@ fn main() {
             }
             Err(error) => {
                 eprintln!("vigil-lock: {error}");
-                std::process::exit(2);
+                span_lines::exit(2);
             }
         }
     };
@@ -1333,24 +1348,24 @@ fn main() {
         Ok(locker) => locker,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
-            std::process::exit(1);
+            span_lines::exit(1);
         }
     };
     let _lock_ipc_socket = lock_ipc_socket;
     match vigil_wayland::run_with_lock(locker, &lock_policy, None) {
-        Ok(LockOutcome::Unlocked) => std::process::exit(0),
+        Ok(LockOutcome::Unlocked) => span_lines::exit(0),
         Ok(LockOutcome::Denied) => {
             eprintln!("vigil-lock: lock denied (another locker running?)");
-            std::process::exit(2);
+            span_lines::exit(2);
         }
         Ok(LockOutcome::Invalidated) => {
             eprintln!("vigil-lock: lock invalidated by the compositor");
-            std::process::exit(1);
+            span_lines::exit(1);
         }
-        Ok(LockOutcome::Cancelled) => std::process::exit(3),
+        Ok(LockOutcome::Cancelled) => span_lines::exit(3),
         Err(e) => {
             eprintln!("vigil-lock: {e}");
-            std::process::exit(1);
+            span_lines::exit(1);
         }
     }
 }

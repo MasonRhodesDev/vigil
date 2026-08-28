@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 slint-idle-runtime.workspace = true
 singleton-guard.workspace = true
+span-lines.workspace = true
+tracing-subscriber.workspace = true
 vigil-core.workspace = true
 monitor-profiles.workspace = true
 appearance-profiles.workspace = true
