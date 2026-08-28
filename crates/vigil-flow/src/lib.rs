@@ -167,6 +167,35 @@ pub enum FlowCmd {
     /// controller stays free of presentation policy, tests can assert
     /// *which* degradation, and the note can carry its own numbers.
     Journal(FlowNote),
+    /// The phase moved.
+    ///
+    /// Ordering rule: a `PhaseChanged` precedes every command that entering
+    /// the new phase causes. The one shape that reads backwards is the
+    /// terminal one, and only because `Exit` is documented to run last:
+    /// `finish` emits `PhaseChanged` then `Exit`, while a command caused by
+    /// the *event* rather than by the new phase - `ReleaseSessionLock` on
+    /// unlock - still precedes both.
+    ///
+    /// The starting phase is not reported, because nothing transitions into
+    /// it. An adapter mirroring the phase from this stream must seed itself
+    /// from [`LockFlow::phase`] first; on the immediate path the flow is
+    /// already in `Committing` when `new` returns, so a mirror initialised
+    /// to `PreLock` would disagree with the first transition\'s `from`.
+    ///
+    /// This crate is pure, so it cannot report a transition by writing one
+    /// out; and a `phase()` getter alone forced every adapter to snapshot
+    /// the phase before each `step()` and compare afterwards, at three call
+    /// sites in the Wayland executor and once more in the simulator. That
+    /// is the boilerplate `Journal` exists to avoid for notes, and it stays
+    /// correct only until someone adds a fourth `step()` call.
+    ///
+    /// Putting transitions in the command stream also means `vigil-sim` can
+    /// assert transition *ordering* against everything else the controller
+    /// emitted, which nothing outside a live adapter could observe before.
+    PhaseChanged {
+        from: FlowPhase,
+        to: FlowPhase,
+    },
     /// Terminal: the process should exit with this outcome after executing
     /// prior commands.
     Exit(LockOutcome),
@@ -205,6 +234,28 @@ pub enum FlowPhase {
     /// Lock released; fade running.
     Revealing,
     Done(LockOutcome),
+}
+
+impl std::fmt::Display for FlowPhase {
+    /// Stable, inert names. These reach a journal record as an attribute
+    /// value, so they avoid whitespace and `=` deliberately.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreLock => f.write_str("PreLock"),
+            Self::Committing => f.write_str("Committing"),
+            Self::Locked => f.write_str("Locked"),
+            Self::RevealPending => f.write_str("RevealPending"),
+            Self::Revealing => f.write_str("Revealing"),
+            // Matched rather than `{outcome:?}`: Debug is not a stability
+            // guarantee, so a future `Denied { reason: String }` would
+            // silently start emitting braces, quotes and spaces into a
+            // value this impl promises is inert.
+            Self::Done(LockOutcome::Unlocked) => f.write_str("Done:Unlocked"),
+            Self::Done(LockOutcome::Denied) => f.write_str("Done:Denied"),
+            Self::Done(LockOutcome::Invalidated) => f.write_str("Done:Invalidated"),
+            Self::Done(LockOutcome::Cancelled) => f.write_str("Done:Cancelled"),
+        }
+    }
 }
 
 pub struct LockFlow {
@@ -360,7 +411,7 @@ impl LockFlow {
             }
             FlowEvent::LockConfirmed => {
                 if matches!(self.phase, FlowPhase::PreLock | FlowPhase::Committing) {
-                    self.phase = FlowPhase::Locked;
+                    self.set_phase(FlowPhase::Locked, &mut cmds);
                     if let Some(timeline) = self.timeline.as_mut() {
                         timeline.locked(now.elapsed);
                     }
@@ -485,7 +536,7 @@ impl LockFlow {
                         self.finish(LockOutcome::Cancelled, cmds);
                     }
                     _ if sample.should_commit && self.phase == FlowPhase::PreLock => {
-                        self.phase = FlowPhase::Committing;
+                        self.set_phase(FlowPhase::Committing, cmds);
                         cmds.push(FlowCmd::RequestSessionLock);
                     }
                     _ => {}
@@ -559,10 +610,15 @@ impl LockFlow {
 
     /// Auth success, grace dismissal, or logind Unlock.
     fn unlock_authorized(&mut self, now: Now, cmds: &mut Vec<FlowCmd>) {
+        // The transition comes first, then everything entering the phase
+        // entails - DetachAuth and SetLockedHint are consequences of the
+        // unlock, not events that precede it.
+        if self.transition.reveals() {
+            self.set_phase(FlowPhase::RevealPending, cmds);
+        }
         cmds.push(FlowCmd::DetachAuth);
         cmds.push(FlowCmd::SetLockedHint(false));
         if self.transition.reveals() {
-            self.phase = FlowPhase::RevealPending;
             self.reveal = Some(Reveal::new(
                 self.transition.wallpaper_out_ms,
                 self.transition.frost_out_ms,
@@ -577,23 +633,44 @@ impl LockFlow {
             });
             cmds.push(FlowCmd::CreateRevealOverlays);
         } else {
+            // ReleaseSessionLock is a consequence of the unlock, not of
+            // entering Done, and `Exit` is documented to run last - so it
+            // stays ahead of `finish`, which emits PhaseChanged then Exit.
             cmds.push(FlowCmd::ReleaseSessionLock);
             self.finish(LockOutcome::Unlocked, cmds);
         }
     }
 
     fn release_and_start_reveal(&mut self, now: Now, cmds: &mut Vec<FlowCmd>) {
+        self.set_phase(FlowPhase::Revealing, cmds);
         cmds.push(FlowCmd::ReleaseSessionLock);
         if let Some(reveal) = self.reveal.as_mut() {
             reveal.start(now.elapsed);
         }
         self.reveal_started = Some(now.elapsed);
-        self.phase = FlowPhase::Revealing;
         self.wait = Some(Duration::from_millis(vigil_warning::FRAME_INTERVAL_MS));
     }
 
+    /// Move to `to`, recording the transition in the command stream.
+    ///
+    /// Every phase assignment goes through here. Diffing `phase()` around
+    /// `step()` would collapse two transitions in one step into one, and
+    /// would place the report after every command the step emitted rather
+    /// than at the point the phase actually moved.
+    fn set_phase(&mut self, to: FlowPhase, cmds: &mut Vec<FlowCmd>) {
+        let from = self.phase;
+        // No caller can reach this with an unchanged phase today. Asserting
+        // that is better than branching on it: a silent early return would
+        // be an unreachable arm no test can honestly cover, and a
+        // self-transition reaching the stream would make the variant's name
+        // untrue rather than merely noisy.
+        debug_assert_ne!(from, to, "set_phase called with an unchanged phase");
+        self.phase = to;
+        cmds.push(FlowCmd::PhaseChanged { from, to });
+    }
+
     fn finish(&mut self, outcome: LockOutcome, cmds: &mut Vec<FlowCmd>) {
-        self.phase = FlowPhase::Done(outcome);
+        self.set_phase(FlowPhase::Done(outcome), cmds);
         self.timeline = None;
         self.reveal = None;
         self.wait = None;
@@ -668,6 +745,23 @@ mod tests {
 
     fn has(cmds: &[FlowCmd], wanted: &FlowCmd) -> bool {
         cmds.contains(wanted)
+    }
+
+    /// Every transition reported by this command batch, in order.
+    fn transitions(cmds: &[FlowCmd]) -> Vec<(FlowPhase, FlowPhase)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                FlowCmd::PhaseChanged { from, to } => Some((*from, *to)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where `wanted` sits in the batch, for ordering assertions.
+    fn position(cmds: &[FlowCmd], wanted: &FlowCmd) -> usize {
+        cmds.iter()
+            .position(|cmd| cmd == wanted)
+            .unwrap_or_else(|| panic!("{wanted:?} not in {cmds:?}"))
     }
 
     /// Drive to Locked via the standard handshake; returns the flow.
@@ -1287,6 +1381,170 @@ mod tests {
                 .iter()
                 .any(|cmd| matches!(cmd, FlowCmd::OverlayProgress { .. })),
             "{second:?}"
+        );
+    }
+
+    #[test]
+    fn a_transition_is_reported_where_it_happens() {
+        // The point of the seam: an adapter learns the phase moved without
+        // snapshotting phase() around every step(), and learns it in the
+        // right place relative to the commands the move caused.
+        let lock = manual_lock();
+        let (mut flow, _) = LockFlow::new(at(0), &lock, Some(0));
+
+        let cmds = flow.step(at(lock.transition.in_ms()), FlowEvent::Tick);
+        assert_eq!(
+            transitions(&cmds),
+            [(FlowPhase::PreLock, FlowPhase::Committing)],
+            "{cmds:?}"
+        );
+        assert!(
+            position(
+                &cmds,
+                &FlowCmd::PhaseChanged {
+                    from: FlowPhase::PreLock,
+                    to: FlowPhase::Committing,
+                }
+            ) < position(&cmds, &FlowCmd::RequestSessionLock),
+            "the transition must precede the command it caused: {cmds:?}"
+        );
+
+        let cmds = flow.step(at(lock.transition.in_ms() + 10), FlowEvent::LockConfirmed);
+        assert_eq!(
+            transitions(&cmds),
+            [(FlowPhase::Committing, FlowPhase::Locked)],
+            "{cmds:?}"
+        );
+        assert!(
+            position(
+                &cmds,
+                &FlowCmd::PhaseChanged {
+                    from: FlowPhase::Committing,
+                    to: FlowPhase::Locked,
+                }
+            ) < position(&cmds, &FlowCmd::SignalReady),
+            "readiness is a consequence of being locked: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_reported_transition_always_matches_the_phase_that_follows() {
+        // The invariant an adapter relies on: after a batch, `to` from the
+        // last reported transition is what phase() says. A missed report
+        // would desynchronise every observer silently.
+        let lock = manual_lock();
+        let (mut flow, _) = LockFlow::new(at(0), &lock, Some(0));
+        let mut seen = FlowPhase::PreLock;
+        let mut steps = 0;
+
+        for (ms, event) in [
+            (lock.transition.in_ms(), FlowEvent::Tick),
+            (lock.transition.in_ms() + 10, FlowEvent::LockConfirmed),
+            (lock.transition.in_ms() + 20, FlowEvent::AuthOk),
+            (
+                lock.transition.in_ms() + 30,
+                FlowEvent::RevealOverlaysMapped,
+            ),
+        ] {
+            let cmds = flow.step(at(ms), event);
+            for (from, to) in transitions(&cmds) {
+                assert_eq!(from, seen, "a transition skipped a phase: {cmds:?}");
+                seen = to;
+                steps += 1;
+            }
+            assert_eq!(flow.phase(), seen, "phase() disagrees with the stream");
+        }
+        assert!(steps >= 3, "expected several transitions, saw {steps}");
+    }
+
+    #[test]
+    fn entering_done_is_reported_like_any_other_transition() {
+        // The terminal transition is the one an adapter most needs and was
+        // the one no test reached: a mutant turning `finish` back into a
+        // raw assignment left all 63 tests green.
+        for (label, drive) in [
+            (
+                "cancelled",
+                Box::new(|flow: &mut LockFlow| flow.step(at(10), FlowEvent::Input(key())))
+                    as Box<dyn Fn(&mut LockFlow) -> Vec<FlowCmd>>,
+            ),
+            (
+                "denied",
+                Box::new(|flow: &mut LockFlow| flow.step(at(10), FlowEvent::LockDenied)),
+            ),
+            (
+                "invalidated",
+                Box::new(|flow: &mut LockFlow| flow.step(at(10), FlowEvent::LockInvalidated)),
+            ),
+        ] {
+            let (mut flow, _) = LockFlow::new(at(0), &warning_lock(3_000), None);
+            let before = flow.phase();
+            let cmds = drive(&mut flow);
+            let reported = transitions(&cmds);
+            assert_eq!(
+                reported.len(),
+                1,
+                "{label}: expected one transition: {cmds:?}"
+            );
+            let (from, to) = reported[0];
+            assert_eq!(from, before, "{label}: wrong `from`");
+            assert!(
+                matches!(to, FlowPhase::Done(_)),
+                "{label}: expected a terminal phase, got {to:?}"
+            );
+            assert_eq!(
+                flow.phase(),
+                to,
+                "{label}: phase() disagrees with the stream"
+            );
+            // The transition precedes the Exit it causes.
+            let exit = cmds
+                .iter()
+                .position(|cmd| matches!(cmd, FlowCmd::Exit(_)))
+                .unwrap_or_else(|| panic!("{label}: no Exit in {cmds:?}"));
+            let changed = cmds
+                .iter()
+                .position(|cmd| matches!(cmd, FlowCmd::PhaseChanged { .. }))
+                .expect("checked above");
+            assert!(
+                changed < exit,
+                "{label}: Exit must follow the transition: {cmds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unlock_path_reports_its_transitions_before_what_they_cause() {
+        // The three sites that used to push the transition last:
+        // RevealPending, Revealing, and the non-reveal unlock.
+        let lock = manual_lock();
+        let mut flow = locked_flow(&lock);
+        let cmds = flow.step(at(10_000), FlowEvent::AuthOk);
+        let changed = cmds
+            .iter()
+            .position(|cmd| matches!(cmd, FlowCmd::PhaseChanged { .. }))
+            .unwrap_or_else(|| panic!("no transition in {cmds:?}"));
+        for caused in [FlowCmd::DetachAuth, FlowCmd::SetLockedHint(false)] {
+            assert!(
+                changed < position(&cmds, &caused),
+                "{caused:?} is a consequence of the transition: {cmds:?}"
+            );
+        }
+
+        // ... and the same again one phase later, where the reveal starts.
+        let cmds = flow.step(at(10_010), FlowEvent::RevealOverlaysMapped);
+        assert_eq!(
+            transitions(&cmds),
+            [(FlowPhase::RevealPending, FlowPhase::Revealing)],
+            "{cmds:?}"
+        );
+        let changed = cmds
+            .iter()
+            .position(|cmd| matches!(cmd, FlowCmd::PhaseChanged { .. }))
+            .expect("checked above");
+        assert!(
+            changed < position(&cmds, &FlowCmd::ReleaseSessionLock),
+            "releasing the lock is what entering Revealing means: {cmds:?}"
         );
     }
 }
