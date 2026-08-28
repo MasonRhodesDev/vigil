@@ -4333,6 +4333,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "span-lines"
+version = "0.1.0"
+source = "git+https://github.com/MasonRhodesDev/desktop-commons?rev=952421e#952421e828f63d076b4fcfefa9ddf10d8f17d27b"
+
+[[package]]
 name = "spin_on"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5206,6 +5211,7 @@ dependencies = [
  "calloop-wayland-source 0.4.1",
  "slint-idle-runtime",
  "smithay-client-toolkit 0.21.1",
+ "span-lines",
  "vigil-config",
  "vigil-core",
  "vigil-flow",

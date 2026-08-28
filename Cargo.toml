@@ -26,6 +26,7 @@ slint = { version = "=1.17.1", default-features = false, features = ["std", "com
 slint-interpreter = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2"] }
 slint-idle-runtime = { git = "https://github.com/MasonRhodesDev/slint-idle-runtime", tag = "v0.2.0" }
 singleton-guard = { git = "https://github.com/MasonRhodesDev/desktop-commons", rev = "43229f9" }
+span-lines = { git = "https://github.com/MasonRhodesDev/desktop-commons", rev = "952421e" }
 greetd_ipc = { version = "0.10", features = ["sync-codec"] }
 xkbcommon = "0.9"
 calloop = "0.14"
