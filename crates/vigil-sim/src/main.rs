@@ -635,6 +635,19 @@ impl Simulator {
                 // {note:?} not {note}: the trace is a test surface, and the
                 // typed note exists so a test can assert which degradation.
                 FlowCmd::Journal(note) => self.record(format!("flow: {note:?}")),
+                // Recorded, so a scenario can assert *where* a transition
+                // sits relative to everything else the controller emitted.
+                FlowCmd::PhaseChanged { from, to } => {
+                    // phase_label, not Display: this crate already owns a
+                    // label scheme that its fixtures compare exactly, and
+                    // two spellings of the same phase in one state file
+                    // would be a contract with itself it cannot keep.
+                    self.record(format!(
+                        "flow: phase {} -> {}",
+                        Self::phase_label(from),
+                        Self::phase_label(to)
+                    ));
+                }
                 FlowCmd::RequestSessionLock => {
                     self.record("flow: committed");
                     pending_mode = Some(Mode::Lock);

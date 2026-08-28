@@ -389,8 +389,26 @@ impl<S: LockSession> App<S> {
                 // implementation that does not override flow_command —
                 // exactly the silence the variant exists to prevent.
                 FlowCmd::Journal(note) => eprintln!("vigil-lock: {note}"),
+                // Explicit, not left to the catch-all below: routed to the
+                // session it would reach a `flow_command` that most
+                // implementations do not override, and be dropped.
+                FlowCmd::PhaseChanged { from, to } => {
+                    eprintln!("vigil-lock: phase {from} -> {to}");
+                }
                 FlowCmd::Exit(outcome) => self.outcome = Some(outcome),
-                ref session_cmd => self.session.flow_command(session_cmd),
+                // Listed, not caught by a wildcard. A `_ =>` arm here would
+                // route a future variant to `flow_command`, whose trait
+                // default is empty - so the next command added would be
+                // dropped silently, which is exactly what the comment above
+                // `Journal` warns about. Naming them makes the compiler
+                // raise it instead.
+                ref session_cmd @ (FlowCmd::ShowPanel(_)
+                | FlowCmd::DispatchInput(_)
+                | FlowCmd::StartAuth
+                | FlowCmd::ShowAuthError(_)
+                | FlowCmd::DetachAuth
+                | FlowCmd::SetLockedHint(_)
+                | FlowCmd::SignalReady) => self.session.flow_command(session_cmd),
             }
         }
     }
