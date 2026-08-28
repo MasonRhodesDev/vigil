@@ -42,6 +42,7 @@ use smithay_client_toolkit::{
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
+use span_lines::{Detail, Span, Trace};
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
     globals::registry_queue_init,
@@ -322,6 +323,12 @@ struct App<S: LockSession + 'static> {
     scene_ids: BTreeSet<OutputId>,
     initial_outputs_added: bool,
     unlock_sent: bool,
+    /// Root span for the whole lock, ended with its outcome by
+    /// `run_with_lock`. `None` only when tracing is off.
+    root_span: Option<Span>,
+    /// Span covering the phase the controller is currently in. Replaced -
+    /// and so emitted - on every `FlowCmd::PhaseChanged`.
+    phase_span: Option<Span>,
     /// Controller events raised inside protocol callbacks. Drained at the
     /// top of the next tick so no callback creates surfaces or tears the
     /// lock down mid-dispatch — the same rule presentation follows, and the
@@ -393,7 +400,19 @@ impl<S: LockSession> App<S> {
                 // session it would reach a `flow_command` that most
                 // implementations do not override, and be dropped.
                 FlowCmd::PhaseChanged { from, to } => {
-                    eprintln!("vigil-lock: phase {from} -> {to}");
+                    if let Some(root) = self.root_span.as_ref() {
+                        root.event(
+                            "flow.transition",
+                            &[("from", &from.to_string()), ("to", &to.to_string())],
+                        );
+                    }
+                    // Assigning drops the outgoing span, which emits it, so
+                    // a phase's duration closes at the transition rather
+                    // than whenever the field is next touched.
+                    self.phase_span = self
+                        .root_span
+                        .as_ref()
+                        .map(|root| root.child("flow.phase").attr("phase", to));
                 }
                 FlowCmd::Exit(outcome) => self.outcome = Some(outcome),
                 // Listed, not caught by a wildcard. A `_ =>` arm here would
@@ -780,6 +799,17 @@ impl<S: LockSession> App<S> {
             return;
         }
         self.metrics.record_buffer_acquire();
+        // Opened after the dirtiness probe: a present that owes nothing is
+        // not a frame, and counting it as one would bury the real frames in
+        // the answer to "what happened during this transition". Dropped
+        // when `present` returns, on every path including the early ones,
+        // so a failed buffer acquisition still reads as a frame that cost
+        // time.
+        let _frame = self.root_span.as_ref().map(|root| {
+            root.frame_child("frame.present")
+                .attr("output", id.0)
+                .attr("forced", force)
+        });
         let stride = w as usize * 4;
         let format = if overlay {
             wl_shm::Format::Argb8888
@@ -1052,6 +1082,15 @@ pub fn run_with_lock<S: LockSession + 'static>(
     lock_config: &Lock,
     warning_ms_override: Option<u64>,
 ) -> Result<LockOutcome, LockError> {
+    // Adopts TRACEPARENT when the caller set one, so a lock that starts in
+    // lock-cmd.sh and ends here is one trace.
+    let trace = Trace::from_env();
+    let root_span = (trace.detail() != Detail::Off).then(|| {
+        trace
+            .span("lock.session")
+            .attr("version", env!("CARGO_PKG_VERSION"))
+    });
+
     let conn = Connection::connect_to_env().map_err(err)?;
     let (globals, event_queue) = registry_queue_init(&conn).map_err(err)?;
     let qh: QueueHandle<App<S>> = event_queue.handle();
@@ -1088,6 +1127,13 @@ pub fn run_with_lock<S: LockSession + 'static>(
         warning_ms_override,
     );
     let pre_lock_overlays = flow.phase() == vigil_flow::FlowPhase::PreLock;
+    // The phase the controller starts in is never announced - there is no
+    // transition into it - so open its span here or the first phase of every
+    // lock is missing from the trace, and the frames before the first
+    // transition sit inside no phase at all.
+    let phase_span = root_span
+        .as_ref()
+        .map(|root| root.child("flow.phase").attr("phase", flow.phase()));
     let compositor_proxy: wl_compositor::WlCompositor =
         globals.bind(&qh, 1..=6, ()).map_err(err)?;
     let mut app = App {
@@ -1127,6 +1173,8 @@ pub fn run_with_lock<S: LockSession + 'static>(
         scene_ids: BTreeSet::new(),
         initial_outputs_added: false,
         unlock_sent: false,
+        root_span,
+        phase_span,
         protocol_events: Vec::new(),
     };
     eprintln!(
@@ -1175,6 +1223,14 @@ pub fn run_with_lock<S: LockSession + 'static>(
         {
             timeout = Some(timeout.map_or(retry, |current| current.min(retry)));
         }
+        // One span per wake, at `frames` detail. This is what places a
+        // transition relative to the loop that produced it: every
+        // frame.present sits inside the loop.iteration that drove it, and a
+        // flow.transition's t_us falls inside exactly one of them.
+        let _iteration = app
+            .root_span
+            .as_ref()
+            .map(|root| root.frame_child("loop.iteration"));
         event_loop.dispatch(timeout, &mut app).map_err(err)?;
         app.wake.acknowledge();
         app.metrics.record_wake();
@@ -1182,11 +1238,24 @@ pub fn run_with_lock<S: LockSession + 'static>(
         // all converge here. No expensive client work belongs in callbacks.
         app.tick();
     }
-    match (app.error, app.outcome) {
-        (Some(e), _) => Err(e),
+    // Close the phase before the session, so the tree nests the way it
+    // happened rather than by whatever order the fields drop in.
+    app.phase_span = None;
+    let result = match (&app.error, app.outcome) {
+        (Some(_), _) => Err(app.error.take().expect("checked above")),
         (None, Some(outcome)) => Ok(outcome),
         (None, None) => unreachable!(),
+    };
+    if let Some(root) = app.root_span.take() {
+        // end(), not drop: vigil-lock leaves through std::process::exit on
+        // every terminal path, and a span waiting on Drop would be lost on
+        // exactly the outcomes worth recording.
+        match &result {
+            Ok(outcome) => root.attr("outcome", format!("{outcome:?}")).end(),
+            Err(error) => root.attr("error", error.to_string()).end(),
+        }
     }
+    result
 }
 
 impl<S: LockSession> SessionLockHandler for App<S> {
