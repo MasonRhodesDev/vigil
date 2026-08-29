@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 slint-idle-runtime.workspace = true
-span-lines.workspace = true
 tracing.workspace = true
 vigil-core.workspace = true
 vigil-config.workspace = true

@@ -5247,7 +5247,6 @@ dependencies = [
  "calloop-wayland-source 0.4.1",
  "slint-idle-runtime",
  "smithay-client-toolkit 0.21.1",
- "span-lines",
  "tracing",
  "vigil-config",
  "vigil-core",
