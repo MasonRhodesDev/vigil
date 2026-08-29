@@ -1251,8 +1251,13 @@ fn signal_ready_fd(ready_fd: Option<i32>) {
 fn main() {
     // Before anything else, so no span is opened without somewhere to go.
     // `install` rather than `layer`: it registers the layer with
-    // `span_lines::exit`, which is what closes whatever is still open on
-    // the terminal paths below - none of which unwind.
+    // `span_lines::exit`, so anything still open at a terminal path is
+    // closed and marked `status=exit` instead of silently lost. Today that
+    // is insurance, not the active mechanism: every span lives inside
+    // `run_with_lock`, which returns before any of the exit calls below
+    // run, so their open set is empty - no captured trace has ever carried
+    // a `status=exit` record. It pays off on future exit paths, and for
+    // signal handling (vigil#79), where spans genuinely are still open.
     //
     // The allowlist is "vigil" and nothing else. Installing a subscriber
     // makes this process collect every instrumented crate in its tree, and
