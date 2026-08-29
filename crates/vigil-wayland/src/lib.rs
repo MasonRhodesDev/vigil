@@ -1110,13 +1110,18 @@ pub fn run_with_lock<S: LockSession + 'static>(
     lock_config: &Lock,
     warning_ms_override: Option<u64>,
 ) -> Result<LockOutcome, LockError> {
-    // The root of the whole lock. Entered for the duration of this
-    // function, so every span and event below becomes its descendant
-    // without a parent being threaded through the executor.
+    // The root of the whole lock. Entered for the duration of the body, so
+    // every span and event below becomes its descendant without a parent
+    // being threaded through the executor.
     //
-    // `outcome` is declared Empty and recorded at the end: a span's fields
-    // are fixed at creation, and the outcome is the one attribute that
-    // cannot be known then.
+    // `outcome` and `error` are declared Empty and recorded here, after the
+    // body returns: a span's fields are fixed at creation, and how the lock
+    // ended is the one attribute that cannot be known then. The body is a
+    // separate function so its `?` early returns - every setup failure from
+    // connect_to_env through WaylandSource::insert - still land on this
+    // recording; recording at the body's own tail left a failed setup
+    // emitting a `lock.session` with neither field, indistinguishable from
+    // a session that ended without an outcome.
     let root = tracing::info_span!(
         target: "vigil",
         "lock.session",
@@ -1125,6 +1130,24 @@ pub fn run_with_lock<S: LockSession + 'static>(
         error = tracing::field::Empty
     );
     let _root = root.clone().entered();
+    let result = run_with_lock_body(session, lock_config, warning_ms_override);
+    match &result {
+        Ok(outcome) => root.record("outcome", tracing::field::debug(outcome)),
+        Err(error) => root.record("error", tracing::field::display(error)),
+    };
+    result
+}
+
+/// The fallible body of [`run_with_lock`]. The caller has entered the
+/// `lock.session` root span and records `outcome`/`error` from this
+/// function's return value, so a `?` here never skips the recording.
+fn run_with_lock_body<S: LockSession + 'static>(
+    session: S,
+    lock_config: &Lock,
+    warning_ms_override: Option<u64>,
+) -> Result<LockOutcome, LockError> {
+    // The entered `lock.session` root, reborrowed for explicit parenting.
+    let root = tracing::Span::current();
 
     let conn = Connection::connect_to_env().map_err(err)?;
     let (globals, event_queue) = registry_queue_init(&conn).map_err(err)?;
@@ -1276,16 +1299,11 @@ pub fn run_with_lock<S: LockSession + 'static>(
     // Close the phase before the session, so the tree nests the way it
     // happened rather than by whatever order the fields drop in.
     app.phase_span = None;
-    let result = match (&app.error, app.outcome) {
+    match (&app.error, app.outcome) {
         (Some(_), _) => Err(app.error.take().expect("checked above")),
         (None, Some(outcome)) => Ok(outcome),
         (None, None) => unreachable!(),
-    };
-    match &result {
-        Ok(outcome) => root.record("outcome", tracing::field::debug(outcome)),
-        Err(error) => root.record("error", tracing::field::display(error)),
-    };
-    result
+    }
 }
 
 impl<S: LockSession> SessionLockHandler for App<S> {
