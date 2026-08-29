@@ -16,3 +16,28 @@
   kernel's vkms (never blocks; see ci.yml).
 
 Per-crate unit tests live inside each crate.
+
+## journald (`tests/journald/`)
+
+Does a trace survive the transport it is designed for? Every other capture
+redirects stderr to a file, which proves the records are well-formed and
+proves nothing about journald - and journald is the reason the format
+carries no timestamps of its own.
+
+Borrows a headless sway for `ext-session-lock` and the host's own journald
+for the transport, running the locker in a transient scope started from a
+transient service: the topology `lock-cmd.sh` uses, so stderr is a real
+journald stream rather than a pipe. The child gets a private
+`XDG_RUNTIME_DIR`, so its logind calls cannot reach the seat you are
+sitting at.
+
+    cargo build -p vigil-lock && ./tests/journald/run.sh
+
+Checks one entry per record, full field sets, `seq` contiguous from zero,
+`__MONOTONIC_TIMESTAMP` agreeing with `seq` order, no dangling parents, one
+`lock.session` carrying its outcome, and no journald suppression. Skips
+cleanly without sway, wtype, systemd-run or a user manager.
+
+Cancels the warning so the locker leaves through `span_lines::exit`; a
+killed locker loses whatever is still open, which is #79 and not what this
+measures.
