@@ -1100,10 +1100,10 @@ fn detach_and_wait_for_lock() -> ! {
         }
     })();
     match result {
-        Ok(code) => std::process::exit(code),
+        Ok(code) => span_lines::exit(code),
         Err(e) => {
             eprintln!("vigil-lock: wait: {e}");
-            std::process::exit(1);
+            span_lines::exit(1);
         }
     }
 }
@@ -1199,7 +1199,7 @@ fn start_lock_ipc() -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String>
 fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String> {
     use std::os::unix::fs::PermissionsExt;
     // Callers hold the singleton-guard flock, so any existing socket file is
-    // a leftover from a dead owner (std::process::exit skips Drop): bind
+    // a leftover from a dead owner (span_lines::exit skips Drop): bind
     // first, and only unlink + retry when the address is genuinely in use.
     // The old probe-then-unlink order let two racing starts both unlink and
     // both bind, stacking lockers (issue #50 TOCTOU).
@@ -1249,11 +1249,31 @@ fn signal_ready_fd(ready_fd: Option<i32>) {
 }
 
 fn main() {
+    // Before anything else, so no span is opened without somewhere to go.
+    // `install` rather than `layer`: it registers the layer with
+    // `span_lines::exit`, so anything still open at a terminal path is
+    // closed and marked `status=exit` instead of silently lost. Today that
+    // is insurance, not the active mechanism: every span lives inside
+    // `run_with_lock`, which returns before any of the exit calls below
+    // run, so their open set is empty - no captured trace has ever carried
+    // a `status=exit` record. It pays off on future exit paths, and for
+    // signal handling (vigil#79), where spans genuinely are still open.
+    //
+    // The allowlist is "vigil" and nothing else. Installing a subscriber
+    // makes this process collect every instrumented crate in its tree, and
+    // zbus and calloop are in that tree carrying D-Bus paths and error
+    // strings into a journal readable by adm.
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    tracing_subscriber::registry()
+        .with(span_lines::tracing_layer::install(&["vigil"]))
+        .init();
+
     let mut cli = match parse_cli() {
         Ok(cli) => cli,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
-            std::process::exit(2);
+            span_lines::exit(2);
         }
     };
     if cli.wait {
@@ -1263,7 +1283,7 @@ fn main() {
     apply_cli_to_config(&cli, &mut config);
     if let Err(error) = config.validate_warning() {
         eprintln!("vigil-lock: {error}");
-        std::process::exit(2);
+        span_lines::exit(2);
     }
     // `apply_cli_to_config` already folded --warn/--no-warn/--immediate in,
     // so the policy the controller runs is exactly the resolved config.
@@ -1300,7 +1320,7 @@ fn main() {
                     match join_lock() {
                         Ok(true) => {
                             signal_ready_fd(cli.ready_fd.take());
-                            std::process::exit(0);
+                            span_lines::exit(0);
                         }
                         Ok(false) => {}
                         Err(error) => eprintln!("vigil-lock: {error}"),
@@ -1310,7 +1330,7 @@ fn main() {
                         eprintln!(
                             "vigil-lock: another locker owns the seat but never confirmed the lock; refusing to stack"
                         );
-                        std::process::exit(2);
+                        span_lines::exit(2);
                     }
                     std::thread::sleep(Duration::from_millis(100));
                     if matches!(
@@ -1325,7 +1345,7 @@ fn main() {
             }
             Err(error) => {
                 eprintln!("vigil-lock: {error}");
-                std::process::exit(2);
+                span_lines::exit(2);
             }
         }
     };
@@ -1333,24 +1353,24 @@ fn main() {
         Ok(locker) => locker,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
-            std::process::exit(1);
+            span_lines::exit(1);
         }
     };
     let _lock_ipc_socket = lock_ipc_socket;
     match vigil_wayland::run_with_lock(locker, &lock_policy, None) {
-        Ok(LockOutcome::Unlocked) => std::process::exit(0),
+        Ok(LockOutcome::Unlocked) => span_lines::exit(0),
         Ok(LockOutcome::Denied) => {
             eprintln!("vigil-lock: lock denied (another locker running?)");
-            std::process::exit(2);
+            span_lines::exit(2);
         }
         Ok(LockOutcome::Invalidated) => {
             eprintln!("vigil-lock: lock invalidated by the compositor");
-            std::process::exit(1);
+            span_lines::exit(1);
         }
-        Ok(LockOutcome::Cancelled) => std::process::exit(3),
+        Ok(LockOutcome::Cancelled) => span_lines::exit(3),
         Err(e) => {
             eprintln!("vigil-lock: {e}");
-            std::process::exit(1);
+            span_lines::exit(1);
         }
     }
 }
@@ -1514,7 +1534,7 @@ mod tests {
 
     #[test]
     fn stale_socket_from_a_dead_owner_is_reclaimed() {
-        // std::process::exit skips Drop, so a killed owner always leaves its
+        // span_lines::exit skips Drop, so a killed owner always leaves its
         // socket file behind. Under the singleton flock that leftover is
         // provably dead: bind must reclaim it instead of refusing to start.
         let path = std::env::temp_dir().join(format!(
