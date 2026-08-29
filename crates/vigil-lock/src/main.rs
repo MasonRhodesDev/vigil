@@ -1199,7 +1199,7 @@ fn start_lock_ipc() -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String>
 fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String> {
     use std::os::unix::fs::PermissionsExt;
     // Callers hold the singleton-guard flock, so any existing socket file is
-    // a leftover from a dead owner (std::process::exit skips Drop): bind
+    // a leftover from a dead owner (span_lines::exit skips Drop): bind
     // first, and only unlink + retry when the address is genuinely in use.
     // The old probe-then-unlink order let two racing starts both unlink and
     // both bind, stacking lockers (issue #50 TOCTOU).
@@ -1534,7 +1534,7 @@ mod tests {
 
     #[test]
     fn stale_socket_from_a_dead_owner_is_reclaimed() {
-        // std::process::exit skips Drop, so a killed owner always leaves its
+        // span_lines::exit skips Drop, so a killed owner always leaves its
         // socket file behind. Under the singleton flock that leftover is
         // provably dead: bind must reclaim it instead of refusing to start.
         let path = std::env::temp_dir().join(format!(
