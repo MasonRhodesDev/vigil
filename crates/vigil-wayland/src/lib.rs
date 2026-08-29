@@ -331,14 +331,22 @@ struct App<S: LockSession + 'static> {
     /// Span covering the phase the controller is currently in. Replaced -
     /// and so emitted - on every `FlowCmd::PhaseChanged`.
     ///
-    /// Held but deliberately *not* entered. Entering it would put it on the
-    /// thread's span stack, and the stack must unwind in order: a phase is
-    /// swapped from inside `tick`, which runs inside an entered
-    /// `loop.iteration`, so exiting the phase there would exit out of
-    /// order. That silently cost every `flow.phase` record at frames
-    /// detail while leaving them intact at session detail, where no
-    /// `loop.iteration` span exists to be inside of. Children are given
-    /// this span as an explicit parent instead.
+    /// Held but deliberately *not* entered; children are given this span
+    /// as an explicit parent instead. Not because entering loses records -
+    /// it does not: an entered phase swapped from inside `tick` exits out
+    /// of stack order, but the subscriber removes an exited span by id
+    /// wherever it sits on the thread's stack and still closes it, so its
+    /// record is still written (measured: two `flow.phase` records at both
+    /// tiers either way, over repeated runs; an earlier "frames lost them"
+    /// observation had compared a clean exit against a killed run, and a
+    /// kill loses whatever is still open at every tier). What entering
+    /// does corrupt is frames-detail parentage: an entered phase becomes
+    /// the contextual parent of every `loop.iteration`, and the
+    /// replacement phase created inside `tick` nests under whichever
+    /// iteration happens to be running (measured: `flow.phase` with a
+    /// `loop.iteration` parent). Session detail hides the damage only
+    /// because filtered ancestors are skipped. Explicit parents keep
+    /// phases and iterations siblings under the root at every tier.
     phase_span: Option<tracing::Span>,
     /// Controller events raised inside protocol callbacks. Drained at the
     /// top of the next tick so no callback creates surfaces or tears the
