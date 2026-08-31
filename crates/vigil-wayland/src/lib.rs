@@ -250,10 +250,19 @@ impl SurfaceOpacity {
 /// uncommitted surface would map it empty).
 fn ramp_commit_only(
     wallpaper: f32,
+    prev_wallpaper: f32,
     scene_synced: bool,
     entries: impl Iterator<Item = (bool, bool, bool)>,
 ) -> bool {
-    if wallpaper != 0.0 || !scene_synced {
+    // Both this tick's wallpaper AND the previous one must be zero. The
+    // invariant commit-only rides on is a property of the buffer already
+    // committed on the surface - and on the reveal's descending edge
+    // (wallpaper > 0 -> 0.0, which Reveal::sample produces on every
+    // unlock) that buffer still carries the half-dissolved wallpaper. One
+    // full round rebakes it; from then on prev is 0.0 and the latch
+    // resumes. The same edge covers a mid-warning hotplug driving
+    // wallpaper-ready back to false.
+    if wallpaper != 0.0 || prev_wallpaper != 0.0 || !scene_synced {
         return false;
     }
     let mut overlays = 0;
@@ -473,9 +482,11 @@ impl<S: LockSession> App<S> {
             match cmd {
                 FlowCmd::RequestSessionLock => self.begin_lock(),
                 FlowCmd::OverlayProgress { frost, wallpaper } => {
+                    let prev_wallpaper = self.overlay_progress.1;
                     self.overlay_progress = (frost, wallpaper);
                     if ramp_commit_only(
                         wallpaper,
+                        prev_wallpaper,
                         self.ramp_scene_synced,
                         self.entries.iter().map(|entry| {
                             (
@@ -1877,6 +1888,7 @@ mod ramp_commit_only_tests {
     fn a_settled_lever_ramp_skips_rendering() {
         assert!(ramp_commit_only(
             0.0,
+            0.0,
             true,
             [OVERLAY_OK, OVERLAY_OK].into_iter()
         ));
@@ -1885,11 +1897,12 @@ mod ramp_commit_only_tests {
     #[test]
     fn every_condition_alone_forces_the_full_round() {
         // wallpaper > 0: the blend depends on the rendered input.
-        assert!(!ramp_commit_only(0.5, true, [OVERLAY_OK].into_iter()));
+        assert!(!ramp_commit_only(0.5, 0.0, true, [OVERLAY_OK].into_iter()));
         // Scene not yet synced: panel/cursor hiding has not been applied.
-        assert!(!ramp_commit_only(0.0, false, [OVERLAY_OK].into_iter()));
+        assert!(!ramp_commit_only(0.0, 0.0, false, [OVERLAY_OK].into_iter()));
         // An overlay without a lever needs its pixels re-blended per tick.
         assert!(!ramp_commit_only(
+            0.0,
             0.0,
             true,
             [OVERLAY_OK, (false, false, true)].into_iter()
@@ -1898,19 +1911,43 @@ mod ramp_commit_only_tests {
         // map with no buffer (#35/#37).
         assert!(!ramp_commit_only(
             0.0,
+            0.0,
             true,
             [OVERLAY_OK, (false, true, false)].into_iter()
         ));
     }
 
     #[test]
+    fn the_first_tick_after_a_wallpaper_fade_renders_a_full_round() {
+        // The invariant is about the buffer already committed on the
+        // surface, not the value arriving this tick. On the reveal's
+        // descending edge (wallpaper > 0 -> 0.0) the committed buffer still
+        // carries the half-dissolved wallpaper; skipping the render there
+        // freezes it for the whole frost-out. Reproduced in pixels: with a
+        // linear 165/1500 reveal the composite stuck at 141 where main
+        // reached 172.
+        assert!(
+            !ramp_commit_only(0.0, 0.2, true, [OVERLAY_OK].into_iter()),
+            "the tick after a fade must re-render the pure tint"
+        );
+        // ... and only that one tick: once a full round has rebaked the
+        // buffer, prev is 0.0 and commit-only resumes.
+        assert!(ramp_commit_only(0.0, 0.0, true, [OVERLAY_OK].into_iter()));
+    }
+
+    #[test]
     fn lock_surfaces_neither_qualify_nor_disqualify() {
         // The lock surface has no lever and is not part of the ramp; its
         // state must be invisible to this decision.
-        assert!(ramp_commit_only(0.0, true, [LOCK, OVERLAY_OK].into_iter()));
+        assert!(ramp_commit_only(
+            0.0,
+            0.0,
+            true,
+            [LOCK, OVERLAY_OK].into_iter()
+        ));
         // ... and a world with only lock surfaces has nothing to latch.
-        assert!(!ramp_commit_only(0.0, true, [LOCK].into_iter()));
-        assert!(!ramp_commit_only(0.0, true, std::iter::empty()));
+        assert!(!ramp_commit_only(0.0, 0.0, true, [LOCK].into_iter()));
+        assert!(!ramp_commit_only(0.0, 0.0, true, std::iter::empty()));
     }
 }
 
