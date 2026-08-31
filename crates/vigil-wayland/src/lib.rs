@@ -225,19 +225,6 @@ impl SurfaceOpacity {
     }
 }
 
-/// Per-pixel frost to bake into the overlay buffer. With a whole-surface
-/// opacity lever the buffer carries the full tint and the surface fades.
-/// Composite the frost tint (and, during reveal, the lock wallpaper) into a
-/// rendered overlay buffer. wl_shm ARGB8888 is premultiplied. With a
-/// whole-surface opacity lever the tint is baked at full strength and
-/// `frost` drives the surface — and, on Hyprland, the blur strength too.
-///
-/// Split out of `present` and kept pure so the fast path below can be held
-/// byte-identical to the arithmetic it replaces by a test, instead of by
-/// trust. The measurement that forced this: at 3840x2160 the per-pixel loop
-/// cost 375–405 ms per frame while the Slint render beside it cost 4–58 ms,
-/// so a 1.5 s frost ease collapsed to two visible frames — a single-frame
-/// snap to ~96% — on a machine that renders three outputs serially.
 /// Whether an OverlayProgress tick may skip rendering and only latch the
 /// surface opacity with a bare commit.
 ///
@@ -278,6 +265,19 @@ fn ramp_commit_only(
     overlays > 0
 }
 
+/// Composite the frost tint (and, during reveal, the lock wallpaper) into a
+/// rendered overlay buffer. wl_shm ARGB8888 is premultiplied. With a
+/// whole-surface opacity lever the tint is baked at full strength and
+/// `frost` drives the surface — and, on Hyprland, the blur strength too.
+///
+/// Split out of `present` and kept pure so the fast path below can be held
+/// byte-identical to the arithmetic it replaces by a test, instead of by
+/// trust. The measurement that forced this, labelled by build: at
+/// 3840x2160 the per-pixel loop cost 46 ms per frame in release and
+/// 375-405 ms in debug, against 4-58 ms for the Slint render beside it -
+/// so a machine rendering three outputs serially shed most of a 1.5 s
+/// ease's 45 steps, and under the debug build the snap was first
+/// captured on, collapsed to two visible frames.
 fn overlay_blend(
     canvas: &mut [u8],
     frost: f32,
@@ -291,10 +291,11 @@ fn overlay_blend(
     let alpha = wallpaper + tint_alpha;
     if wallpaper == 0.0 {
         // Frost-only: the output does not depend on the rendered input at
-        // all — every pixel becomes the same premultiplied tint. Writing
-        // that one pixel across the first row and copying rows replaces
-        // ~8.3M float round-trips with a fill; measured 375–405 ms → the
-        // cost of a memset at 4K.
+        // all - every pixel becomes the same premultiplied tint, computed
+        // once and written per 4-byte chunk instead of recomputed through
+        // ~25M per-channel float round-trips at 4K. Measured, labelled by
+        // build: release 46 ms -> 4 ms per 4K frame; debug 375-405 ms ->
+        // ~15 ms (debug is the build the snap was first captured under).
         let tint_channel = (18.0 * tint_alpha).round() as u8;
         let pixel = [
             tint_channel,
@@ -318,6 +319,8 @@ fn overlay_blend(
     }
 }
 
+/// Per-pixel frost to bake into the overlay buffer. With a whole-surface
+/// opacity lever the buffer carries the full tint and the surface fades.
 fn pixel_frost(frost: f32, surface_opacity_available: bool) -> f32 {
     if surface_opacity_available {
         1.0
@@ -413,10 +416,15 @@ struct App<S: LockSession + 'static> {
     scene_ids: BTreeSet<OutputId>,
     initial_outputs_added: bool,
     unlock_sent: bool,
-    /// A full session.overlay_progress round has run since the last scene
-    /// change, so panel/cursor hiding is applied and overlay buffers carry
-    /// the full-strength tint. Only then may a frost-only tick skip the
-    /// render and latch opacity with a bare commit.
+    /// A session.overlay_progress round has been REQUESTED since startup -
+    /// not proof one landed - and it is never reset. The resets that force
+    /// a full round after scene changes are carried elsewhere: by
+    /// entry.committed (cleared on every configure) and by the
+    /// previous-wallpaper guard in ramp_commit_only. Known reliance
+    /// (review F7): a mid-ramp PointerEnter can re-show the panel and
+    /// cursor, and only the frost-only fill overwriting every pixel keeps
+    /// them invisible - main re-hid them on every tick, the latch path
+    /// does not.
     ramp_scene_synced: bool,
     /// The lock's root span, kept so phases can be parented to it
     /// explicitly. A phase is created from inside `tick`, where the current
