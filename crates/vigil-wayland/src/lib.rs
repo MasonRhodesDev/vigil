@@ -238,6 +238,37 @@ impl SurfaceOpacity {
 /// cost 375–405 ms per frame while the Slint render beside it cost 4–58 ms,
 /// so a 1.5 s frost ease collapsed to two visible frames — a single-frame
 /// snap to ~96% — on a machine that renders three outputs serially.
+/// Whether an OverlayProgress tick may skip rendering and only latch the
+/// surface opacity with a bare commit.
+///
+/// Pure, because this is the decision the ramp's smoothness rides on and it
+/// has four ANDed conditions - exactly the shape where an untested arm
+/// hides. True only when: the frost is running alone (wallpaper == 0, so
+/// the buffer is input-independent), a full session round has already
+/// synced the scene, and every overlay surface both has an opacity lever
+/// and has committed its first real buffer (#35/#37: a bare commit on an
+/// uncommitted surface would map it empty).
+fn ramp_commit_only(
+    wallpaper: f32,
+    scene_synced: bool,
+    entries: impl Iterator<Item = (bool, bool, bool)>,
+) -> bool {
+    if wallpaper != 0.0 || !scene_synced {
+        return false;
+    }
+    let mut overlays = 0;
+    for (is_lock, has_lever, committed) in entries {
+        if is_lock {
+            continue;
+        }
+        overlays += 1;
+        if !has_lever || !committed {
+            return false;
+        }
+    }
+    overlays > 0
+}
+
 fn overlay_blend(
     canvas: &mut [u8],
     frost: f32,
@@ -373,6 +404,11 @@ struct App<S: LockSession + 'static> {
     scene_ids: BTreeSet<OutputId>,
     initial_outputs_added: bool,
     unlock_sent: bool,
+    /// A full session.overlay_progress round has run since the last scene
+    /// change, so panel/cursor hiding is applied and overlay buffers carry
+    /// the full-strength tint. Only then may a frost-only tick skip the
+    /// render and latch opacity with a bare commit.
+    ramp_scene_synced: bool,
     /// The lock's root span, kept so phases can be parented to it
     /// explicitly. A phase is created from inside `tick`, where the current
     /// span is whichever `loop.iteration` is running, so without this the
@@ -438,9 +474,46 @@ impl<S: LockSession> App<S> {
                 FlowCmd::RequestSessionLock => self.begin_lock(),
                 FlowCmd::OverlayProgress { frost, wallpaper } => {
                     self.overlay_progress = (frost, wallpaper);
-                    self.session.overlay_progress(frost, wallpaper);
-                    for entry in &self.entries {
-                        self.dirty.mark(entry.id);
+                    if ramp_commit_only(
+                        wallpaper,
+                        self.ramp_scene_synced,
+                        self.entries.iter().map(|entry| {
+                            (
+                                entry.role.is_lock(),
+                                entry.opacity.is_some(),
+                                entry.committed,
+                            )
+                        }),
+                    ) {
+                        // Frost-only tick on lever surfaces: the buffer is
+                        // already the full-strength tint, so a render would
+                        // reproduce it byte for byte (overlay_blend's
+                        // fast-path property). Latch the new opacity with a
+                        // bare commit - no buffer, no render - and the ramp
+                        // runs at grid rate even where a present round
+                        // costs hundreds of milliseconds.
+                        for entry in &self.entries {
+                            if !entry.role.is_lock() {
+                                entry.opacity.set(frost);
+                                entry.surface.commit();
+                                tracing::event!(
+                                    name: "ramp.commit",
+                                    target: "vigil",
+                                    tracing::Level::DEBUG,
+                                    output = entry.id.0,
+                                    frost = frost
+                                );
+                            }
+                        }
+                    } else {
+                        self.session.overlay_progress(frost, wallpaper);
+                        // The session pass hides the panel and cursor; once
+                        // a full round has run, later frost-only ticks need
+                        // only the opacity latch above.
+                        self.ramp_scene_synced = true;
+                        for entry in &self.entries {
+                            self.dirty.mark(entry.id);
+                        }
                     }
                 }
                 FlowCmd::OverlayElements(ref elements) => {
@@ -1267,6 +1340,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
         scene_ids: BTreeSet::new(),
         initial_outputs_added: false,
         unlock_sent: false,
+        ramp_scene_synced: false,
         root_span: root.clone(),
         phase_span,
         protocol_events: Vec::new(),
@@ -1790,6 +1864,55 @@ impl<S: LockSession> ShmHandler for App<S> {
 
 smithay_client_toolkit::delegate_registry!(@<S: LockSession + 'static> App<S>);
 smithay_client_toolkit::delegate_dispatch2!(@<S: LockSession + 'static> App<S>);
+
+#[cfg(test)]
+mod ramp_commit_only_tests {
+    use super::ramp_commit_only;
+
+    // (is_lock, has_lever, committed)
+    const OVERLAY_OK: (bool, bool, bool) = (false, true, true);
+    const LOCK: (bool, bool, bool) = (true, false, false);
+
+    #[test]
+    fn a_settled_lever_ramp_skips_rendering() {
+        assert!(ramp_commit_only(
+            0.0,
+            true,
+            [OVERLAY_OK, OVERLAY_OK].into_iter()
+        ));
+    }
+
+    #[test]
+    fn every_condition_alone_forces_the_full_round() {
+        // wallpaper > 0: the blend depends on the rendered input.
+        assert!(!ramp_commit_only(0.5, true, [OVERLAY_OK].into_iter()));
+        // Scene not yet synced: panel/cursor hiding has not been applied.
+        assert!(!ramp_commit_only(0.0, false, [OVERLAY_OK].into_iter()));
+        // An overlay without a lever needs its pixels re-blended per tick.
+        assert!(!ramp_commit_only(
+            0.0,
+            true,
+            [OVERLAY_OK, (false, false, true)].into_iter()
+        ));
+        // An uncommitted overlay must not receive a bare commit: it would
+        // map with no buffer (#35/#37).
+        assert!(!ramp_commit_only(
+            0.0,
+            true,
+            [OVERLAY_OK, (false, true, false)].into_iter()
+        ));
+    }
+
+    #[test]
+    fn lock_surfaces_neither_qualify_nor_disqualify() {
+        // The lock surface has no lever and is not part of the ramp; its
+        // state must be invisible to this decision.
+        assert!(ramp_commit_only(0.0, true, [LOCK, OVERLAY_OK].into_iter()));
+        // ... and a world with only lock surfaces has nothing to latch.
+        assert!(!ramp_commit_only(0.0, true, [LOCK].into_iter()));
+        assert!(!ramp_commit_only(0.0, true, std::iter::empty()));
+    }
+}
 
 #[cfg(test)]
 mod overlay_blend_tests {
