@@ -507,6 +507,11 @@ impl<S: LockSession> App<S> {
                             if !entry.role.is_lock() {
                                 entry.opacity.set(frost);
                                 entry.surface.commit();
+                                // The metric's contract is commits, not
+                                // commits that carried a buffer (review F5:
+                                // the wire showed 46 while the counter saw
+                                // 4, in exactly the phase it measures).
+                                self.metrics.record_commit();
                                 tracing::event!(
                                     name: "ramp.commit",
                                     target: "vigil",
