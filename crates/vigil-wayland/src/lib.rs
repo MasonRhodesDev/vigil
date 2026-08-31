@@ -227,6 +227,57 @@ impl SurfaceOpacity {
 
 /// Per-pixel frost to bake into the overlay buffer. With a whole-surface
 /// opacity lever the buffer carries the full tint and the surface fades.
+/// Composite the frost tint (and, during reveal, the lock wallpaper) into a
+/// rendered overlay buffer. wl_shm ARGB8888 is premultiplied. With a
+/// whole-surface opacity lever the tint is baked at full strength and
+/// `frost` drives the surface — and, on Hyprland, the blur strength too.
+///
+/// Split out of `present` and kept pure so the fast path below can be held
+/// byte-identical to the arithmetic it replaces by a test, instead of by
+/// trust. The measurement that forced this: at 3840x2160 the per-pixel loop
+/// cost 375–405 ms per frame while the Slint render beside it cost 4–58 ms,
+/// so a 1.5 s frost ease collapsed to two visible frames — a single-frame
+/// snap to ~96% — on a machine that renders three outputs serially.
+fn overlay_blend(
+    canvas: &mut [u8],
+    frost: f32,
+    wallpaper: f32,
+    frost_alpha: f32,
+    surface_opacity: bool,
+) {
+    let wallpaper = wallpaper.clamp(0.0, 1.0);
+    let tint_alpha =
+        (pixel_frost(frost, surface_opacity) * frost_alpha * (1.0 - wallpaper)).clamp(0.0, 1.0);
+    let alpha = wallpaper + tint_alpha;
+    if wallpaper == 0.0 {
+        // Frost-only: the output does not depend on the rendered input at
+        // all — every pixel becomes the same premultiplied tint. Writing
+        // that one pixel across the first row and copying rows replaces
+        // ~8.3M float round-trips with a fill; measured 375–405 ms → the
+        // cost of a memset at 4K.
+        let tint_channel = (18.0 * tint_alpha).round() as u8;
+        let pixel = [
+            tint_channel,
+            tint_channel,
+            tint_channel,
+            (alpha * 255.0).round() as u8,
+        ];
+        let (chunks, _) = canvas.as_chunks_mut::<4>();
+        for target in chunks.iter_mut() {
+            *target = pixel;
+        }
+        return;
+    }
+    for pixel in canvas.as_chunks_mut::<4>().0 {
+        for channel in &mut pixel[..3] {
+            let wallpaper_channel = f32::from(*channel) * wallpaper;
+            let tint_channel = 18.0 * tint_alpha;
+            *channel = (wallpaper_channel + tint_channel).round() as u8;
+        }
+        pixel[3] = (alpha * 255.0).round() as u8;
+    }
+}
+
 fn pixel_frost(frost: f32, surface_opacity_available: bool) -> f32 {
     if surface_opacity_available {
         1.0
@@ -883,25 +934,7 @@ impl<S: LockSession> App<S> {
             return;
         }
         if let Some((frost, wallpaper)) = overlay_progress {
-            // wl_shm ARGB8888 is premultiplied. Fade the rendered lock
-            // wallpaper in (or out) over a neutral frost tint while the
-            // compositor supplies the live blur behind this translucent
-            // surface. With a whole-surface opacity lever the tint is baked
-            // at full strength and `frost` drives the surface — and, on
-            // Hyprland, the blur strength with it.
-            let wallpaper = wallpaper.clamp(0.0, 1.0);
-            let tint_alpha =
-                (pixel_frost(frost, surface_opacity) * self.frost_alpha * (1.0 - wallpaper))
-                    .clamp(0.0, 1.0);
-            let alpha = wallpaper + tint_alpha;
-            for pixel in canvas.as_chunks_mut::<4>().0 {
-                for channel in &mut pixel[..3] {
-                    let wallpaper_channel = f32::from(*channel) * wallpaper;
-                    let tint_channel = 18.0 * tint_alpha;
-                    *channel = (wallpaper_channel + tint_channel).round() as u8;
-                }
-                pixel[3] = (alpha * 255.0).round() as u8;
-            }
+            overlay_blend(canvas, frost, wallpaper, self.frost_alpha, surface_opacity);
         }
         // Captured after the overlay blend: the full-buffer premultiply is
         // the cost this diagnostic exists to surface on slow compositors.
@@ -1757,3 +1790,99 @@ impl<S: LockSession> ShmHandler for App<S> {
 
 smithay_client_toolkit::delegate_registry!(@<S: LockSession + 'static> App<S>);
 smithay_client_toolkit::delegate_dispatch2!(@<S: LockSession + 'static> App<S>);
+
+#[cfg(test)]
+mod overlay_blend_tests {
+    use super::*;
+
+    /// The arithmetic present() shipped before the fast path existed,
+    /// transcribed verbatim. The fast path must be byte-identical to this
+    /// on every input, or a "performance" change is silently a visual one.
+    fn reference(
+        canvas: &mut [u8],
+        frost: f32,
+        wallpaper: f32,
+        frost_alpha: f32,
+        surface_opacity: bool,
+    ) {
+        let wallpaper = wallpaper.clamp(0.0, 1.0);
+        let tint_alpha =
+            (pixel_frost(frost, surface_opacity) * frost_alpha * (1.0 - wallpaper)).clamp(0.0, 1.0);
+        let alpha = wallpaper + tint_alpha;
+        for pixel in canvas.as_chunks_mut::<4>().0 {
+            for channel in &mut pixel[..3] {
+                let wallpaper_channel = f32::from(*channel) * wallpaper;
+                let tint_channel = 18.0 * tint_alpha;
+                *channel = (wallpaper_channel + tint_channel).round() as u8;
+            }
+            pixel[3] = (alpha * 255.0).round() as u8;
+        }
+    }
+
+    /// Deterministic junk that exercises every byte value.
+    fn scribble(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn the_fast_path_is_byte_identical_to_the_reference() {
+        // The frost-only fill is valid precisely because the output ignores
+        // the rendered input; the wallpaper>0 loop must keep depending on
+        // it. Cover both, across the ramp and both lever states, on
+        // buffers whose every input byte differs.
+        for &surface_opacity in &[true, false] {
+            for &frost in &[0.0, 0.001, 0.35, 0.42, 0.9648, 1.0] {
+                for &wallpaper in &[0.0, 0.001, 0.5, 0.97, 1.0, 1.5, -0.2] {
+                    for &frost_alpha in &[0.0, 0.35, 1.0] {
+                        let mut fast = scribble(64 * 4, 7);
+                        let mut slow = fast.clone();
+                        overlay_blend(&mut fast, frost, wallpaper, frost_alpha, surface_opacity);
+                        reference(&mut slow, frost, wallpaper, frost_alpha, surface_opacity);
+                        assert_eq!(
+                            fast, slow,
+                            "diverged at frost={frost} wallpaper={wallpaper}                              frost_alpha={frost_alpha} lever={surface_opacity}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frost_only_output_ignores_the_rendered_input() {
+        // The property the fill relies on, asserted directly rather than
+        // implied: two entirely different renders blend to the same bytes
+        // when wallpaper is zero.
+        let mut a = scribble(64 * 4, 1);
+        let mut b = scribble(64 * 4, 200);
+        overlay_blend(&mut a, 0.42, 0.0, 0.35, true);
+        overlay_blend(&mut b, 0.42, 0.0, 0.35, true);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_reveal_blend_still_depends_on_the_rendered_input() {
+        // The discrimination sibling: wallpaper>0 must NOT collapse to a
+        // constant, or the reveal would fade a grey card instead of the
+        // lock wallpaper.
+        let mut a = scribble(64 * 4, 1);
+        let mut b = scribble(64 * 4, 200);
+        overlay_blend(&mut a, 1.0, 0.5, 0.35, true);
+        overlay_blend(&mut b, 1.0, 0.5, 0.35, true);
+        assert_ne!(a, b, "wallpaper blend lost its input dependence");
+    }
+
+    #[test]
+    fn a_tail_shorter_than_a_pixel_is_left_alone_by_both_paths() {
+        // as_chunks_mut::<4> ignores a ragged tail; the fill must too.
+        let original = scribble(4 * 3 + 2, 9);
+        let mut fast = original.clone();
+        let mut slow = original.clone();
+        overlay_blend(&mut fast, 0.5, 0.0, 0.35, true);
+        reference(&mut slow, 0.5, 0.0, 0.35, true);
+        assert_eq!(fast, slow);
+        assert_eq!(&fast[12..], &original[12..], "tail bytes must survive");
+    }
+}
