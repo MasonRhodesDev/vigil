@@ -153,6 +153,27 @@ fn err(e: impl std::fmt::Display) -> LockError {
     LockError(e.to_string())
 }
 
+/// Stable, inert names for [`FlowEvent`]s in diagnostic records.
+fn flow_event_kind(event: &FlowEvent) -> &'static str {
+    match event {
+        FlowEvent::Input(_) => "Input",
+        FlowEvent::PointerEnter { .. } => "PointerEnter",
+        FlowEvent::OutputAdded => "OutputAdded",
+        FlowEvent::OutputGone => "OutputGone",
+        FlowEvent::WallpaperReady(true) => "WallpaperReady:true",
+        FlowEvent::WallpaperReady(false) => "WallpaperReady:false",
+        FlowEvent::CommitRequested => "CommitRequested",
+        FlowEvent::LockConfirmed => "LockConfirmed",
+        FlowEvent::LockDenied => "LockDenied",
+        FlowEvent::LockInvalidated => "LockInvalidated",
+        FlowEvent::AuthOk => "AuthOk",
+        FlowEvent::LogindUnlock => "LogindUnlock",
+        FlowEvent::RevealOverlaysMapped => "RevealOverlaysMapped",
+        FlowEvent::Tick => "Tick",
+        _ => "other",
+    }
+}
+
 enum SurfaceRole {
     Warning(LayerSurface),
     Lock {
@@ -980,6 +1001,14 @@ impl<S: LockSession> App<S> {
             .chain(self.session.poll_events())
             .collect();
         for event in events {
+            // Diagnostic record: which inputs actually reach the flow, at
+            // what elapsed time. Session tier: a handful per lock.
+            tracing::event!(
+                name: "flow.input",
+                target: "vigil",
+                tracing::Level::INFO,
+                kind = flow_event_kind(&event)
+            );
             let cmds = self.flow.step(self.now(), event);
             self.run(cmds);
             if self.outcome.is_some() {
@@ -991,6 +1020,17 @@ impl<S: LockSession> App<S> {
         if self.outcome.is_some() {
             return;
         }
+        // What the flow armed after this tick - the fact whose absence a
+        // 123 s live hang came down to, and which nothing recorded.
+        tracing::event!(
+            name: "flow.wait",
+            target: "vigil",
+            tracing::Level::DEBUG,
+            wait_ms = self
+                .flow
+                .next_wake()
+                .map_or(-1i64, |d| d.as_millis() as i64)
+        );
         // The DirtySet is advisory, not the render gate. The software adapter
         // cannot intercept Slint's request_redraw (the slint::Window belongs to
         // the inner MinimalSoftwareWindow, so core never calls the tracking

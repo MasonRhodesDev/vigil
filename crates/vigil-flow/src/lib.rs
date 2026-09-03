@@ -709,11 +709,11 @@ impl Grace {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use vigil_config::{Lock, LockTransition, LockWarning};
 
-    fn key() -> InputEvent {
+    pub(crate) fn key() -> InputEvent {
         InputEvent::Key {
             keysym: 1,
             utf8: None,
@@ -721,13 +721,13 @@ mod tests {
         }
     }
 
-    fn manual_lock() -> Lock {
+    pub(crate) fn manual_lock() -> Lock {
         // The hypr-DE production shape: --no-warn (no cancelable warning),
         // default transition.
         Lock::default()
     }
 
-    fn warning_lock(duration_ms: u64) -> Lock {
+    pub(crate) fn warning_lock(duration_ms: u64) -> Lock {
         Lock {
             warning: LockWarning {
                 duration_ms,
@@ -739,11 +739,11 @@ mod tests {
         }
     }
 
-    fn at(ms: u64) -> Now {
+    pub(crate) fn at(ms: u64) -> Now {
         Now::at(Duration::from_millis(ms))
     }
 
-    fn has(cmds: &[FlowCmd], wanted: &FlowCmd) -> bool {
+    pub(crate) fn has(cmds: &[FlowCmd], wanted: &FlowCmd) -> bool {
         cmds.contains(wanted)
     }
 
@@ -1545,6 +1545,83 @@ mod tests {
         assert!(
             changed < position(&cmds, &FlowCmd::ReleaseSessionLock),
             "releasing the lock is what entering Revealing means: {cmds:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod late_wallpaper_replay {
+    use super::tests::*;
+    use super::*;
+
+    /// Replay of the 2026-08-30 live run (vigil trace ec1b6c3f…): --warn
+    /// 4000, wallpaper ready only at 8.3 s because a portrait output's
+    /// background took a 6.9 s software resize. The real locker then armed
+    /// no wake and never committed for 123 s.
+    #[test]
+    fn a_wallpaper_ready_after_the_hold_cap_still_commits() {
+        replay(LockFlow::new(at(0), &warning_lock(4_000), None).0);
+    }
+
+    /// Identical cadence, but through the CLI path the real run used:
+    /// `--warn 4000` is warning_ms_override on a default config, not a
+    /// config whose warning block was populated.
+    #[test]
+    fn the_cli_warn_override_commits_like_a_configured_warning() {
+        replay(LockFlow::new(at(0), &Lock::default(), Some(4_000)).0);
+    }
+
+    fn replay(mut flow: LockFlow) {
+        flow.step(at(100), FlowEvent::WallpaperReady(false));
+        for ms in [1_000, 2_000, 2_850, 2_851] {
+            flow.step(at(ms), FlowEvent::Tick);
+        }
+        // Ready arrives AFTER the hold cap (4000 + 5000 = 9000? no: cap is
+        // commit_at + hold = 4000+5000 = 9000; ready at 8309 is before) —
+        // exercise both sides.
+        flow.step(at(8_308), FlowEvent::Tick);
+        let cmds = flow.step(at(8_309), FlowEvent::WallpaperReady(true));
+        assert_eq!(flow.phase(), FlowPhase::PreLock, "{cmds:?}");
+        assert!(
+            flow.next_wake().is_some(),
+            "ready must leave a wake armed: {cmds:?}"
+        );
+        let mut committed = false;
+        for ms in [8_310, 9_000, 9_500, 9_900, 60_891] {
+            let cmds = flow.step(at(ms), FlowEvent::Tick);
+            if has(&cmds, &FlowCmd::RequestSessionLock) {
+                committed = true;
+                break;
+            }
+        }
+        assert!(
+            committed,
+            "the lock never committed; phase={:?}",
+            flow.phase()
+        );
+    }
+
+    /// Same, but ready arrives after the cap has already fired its
+    /// forced-commit path internally.
+    #[test]
+    fn a_wallpaper_ready_after_the_cap_expired_still_commits() {
+        let (mut flow, _) = LockFlow::new(at(0), &warning_lock(4_000), None);
+        flow.step(at(100), FlowEvent::WallpaperReady(false));
+        flow.step(at(2_851), FlowEvent::Tick);
+        // sleep past the cap (9 000) with no tick — the real loop slept too
+        let cmds = flow.step(at(9_500), FlowEvent::WallpaperReady(true));
+        let mut committed = has(&cmds, &FlowCmd::RequestSessionLock);
+        for ms in [9_501, 10_000, 60_891] {
+            let cmds = flow.step(at(ms), FlowEvent::Tick);
+            if has(&cmds, &FlowCmd::RequestSessionLock) {
+                committed = true;
+            }
+        }
+        assert!(
+            committed,
+            "phase={:?} wake={:?}",
+            flow.phase(),
+            flow.next_wake()
         );
     }
 }
