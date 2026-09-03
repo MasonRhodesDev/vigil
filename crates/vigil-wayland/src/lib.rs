@@ -246,6 +246,100 @@ impl SurfaceOpacity {
     }
 }
 
+/// Whether an OverlayProgress tick may skip rendering and only latch the
+/// surface opacity with a bare commit.
+///
+/// Pure, because this is the decision the ramp's smoothness rides on and it
+/// has four ANDed conditions - exactly the shape where an untested arm
+/// hides. True only when: the frost is running alone (wallpaper == 0, so
+/// the buffer is input-independent), a full session round has already
+/// synced the scene, and every overlay surface both has an opacity lever
+/// and has committed its first real buffer (#35/#37: a bare commit on an
+/// uncommitted surface would map it empty).
+fn ramp_commit_only(
+    wallpaper: f32,
+    prev_wallpaper: f32,
+    scene_synced: bool,
+    entries: impl Iterator<Item = (bool, bool, bool)>,
+) -> bool {
+    // Both this tick's wallpaper AND the previous one must be zero. The
+    // invariant commit-only rides on is a property of the buffer already
+    // committed on the surface - and on the reveal's descending edge
+    // (wallpaper > 0 -> 0.0, which Reveal::sample produces on every
+    // unlock) that buffer still carries the half-dissolved wallpaper. One
+    // full round rebakes it; from then on prev is 0.0 and the latch
+    // resumes. The same edge covers a mid-warning hotplug driving
+    // wallpaper-ready back to false.
+    if wallpaper != 0.0 || prev_wallpaper != 0.0 || !scene_synced {
+        return false;
+    }
+    let mut overlays = 0;
+    for (is_lock, has_lever, committed) in entries {
+        if is_lock {
+            continue;
+        }
+        overlays += 1;
+        if !has_lever || !committed {
+            return false;
+        }
+    }
+    overlays > 0
+}
+
+/// Composite the frost tint (and, during reveal, the lock wallpaper) into a
+/// rendered overlay buffer. wl_shm ARGB8888 is premultiplied. With a
+/// whole-surface opacity lever the tint is baked at full strength and
+/// `frost` drives the surface — and, on Hyprland, the blur strength too.
+///
+/// Split out of `present` and kept pure so the fast path below can be held
+/// byte-identical to the arithmetic it replaces by a test, instead of by
+/// trust. The measurement that forced this, labelled by build: at
+/// 3840x2160 the per-pixel loop cost 46 ms per frame in release and
+/// 375-405 ms in debug, against 4-58 ms for the Slint render beside it -
+/// so a machine rendering three outputs serially shed most of a 1.5 s
+/// ease's 45 steps, and under the debug build the snap was first
+/// captured on, collapsed to two visible frames.
+fn overlay_blend(
+    canvas: &mut [u8],
+    frost: f32,
+    wallpaper: f32,
+    frost_alpha: f32,
+    surface_opacity: bool,
+) {
+    let wallpaper = wallpaper.clamp(0.0, 1.0);
+    let tint_alpha =
+        (pixel_frost(frost, surface_opacity) * frost_alpha * (1.0 - wallpaper)).clamp(0.0, 1.0);
+    let alpha = wallpaper + tint_alpha;
+    if wallpaper == 0.0 {
+        // Frost-only: the output does not depend on the rendered input at
+        // all - every pixel becomes the same premultiplied tint, computed
+        // once and written per 4-byte chunk instead of recomputed through
+        // ~25M per-channel float round-trips at 4K. Measured, labelled by
+        // build: release 46 ms -> 4 ms per 4K frame; debug 375-405 ms ->
+        // ~15 ms (debug is the build the snap was first captured under).
+        let tint_channel = (18.0 * tint_alpha).round() as u8;
+        let pixel = [
+            tint_channel,
+            tint_channel,
+            tint_channel,
+            (alpha * 255.0).round() as u8,
+        ];
+        let (chunks, _) = canvas.as_chunks_mut::<4>();
+        for target in chunks.iter_mut() {
+            *target = pixel;
+        }
+        return;
+    }
+    for pixel in canvas.as_chunks_mut::<4>().0 {
+        for channel in &mut pixel[..3] {
+            let wallpaper_channel = f32::from(*channel) * wallpaper;
+            let tint_channel = 18.0 * tint_alpha;
+            *channel = (wallpaper_channel + tint_channel).round() as u8;
+        }
+        pixel[3] = (alpha * 255.0).round() as u8;
+    }
+}
+
 /// Per-pixel frost to bake into the overlay buffer. With a whole-surface
 /// opacity lever the buffer carries the full tint and the surface fades.
 fn pixel_frost(frost: f32, surface_opacity_available: bool) -> f32 {
@@ -343,6 +437,16 @@ struct App<S: LockSession + 'static> {
     scene_ids: BTreeSet<OutputId>,
     initial_outputs_added: bool,
     unlock_sent: bool,
+    /// A session.overlay_progress round has been REQUESTED since startup -
+    /// not proof one landed - and it is never reset. The resets that force
+    /// a full round after scene changes are carried elsewhere: by
+    /// entry.committed (cleared on every configure) and by the
+    /// previous-wallpaper guard in ramp_commit_only. Known reliance
+    /// (review F7): a mid-ramp PointerEnter can re-show the panel and
+    /// cursor, and only the frost-only fill overwriting every pixel keeps
+    /// them invisible - main re-hid them on every tick, the latch path
+    /// does not.
+    ramp_scene_synced: bool,
     /// The lock's root span, kept so phases can be parented to it
     /// explicitly. A phase is created from inside `tick`, where the current
     /// span is whichever `loop.iteration` is running, so without this the
@@ -407,10 +511,54 @@ impl<S: LockSession> App<S> {
             match cmd {
                 FlowCmd::RequestSessionLock => self.begin_lock(),
                 FlowCmd::OverlayProgress { frost, wallpaper } => {
+                    let prev_wallpaper = self.overlay_progress.1;
                     self.overlay_progress = (frost, wallpaper);
-                    self.session.overlay_progress(frost, wallpaper);
-                    for entry in &self.entries {
-                        self.dirty.mark(entry.id);
+                    if ramp_commit_only(
+                        wallpaper,
+                        prev_wallpaper,
+                        self.ramp_scene_synced,
+                        self.entries.iter().map(|entry| {
+                            (
+                                entry.role.is_lock(),
+                                entry.opacity.is_some(),
+                                entry.committed,
+                            )
+                        }),
+                    ) {
+                        // Frost-only tick on lever surfaces: the buffer is
+                        // already the full-strength tint, so a render would
+                        // reproduce it byte for byte (overlay_blend's
+                        // fast-path property). Latch the new opacity with a
+                        // bare commit - no buffer, no render - and the ramp
+                        // runs at grid rate even where a present round
+                        // costs hundreds of milliseconds.
+                        for entry in &self.entries {
+                            if !entry.role.is_lock() {
+                                entry.opacity.set(frost);
+                                entry.surface.commit();
+                                // The metric's contract is commits, not
+                                // commits that carried a buffer (review F5:
+                                // the wire showed 46 while the counter saw
+                                // 4, in exactly the phase it measures).
+                                self.metrics.record_commit();
+                                tracing::event!(
+                                    name: "ramp.commit",
+                                    target: "vigil",
+                                    tracing::Level::DEBUG,
+                                    output = entry.id.0,
+                                    frost = frost
+                                );
+                            }
+                        }
+                    } else {
+                        self.session.overlay_progress(frost, wallpaper);
+                        // The session pass hides the panel and cursor; once
+                        // a full round has run, later frost-only ticks need
+                        // only the opacity latch above.
+                        self.ramp_scene_synced = true;
+                        for entry in &self.entries {
+                            self.dirty.mark(entry.id);
+                        }
                     }
                 }
                 FlowCmd::OverlayElements(ref elements) => {
@@ -904,25 +1052,7 @@ impl<S: LockSession> App<S> {
             return;
         }
         if let Some((frost, wallpaper)) = overlay_progress {
-            // wl_shm ARGB8888 is premultiplied. Fade the rendered lock
-            // wallpaper in (or out) over a neutral frost tint while the
-            // compositor supplies the live blur behind this translucent
-            // surface. With a whole-surface opacity lever the tint is baked
-            // at full strength and `frost` drives the surface — and, on
-            // Hyprland, the blur strength with it.
-            let wallpaper = wallpaper.clamp(0.0, 1.0);
-            let tint_alpha =
-                (pixel_frost(frost, surface_opacity) * self.frost_alpha * (1.0 - wallpaper))
-                    .clamp(0.0, 1.0);
-            let alpha = wallpaper + tint_alpha;
-            for pixel in canvas.as_chunks_mut::<4>().0 {
-                for channel in &mut pixel[..3] {
-                    let wallpaper_channel = f32::from(*channel) * wallpaper;
-                    let tint_channel = 18.0 * tint_alpha;
-                    *channel = (wallpaper_channel + tint_channel).round() as u8;
-                }
-                pixel[3] = (alpha * 255.0).round() as u8;
-            }
+            overlay_blend(canvas, frost, wallpaper, self.frost_alpha, surface_opacity);
         }
         // Captured after the overlay blend: the full-buffer premultiply is
         // the cost this diagnostic exists to surface on slow compositors.
@@ -1274,6 +1404,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
         scene_ids: BTreeSet::new(),
         initial_outputs_added: false,
         unlock_sent: false,
+        ramp_scene_synced: false,
         root_span: root.clone(),
         phase_span,
         protocol_events: Vec::new(),
@@ -1797,3 +1928,174 @@ impl<S: LockSession> ShmHandler for App<S> {
 
 smithay_client_toolkit::delegate_registry!(@<S: LockSession + 'static> App<S>);
 smithay_client_toolkit::delegate_dispatch2!(@<S: LockSession + 'static> App<S>);
+
+#[cfg(test)]
+mod ramp_commit_only_tests {
+    use super::ramp_commit_only;
+
+    // (is_lock, has_lever, committed)
+    const OVERLAY_OK: (bool, bool, bool) = (false, true, true);
+    const LOCK: (bool, bool, bool) = (true, false, false);
+
+    #[test]
+    fn a_settled_lever_ramp_skips_rendering() {
+        assert!(ramp_commit_only(
+            0.0,
+            0.0,
+            true,
+            [OVERLAY_OK, OVERLAY_OK].into_iter()
+        ));
+    }
+
+    #[test]
+    fn every_condition_alone_forces_the_full_round() {
+        // wallpaper > 0: the blend depends on the rendered input.
+        assert!(!ramp_commit_only(0.5, 0.0, true, [OVERLAY_OK].into_iter()));
+        // Scene not yet synced: panel/cursor hiding has not been applied.
+        assert!(!ramp_commit_only(0.0, 0.0, false, [OVERLAY_OK].into_iter()));
+        // An overlay without a lever needs its pixels re-blended per tick.
+        assert!(!ramp_commit_only(
+            0.0,
+            0.0,
+            true,
+            [OVERLAY_OK, (false, false, true)].into_iter()
+        ));
+        // An uncommitted overlay must not receive a bare commit: it would
+        // map with no buffer (#35/#37).
+        assert!(!ramp_commit_only(
+            0.0,
+            0.0,
+            true,
+            [OVERLAY_OK, (false, true, false)].into_iter()
+        ));
+    }
+
+    #[test]
+    fn the_first_tick_after_a_wallpaper_fade_renders_a_full_round() {
+        // The invariant is about the buffer already committed on the
+        // surface, not the value arriving this tick. On the reveal's
+        // descending edge (wallpaper > 0 -> 0.0) the committed buffer still
+        // carries the half-dissolved wallpaper; skipping the render there
+        // freezes it for the whole frost-out. Reproduced in pixels: with a
+        // linear 165/1500 reveal the composite stuck at 141 where main
+        // reached 172.
+        assert!(
+            !ramp_commit_only(0.0, 0.2, true, [OVERLAY_OK].into_iter()),
+            "the tick after a fade must re-render the pure tint"
+        );
+        // ... and only that one tick: once a full round has rebaked the
+        // buffer, prev is 0.0 and commit-only resumes.
+        assert!(ramp_commit_only(0.0, 0.0, true, [OVERLAY_OK].into_iter()));
+    }
+
+    #[test]
+    fn lock_surfaces_neither_qualify_nor_disqualify() {
+        // The lock surface has no lever and is not part of the ramp; its
+        // state must be invisible to this decision.
+        assert!(ramp_commit_only(
+            0.0,
+            0.0,
+            true,
+            [LOCK, OVERLAY_OK].into_iter()
+        ));
+        // ... and a world with only lock surfaces has nothing to latch.
+        assert!(!ramp_commit_only(0.0, 0.0, true, [LOCK].into_iter()));
+        assert!(!ramp_commit_only(0.0, 0.0, true, std::iter::empty()));
+    }
+}
+
+#[cfg(test)]
+mod overlay_blend_tests {
+    use super::*;
+
+    /// The arithmetic present() shipped before the fast path existed,
+    /// transcribed verbatim. The fast path must be byte-identical to this
+    /// on every input, or a "performance" change is silently a visual one.
+    fn reference(
+        canvas: &mut [u8],
+        frost: f32,
+        wallpaper: f32,
+        frost_alpha: f32,
+        surface_opacity: bool,
+    ) {
+        let wallpaper = wallpaper.clamp(0.0, 1.0);
+        let tint_alpha =
+            (pixel_frost(frost, surface_opacity) * frost_alpha * (1.0 - wallpaper)).clamp(0.0, 1.0);
+        let alpha = wallpaper + tint_alpha;
+        for pixel in canvas.as_chunks_mut::<4>().0 {
+            for channel in &mut pixel[..3] {
+                let wallpaper_channel = f32::from(*channel) * wallpaper;
+                let tint_channel = 18.0 * tint_alpha;
+                *channel = (wallpaper_channel + tint_channel).round() as u8;
+            }
+            pixel[3] = (alpha * 255.0).round() as u8;
+        }
+    }
+
+    /// Deterministic junk that exercises every byte value.
+    fn scribble(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn the_fast_path_is_byte_identical_to_the_reference() {
+        // The frost-only fill is valid precisely because the output ignores
+        // the rendered input; the wallpaper>0 loop must keep depending on
+        // it. Cover both, across the ramp and both lever states, on
+        // buffers whose every input byte differs.
+        for &surface_opacity in &[true, false] {
+            for &frost in &[0.0, 0.001, 0.35, 0.42, 0.9648, 1.0] {
+                for &wallpaper in &[0.0, 0.001, 0.5, 0.97, 1.0, 1.5, -0.2] {
+                    for &frost_alpha in &[0.0, 0.35, 1.0] {
+                        let mut fast = scribble(64 * 4, 7);
+                        let mut slow = fast.clone();
+                        overlay_blend(&mut fast, frost, wallpaper, frost_alpha, surface_opacity);
+                        reference(&mut slow, frost, wallpaper, frost_alpha, surface_opacity);
+                        assert_eq!(
+                            fast, slow,
+                            "diverged at frost={frost} wallpaper={wallpaper}                              frost_alpha={frost_alpha} lever={surface_opacity}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frost_only_output_ignores_the_rendered_input() {
+        // The property the fill relies on, asserted directly rather than
+        // implied: two entirely different renders blend to the same bytes
+        // when wallpaper is zero.
+        let mut a = scribble(64 * 4, 1);
+        let mut b = scribble(64 * 4, 200);
+        overlay_blend(&mut a, 0.42, 0.0, 0.35, true);
+        overlay_blend(&mut b, 0.42, 0.0, 0.35, true);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_reveal_blend_still_depends_on_the_rendered_input() {
+        // The discrimination sibling: wallpaper>0 must NOT collapse to a
+        // constant, or the reveal would fade a grey card instead of the
+        // lock wallpaper.
+        let mut a = scribble(64 * 4, 1);
+        let mut b = scribble(64 * 4, 200);
+        overlay_blend(&mut a, 1.0, 0.5, 0.35, true);
+        overlay_blend(&mut b, 1.0, 0.5, 0.35, true);
+        assert_ne!(a, b, "wallpaper blend lost its input dependence");
+    }
+
+    #[test]
+    fn a_tail_shorter_than_a_pixel_is_left_alone_by_both_paths() {
+        // as_chunks_mut::<4> ignores a ragged tail; the fill must too.
+        let original = scribble(4 * 3 + 2, 9);
+        let mut fast = original.clone();
+        let mut slow = original.clone();
+        overlay_blend(&mut fast, 0.5, 0.0, 0.35, true);
+        reference(&mut slow, 0.5, 0.0, 0.35, true);
+        assert_eq!(fast, slow);
+        assert_eq!(&fast[12..], &original[12..], "tail bytes must survive");
+    }
+}
