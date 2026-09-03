@@ -227,11 +227,18 @@ pub struct LockTransition {
 
 impl Default for LockTransition {
     fn default() -> Self {
+        // On lock: the blur ramps up (frost_in) and the wallpaper fades in to
+        // opaque (wallpaper_in) over the lock clock - blur IS the warning that
+        // the device is about to lock, and the wallpaper covers the desktop
+        // before the lock commits. On unlock: instant. wallpaper_out = 0, so
+        // reveals() is false and auth success releases the lock at once - no
+        // blur, no tint, no fade. The reveal is a modular opt-in slot: set
+        // wallpaper_out_ms > 0 for a (still blur-free) unlock fade.
         Self {
             frost_in_ms: 150,
             wallpaper_in_ms: 250,
-            wallpaper_out_ms: 250,
-            frost_out_ms: 150,
+            wallpaper_out_ms: 0,
+            frost_out_ms: 0,
             easing: WarningEasing::EaseOut,
         }
     }
@@ -306,7 +313,16 @@ impl LockTransition {
             true
         }
         let changed_in = clamp_pair(&mut self.frost_in_ms, &mut self.wallpaper_in_ms);
-        let changed_out = clamp_pair(&mut self.wallpaper_out_ms, &mut self.frost_out_ms);
+        // The out ramp is a single opacity fade: only wallpaper_out_ms is
+        // live. frost_out_ms is deprecated and ignored, so it must not share
+        // the budget (a stale value would otherwise shrink the reveal and
+        // trip a spurious clamp warning). Clamp wallpaper_out_ms alone.
+        let changed_out = if self.wallpaper_out_ms > Self::MAX_RAMP_MS {
+            self.wallpaper_out_ms = Self::MAX_RAMP_MS;
+            true
+        } else {
+            false
+        };
         changed_in || changed_out
     }
 }
@@ -698,11 +714,12 @@ easing = "linear"
     #[test]
     fn transition_defaults_are_short() {
         let transition = LockTransition::default();
+        // On lock: blur ramp + wallpaper fade-in (the warning). On unlock:
+        // instant - out 0, so reveals() is false and the reveal is opt-in.
         assert_eq!(transition.in_ms(), 400);
-        // The reveal is a single opacity fade now (wallpaper_out only); the
-        // deprecated frost_out no longer contributes.
-        assert_eq!(transition.out_ms(), 250);
-        assert!(transition.ramps_in() && transition.reveals());
+        assert_eq!(transition.out_ms(), 0);
+        assert!(transition.ramps_in());
+        assert!(!transition.reveals(), "unlock is instant by default");
         assert_eq!(parse("").unwrap().lock.transition, transition);
     }
 
@@ -734,13 +751,34 @@ easing = "linear"
         let mut transition = LockTransition {
             frost_in_ms: 3_000,
             wallpaper_in_ms: 3_000,
+            wallpaper_out_ms: 3_000,
             ..LockTransition::default()
         };
         assert!(transition.clamp());
         assert_eq!(transition.in_ms(), LockTransition::MAX_RAMP_MS);
         assert_eq!(transition.frost_in_ms, 1_000);
-        assert_eq!(transition.out_ms(), 250);
+        // The opt-in out ramp clamps to the same ceiling as the in ramps.
+        assert_eq!(transition.out_ms(), LockTransition::MAX_RAMP_MS);
         assert!(!LockTransition::default().clone().clamp());
+    }
+
+    #[test]
+    fn clamp_ignores_deprecated_frost_out_ms() {
+        // An upgraded config may carry a leftover frost_out_ms. It is
+        // deprecated and ignored, so it must NOT eat into the wallpaper_out
+        // budget: a within-limit reveal must neither shrink nor trip the
+        // clamp warning just because a stale frost_out is present.
+        let mut transition = LockTransition {
+            wallpaper_out_ms: LockTransition::MAX_RAMP_MS,
+            frost_out_ms: 150,
+            ..LockTransition::default()
+        };
+        assert!(
+            !transition.clamp(),
+            "stale frost_out must not force a clamp"
+        );
+        assert_eq!(transition.wallpaper_out_ms, LockTransition::MAX_RAMP_MS);
+        assert_eq!(transition.out_ms(), LockTransition::MAX_RAMP_MS);
     }
 
     #[test]

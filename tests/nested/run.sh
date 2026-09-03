@@ -106,11 +106,13 @@ teardown_check() {
 }
 
 echo "S1: readiness — locked event precedes --wait success"
-# Default path since issue #52: a short non-cancelable frost transition
-# (warning-role overlay) before the lock, a reveal overlay after unlock. The
-# trace is checked after teardown so it also covers the reveal. Note: a
-# compositor may decline to configure a layer surface while locked; the
-# --reveal check allows the bounded-deadline unlock in that case.
+# On lock: a short non-cancelable frost transition (warning-role overlay,
+# blur ramp + wallpaper fade-in) precedes the lock - blur is the "about to
+# lock" warning. On unlock: instant, with NO reveal overlay (the shipped
+# default). --handoff checks the warning surface never exposes the desktop;
+# --no-reveal checks unlock created no vigil-reveal surface. The reveal is an
+# opt-in modular slot (LockTransition.wallpaper_out_ms > 0), covered by
+# vigil-flow and vigil-warning unit tests rather than a nested scenario.
 [ "$(probe_state)" = 0 ] || fail "S1: fresh session reports locked"
 WAYLAND_DEBUG=1 timeout 30 "$VLOCK" --wait --no-warn --grace 300 2>"$WORK/s1.trace" && rc=0 || rc=$?
 [ "$rc" = 0 ] || { grep -v '^\[' "$WORK/s1.trace" | tail -5; fail "S1: --wait exited $rc"; }
@@ -129,7 +131,7 @@ s1_probe=$(probe_state)
 }
 tap
 teardown_check S1
-python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --reveal || fail "S1: trace check"
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --no-reveal || fail "S1: trace check"
 pass "S1"
 
 echo "S2: second locker joins the in-flight warning"

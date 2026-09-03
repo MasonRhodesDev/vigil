@@ -697,7 +697,11 @@ impl<S: LockSession> App<S> {
         // Blur is a pre-lock warning signal only: the reveal overlay carries
         // no blur region, so unlocking uncovers a sharp desktop.
         let effect = blur
-            .then(|| self.background_effects.get_background_effect(surface, qh).ok())
+            .then(|| {
+                self.background_effects
+                    .get_background_effect(surface, qh)
+                    .ok()
+            })
             .flatten();
         if let Some(effect) = &effect {
             let region = self.compositor_proxy.create_region(qh, ());
@@ -971,6 +975,7 @@ impl<S: LockSession> App<S> {
         let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
         let overlay = !self.entries[idx].role.is_lock();
         let surface_opacity = self.entries[idx].opacity.is_some();
+        let is_reveal = self.entries[idx].role.is_reveal();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             eprintln!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
             self.schedule_present_retry(id);
@@ -1054,7 +1059,13 @@ impl<S: LockSession> App<S> {
             return;
         }
         if let Some((frost, wallpaper)) = overlay_progress {
-            overlay_blend(canvas, frost, wallpaper, self.frost_alpha, surface_opacity);
+            // The reveal is blur- AND tint-free: its buffer is pure
+            // wallpaper. pixel_frost() forces full frost on lever surfaces
+            // (the surface opacity carries the ramp there), so a nonzero
+            // frost_alpha would still bake a gray tint even with frost
+            // pinned 0. Zero the tint explicitly for the reveal role.
+            let frost_alpha = if is_reveal { 0.0 } else { self.frost_alpha };
+            overlay_blend(canvas, frost, wallpaper, frost_alpha, surface_opacity);
         }
         // Captured after the overlay blend: the full-buffer premultiply is
         // the cost this diagnostic exists to surface on slow compositors.
