@@ -620,12 +620,12 @@ impl LockFlow {
         cmds.push(FlowCmd::SetLockedHint(false));
         if self.transition.reveals() {
             self.reveal = Some(Reveal::new(
-                self.transition.wallpaper_out_ms,
-                self.transition.frost_out_ms,
+                self.transition.reveal_ms(),
                 self.transition.easing,
             ));
             self.reveal_entered = Some(now.elapsed);
-            self.progress = (1.0, 1.0);
+            // frost 0 from the first reveal frame: no blur/tint on unlock.
+            self.progress = (0.0, 1.0);
             cmds.push(FlowCmd::ShowPanel(false));
             cmds.push(FlowCmd::OverlayProgress {
                 frost: 1.0,

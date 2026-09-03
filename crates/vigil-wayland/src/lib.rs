@@ -666,6 +666,7 @@ impl<S: LockSession> App<S> {
         output: &wl_output::WlOutput,
         namespace: &str,
         pass_through: bool,
+        blur: bool,
     ) -> Option<(
         LayerSurface,
         Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
@@ -693,10 +694,11 @@ impl<S: LockSession> App<S> {
             surface.set_input_region(Some(&region));
             region.destroy();
         }
-        let effect = self
-            .background_effects
-            .get_background_effect(surface, qh)
-            .ok();
+        // Blur is a pre-lock warning signal only: the reveal overlay carries
+        // no blur region, so unlocking uncovers a sharp desktop.
+        let effect = blur
+            .then(|| self.background_effects.get_background_effect(surface, qh).ok())
+            .flatten();
         if let Some(effect) = &effect {
             let region = self.compositor_proxy.create_region(qh, ());
             region.add(0, 0, i32::MAX, i32::MAX);
@@ -754,7 +756,7 @@ impl<S: LockSession> App<S> {
         });
         let (role, background_effect, opacity) = if adding_warning {
             let Some((layer, effect, opacity)) =
-                self.create_overlay(qh, &surface, &output, "vigil-warning", false)
+                self.create_overlay(qh, &surface, &output, "vigil-warning", false, true)
             else {
                 return;
             };
@@ -821,7 +823,7 @@ impl<S: LockSession> App<S> {
             )
         });
         let Some((layer, effect, opacity)) =
-            self.create_overlay(qh, &surface, &output, "vigil-reveal", true)
+            self.create_overlay(qh, &surface, &output, "vigil-reveal", true, false)
         else {
             return;
         };
@@ -1063,8 +1065,16 @@ impl<S: LockSession> App<S> {
         if !drew {
             eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
         }
-        if let Some((frost, _)) = overlay_progress {
-            self.entries[idx].opacity.set(frost);
+        if let Some((frost, wallpaper)) = overlay_progress {
+            // The warning fades via frost (surface opacity ramps the blur
+            // strength in); the reveal fades via the lock wallpaper's
+            // opacity, with frost pinned 0 - so unlock has no blur or tint.
+            let opacity = if self.entries[idx].role.is_reveal() {
+                wallpaper
+            } else {
+                frost
+            };
+            self.entries[idx].opacity.set(opacity);
         }
         let surface = &self.entries[idx].surface;
         let commit_started = std::time::Instant::now();

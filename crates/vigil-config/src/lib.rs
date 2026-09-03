@@ -215,8 +215,12 @@ pub struct LockTransition {
     /// Lock: tint ramps in over this, then the wallpaper.
     pub frost_in_ms: u64,
     pub wallpaper_in_ms: u64,
-    /// Unlock: the wallpaper fades out over this, then the tint.
+    /// Unlock: the lock wallpaper's opacity fades out over this, uncovering
+    /// the sharp desktop. No blur or tint on unlock - blur is a pre-lock
+    /// warning signal only.
     pub wallpaper_out_ms: u64,
+    /// Deprecated and ignored: the unlock fade no longer has a frost phase
+    /// (blur is pre-lock only). Kept so existing configs still parse.
     pub frost_out_ms: u64,
     pub easing: WarningEasing,
 }
@@ -252,8 +256,14 @@ impl LockTransition {
         self.frost_in_ms + self.wallpaper_in_ms
     }
 
+    /// The unlock fade duration. `frost_out_ms` is deprecated and no longer
+    /// contributes - the reveal is a single opacity fade with no blur.
+    pub fn reveal_ms(&self) -> u64 {
+        self.wallpaper_out_ms
+    }
+
     pub fn out_ms(&self) -> u64 {
-        self.wallpaper_out_ms + self.frost_out_ms
+        self.wallpaper_out_ms
     }
 
     pub fn ramps_in(&self) -> bool {
@@ -689,7 +699,9 @@ easing = "linear"
     fn transition_defaults_are_short() {
         let transition = LockTransition::default();
         assert_eq!(transition.in_ms(), 400);
-        assert_eq!(transition.out_ms(), 400);
+        // The reveal is a single opacity fade now (wallpaper_out only); the
+        // deprecated frost_out no longer contributes.
+        assert_eq!(transition.out_ms(), 250);
         assert!(transition.ramps_in() && transition.reveals());
         assert_eq!(parse("").unwrap().lock.transition, transition);
     }
@@ -727,7 +739,7 @@ easing = "linear"
         assert!(transition.clamp());
         assert_eq!(transition.in_ms(), LockTransition::MAX_RAMP_MS);
         assert_eq!(transition.frost_in_ms, 1_000);
-        assert_eq!(transition.out_ms(), 400);
+        assert_eq!(transition.out_ms(), 250);
         assert!(!LockTransition::default().clone().clamp());
     }
 
