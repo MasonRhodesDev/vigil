@@ -212,12 +212,14 @@ def main():
     # which is the wl_output's protocol id — the same number as above.
     first_lock_hash = {}         # output -> (hash, width, height)
     warning_hashed = set()       # outputs whose warning committed a frame
-    # A frame.hash record is written immediately before its own attach, so
-    # the next commit-with-buffer on that output's lock surface is the frame
-    # it fingerprints. That is what turns "when did a buffer arrive" into
+    # A frame.hash record is written immediately AFTER its own commit, so it
+    # fingerprints the most recent lock commit-with-buffer on that output —
+    # not the next one. Hashing moved behind the commit so the diagnostic
+    # could not lengthen the black window it measures, and the correlation
+    # has to follow it. That is what turns "when did a buffer arrive" into
     # "when did a buffer that is not black arrive" — the number issue #86 is
     # actually about.
-    pending_lock_hash = {}       # output -> is this next lock frame black
+    last_lock_commit_ms = {}     # output -> ms of most recent lock commit
     first_nonblack_ms = {}       # output -> ms of first non-black lock commit
 
     with open(args.trace, errors="replace") as fh:
@@ -233,9 +235,13 @@ def main():
                     digest = record.get("hash")
                     width, height = record.get("width", ""), record.get("height", "")
                     first_lock_hash.setdefault(output, (digest, width, height))
-                    if width.isdigit() and height.isdigit():
-                        black = black_hash(int(width) * int(height) * 4)
-                        pending_lock_hash[output] = digest == black
+                    if (
+                        width.isdigit()
+                        and height.isdigit()
+                        and digest != black_hash(int(width) * int(height) * 4)
+                        and output in last_lock_commit_ms
+                    ):
+                        first_nonblack_ms.setdefault(output, last_lock_commit_ms[output])
                 continue
             m = SEND.match(line)
             if m:
@@ -282,8 +288,7 @@ def main():
                     output = lock_surface_output.get(oid)
                     if attached and output is not None:
                         first_lock_commit_ms.setdefault(output, ts)
-                        if pending_lock_hash.pop(output, None) is False:
-                            first_nonblack_ms.setdefault(output, ts)
+                        last_lock_commit_ms[output] = ts
                     if attached and oid in warning_surface_output:
                         warning_commits_ms.setdefault(warning_surface_output[oid], []).append(ts)
                     if attached and oid in reveal_surfaces.values():
