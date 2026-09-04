@@ -1,8 +1,42 @@
 # vigil example configuration — copy to /etc/greetd/vigil.toml.
 # Every key is optional; a missing file or broken value falls back to the
 # built-in default and can never block login. CLI flags override config.
-# The lockscreen reads ~/.config/vigil/config.toml first, then this file
-# (shared [look] = one visual identity for greeter and lock).
+# The lockscreen loads this file, then MERGES ~/.config/vigil/config.toml
+# over it key by key (shared [look] = one visual identity for greeter and
+# lock). The user file is a whitelisted overlay, not a replacement: it may
+# only restyle the lock.
+#
+#   overlay-allowed  look.theme/background/fit/clock_format, the
+#                    [output."NAME"] tables, profiles.dir, the whole
+#                    [lock.transition] ramp shape and easing, and
+#                    lock.warning frost_in_ms / frost_alpha / easing /
+#                    the [lock.warning.gui] table.
+#
+#   security floor   lock.grace_secs, lock.warning.duration_ms,
+#                    lock.warning.cancel_on_motion_px,
+#                    lock.warning.wallpaper_hold_max_ms and
+#                    lock.warning.wallpaper_in_ms come from this file
+#                    ALONE. A session that could write them could grant
+#                    itself an unlock-without-auth window, or a warning
+#                    that waits for ever — a one-file disarm of the lock.
+#                    lock.warning.wallpaper_in_ms is on this list because
+#                    the cancelable warning commits at the END of that
+#                    fade: a fade as long as the warning postpones both
+#                    the lock and the hold cap that backstops it. Its
+#                    [lock.transition] namesake is a ramp shape, not a
+#                    deadline, and stays overlay-able.
+#
+# Greeter-scope keys ([keyboard], [sessions], [users], [power], [greeter],
+# [render]) are ignored in the user file: the greeter reads only this one.
+# Every ignored user key is named on stderr with its reason, including an
+# unrecognised key inside [lock.warning.gui] or [output."NAME"] — those
+# tables are taken whole, and an unknown key in one refuses the whole
+# table rather than being swallowed. [output."NAME"] merges per connector
+# and per field, so a user overriding one output keeps the rest of this
+# file's.
+#
+# `vigil-lock --config PATH` is the exception and stays whole-file — an
+# operator and test affordance, already a root-or-owner choice.
 
 [look]
 # Runtime theme; falls back to the compiled-in default on any error.
