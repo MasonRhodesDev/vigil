@@ -16,6 +16,8 @@ use std::thread::JoinHandle;
 use pam_client::{Context, ConversationHandler, ErrorCode, Flag};
 use vigil_core::{AuthError, AuthEvent};
 
+pub mod faillock;
+
 /// The PAM service to use: our own file when packaged, else the login stack
 /// (verbatim what hyprlock/swaylock ship: `auth include login`).
 pub fn service_name() -> &'static str {
@@ -174,8 +176,34 @@ fn authenticate<E: Fn(AuthEvent)>(user: &str, bridge: Bridge<&E>) -> Result<(), 
     // helper, which fails from a systemd user-service context (hypridle →
     // vigil-lock): the correct password would be REJECTED at unlock.
     ctx.authenticate(Flag::NONE)
-        .map_err(|e| classify(e.code(), e.to_string(), broken.load(Ordering::SeqCst)))?;
+        .map_err(|e| classify(e.code(), e.to_string(), broken.load(Ordering::SeqCst)))
+        .map_err(|failure| lockout_aware(user, failure))?;
     Ok(())
+}
+
+/// A denial may be a faillock lockout rather than a wrong password (issue
+/// #92). Read the tally here, on the worker, the moment PAM answers: it now
+/// includes the attempt that just failed, so the user is told they are
+/// locked out by the very attempt that locked them out.
+///
+/// Only a denial is reclassified. A broken conversation is vigil's own fault
+/// and must never be dressed up as either a rejected credential or a
+/// lockout.
+fn lockout_aware(user: &str, failure: AuthError) -> AuthError {
+    let AuthError::Denied(message) = failure else {
+        return failure;
+    };
+    match faillock::read(user) {
+        Some(faillock::Lockout::Until(remaining)) => AuthError::Locked {
+            message,
+            remaining: Some(remaining),
+        },
+        Some(faillock::Lockout::Indefinite) => AuthError::Locked {
+            message,
+            remaining: None,
+        },
+        None => AuthError::Denied(message),
+    }
 }
 
 #[cfg(test)]

@@ -409,9 +409,19 @@ pub enum UiMessage {
 /// drive the failure the user sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
-    /// PAM evaluated the credential and said no (wrong password, unknown
-    /// user, account locked out). A real, countable authentication failure.
+    /// PAM evaluated the credential and said no. A real, countable
+    /// authentication failure.
     Denied(String),
+    /// PAM said no because `pam_faillock` has the account locked, not
+    /// because this password was wrong (issue #92). Indistinguishable from
+    /// `Denied` by return code — the tally is what tells them apart — and
+    /// worth telling apart, because "wrong password" is a lie to someone
+    /// holding the right one. `remaining` is `None` when the lockout does
+    /// not clear on its own.
+    Locked {
+        message: String,
+        remaining: Option<std::time::Duration>,
+    },
     /// The conversation or transport broke before PAM could judge anything:
     /// the response channel was dropped (the attempt was superseded,
     /// cancelled or detached), or the transaction could not be built at all.
@@ -422,7 +432,9 @@ pub enum AuthError {
 impl AuthError {
     pub fn message(&self) -> &str {
         match self {
-            Self::Denied(message) | Self::Conversation(message) => message,
+            Self::Denied(message) | Self::Locked { message, .. } | Self::Conversation(message) => {
+                message
+            }
         }
     }
 

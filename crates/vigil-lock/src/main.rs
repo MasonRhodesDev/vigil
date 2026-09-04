@@ -448,6 +448,12 @@ enum DoneOutcome {
     Ignore,
     /// PAM judged the credential: show it, re-prompt.
     Denied(String),
+    /// PAM refused because faillock has the account locked. Say so, with the
+    /// time left, instead of blaming the password (issue #92).
+    LockedOut {
+        message: String,
+        remaining: Option<Duration>,
+    },
     /// Our own conversation broke: reopen it without blaming the user.
     ReopenQuietly(String),
     /// Conversations keep breaking. Stop hiding it.
@@ -466,6 +472,9 @@ fn done_outcome(result: Result<(), AuthError>, unlocked: bool, losses: u32) -> D
         // pam_faillock strike against the user.
         Err(_) if unlocked => DoneOutcome::Ignore,
         Err(AuthError::Denied(message)) => DoneOutcome::Denied(message),
+        Err(AuthError::Locked { message, remaining }) => {
+            DoneOutcome::LockedOut { message, remaining }
+        }
         Err(AuthError::Conversation(message)) => {
             if losses > MAX_SILENT_CONVERSATION_RETRIES {
                 DoneOutcome::Surface(message)
@@ -473,6 +482,24 @@ fn done_outcome(result: Result<(), AuthError>, unlocked: bool, losses: u32) -> D
                 DoneOutcome::ReopenQuietly(message)
             }
         }
+    }
+}
+
+/// The lockout line the user reads (issue #92).
+///
+/// Deliberately not "authentication failed": the whole point is that this
+/// user's password is probably fine and the account is the problem. The
+/// countdown is what turns a mystery into a wait.
+fn account_locked_message(remaining: Option<Duration>) -> String {
+    let Some(remaining) = remaining else {
+        // unlock_time = 0: nothing but `faillock --reset` clears it.
+        return "Account locked \u{2014} it will not unlock on its own".into();
+    };
+    let seconds = remaining.as_secs();
+    match (seconds / 60, seconds % 60) {
+        (0, 0) => "Account unlocked \u{2014} try again".into(),
+        (0, s) => format!("Account locked \u{2014} try again in {s}s"),
+        (m, s) => format!("Account locked \u{2014} try again in {m}m {s:02}s"),
     }
 }
 
@@ -772,6 +799,11 @@ impl Locker {
                 // The controller decides the retry (a fresh PAM transaction
                 // per attempt, hyprlock's model).
                 self.pending.push(FlowEvent::AuthErr(message));
+            }
+            DoneOutcome::LockedOut { message, remaining } => {
+                eprintln!("vigil-lock: account is faillocked ({message})");
+                self.auth.retire();
+                self.pending.push(FlowEvent::AuthLocked { remaining });
             }
             DoneOutcome::ReopenQuietly(message) => {
                 eprintln!("vigil-lock: PAM conversation lost ({message}); reopening");
@@ -1201,6 +1233,15 @@ impl LockSession for Locker {
                 // StartAuth — so retiring here could only ever hit an
                 // attempt started *since*, which is issue #91's whole
                 // failure mode. Retiring belongs where the verdict arrives.
+            }
+            FlowCmd::ShowAccountLocked { remaining } => {
+                let message = account_locked_message(*remaining);
+                self.snapshot.error = message.clone();
+                self.snapshot.busy = false;
+                self.each_window(move |window| {
+                    window.show_error(&message);
+                    window.set_busy(false);
+                });
             }
             FlowCmd::DetachAuth => self.detach_auth(),
             FlowCmd::SetLockedHint(on) => {
@@ -1774,6 +1815,70 @@ mod tests {
         assert_eq!(
             done_outcome(Err(broken()), false, MAX_SILENT_CONVERSATION_RETRIES + 1),
             DoneOutcome::Surface("Authentication failure".into())
+        );
+    }
+
+    /// Issue #92. The lockout line has to be legible at a glance and never
+    /// read as "you typed it wrong".
+    #[test]
+    fn the_lockout_line_says_locked_and_counts_down() {
+        let line = |secs| account_locked_message(Some(Duration::from_secs(secs)));
+        assert_eq!(line(581), "Account locked \u{2014} try again in 9m 41s");
+        assert_eq!(line(600), "Account locked \u{2014} try again in 10m 00s");
+        assert_eq!(line(41), "Account locked \u{2014} try again in 41s");
+        assert_eq!(line(0), "Account unlocked \u{2014} try again");
+        assert_eq!(
+            account_locked_message(None),
+            "Account locked \u{2014} it will not unlock on its own"
+        );
+        for secs in [1u64, 59, 60, 600] {
+            assert!(line(secs).starts_with("Account locked"), "{}", line(secs));
+        }
+    }
+
+    /// A lockout, a denial and a broken conversation are three different
+    /// things and must stay three different things: the #91 bug was two of
+    /// them sharing a path, and #92 is the third hiding inside the second.
+    #[test]
+    fn a_lockout_is_neither_a_denial_nor_a_conversation_failure() {
+        let remaining = Some(Duration::from_secs(581));
+        assert_eq!(
+            done_outcome(
+                Err(AuthError::Locked {
+                    message: "Authentication failure".into(),
+                    remaining,
+                }),
+                false,
+                0
+            ),
+            DoneOutcome::LockedOut {
+                message: "Authentication failure".into(),
+                remaining,
+            }
+        );
+        // A conversation failure can never be dressed up as a lockout, no
+        // matter how many of them there have been.
+        for losses in [1, MAX_SILENT_CONVERSATION_RETRIES + 1] {
+            assert!(!matches!(
+                done_outcome(
+                    Err(AuthError::Conversation("Authentication failure".into())),
+                    false,
+                    losses
+                ),
+                DoneOutcome::LockedOut { .. }
+            ));
+        }
+        // ...and a lockout past the release is still nothing to act on.
+        assert_eq!(
+            done_outcome(
+                Err(AuthError::Locked {
+                    message: "no".into(),
+                    remaining
+                }),
+                true,
+                0
+            ),
+            DoneOutcome::Ignore
         );
     }
 
