@@ -531,12 +531,26 @@ impl Config {
     /// [`Config::load`] — a broken user file costs its overlay, never the lock.
     pub fn load_layered(path: Option<&Path>) -> Config {
         let (config, ignored) = Config::load_layered_reporting(path);
-        for notice in &ignored {
+        for notice in ignored.iter().take(MAX_REPORTED_REFUSALS) {
             eprintln!("vigil-config: {notice}");
+        }
+        // vigil-lock is spawned per lock, so an unbounded list is a journal
+        // flood a user file can arrange for free. The count still tells the
+        // operator something is wrong; the full list is a
+        // load_layered_reporting call away.
+        if let Some(rest) = ignored.len().checked_sub(MAX_REPORTED_REFUSALS)
+            && rest > 0
+        {
+            eprintln!("vigil-config: user config: and {rest} more ignored keys");
         }
         config
     }
 }
+
+/// How many refusals [`Config::load_layered`] names before summarising.
+/// Every refusal is still returned by [`Config::load_layered_reporting`];
+/// this bounds only what one lock spawn writes to the journal.
+const MAX_REPORTED_REFUSALS: usize = 8;
 
 /// How a user-overlay key lands on the config. One `fn` per whitelisted
 /// leaf so the whitelist and the merge cannot drift apart.
@@ -1718,6 +1732,17 @@ dir = \"/home/mason/.config/monitor-profiles\"
             config.output["eDP-1"].background,
             Some(PathBuf::from("/etc/greetd/internal.png"))
         );
+    }
+
+    #[test]
+    fn refusal_output_is_capped_but_the_list_is_not() {
+        // vigil-lock is spawned per lock, so an unbounded refusal list is a
+        // journal flood any user file can arrange. Only the printing is
+        // capped: the caller still gets everything.
+        let junk: String = (0..40).map(|n| format!("junk_key_{n} = {n}\n")).collect();
+        let (_, ignored) = overlay(&junk);
+        assert_eq!(ignored.len(), 40);
+        assert!(MAX_REPORTED_REFUSALS < ignored.len());
     }
 
     #[test]
