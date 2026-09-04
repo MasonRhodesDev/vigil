@@ -131,7 +131,13 @@ s1_probe=$(probe_state)
 }
 tap
 teardown_check S1
-python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --no-reveal || fail "S1: trace check"
+# --handoff-gap bounds how long the output has no lock buffer at all: from
+# the warning's last commit (or the lock request) to the lock surface's
+# first commit-with-buffer. 250 ms against a measured ~3 ms is deliberately
+# loose — it catches a whole scheduling round being added to the handoff,
+# which is the regression worth a gate, and does not pretend this tier's
+# timing predicts the seat's. The gaps are printed either way.
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --handoff-gap 250 --no-reveal || fail "S1: trace check"
 pass "S1"
 
 echo "S2: second locker joins the in-flight warning"
@@ -165,9 +171,15 @@ pass "S3"
 
 echo "S4: two-output warning handoff never exposes the desktop"
 sm create_output >/dev/null
-timeout 60 env WAYLAND_DEBUG=1 "$VLOCK" --wait --warn 2 --grace 300 2>"$WORK/s4.trace" && rc=0 || rc=$?
+# VIGIL_FRAME_HASH=1 fingerprints every committed frame into this trace, so
+# --first-frame-not-black can assert the positive: an output whose warning
+# painted must not get an all-black first lock frame (issue #86 — the old
+# handoff committed instantly and committed black). Hashing walks the whole
+# buffer per frame, so this trace's timings are inflated; the gap gate lives
+# on the unhashed S1 and the numbers here are printed, not gated.
+timeout 60 env WAYLAND_DEBUG=1 VIGIL_FRAME_HASH=1 "$VLOCK" --wait --warn 2 --grace 300 2>"$WORK/s4.trace" && rc=0 || rc=$?
 [ "$rc" = 0 ] || fail "S4: exited $rc"
-python3 "$REPO/tests/nested/check_trace.py" "$WORK/s4.trace" --expect locked --handoff --outputs 2 || fail "S4: trace check"
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s4.trace" --expect locked --handoff --first-frame-not-black --outputs 2 || fail "S4: trace check"
 tap
 wait_free S4
 sm output HEADLESS-2 unplug >/dev/null 2>&1 || echo "  note: sway cannot unplug outputs; leaving HEADLESS-2"

@@ -11,6 +11,14 @@ and asserts:
   --handoff            every warning surface teardown happens only after
                        every lock surface's first commit-with-buffer
                        (the handoff never exposes the desktop)
+  --handoff-gap MS     every output's warn-to-lock handoff gap is under MS
+                       (see "Handoff gap" below); the measured gaps are
+                       printed whether or not a bound is given
+  --first-frame-not-black
+                       with VIGIL_FRAME_HASH=1 in the environment of the
+                       traced locker: the first lock-surface frame of any
+                       output whose warning painted is not the all-black
+                       buffer (see "Frame hashes" below)
   --outputs N          at least N lock surfaces were created
   --reveal             the post-unlock reveal overlay (issue #52) was
                        created after `locked`, unlock_and_destroy came after
@@ -29,14 +37,97 @@ get_layer_surface: "vigil-warning" (pre-lock overlay, --handoff) versus
 
 The capture check always runs: binding any screencopy/image-capture/
 export-dmabuf global is forbidden (capture-free warning, ADR).
+
+Handoff gap (issue #86)
+-----------------------
+The compositor stops rendering normal surfaces the instant it grants the
+session lock, and shows nothing on an output until that output's lock
+surface commits a buffer. So per output:
+
+    gap = first lock-surface commit-with-buffer
+          - max(last warning-surface commit before it, the lock request)
+
+That window is the black flash. WAYLAND_DEBUG stamps every line with a
+monotonic `[ ms.us ]`, so the gap is measured, not inferred.
+
+Read the number for what it is: sway-tier timing is NOT Hyprland-tier
+timing. This harness runs a headless pixman wlroots against an unoptimized
+debug build, and its numbers say nothing about the seat's. What it can do is
+catch a regression that adds a whole scheduling round to the handoff, which
+is the failure mode worth a gate.
+
+Frame hashes (issue #86)
+------------------------
+The gap being short does not mean the frame is right: the old handoff
+committed instantly and committed *black*. `VIGIL_FRAME_HASH=1` makes
+vigil-lock emit a span-lines `event=frame.hash` record (FNV-1a over the
+committed pixels) for every frame it commits, onto the same stderr this
+trace captures. `--first-frame-not-black` uses those to assert the
+positive: an output whose warning painted must not receive an all-black
+first lock frame. Hashing costs a pass over the whole buffer, so it
+inflates every timing in a trace that carries it — do not gate a gap on a
+hashed run.
+
+Full pixel continuity (warning's last frame == lock's first frame) is NOT
+asserted here and cannot be: the warning buffer is ARGB after the overlay
+blend and the lock buffer is XRGB straight out of the scene shadow, so the
+two agree on colour and disagree on the fourth byte. Equality belongs to a
+metal check that compares channels, alongside seat verification.
 """
 
 import argparse
 import re
 import sys
 
-SEND = re.compile(r"^\[[^\]]+\](?:\[rs\])?\s*(?:\[discarded\])?\s*-> ([a-z0-9_]+)[#@](\d+)\.([a-z0-9_]+)\((.*)\)")
-EVENT = re.compile(r"^\[[^\]]+\](?:\[rs\])?\s*(?:<- )?([a-z0-9_]+)[#@](\d+)\.([a-z0-9_]+)[,(]")
+SEND = re.compile(r"^\[\s*([0-9.]+)\](?:\[rs\])?\s*(?:\[discarded\])?\s*-> ([a-z0-9_]+)[#@](\d+)\.([a-z0-9_]+)\((.*)\)")
+EVENT = re.compile(r"^\[\s*([0-9.]+)\](?:\[rs\])?\s*(?:<- )?([a-z0-9_]+)[#@](\d+)\.([a-z0-9_]+)[,(]")
+# span-lines records share this stderr; they carry no `[ts]` prefix, so the
+# protocol regexes above never match one.
+HASH = re.compile(r"^event=frame\.hash\s")
+
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
+MASK64 = (1 << 64) - 1
+
+
+def black_hash(byte_count):
+    """The fingerprint vigil-lock emits for a buffer of `byte_count` zeros.
+
+    FNV-1a over zeros never XORs anything in, so the whole loop collapses to
+    repeated multiplication: h = offset * prime**n. Closed form rather than
+    a Python loop over eight megabytes per output.
+    """
+    return f"{(FNV_OFFSET * pow(FNV_PRIME, byte_count, MASK64 + 1)) & MASK64:016x}"
+
+
+def parse_record(line):
+    """span-lines record -> dict. Keys and values never contain space or `=`."""
+    fields = {}
+    for token in line.split():
+        key, sep, value = token.partition("=")
+        if sep:
+            fields[key] = value
+    return fields
+
+def handoff_gaps(lock_request_ms, first_lock_commit_ms, warning_commits_ms):
+    """{wl_output: (gap_ms, start_ms, commit_ms)} for every output that locked.
+
+    The gap starts at the last thing the user could still have been shown on
+    that output — its warning surface's last commit — or at the lock request
+    if the warning had already stopped committing, whichever is later. It
+    ends at the lock surface's first commit-with-buffer.
+    """
+    gaps = {}
+    for output, commit_ms in first_lock_commit_ms.items():
+        candidates = [ms for ms in warning_commits_ms.get(output, []) if ms <= commit_ms]
+        start = max(candidates) if candidates else None
+        if lock_request_ms is not None and lock_request_ms <= commit_ms:
+            start = lock_request_ms if start is None else max(start, lock_request_ms)
+        if start is None:
+            continue
+        gaps[output] = (commit_ms - start, start, commit_ms)
+    return gaps
+
 
 CAPTURE_MARKERS = (
     "screencopy",
@@ -51,6 +142,8 @@ def main():
     ap.add_argument("trace")
     ap.add_argument("--expect", choices=["locked", "cancelled"])
     ap.add_argument("--handoff", action="store_true")
+    ap.add_argument("--handoff-gap", type=float, metavar="MS")
+    ap.add_argument("--first-frame-not-black", action="store_true")
     ap.add_argument("--outputs", type=int, default=0)
     ap.add_argument("--reveal", action="store_true")
     ap.add_argument("--no-reveal", action="store_true")
@@ -74,34 +167,78 @@ def main():
     reveal_teardowns = []   # line indices of reveal surface/layer destroys
     layer_requests = 0
     capture_binds = []
+    # Handoff-gap bookkeeping, all keyed by the wl_output the surface was
+    # created on — the one identity the warning surface and the lock surface
+    # of a single display share.
+    lock_surface_output = {}     # wl_surface id -> wl_output id
+    warning_surface_output = {}  # wl_surface id -> wl_output id
+    lock_request_ms = None
+    locked_ms = None
+    first_lock_commit_ms = {}    # wl_output id -> ms of first buffer commit
+    warning_commits_ms = {}      # wl_output id -> [ms of every buffer commit]
+    # frame.hash records (VIGIL_FRAME_HASH=1), keyed by vigil's OutputId,
+    # which is the wl_output's protocol id — the same number as above.
+    first_lock_hash = {}         # output -> (hash, width, height)
+    warning_hashed = set()       # outputs whose warning committed a frame
+    # A frame.hash record is written immediately before its own attach, so
+    # the next commit-with-buffer on that output's lock surface is the frame
+    # it fingerprints. That is what turns "when did a buffer arrive" into
+    # "when did a buffer that is not black arrive" — the number issue #86 is
+    # actually about.
+    pending_lock_hash = {}       # output -> is this next lock frame black
+    first_nonblack_ms = {}       # output -> ms of first non-black lock commit
 
     with open(args.trace, errors="replace") as fh:
         for lineno, line in enumerate(fh):
+            if HASH.match(line):
+                record = parse_record(line)
+                output, role = record.get("output"), record.get("role")
+                if output is None:
+                    continue
+                if role == "warning":
+                    warning_hashed.add(output)
+                elif role == "lock":
+                    digest = record.get("hash")
+                    width, height = record.get("width", ""), record.get("height", "")
+                    first_lock_hash.setdefault(output, (digest, width, height))
+                    if width.isdigit() and height.isdigit():
+                        black = black_hash(int(width) * int(height) * 4)
+                        pending_lock_hash[output] = digest == black
+                continue
             m = SEND.match(line)
             if m:
-                iface, oid, req, req_args = m.group(1), m.group(2), m.group(3), m.group(4)
+                ts = float(m.group(1))
+                iface, oid, req, req_args = m.group(2), m.group(3), m.group(4), m.group(5)
                 if iface == "wl_registry" and req == "bind":
                     lowered = req_args.lower()
                     if any(marker in lowered for marker in CAPTURE_MARKERS):
                         capture_binds.append((lineno, line.strip()))
                 elif iface == "ext_session_lock_manager_v1" and req == "lock":
                     lock_requested = True
+                    if lock_request_ms is None:
+                        lock_request_ms = ts
                 elif iface == "ext_session_lock_v1" and req == "get_lock_surface":
                     ids = re.findall(r"(?:ext_session_lock_surface_v1|wl_surface)[#@](\d+)", req_args)
                     surface = re.search(r"wl_surface[#@](\d+)", req_args)
                     new_id = re.search(r"ext_session_lock_surface_v1[#@](\d+)", req_args)
+                    output = re.search(r"wl_output[#@](\d+)", req_args)
                     if surface:
                         lock_surfaces[new_id.group(1) if new_id else f"line{lineno}"] = surface.group(1)
+                        if output:
+                            lock_surface_output[surface.group(1)] = output.group(1)
                 elif iface == "zwlr_layer_shell_v1" and req == "get_layer_surface":
                     layer_requests += 1
                     surface = re.search(r"wl_surface[#@](\d+)", req_args)
                     new_id = re.search(r"zwlr_layer_surface_v1[#@](\d+)", req_args)
+                    output = re.search(r"wl_output[#@](\d+)", req_args)
                     key = new_id.group(1) if new_id else f"line{lineno}"
                     if surface and "vigil-reveal" in req_args:
                         reveal_surfaces[key] = surface.group(1)
                         reveal_requests.append(lineno)
                     elif surface:
                         warning_surfaces[key] = surface.group(1)
+                        if output:
+                            warning_surface_output[surface.group(1)] = output.group(1)
                 elif iface == "ext_session_lock_v1" and req == "unlock_and_destroy":
                     unlock_line = lineno
                 elif iface == "wl_surface" and req == "attach":
@@ -110,6 +247,13 @@ def main():
                     attached = pending_attach.pop(oid, False)
                     if attached and oid in lock_surfaces.values():
                         first_lock_commit.setdefault(oid, lineno)
+                    output = lock_surface_output.get(oid)
+                    if attached and output is not None:
+                        first_lock_commit_ms.setdefault(output, ts)
+                        if pending_lock_hash.pop(output, None) is False:
+                            first_nonblack_ms.setdefault(output, ts)
+                    if attached and oid in warning_surface_output:
+                        warning_commits_ms.setdefault(warning_surface_output[oid], []).append(ts)
                     if attached and oid in reveal_surfaces.values():
                         reveal_first_commit.setdefault(oid, lineno)
                 elif req == "destroy":
@@ -123,13 +267,16 @@ def main():
                         reveal_teardowns.append(lineno)
                 continue
             m = EVENT.match(line)
-            if m and m.group(1) == "ext_session_lock_v1" and m.group(3) == "locked":
+            if m and m.group(2) == "ext_session_lock_v1" and m.group(4) == "locked":
                 locked_seen = True
                 locked_line = lineno
-            elif m and m.group(1) == "zwlr_layer_surface_v1" and m.group(3) == "configure":
-                if m.group(2) in reveal_surfaces:
-                    reveal_configured.setdefault(m.group(2), lineno)
+                if locked_ms is None:
+                    locked_ms = float(m.group(1))
+            elif m and m.group(2) == "zwlr_layer_surface_v1" and m.group(4) == "configure":
+                if m.group(3) in reveal_surfaces:
+                    reveal_configured.setdefault(m.group(3), lineno)
 
+    gaps = handoff_gaps(lock_request_ms, first_lock_commit_ms, warning_commits_ms)
     failures = []
     if capture_binds:
         for lineno, line in capture_binds:
@@ -158,6 +305,46 @@ def main():
                         f"every lock surface had committed (last first-commit at {last_commit})"
                     )
 
+        if args.handoff_gap is not None:
+            if not gaps:
+                failures.append(
+                    "--handoff-gap: no output had both a lock request and a "
+                    "lock-surface buffer commit"
+                )
+            for output, (gap, _, _) in sorted(gaps.items()):
+                if gap > args.handoff_gap:
+                    failures.append(
+                        f"--handoff-gap: output {output} was uncovered for {gap:.1f} ms "
+                        f"(bound {args.handoff_gap:.1f} ms)"
+                    )
+        if args.first_frame_not_black:
+            if not first_lock_hash:
+                failures.append(
+                    "--first-frame-not-black: no frame.hash records; run the "
+                    "locker with VIGIL_FRAME_HASH=1"
+                )
+            for output in sorted(warning_hashed):
+                frame = first_lock_hash.get(output)
+                if frame is None:
+                    failures.append(
+                        f"--first-frame-not-black: output {output} painted a warning "
+                        "frame but never a lock frame"
+                    )
+                    continue
+                digest, width, height = frame
+                if not (width or "").isdigit() or not (height or "").isdigit():
+                    failures.append(
+                        f"--first-frame-not-black: output {output} frame.hash record "
+                        f"has no usable size ({width}x{height})"
+                    )
+                    continue
+                black = black_hash(int(width) * int(height) * 4)
+                if digest == black:
+                    failures.append(
+                        f"--first-frame-not-black: output {output} committed an "
+                        f"all-black {width}x{height} first lock frame ({digest}) after "
+                        "its warning had painted — the warn→lock cut flashes (#86)"
+                    )
         if args.no_layer and layer_requests:
             failures.append(f"--no-layer: {layer_requests} layer surface(s) requested")
         if args.reveal:
@@ -188,6 +375,30 @@ def main():
                 f"--no-reveal: {len(reveal_surfaces)} vigil-reveal surface(s) created; "
                 "instant unlock must not create a reveal overlay"
             )
+
+    # Printed on every run that measured one, pass or fail: a gate nobody
+    # can read the number behind is a gate nobody retunes. `locked` is here
+    # because the compositor stops rendering normal surfaces at that event,
+    # not at the request, so it bounds the part of the gap that is actually
+    # black on a strict compositor.
+    for output, (gap, start, commit) in sorted(gaps.items()):
+        since_locked = "" if locked_ms is None else f" since_locked={commit - locked_ms:.1f}ms"
+        # The gap above ends at the first buffer; this one ends at the first
+        # buffer that is not black, which is what the eye sees. They are the
+        # same number exactly when the fix is working, and only a hashed run
+        # can tell them apart.
+        nonblack = first_nonblack_ms.get(output)
+        to_content = "" if nonblack is None else f" to_content={nonblack - start:.1f}ms"
+        print(
+            f"check_trace: handoff gap output {output}: {gap:.1f}ms "
+            f"(start {start:.3f} -> first lock commit {commit:.3f}){since_locked}{to_content}"
+        )
+    for output, (digest, width, height) in sorted(first_lock_hash.items()):
+        warned = "after-warning" if output in warning_hashed else "no-warning"
+        print(
+            f"check_trace: first lock frame output {output}: {width}x{height} "
+            f"hash={digest} ({warned})"
+        )
 
     if failures:
         for failure in failures:
