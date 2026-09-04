@@ -202,8 +202,13 @@ def main():
     # Handoff-gap bookkeeping, all keyed by the wl_output the surface was
     # created on — the one identity the warning surface and the lock surface
     # of a single display share.
-    lock_surface_output = {}     # wl_surface id -> wl_output id
-    warning_surface_output = {}  # wl_surface id -> wl_output id
+    lock_surface_output = {}     # wl_surface id -> wl_output id (live only)
+    warning_surface_output = {}  # wl_surface id -> wl_output id (live only)
+    # Outputs that ever carried a warning surface. Separate from the live map
+    # above, which is pruned on destroy: warning surfaces are torn down at the
+    # end of the handoff, so asking the live map afterwards says "no output
+    # went through the handoff" about a trace that is entirely a handoff.
+    handoff_outputs = set()
     lock_request_ms = None
     locked_ms = None
     first_lock_commit_ms = {}    # wl_output id -> ms of first buffer commit
@@ -277,6 +282,7 @@ def main():
                         warning_surfaces[key] = surface.group(1)
                         if output:
                             warning_surface_output[surface.group(1)] = output.group(1)
+                            handoff_outputs.add(output.group(1))
                 elif iface == "ext_session_lock_v1" and req == "unlock_and_destroy":
                     unlock_line = lineno
                 elif iface == "wl_surface" and req == "attach":
@@ -302,6 +308,21 @@ def main():
                         reveal_teardowns.append(lineno)
                     elif iface == "wl_surface" and oid in reveal_surfaces.values():
                         reveal_teardowns.append(lineno)
+                    # Forget the surface->output mapping when the surface
+                    # goes. Wayland object ids are recycled, so a later
+                    # surface can be handed the number this one just
+                    # released; keeping the old entry would attribute its
+                    # commits to the wrong output and silently corrupt the
+                    # timing measurements. No current trace reuses an id -
+                    # this is here so none has to.
+                    if iface == "wl_surface":
+                        gone = lock_surface_output.pop(oid, None)
+                        warning_surface_output.pop(oid, None)
+                        if gone is not None:
+                            # Its output has no live lock surface now, so a
+                            # later hash must not be attributed to this
+                            # surface's last commit.
+                            last_lock_commit_ms.pop(gone, None)
                 continue
             m = EVENT.match(line)
             if m and m.group(2) == "ext_session_lock_v1" and m.group(4) == "locked":
@@ -314,9 +335,7 @@ def main():
                     reveal_configured.setdefault(m.group(3), lineno)
 
     gaps = handoff_gaps(lock_request_ms, first_lock_commit_ms, warning_commits_ms)
-    uncovered = locked_to_commit(
-        locked_ms, first_lock_commit_ms, set(warning_surface_output.values())
-    )
+    uncovered = locked_to_commit(locked_ms, first_lock_commit_ms, handoff_outputs)
     failures = []
     if capture_binds:
         for lineno, line in capture_binds:
