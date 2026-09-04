@@ -457,22 +457,281 @@ impl Config {
         load_file(path.unwrap_or_else(|| Path::new(SYSTEM_CONFIG))).unwrap_or_default()
     }
 
-    /// Lock load: explicit path, else $XDG_CONFIG_HOME/vigil/config.toml
-    /// (fallback $HOME/.config/vigil/config.toml) if that file exists,
-    /// else SYSTEM_CONFIG. Same error philosophy.
-    pub fn load_layered(path: Option<&Path>) -> Config {
-        if let Some(path) = path {
-            return load_file(path).unwrap_or_default();
+    /// Layer a parsed user overlay onto this config and report what was
+    /// refused. Pure: the file and stderr layers are [`Config::load_layered`].
+    ///
+    /// Only [`OVERLAY`] keys land, leaf by leaf, so a user file restyles the
+    /// lock rather than replacing its policy. Everything else — the security
+    /// floor, greeter-scope tables, typos — is left on the system config's
+    /// value and named in the returned notices.
+    pub fn overlay(&mut self, user: &toml::Table) -> Vec<IgnoredOverlayKey> {
+        let mut allowed = Vec::new();
+        let mut ignored = Vec::new();
+        walk_overlay("", user, &mut allowed, &mut ignored);
+        for (key, value) in allowed {
+            let apply = OVERLAY
+                .iter()
+                .find(|(path, _)| *path == key)
+                .map(|(_, apply)| apply)
+                .expect("walk_overlay only yields OVERLAY keys");
+            if let Err(err) = apply(self, value) {
+                ignored.push(IgnoredOverlayKey {
+                    key,
+                    refusal: OverlayRefusal::Invalid(err.message().trim().replace('\n', "; ")),
+                });
+            }
         }
-        let user_path = xdg_paths::ConfigDirs::from_env()
+        ignored.sort_by(|a, b| a.key.cmp(&b.key));
+        ignored
+    }
+
+    /// Lock load, reporting every user-file key the overlay refused so the
+    /// caller can name it. [`Config::load_layered`] is this plus stderr.
+    ///
+    /// An explicit `path` is whole-file: `--config` is an operator and test
+    /// affordance, already a root-or-owner choice, and the lock's own
+    /// `lock-cmd.sh` never passes it. Without one the system config is the
+    /// base and `$XDG_CONFIG_HOME/vigil/config.toml` (fallback
+    /// `$HOME/.config/vigil/config.toml`) is a whitelisted overlay on top.
+    pub fn load_layered_reporting(path: Option<&Path>) -> (Config, Vec<IgnoredOverlayKey>) {
+        if let Some(path) = path {
+            return (load_file(path).unwrap_or_default(), Vec::new());
+        }
+        let user = xdg_paths::ConfigDirs::from_env()
             .ok()
             .map(|dirs| dirs.config_dir("vigil").join("config.toml"));
-        if let Some(path) = user_path
-            && path.exists()
-        {
-            return load_file(&path).unwrap_or_default();
+        load_layered_from(Path::new(SYSTEM_CONFIG), user.as_deref())
+    }
+
+    /// Lock load: the system config, with a whitelisted user overlay on top.
+    /// Ignored user keys are named on stderr. Same error philosophy as
+    /// [`Config::load`] — a broken user file costs its overlay, never the lock.
+    pub fn load_layered(path: Option<&Path>) -> Config {
+        let (config, ignored) = Config::load_layered_reporting(path);
+        for notice in &ignored {
+            eprintln!("vigil-config: {notice}");
         }
-        load_file(Path::new(SYSTEM_CONFIG)).unwrap_or_default()
+        config
+    }
+}
+
+/// How a user-overlay key lands on the config. One `fn` per whitelisted
+/// leaf so the whitelist and the merge cannot drift apart.
+type OverlaySetter = fn(&mut Config, toml::Value) -> Result<(), toml::de::Error>;
+
+/// The overlay whitelist: everything a session-writable
+/// `~/.config/vigil/config.toml` may set, and where it lands (issue #88).
+///
+/// Cosmetic only, by construction. The lock is the one part of the desktop a
+/// session must not be able to weaken from inside itself, so anything that
+/// decides *when* or *whether* the screen locks — [`SECURITY_FLOOR`] — is
+/// absent here and stays whatever the system config says. Adding a key to
+/// this table is a security decision, not a convenience one.
+const OVERLAY: &[(&str, OverlaySetter)] = &[
+    ("look.theme", |config, value| {
+        config.look.theme = value.try_into()?;
+        Ok(())
+    }),
+    ("look.background", |config, value| {
+        config.look.background = value.try_into()?;
+        Ok(())
+    }),
+    ("look.fit", |config, value| {
+        config.look.fit = value.try_into()?;
+        Ok(())
+    }),
+    ("look.clock_format", |config, value| {
+        config.look.clock_format = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.transition.frost_in_ms", |config, value| {
+        config.lock.transition.frost_in_ms = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.transition.wallpaper_in_ms", |config, value| {
+        config.lock.transition.wallpaper_in_ms = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.transition.wallpaper_out_ms", |config, value| {
+        config.lock.transition.wallpaper_out_ms = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.transition.frost_out_ms", |config, value| {
+        config.lock.transition.frost_out_ms = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.transition.easing", |config, value| {
+        config.lock.transition.easing = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.warning.frost_in_ms", |config, value| {
+        config.lock.warning.frost_in_ms = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.warning.wallpaper_in_ms", |config, value| {
+        config.lock.warning.wallpaper_in_ms = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.warning.frost_alpha", |config, value| {
+        config.lock.warning.frost_alpha = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.warning.easing", |config, value| {
+        config.lock.warning.easing = value.try_into()?;
+        Ok(())
+    }),
+    ("lock.warning.gui", |config, value| {
+        config.lock.warning.gui = value.try_into()?;
+        Ok(())
+    }),
+    ("output", |config, value| {
+        config.output = value.try_into()?;
+        Ok(())
+    }),
+    ("profiles.dir", |config, value| {
+        config.profiles.dir = value.try_into()?;
+        Ok(())
+    }),
+];
+
+/// Lock policy the overlay must never reach: how long the screen may stay
+/// unlocked, and how long a warning may be held open or cancelled.
+///
+/// A session that can write these can grant itself an unlock-without-auth
+/// window (`grace_secs`) or a wait-for-ever warning (`wallpaper_hold_max_ms
+/// = 0`, the issue #56 class) — a durable, one-file disarm of the failsafe,
+/// which is exactly the shape desktop-commons ADR 0006 rejects. Listed
+/// separately from "not whitelisted" so the refusal says *why*.
+const SECURITY_FLOOR: &[&str] = &[
+    "lock.grace_secs",
+    "lock.warning.cancel_on_motion_px",
+    "lock.warning.duration_ms",
+    "lock.warning.wallpaper_hold_max_ms",
+];
+
+/// Top-level tables only the greeter reads. The greeter loads the system
+/// config alone ([`Config::load`]), so setting these in a user file has no
+/// effect anywhere — worth naming, since silence reads as "it worked".
+const GREETER_SCOPE: &[&str] = &[
+    "greeter", "keyboard", "power", "render", "sessions", "users",
+];
+
+/// Why a user-overlay key did not reach the running config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayRefusal {
+    /// Lock policy. The system config is the only place that sets it.
+    SecurityFloor,
+    /// A greeter-only key, which the user file never feeds.
+    GreeterScope,
+    /// Not on the whitelist: a typo, or an operator-only key.
+    NotOverlayable,
+    /// Whitelisted, but the value did not parse as that field's type.
+    Invalid(String),
+}
+
+/// One refused user-overlay key and its reason, so a caller can name it
+/// without vigil-config choosing the log sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredOverlayKey {
+    pub key: String,
+    pub refusal: OverlayRefusal,
+}
+
+impl std::fmt::Display for IgnoredOverlayKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match &self.refusal {
+            OverlayRefusal::SecurityFloor => "security policy — system config only".to_string(),
+            OverlayRefusal::GreeterScope => {
+                "greeter-scope — the greeter never reads the user file".to_string()
+            }
+            OverlayRefusal::NotOverlayable => {
+                "not overlay-allowed — system config only".to_string()
+            }
+            OverlayRefusal::Invalid(err) => format!("invalid value — {err}"),
+        };
+        write!(f, "user config: ignoring {}: {reason}", self.key)
+    }
+}
+
+/// Split a user table into whitelisted (path, value) leaves and named
+/// refusals. Descends only where the whitelist has something deeper, so a
+/// wholly out-of-scope table (`[keyboard]`) is reported once rather than
+/// key by key, and a whitelisted table (`output`, `lock.warning.gui`) is
+/// taken whole.
+fn walk_overlay(
+    prefix: &str,
+    table: &toml::Table,
+    allowed: &mut Vec<(String, toml::Value)>,
+    ignored: &mut Vec<IgnoredOverlayKey>,
+) {
+    for (key, value) in table {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if OVERLAY.iter().any(|(whitelisted, _)| *whitelisted == path) {
+            allowed.push((path, value.clone()));
+            continue;
+        }
+        let descend = format!("{path}.");
+        match value.as_table() {
+            Some(sub)
+                if OVERLAY
+                    .iter()
+                    .any(|(deeper, _)| deeper.starts_with(&descend)) =>
+            {
+                walk_overlay(&path, sub, allowed, ignored);
+            }
+            _ => ignored.push(IgnoredOverlayKey {
+                refusal: refuse(&path),
+                key: path,
+            }),
+        }
+    }
+}
+
+fn refuse(path: &str) -> OverlayRefusal {
+    if SECURITY_FLOOR.contains(&path) {
+        OverlayRefusal::SecurityFloor
+    } else if GREETER_SCOPE.contains(&path.split('.').next().unwrap_or(path)) {
+        OverlayRefusal::GreeterScope
+    } else {
+        OverlayRefusal::NotOverlayable
+    }
+}
+
+/// The merge with both paths named, so it is testable without $HOME.
+fn load_layered_from(system: &Path, user: Option<&Path>) -> (Config, Vec<IgnoredOverlayKey>) {
+    let mut config = load_file(system).unwrap_or_default();
+    let Some(user) = user else {
+        return (config, Vec::new());
+    };
+    let source = match std::fs::read_to_string(user) {
+        Ok(source) => source,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (config, Vec::new()),
+        Err(err) => {
+            eprintln!(
+                "vigil-config: {}: {err}; ignoring the user overlay",
+                user.display()
+            );
+            return (config, Vec::new());
+        }
+    };
+    // A broken user file costs its overlay, not the lock: the system
+    // config it was layering onto is already loaded and stands as-is.
+    match toml::from_str::<toml::Table>(&source) {
+        Ok(table) => {
+            let ignored = config.overlay(&table);
+            (config, ignored)
+        }
+        Err(err) => {
+            eprintln!(
+                "vigil-config: {}: {err}; ignoring the user overlay",
+                user.display()
+            );
+            (config, Vec::new())
+        }
     }
 }
 
@@ -848,13 +1107,275 @@ selector = "not-a-real-component"
         );
     }
 
+    /// The system config every overlay test layers onto: a hardened lock
+    /// (no grace, a bounded hold, a real warning) with a distinctive look.
+    const SYSTEM: &str = "
+[look]
+clock_format = \"%H:%M\"
+background = \"/etc/greetd/system.png\"
+
+[lock]
+grace_secs = 0
+
+[lock.warning]
+duration_ms = 20000
+frost_in_ms = 1500
+cancel_on_motion_px = 8.0
+wallpaper_hold_max_ms = 5000
+
+[lock.transition]
+frost_in_ms = 150
+";
+
+    /// Overlay a user source onto [`SYSTEM`], as load_layered does.
+    fn overlay(user: &str) -> (Config, Vec<IgnoredOverlayKey>) {
+        let mut config = parse(SYSTEM).unwrap();
+        let table: toml::Table = toml::from_str(user).unwrap();
+        let ignored = config.overlay(&table);
+        (config, ignored)
+    }
+
+    /// A temp file that removes itself, so a failing assert cannot leak one.
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str, body: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("vigil-{tag}-{}-{serial}.toml", std::process::id()));
+            std::fs::write(&path, body).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
-    fn layered_prefers_user_file() {
-        let path =
-            std::env::temp_dir().join(format!("vigil-layered-test-{}.toml", std::process::id()));
-        std::fs::write(&path, "[look]\nclock_format = \"%S\"").unwrap();
-        assert_eq!(Config::load_layered(Some(&path)).look.clock_format, "%S");
-        std::fs::remove_file(path).unwrap();
+    fn overlay_merges_cosmetic_keys_over_system() {
+        let (config, ignored) = overlay(
+            "
+[look]
+clock_format = \"%S\"
+
+[lock.transition]
+frost_in_ms = 400
+frost_out_ms = 300
+
+[lock.warning]
+frost_alpha = 0.8
+easing = \"linear\"
+
+[output.\"DP-1\"]
+scale = 2.0
+
+[profiles]
+dir = \"/home/mason/.config/monitor-profiles\"
+",
+        );
+        assert_eq!(ignored, Vec::new());
+        assert_eq!(config.look.clock_format, "%S");
+        assert_eq!(config.lock.transition.frost_in_ms, 400);
+        assert_eq!(config.lock.transition.frost_out_ms, 300);
+        assert_eq!(config.lock.warning.frost_alpha, 0.8);
+        assert_eq!(config.lock.warning.easing, WarningEasing::Linear);
+        assert_eq!(config.output["DP-1"].scale, Some(2.0));
+        assert_eq!(
+            config.profiles.dir,
+            Some(PathBuf::from("/home/mason/.config/monitor-profiles"))
+        );
+        // Leaf-wise: a key the user did not name keeps the system value.
+        assert_eq!(
+            config.look.background,
+            Some(PathBuf::from("/etc/greetd/system.png"))
+        );
+        assert_eq!(config.lock.warning.frost_in_ms, 1_500);
+    }
+
+    #[test]
+    fn overlay_cannot_change_grace_secs() {
+        let (config, ignored) = overlay("[lock]\ngrace_secs = 86400\n");
+        assert_eq!(config.lock.grace_secs, 0);
+        assert_eq!(
+            ignored,
+            vec![IgnoredOverlayKey {
+                key: "lock.grace_secs".into(),
+                refusal: OverlayRefusal::SecurityFloor,
+            }]
+        );
+    }
+
+    #[test]
+    fn overlay_cannot_disable_the_wallpaper_hold_cap() {
+        let (config, ignored) = overlay("[lock.warning]\nwallpaper_hold_max_ms = 0\n");
+        assert_eq!(config.lock.warning.wallpaper_hold_max_ms, 5_000);
+        assert_eq!(
+            ignored,
+            vec![IgnoredOverlayKey {
+                key: "lock.warning.wallpaper_hold_max_ms".into(),
+                refusal: OverlayRefusal::SecurityFloor,
+            }]
+        );
+    }
+
+    #[test]
+    fn overlay_cannot_change_warning_duration_or_cancel_threshold() {
+        let (config, ignored) = overlay(
+            "
+[lock.warning]
+duration_ms = 0
+cancel_on_motion_px = 100000.0
+",
+        );
+        assert_eq!(config.lock.warning.duration_ms, 20_000);
+        assert_eq!(config.lock.warning.cancel_on_motion_px, 8.0);
+        assert_eq!(
+            ignored,
+            vec![
+                IgnoredOverlayKey {
+                    key: "lock.warning.cancel_on_motion_px".into(),
+                    refusal: OverlayRefusal::SecurityFloor,
+                },
+                IgnoredOverlayKey {
+                    key: "lock.warning.duration_ms".into(),
+                    refusal: OverlayRefusal::SecurityFloor,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn overlay_greeter_keys_are_ignored_and_named() {
+        let (config, ignored) = overlay(
+            "
+[keyboard]
+layout = \"de\"
+
+[sessions]
+default = \"Hyprland\"
+
+[users]
+show_list = false
+
+[power]
+enabled = false
+
+[greeter]
+[render]
+backend = \"gl\"
+
+[look]
+not_a_key = 1
+",
+        );
+        assert_eq!(config.keyboard, Keyboard::default());
+        assert_eq!(config.sessions, Sessions::default());
+        assert!(config.users.show_list);
+        assert!(config.power.enabled);
+        assert_eq!(config.render, Render::default());
+        let named: Vec<_> = ignored
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry.refusal.clone()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("greeter", OverlayRefusal::GreeterScope),
+                ("keyboard", OverlayRefusal::GreeterScope),
+                ("look.not_a_key", OverlayRefusal::NotOverlayable),
+                ("power", OverlayRefusal::GreeterScope),
+                ("render", OverlayRefusal::GreeterScope),
+                ("sessions", OverlayRefusal::GreeterScope),
+                ("users", OverlayRefusal::GreeterScope),
+            ]
+        );
+        // The notice says which key and why, in one line.
+        assert_eq!(
+            ignored[1].to_string(),
+            "user config: ignoring keyboard: greeter-scope — the greeter never reads the user file"
+        );
+    }
+
+    #[test]
+    fn overlay_names_a_whitelisted_key_of_the_wrong_type() {
+        let (config, ignored) = overlay("[lock.transition]\nfrost_in_ms = \"soon\"\n");
+        assert_eq!(config.lock.transition.frost_in_ms, 150);
+        assert_eq!(ignored.len(), 1);
+        assert_eq!(ignored[0].key, "lock.transition.frost_in_ms");
+        assert!(matches!(ignored[0].refusal, OverlayRefusal::Invalid(_)));
+    }
+
+    #[test]
+    fn overlay_absent_leaves_system_config_untouched() {
+        let system = TempFile::new("overlay-system", SYSTEM);
+        let expected = parse(SYSTEM).unwrap();
+        // No user file at all, and a user path that does not exist: both
+        // are the system config, verbatim.
+        assert_eq!(
+            load_layered_from(system.path(), None),
+            (expected.clone(), Vec::new())
+        );
+        assert_eq!(
+            load_layered_from(
+                system.path(),
+                Some(Path::new("/nonexistent/vigil-user.toml"))
+            ),
+            (expected, Vec::new())
+        );
+    }
+
+    /// Was `layered_prefers_user_file`, which pinned the wholesale replace.
+    /// The user file now merges: cosmetics land, policy does not.
+    #[test]
+    fn layered_merges_user_file_over_system() {
+        let system = TempFile::new("layered-system", SYSTEM);
+        let user = TempFile::new(
+            "layered-user",
+            "[look]\nclock_format = \"%S\"\n\n[lock]\ngrace_secs = 86400\n",
+        );
+        let (config, ignored) = load_layered_from(system.path(), Some(user.path()));
+        assert_eq!(config.look.clock_format, "%S");
+        assert_eq!(config.lock.grace_secs, 0);
+        assert_eq!(config.lock.warning.duration_ms, 20_000);
+        assert_eq!(
+            ignored,
+            vec![IgnoredOverlayKey {
+                key: "lock.grace_secs".into(),
+                refusal: OverlayRefusal::SecurityFloor,
+            }]
+        );
+    }
+
+    #[test]
+    fn layered_ignores_an_unparsable_user_file() {
+        let system = TempFile::new("broken-system", SYSTEM);
+        let user = TempFile::new("broken-user", "[lock\ngrace_secs = ");
+        assert_eq!(
+            load_layered_from(system.path(), Some(user.path())),
+            (parse(SYSTEM).unwrap(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn explicit_config_path_bypasses_the_overlay() {
+        // --config is an operator/test affordance and stays whole-file: it
+        // is already a root-or-owner choice, and lock-cmd.sh never passes it.
+        let path = TempFile::new(
+            "explicit",
+            "[look]\nclock_format = \"%S\"\n\n[lock]\ngrace_secs = 300\n",
+        );
+        let (config, ignored) = Config::load_layered_reporting(Some(path.path()));
+        assert_eq!(config.look.clock_format, "%S");
+        assert_eq!(config.lock.grace_secs, 300);
+        assert_eq!(ignored, Vec::new());
     }
 
     #[test]
