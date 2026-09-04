@@ -1048,9 +1048,9 @@ impl<S: LockSession> App<S> {
         }
         // Invariant: a configured lock surface gets a buffer in this event-loop
         // iteration. Repainting stays outside protocol callbacks so redraws
-        // coalesce and no scene is ever constructed here (issue #37); the
-        // first-frame commit above is the bounded exception, a copy-out of a
-        // scene that already exists.
+        // coalesce and no scene is ever *constructed* here (issue #37); the
+        // first-frame commit above is the bounded exception, which draws an
+        // existing scene if it is dirty and otherwise only copies it out.
         self.dirty.mark(id);
         self.wake.wake();
         let elapsed = configure_started.elapsed();
@@ -1074,12 +1074,22 @@ impl<S: LockSession> App<S> {
     ///
     /// Kept next to present() so buffer acquisition stays auditable in one
     /// place. The invariant is not "exactly two call sites": it is that a
-    /// protocol callback constructs no scene and does no unbounded work
-    /// (issue #37 — building the Slint scene inline here serialized the
-    /// reveal across outputs). Copying an already-built scene's shadow into
-    /// an already-sized buffer is a bounded memcpy (2.2 ms at 4K) and does
-    /// neither. Committing at the acked configure size is DESIGN §12
+    /// protocol callback constructs no scene (issue #37 — building the Slint
+    /// scene inline here serialized the reveal across outputs). This
+    /// constructs none. Committing at the acked configure size is DESIGN §12
     /// invariant 1; `px` is that size, set by the caller.
+    ///
+    /// What it costs, stated honestly: `render` goes through
+    /// `draw_into_shadow`, which asks Slint to draw if the scene is dirty.
+    /// The warning leaves the scene settled, so in the handoff this is
+    /// typically the copy-out alone (2.2 ms at 4K, vigil-ui's measurement) —
+    /// but "typically" is the word. Anything that dirtied the scene between
+    /// the warning's last frame and this configure (a panel toggle, a
+    /// property set from the flow) makes it a layout and raster first. That
+    /// is bounded by the lock scene's own complexity, never by desktop
+    /// content, and it is work this output owed anyway; it is not free, and
+    /// calling it a memcpy would be a claim the code does not support.
+    /// Stage 2's prebuilt buffers remove even this.
     fn commit_first_frame(&mut self, idx: usize) {
         let px @ (w, h) = self.entries[idx].px;
         let id = self.entries[idx].id;
