@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.3.4
+Version:        0.3.5
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -119,6 +119,18 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Thu Sep 04 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.5-1
+- The warn-to-lock handoff is one continuous image. The first lock frame
+  was an opaque black placeholder (canvas.fill(0)) even though the fully
+  rendered scene sat in the retained shadow; it is now the scene itself,
+  with black only as the no-scene fallback (--no-warn/--immediate). A
+  mixed-fractional-scale rebind path that could leave an output
+  permanently black is fixed alongside.
+- Frame-hash observability (VIGIL_FRAME_HASH=1): a stable FNV-1a of every
+  committed buffer, emitted post-commit so the diagnostic cannot perturb
+  the handoff it measures. The nested harness gains a locked-to-commit
+  gate (stable at 2-4 ms) and a first-frame-not-black check - the
+  assertion that actually detects this bug class.
 * Wed Sep 03 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.4-1
 - Unlock is instant and blur-free by default: the lock wallpaper is released
   the moment authentication succeeds, with no reveal fade, tint, or scheduled
