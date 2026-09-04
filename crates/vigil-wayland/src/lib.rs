@@ -1105,6 +1105,15 @@ impl<S: LockSession> App<S> {
             return;
         };
         self.metrics.record_buffer_acquire();
+        // Zero first, unconditionally, exactly as present() does. A slot
+        // handed back by the pool holds whatever the last frame in it held,
+        // and `render` answering true is not a promise that it wrote: the
+        // software backend returns true after bailing on a misaligned buffer
+        // under a rotating transform (vigil-ui, `try_cast_slice_mut`). This
+        // is the surface the compositor shows while nothing else is on
+        // screen, so it never attaches memory nobody wrote. Next to a
+        // full-buffer copy-out the fill is noise.
+        canvas.fill(0);
         let drew = self.session.render(
             id,
             FrameTarget {
@@ -1116,8 +1125,6 @@ impl<S: LockSession> App<S> {
         );
         if drew {
             self.metrics.record_render();
-        } else {
-            canvas.fill(0);
         }
         let surface = &self.entries[idx].surface;
         let _ = buffer.attach_to(surface);
