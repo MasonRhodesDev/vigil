@@ -1213,6 +1213,9 @@ wallpaper_hold_max_ms = 5000
 
 [lock.transition]
 frost_in_ms = 150
+
+[output.\"eDP-1\"]
+background = \"/etc/greetd/internal.png\"
 ";
 
     /// Overlay a user source onto [`SYSTEM`], as load_layered does.
@@ -1244,6 +1247,210 @@ frost_in_ms = 150
     impl Drop for TempFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Every [`SECURITY_FLOOR`] key paired with the field it actually
+    /// protects, so the floor is checked by EFFECT rather than by name.
+    /// A floor key with no probe here fails `floor_probes_cover_the_floor`.
+    #[allow(clippy::type_complexity)]
+    fn floor_probes() -> Vec<(&'static str, fn(&Config) -> String)> {
+        vec![
+            ("lock.grace_secs", |c| c.lock.grace_secs.to_string()),
+            ("lock.warning.cancel_on_motion_px", |c| {
+                c.lock.warning.cancel_on_motion_px.to_string()
+            }),
+            ("lock.warning.duration_ms", |c| {
+                c.lock.warning.duration_ms.to_string()
+            }),
+            ("lock.warning.wallpaper_hold_max_ms", |c| {
+                c.lock.warning.wallpaper_hold_max_ms.to_string()
+            }),
+            ("lock.warning.wallpaper_in_ms", |c| {
+                c.lock.warning.wallpaper_in_ms.to_string()
+            }),
+        ]
+    }
+
+    /// One overlay key, a value for it, and the same change made by hand.
+    /// Applying the source must produce exactly the config the closure
+    /// builds — no more, no less — which pins each setter to its own field.
+    struct SetterProbe {
+        key: &'static str,
+        source: &'static str,
+        expect: fn(&mut Config),
+        /// A hostile value of the right type, for the floor sweep.
+        adversarial: &'static str,
+    }
+
+    fn setter_probes() -> Vec<SetterProbe> {
+        macro_rules! probe {
+            ($key:literal, $source:literal, $adversarial:literal, $expect:expr) => {
+                SetterProbe {
+                    key: $key,
+                    source: $source,
+                    adversarial: $adversarial,
+                    expect: $expect,
+                }
+            };
+        }
+        vec![
+            probe!(
+                "look.theme",
+                "[look]\ntheme = \"/tmp/t.slint\"\n",
+                "[look]\ntheme = \"/proc/self/mem\"\n",
+                |c| c.look.theme = Some("/tmp/t.slint".into())
+            ),
+            probe!(
+                "look.background",
+                "[look]\nbackground = \"/tmp/b.png\"\n",
+                "[look]\nbackground = \"/dev/zero\"\n",
+                |c| c.look.background = Some("/tmp/b.png".into())
+            ),
+            probe!(
+                "look.fit",
+                "[look]\nfit = \"tile\"\n",
+                "[look]\nfit = \"\"\n",
+                |c| c.look.fit = Some("tile".into())
+            ),
+            probe!(
+                "look.clock_format",
+                "[look]\nclock_format = \"%S\"\n",
+                "[look]\nclock_format = \"%\"\n",
+                |c| c.look.clock_format = "%S".into()
+            ),
+            probe!(
+                "lock.transition.frost_in_ms",
+                "[lock.transition]\nfrost_in_ms = 321\n",
+                "[lock.transition]\nfrost_in_ms = 9223372036854775807\n",
+                |c| c.lock.transition.frost_in_ms = 321
+            ),
+            probe!(
+                "lock.transition.wallpaper_in_ms",
+                "[lock.transition]\nwallpaper_in_ms = 322\n",
+                "[lock.transition]\nwallpaper_in_ms = 9223372036854775807\n",
+                |c| c.lock.transition.wallpaper_in_ms = 322
+            ),
+            probe!(
+                "lock.transition.wallpaper_out_ms",
+                "[lock.transition]\nwallpaper_out_ms = 323\n",
+                "[lock.transition]\nwallpaper_out_ms = 9223372036854775807\n",
+                |c| c.lock.transition.wallpaper_out_ms = 323
+            ),
+            probe!(
+                "lock.transition.frost_out_ms",
+                "[lock.transition]\nfrost_out_ms = 324\n",
+                "[lock.transition]\nfrost_out_ms = 9223372036854775807\n",
+                |c| c.lock.transition.frost_out_ms = 324
+            ),
+            probe!(
+                "lock.transition.easing",
+                "[lock.transition]\neasing = \"linear\"\n",
+                "[lock.transition]\neasing = \"ease_in_out\"\n",
+                |c| c.lock.transition.easing = WarningEasing::Linear
+            ),
+            probe!(
+                "lock.warning.frost_in_ms",
+                "[lock.warning]\nfrost_in_ms = 325\n",
+                "[lock.warning]\nfrost_in_ms = 9223372036854775807\n",
+                |c| c.lock.warning.frost_in_ms = 325
+            ),
+            probe!(
+                "lock.warning.frost_alpha",
+                "[lock.warning]\nfrost_alpha = 0.25\n",
+                "[lock.warning]\nfrost_alpha = -1000.0\n",
+                |c| c.lock.warning.frost_alpha = 0.25
+            ),
+            probe!(
+                "lock.warning.easing",
+                "[lock.warning]\neasing = \"linear\"\n",
+                "[lock.warning]\neasing = \"ease_in_out\"\n",
+                |c| c.lock.warning.easing = WarningEasing::Linear
+            ),
+            probe!(
+                "lock.warning.gui",
+                "[lock.warning.gui]\nduration_ms = 777\n",
+                "[lock.warning.gui]\nduration_ms = 9223372036854775807\noffset_ms = 9223372036854775807\n",
+                |c| c.lock.warning.gui.duration_ms = 777
+            ),
+            probe!(
+                "output",
+                "[output.\"DP-1\"]\nscale = 2.0\n",
+                "[output.\"DP-1\"]\nscale = 1e30\n",
+                |c| {
+                    c.output = HashMap::from([(
+                        "DP-1".to_string(),
+                        OutputOverride {
+                            scale: Some(2.0),
+                            ..OutputOverride::default()
+                        },
+                    )]);
+                }
+            ),
+            probe!(
+                "profiles.dir",
+                "[profiles]\ndir = \"/tmp/profiles\"\n",
+                "[profiles]\ndir = \"/\"\n",
+                |c| c.profiles.dir = Some("/tmp/profiles".into())
+            ),
+        ]
+    }
+
+    #[test]
+    fn floor_probes_cover_the_floor() {
+        let probed: Vec<_> = floor_probes().iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            probed,
+            SECURITY_FLOOR.to_vec(),
+            "a floor key with no effect probe is a floor nobody checks"
+        );
+    }
+
+    #[test]
+    fn setter_probes_cover_the_whitelist() {
+        let probed: Vec<_> = setter_probes().iter().map(|probe| probe.key).collect();
+        let whitelisted: Vec<_> = OVERLAY.iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            probed, whitelisted,
+            "every overlay key needs a probe: an unprobed setter is an unchecked write"
+        );
+    }
+
+    #[test]
+    fn each_overlay_key_writes_only_its_own_field() {
+        for probe in setter_probes() {
+            let (got, ignored) = overlay(probe.source);
+            assert_eq!(ignored, Vec::new(), "{} was refused", probe.key);
+            let mut want = parse(SYSTEM).unwrap();
+            (probe.expect)(&mut want);
+            assert_eq!(
+                got, want,
+                "{} did not write exactly its own field",
+                probe.key
+            );
+        }
+    }
+
+    #[test]
+    fn no_overlay_key_can_move_a_floored_field() {
+        // The floor stated as an effect: whatever any whitelisted key is
+        // handed, every floored FIELD still reads the system value. This is
+        // what catches a setter wired to the wrong field, and what would
+        // have caught lock.warning.wallpaper_in_ms being shelved among the
+        // ramp shapes.
+        let system = parse(SYSTEM).unwrap();
+        for probe in setter_probes() {
+            for source in [probe.source, probe.adversarial] {
+                let (got, _) = overlay(source);
+                for (key, read) in floor_probes() {
+                    assert_eq!(
+                        read(&got),
+                        read(&system),
+                        "overlay key {} moved floored field {key}",
+                        probe.key
+                    );
+                }
+            }
         }
     }
 
