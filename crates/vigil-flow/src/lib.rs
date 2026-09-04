@@ -121,6 +121,13 @@ pub enum FlowEvent {
     RevealOverlaysMapped,
     AuthOk,
     AuthErr(String),
+    /// The conversation broke before PAM could judge the credential — the
+    /// locker's own transport, not a wrong password (issue #91). Reopen the
+    /// conversation, but do NOT run it through the failure path: what the
+    /// user reads as "wrong password" is [`FlowCmd::ShowAuthError`], and
+    /// teaching them to retype a password that was never wrong is how a
+    /// self-inflicted glitch turns into a faillock lockout.
+    AuthConversationLost,
     /// logind `Unlock`: release without authentication.
     LogindUnlock,
     /// logind `PrepareForSleep`. `true` commits a pending ramp (lock before
@@ -460,6 +467,14 @@ impl LockFlow {
                     cmds.push(FlowCmd::ShowAuthError(message));
                     // A fresh PAM transaction per attempt (hyprlock's
                     // model): the new conversation re-prompts.
+                    cmds.push(FlowCmd::StartAuth);
+                }
+            }
+            FlowEvent::AuthConversationLost => {
+                if self.phase == FlowPhase::Locked {
+                    // Reopen only. No ShowAuthError: the card keeps whatever
+                    // it was showing and the user is never told they failed
+                    // an authentication they never attempted.
                     cmds.push(FlowCmd::StartAuth);
                 }
             }
@@ -1168,6 +1183,58 @@ pub(crate) mod tests {
         assert!(has(&cmds, &FlowCmd::SetLockedHint(false)));
         assert!(has(&cmds, &FlowCmd::CreateRevealOverlays));
         assert_eq!(flow.phase(), FlowPhase::RevealPending);
+    }
+
+    /// One wrong password re-prompts exactly once — one error shown, one
+    /// fresh transaction opened. A second attempt is the user's to make.
+    #[test]
+    fn a_wrong_password_reprompts_exactly_once() {
+        let mut flow = locked_flow(&revealing_lock());
+        let cmds = flow.step(at(600), FlowEvent::AuthErr("denied".into()));
+        assert_eq!(
+            cmds.iter()
+                .filter(|cmd| matches!(cmd, FlowCmd::ShowAuthError(_)))
+                .count(),
+            1,
+            "{cmds:?}"
+        );
+        assert_eq!(
+            cmds.iter()
+                .filter(|cmd| matches!(cmd, FlowCmd::StartAuth))
+                .count(),
+            1,
+            "{cmds:?}"
+        );
+        // Nothing re-fires on a bare wake.
+        let cmds = flow.step(at(700), FlowEvent::Tick);
+        assert!(!has(&cmds, &FlowCmd::StartAuth), "{cmds:?}");
+    }
+
+    /// Issue #91. A conversation vigil broke reopens the transaction without
+    /// ever telling the user they failed an authentication: `ShowAuthError`
+    /// is the failure the user reads, and a self-inflicted transport glitch
+    /// is not one.
+    #[test]
+    fn a_lost_conversation_reopens_without_showing_a_failure() {
+        let mut flow = locked_flow(&revealing_lock());
+        let cmds = flow.step(at(600), FlowEvent::AuthConversationLost);
+        assert!(has(&cmds, &FlowCmd::StartAuth), "{cmds:?}");
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, FlowCmd::ShowAuthError(_))),
+            "a broken conversation was shown to the user as an auth failure: {cmds:?}"
+        );
+    }
+
+    /// Past the lock, a straggling conversation must not reopen anything —
+    /// the transaction it would open is one nobody answers.
+    #[test]
+    fn a_lost_conversation_after_unlock_reopens_nothing() {
+        let mut flow = locked_flow(&revealing_lock());
+        flow.step(at(700), FlowEvent::AuthOk);
+        let cmds = flow.step(at(800), FlowEvent::AuthConversationLost);
+        assert!(!has(&cmds, &FlowCmd::StartAuth), "{cmds:?}");
     }
 
     #[test]

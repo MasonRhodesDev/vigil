@@ -9,11 +9,12 @@
 
 use std::ffi::{CStr, CString};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use pam_client::{Context, ConversationHandler, ErrorCode, Flag};
-use vigil_core::AuthEvent;
+use vigil_core::{AuthError, AuthEvent};
 
 /// The PAM service to use: our own file when packaged, else the login stack
 /// (verbatim what hyprlock/swaylock ship: `auth include login`).
@@ -28,16 +29,37 @@ pub fn service_name() -> &'static str {
 struct Bridge<E: Fn(AuthEvent)> {
     emit: E,
     responses: mpsc::Receiver<String>,
+    /// Set the moment `ask` cannot answer PAM.
+    ///
+    /// The return code alone cannot tell us this happened: pam_unix maps a
+    /// failed conversation onto `PAM_AUTH_ERR` (journal: "conversation
+    /// failed", then "auth could not identify password"), the very same code
+    /// it returns for a wrong password. The only side that knows the
+    /// difference is this one, so it records it (issue #91).
+    broken: Arc<AtomicBool>,
 }
 
 impl<E: Fn(AuthEvent)> Bridge<E> {
+    fn new(emit: E, responses: mpsc::Receiver<String>) -> Self {
+        Self {
+            emit,
+            responses,
+            broken: Arc::default(),
+        }
+    }
+
     fn ask(&mut self, text: &CStr, secret: bool) -> Result<CString, ErrorCode> {
         (self.emit)(AuthEvent::Prompt {
             text: text.to_string_lossy().into_owned(),
             secret,
         });
-        let response = self.responses.recv().map_err(|_| ErrorCode::CONV_ERR)?;
-        CString::new(response).map_err(|_| ErrorCode::CONV_ERR)
+        let broken = self.broken.clone();
+        let fail = move || {
+            broken.store(true, Ordering::SeqCst);
+            ErrorCode::CONV_ERR
+        };
+        let response = self.responses.recv().map_err(|_| fail())?;
+        CString::new(response).map_err(|_| fail())
     }
 }
 
@@ -70,10 +92,7 @@ impl PamAttempt {
         let (tx, rx) = mpsc::channel();
         let user = user.to_owned();
         let worker = std::thread::spawn(move || {
-            let bridge = Bridge {
-                emit: &emit,
-                responses: rx,
-            };
+            let bridge = Bridge::new(&emit, rx);
             let result = authenticate(&user, bridge);
             emit(AuthEvent::Done(result));
         });
@@ -116,15 +135,46 @@ impl Drop for PamAttempt {
     }
 }
 
-fn authenticate<E: Fn(AuthEvent)>(user: &str, bridge: Bridge<&E>) -> Result<(), String> {
+/// Sort a PAM failure into "PAM judged the credential" and "the
+/// conversation broke before it could" (issue #91).
+///
+/// `conversation_broke` wins over the code, because it is the only reliable
+/// signal: a module that never got its answer reports `PAM_AUTH_ERR` like
+/// any wrong password. The codes listed here are the ones that mean the
+/// exchange itself failed even when our own bridge stayed healthy; every
+/// other code is PAM's verdict on the user (`AUTH_ERR`, `USER_UNKNOWN`,
+/// `MAXTRIES` from a faillock lockout, an expired credential) or a module
+/// fault the user must be told about rather than have retried behind their
+/// back.
+fn classify(code: ErrorCode, message: String, conversation_broke: bool) -> AuthError {
+    let transport = matches!(
+        code,
+        ErrorCode::CONV_ERR
+            | ErrorCode::CONV_AGAIN
+            | ErrorCode::ABORT
+            | ErrorCode::BUF_ERR
+            | ErrorCode::INCOMPLETE
+    );
+    if conversation_broke || transport {
+        AuthError::Conversation(message)
+    } else {
+        AuthError::Denied(message)
+    }
+}
+
+fn authenticate<E: Fn(AuthEvent)>(user: &str, bridge: Bridge<&E>) -> Result<(), AuthError> {
+    // Cloned out before the bridge is moved into the context, which owns it
+    // for the rest of the transaction.
+    let broken = bridge.broken.clone();
     let mut ctx = Context::new(service_name(), Some(user), bridge)
-        .map_err(|e| format!("pam context: {e}"))?;
+        .map_err(|e| AuthError::Conversation(format!("pam context: {e}")))?;
     // Authentication ONLY — deliberately no `acct_mgmt`, matching hyprlock/
     // swaylock. The user is already logged in (account validity was settled
     // at login), and pam_unix's account phase needs the setuid unix_chkpwd
     // helper, which fails from a systemd user-service context (hypridle →
     // vigil-lock): the correct password would be REJECTED at unlock.
-    ctx.authenticate(Flag::NONE).map_err(|e| e.to_string())?;
+    ctx.authenticate(Flag::NONE)
+        .map_err(|e| classify(e.code(), e.to_string(), broken.load(Ordering::SeqCst)))?;
     Ok(())
 }
 
@@ -140,10 +190,7 @@ mod tests {
         let events: Arc<Mutex<Vec<AuthEvent>>> = Arc::default();
         let (tx, rx) = mpsc::channel();
         let sink = events.clone();
-        let mut bridge = Bridge {
-            emit: move |e| sink.lock().unwrap().push(e),
-            responses: rx,
-        };
+        let mut bridge = Bridge::new(move |e| sink.lock().unwrap().push(e), rx);
         tx.send("hunter2".into()).unwrap();
         let out = bridge
             .prompt_echo_off(&CString::new("Password:").unwrap())
@@ -162,14 +209,76 @@ mod tests {
     fn dropped_response_channel_aborts_conversation() {
         let (tx, rx) = mpsc::channel::<String>();
         drop(tx);
-        let mut bridge = Bridge {
-            emit: |_| {},
-            responses: rx,
-        };
+        let mut bridge = Bridge::new(|_| {}, rx);
         let err = bridge
             .prompt_echo_off(&CString::new("Password:").unwrap())
             .unwrap_err();
         assert_eq!(err, ErrorCode::CONV_ERR);
+    }
+
+    /// Issue #91. A dropped sender and a wrong password must not land in the
+    /// same bucket: the first is vigil breaking its own conversation, the
+    /// second is PAM's verdict. pam_unix reports BOTH as `PAM_AUTH_ERR`, so
+    /// the bridge's own record of the break is what has to decide.
+    #[test]
+    fn a_broken_conversation_is_not_a_denial() {
+        let (tx, rx) = mpsc::channel::<String>();
+        drop(tx);
+        let mut bridge = Bridge::new(|_| {}, rx);
+        assert!(!bridge.broken.load(Ordering::SeqCst));
+        let code = bridge
+            .prompt_echo_off(&CString::new("Password:").unwrap())
+            .unwrap_err();
+        assert!(
+            bridge.broken.load(Ordering::SeqCst),
+            "the bridge must record that it could not answer PAM"
+        );
+
+        // What pam_unix actually returns after a failed conversation.
+        let outcome = classify(
+            ErrorCode::AUTH_ERR,
+            "Authentication failure".into(),
+            bridge.broken.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            outcome,
+            AuthError::Conversation("Authentication failure".into()),
+            "a conversation vigil broke was reported as a credential denial"
+        );
+        assert_eq!(code, ErrorCode::CONV_ERR);
+    }
+
+    #[test]
+    fn a_rejected_credential_is_a_denial() {
+        for code in [
+            ErrorCode::AUTH_ERR,
+            ErrorCode::USER_UNKNOWN,
+            ErrorCode::PERM_DENIED,
+            // A faillock lockout IS a verdict on the user: they must see it.
+            ErrorCode::MAXTRIES,
+        ] {
+            assert_eq!(
+                classify(code, "no".into(), false),
+                AuthError::Denied("no".into()),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_codes_are_conversation_failures_even_with_a_healthy_bridge() {
+        for code in [
+            ErrorCode::CONV_ERR,
+            ErrorCode::CONV_AGAIN,
+            ErrorCode::ABORT,
+            ErrorCode::BUF_ERR,
+            ErrorCode::INCOMPLETE,
+        ] {
+            assert!(
+                classify(code, "no".into(), false).is_conversation(),
+                "{code:?}"
+            );
+        }
     }
 
     #[test]
@@ -201,10 +310,7 @@ mod tests {
         let events: Arc<Mutex<Vec<AuthEvent>>> = Arc::default();
         let (_tx, rx) = mpsc::channel();
         let sink = events.clone();
-        let mut bridge = Bridge {
-            emit: move |e| sink.lock().unwrap().push(e),
-            responses: rx,
-        };
+        let mut bridge = Bridge::new(move |e| sink.lock().unwrap().push(e), rx);
         bridge.text_info(&CString::new("fp: place finger").unwrap());
         bridge.error_msg(&CString::new("bad").unwrap());
         let got = events.lock().unwrap();

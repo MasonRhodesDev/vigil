@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use vigil_config::{Config, LockTransition};
 use vigil_core::{
-    AppearanceEvent, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget, LoginEvent,
-    OutputId, OutputInfo, UiMessage,
+    AppearanceEvent, AuthError, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget,
+    LoginEvent, OutputId, OutputInfo, UiMessage,
 };
 use vigil_flow::{FlowCmd, FlowEvent};
 use vigil_login::{AppearanceWatcher, LoginSession};
@@ -427,6 +427,55 @@ impl<A: AuthAttempt> AuthTrack<A> {
     }
 }
 
+/// How many consecutive conversation failures the locker will paper over
+/// before it stops hiding them.
+///
+/// Not zero: after the identity fix a conversation failure is a genuine
+/// anomaly the user should not be blamed for, and reopening silently is the
+/// right answer to a one-off. Not unbounded either: each reopened
+/// transaction is another `pam_authenticate` that can end in a faillock
+/// strike, so a stack that fails every time must surface rather than burn
+/// the user's remaining attempts invisibly (issue #91).
+const MAX_SILENT_CONVERSATION_RETRIES: u32 = 3;
+
+/// What a finished attempt means. Split out of the pump so the policy is
+/// testable without a compositor (issue #91).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoneOutcome {
+    /// Authenticated.
+    Authorized,
+    /// A conversation abandoned at unlock, finishing late. Not a failure.
+    Ignore,
+    /// PAM judged the credential: show it, re-prompt.
+    Denied(String),
+    /// Our own conversation broke: reopen it without blaming the user.
+    ReopenQuietly(String),
+    /// Conversations keep breaking. Stop hiding it.
+    Surface(String),
+}
+
+/// `unlocked`: the lock is already released, so any straggling conversation
+/// is one we abandoned. `losses`: consecutive conversation failures so far,
+/// this one included.
+fn done_outcome(result: Result<(), AuthError>, unlocked: bool, losses: u32) -> DoneOutcome {
+    match result {
+        Ok(()) => DoneOutcome::Authorized,
+        // A detached conversation (grace / loginctl unlock) finishing late is
+        // not an auth failure: opening another PAM transaction here means a
+        // conversation nobody answers — a logged failure per unlock, and a
+        // pam_faillock strike against the user.
+        Err(_) if unlocked => DoneOutcome::Ignore,
+        Err(AuthError::Denied(message)) => DoneOutcome::Denied(message),
+        Err(AuthError::Conversation(message)) => {
+            if losses > MAX_SILENT_CONVERSATION_RETRIES {
+                DoneOutcome::Surface(message)
+            } else {
+                DoneOutcome::ReopenQuietly(message)
+            }
+        }
+    }
+}
+
 struct Locker {
     platform: VigilPlatform,
     theme: Theme,
@@ -441,6 +490,9 @@ struct Locker {
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
     auth: AuthTrack,
+    /// Consecutive conversation failures with no PAM verdict and no user
+    /// input in between; reset by either.
+    conversation_losses: u32,
     login: Option<LoginSession>,
     login_rx: mpsc::Receiver<LoginEvent>,
     login_tx: mpsc::Sender<LoginEvent>,
@@ -567,6 +619,7 @@ impl Locker {
             caps_lock: false,
             queue: Rc::default(),
             auth: AuthTrack::new(),
+            conversation_losses: 0,
             login: LoginSession::connect(),
             login_rx,
             login_tx,
@@ -689,29 +742,49 @@ impl Locker {
                 // Exactly one Done ends an attempt, and nothing it emitted
                 // can follow it; the pump stops rather than reasoning about
                 // events that belong to an attempt it just retired.
-                AuthEvent::Done(Ok(())) => {
-                    self.pending.push(FlowEvent::AuthOk);
+                AuthEvent::Done(result) => {
+                    self.finish_attempt(result);
                     return;
                 }
-                AuthEvent::Done(Err(_)) if self.unlocked => {
-                    // A detached conversation (grace / loginctl unlock)
-                    // finishing late is not an auth failure: starting
-                    // another PAM transaction here opened a conversation
-                    // nobody answers -- a logged failure per unlock, and a
-                    // pam_faillock strike against the user.
-                    return;
-                }
-                AuthEvent::Done(Err(message)) => {
-                    // Retire the dead conversation here, not when the
-                    // controller's reply arrives: pump_ui runs later in this
-                    // same tick and would otherwise respond() into it and
-                    // silently lose the submission.
-                    self.auth.retire();
-                    // The controller decides the retry (a fresh PAM
-                    // transaction per attempt, hyprlock's model).
-                    self.pending.push(FlowEvent::AuthErr(message));
-                    return;
-                }
+            }
+        }
+    }
+
+    /// Apply a finished attempt's verdict. Retires the conversation here
+    /// rather than when the controller's reply arrives: pump_ui runs later
+    /// in this same tick and would otherwise respond() into a dead
+    /// conversation and silently lose the submission.
+    fn finish_attempt(&mut self, result: Result<(), AuthError>) {
+        let conversation = result
+            .as_ref()
+            .err()
+            .is_some_and(AuthError::is_conversation);
+        self.conversation_losses = if conversation {
+            self.conversation_losses + 1
+        } else {
+            0
+        };
+        match done_outcome(result, self.unlocked, self.conversation_losses) {
+            DoneOutcome::Authorized => self.pending.push(FlowEvent::AuthOk),
+            DoneOutcome::Ignore => {}
+            DoneOutcome::Denied(message) => {
+                self.auth.retire();
+                // The controller decides the retry (a fresh PAM transaction
+                // per attempt, hyprlock's model).
+                self.pending.push(FlowEvent::AuthErr(message));
+            }
+            DoneOutcome::ReopenQuietly(message) => {
+                eprintln!("vigil-lock: PAM conversation lost ({message}); reopening");
+                self.auth.retire();
+                self.pending.push(FlowEvent::AuthConversationLost);
+            }
+            DoneOutcome::Surface(message) => {
+                eprintln!(
+                    "vigil-lock: {} conversation failures in a row; surfacing the last ({message})",
+                    self.conversation_losses
+                );
+                self.auth.retire();
+                self.pending.push(FlowEvent::AuthErr(message));
             }
         }
     }
@@ -725,6 +798,9 @@ impl Locker {
                     if self.auth.is_live() {
                         self.snapshot.busy = true;
                         self.each_window(|w| w.set_busy(true));
+                        // The user is driving again: whatever ran the quiet
+                        // reopen budget down was transient.
+                        self.conversation_losses = 0;
                     }
                     self.auth.respond(text);
                 }
@@ -1586,7 +1662,9 @@ mod tests {
 
         // Exactly what a dying vigil-pam worker emits, in order.
         let _ = stale.send(AuthEvent::Error("conversation failed".into()));
-        let _ = stale.send(AuthEvent::Done(Err("Authentication failure".into())));
+        let _ = stale.send(AuthEvent::Done(Err(AuthError::Conversation(
+            "Authentication failure".into(),
+        ))));
 
         assert_eq!(
             track.drain(),
@@ -1621,7 +1699,7 @@ mod tests {
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
         let worker = start(&mut track);
         track.retire();
-        let _ = worker.send(AuthEvent::Done(Err("late".into())));
+        let _ = worker.send(AuthEvent::Done(Err(AuthError::Conversation("late".into()))));
         assert!(track.drain().is_empty());
         assert!(!track.is_live());
     }
@@ -1629,17 +1707,16 @@ mod tests {
     /// Detaching (issue #49: unlock must never wait on PAM) leaves the slot
     /// in place on purpose, so the abandoned conversation's inevitable
     /// `Done(Err)` is still delivered — and recognised as the non-event it
-    /// is by the `unlocked` guard, rather than logged as a failed unlock.
+    /// is rather than logged as a failed unlock.
     #[test]
     fn a_detached_attempt_still_reports_so_the_pump_can_ignore_it() {
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
         let worker = start(&mut track);
         track.detach();
-        let _ = worker.send(AuthEvent::Done(Err("Authentication failure".into())));
-        assert_eq!(
-            track.drain(),
-            vec![AuthEvent::Done(Err("Authentication failure".into()))]
-        );
+        let err = AuthError::Conversation("Authentication failure".into());
+        let _ = worker.send(AuthEvent::Done(Err(err.clone())));
+        assert_eq!(track.drain(), vec![AuthEvent::Done(Err(err.clone()))]);
+        assert_eq!(done_outcome(Err(err), true, 1), DoneOutcome::Ignore);
     }
 
     #[test]
@@ -1662,6 +1739,42 @@ mod tests {
         track.retire();
         track.respond("hunter2".into());
         assert_eq!(answered.borrow().len(), 1);
+    }
+
+    /// A genuine wrong password is still a genuine wrong password: the user
+    /// sees it and the controller re-prompts. Nothing about the conversation
+    /// classification may soften that.
+    #[test]
+    fn a_rejected_credential_is_still_shown_and_reprompted() {
+        assert_eq!(
+            done_outcome(
+                Err(AuthError::Denied("Authentication failure".into())),
+                false,
+                0
+            ),
+            DoneOutcome::Denied("Authentication failure".into())
+        );
+        assert_eq!(done_outcome(Ok(()), false, 0), DoneOutcome::Authorized);
+    }
+
+    /// Stage 2. A conversation vigil broke is not a credential failure, so it
+    /// must not travel the path the user reads as one — but it cannot be
+    /// hidden forever either, because every quiet reopen is another
+    /// `pam_authenticate` that faillock can strike.
+    #[test]
+    fn a_broken_conversation_reopens_quietly_but_not_forever() {
+        let broken = || AuthError::Conversation("Authentication failure".into());
+        for losses in 1..=MAX_SILENT_CONVERSATION_RETRIES {
+            assert_eq!(
+                done_outcome(Err(broken()), false, losses),
+                DoneOutcome::ReopenQuietly("Authentication failure".into()),
+                "loss {losses}"
+            );
+        }
+        assert_eq!(
+            done_outcome(Err(broken()), false, MAX_SILENT_CONVERSATION_RETRIES + 1),
+            DoneOutcome::Surface("Authentication failure".into())
+        );
     }
 
     #[test]
