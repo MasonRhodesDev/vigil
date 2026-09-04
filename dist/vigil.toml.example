@@ -28,7 +28,12 @@
 #
 # Greeter-scope keys ([keyboard], [sessions], [users], [power], [greeter],
 # [render]) are ignored in the user file: the greeter reads only this one.
-# Every ignored user key is named on stderr with its reason.
+# Every ignored user key is named on stderr with its reason, including an
+# unrecognised key inside [lock.warning.gui] or [output."NAME"] — those
+# tables are taken whole, and an unknown key in one refuses the whole
+# table rather than being swallowed. [output."NAME"] merges per connector
+# and per field, so a user overriding one output keeps the rest of this
+# file's.
 #
 # `vigil-lock --config PATH` is the exception and stays whole-file — an
 # operator and test affordance, already a root-or-owner choice.

@@ -600,11 +600,32 @@ const OVERLAY: &[(&str, OverlaySetter)] = &[
         Ok(())
     }),
     ("lock.warning.gui", |config, value| {
-        config.lock.warning.gui = value.try_into()?;
+        config.lock.warning.gui = value.try_into::<OverlayWarningGui>()?.into();
         Ok(())
     }),
     ("output", |config, value| {
-        config.output = value.try_into()?;
+        let overrides: HashMap<String, OverlayOutputOverride> = value.try_into()?;
+        for (name, over) in overrides {
+            // Per connector, and per field within one. A user who names
+            // [output."DP-1"] must not erase the operator's
+            // [output."eDP-1"], and setting scale there must not drop the
+            // operator's background for the same connector.
+            let entry = config.output.entry(name).or_default();
+            let OverlayOutputOverride {
+                background,
+                fit,
+                scale,
+            } = over;
+            if background.is_some() {
+                entry.background = background;
+            }
+            if fit.is_some() {
+                entry.fit = fit;
+            }
+            if scale.is_some() {
+                entry.scale = scale;
+            }
+        }
         Ok(())
     }),
     ("profiles.dir", |config, value| {
@@ -612,6 +633,139 @@ const OVERLAY: &[(&str, OverlaySetter)] = &[
         Ok(())
     }),
 ];
+
+/// Overlay mirrors of the tables the whitelist takes WHOLE.
+///
+/// `walk_overlay` names every key it drops, but a table handed to serde in
+/// one piece is a hole in that guarantee: serde silently ignores what it
+/// does not recognise, so `[lock.warning.gui] wallpaper_hold_max_ms = 0`
+/// read as accepted and a typo in `[output."DP-1"]` read as applied. These
+/// mirrors carry `deny_unknown_fields`, so the deserializer names it and
+/// the whole take is refused with a reason.
+///
+/// The real structs cannot carry it: the system config must keep tolerating
+/// unknown keys so an older vigil reads a newer config (`unknown_keys_ignored`).
+/// The overlay is the one place where being told is worth more than being
+/// forgiving.
+///
+/// Each conversion destructures the real struct and rebuilds it with no
+/// `..`, so a field added to either side fails to compile until the mirror
+/// gains it too.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OverlayWarningGui {
+    start: WarningKeyframe,
+    offset_ms: u64,
+    duration_ms: u64,
+    kind: WarningAnimation,
+    element: Vec<OverlayWarningElement>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OverlayWarningElement {
+    selector: String,
+    start: WarningKeyframe,
+    offset_ms: u64,
+    duration_ms: u64,
+    kind: WarningAnimation,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OverlayOutputOverride {
+    background: Option<PathBuf>,
+    fit: Option<String>,
+    scale: Option<f32>,
+}
+
+impl From<WarningGui> for OverlayWarningGui {
+    fn from(gui: WarningGui) -> Self {
+        let WarningGui {
+            start,
+            offset_ms,
+            duration_ms,
+            kind,
+            element,
+        } = gui;
+        Self {
+            start,
+            offset_ms,
+            duration_ms,
+            kind,
+            element: element.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<OverlayWarningGui> for WarningGui {
+    fn from(gui: OverlayWarningGui) -> Self {
+        let OverlayWarningGui {
+            start,
+            offset_ms,
+            duration_ms,
+            kind,
+            element,
+        } = gui;
+        Self {
+            start,
+            offset_ms,
+            duration_ms,
+            kind,
+            element: element.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<WarningElement> for OverlayWarningElement {
+    fn from(element: WarningElement) -> Self {
+        let WarningElement {
+            selector,
+            start,
+            offset_ms,
+            duration_ms,
+            kind,
+        } = element;
+        Self {
+            selector,
+            start,
+            offset_ms,
+            duration_ms,
+            kind,
+        }
+    }
+}
+
+impl From<OverlayWarningElement> for WarningElement {
+    fn from(element: OverlayWarningElement) -> Self {
+        let OverlayWarningElement {
+            selector,
+            start,
+            offset_ms,
+            duration_ms,
+            kind,
+        } = element;
+        Self {
+            selector,
+            start,
+            offset_ms,
+            duration_ms,
+            kind,
+        }
+    }
+}
+
+impl Default for OverlayWarningGui {
+    fn default() -> Self {
+        WarningGui::default().into()
+    }
+}
+
+impl Default for OverlayWarningElement {
+    fn default() -> Self {
+        WarningElement::default().into()
+    }
+}
 
 /// Lock policy the overlay must never reach: how long the screen may stay
 /// unlocked, and how long a warning may be held open or cancelled.
@@ -1378,13 +1532,13 @@ background = \"/etc/greetd/internal.png\"
                 "[output.\"DP-1\"]\nscale = 2.0\n",
                 "[output.\"DP-1\"]\nscale = 1e30\n",
                 |c| {
-                    c.output = HashMap::from([(
+                    c.output.insert(
                         "DP-1".to_string(),
                         OutputOverride {
                             scale: Some(2.0),
                             ..OutputOverride::default()
                         },
-                    )]);
+                    );
                 }
             ),
             probe!(
@@ -1483,6 +1637,11 @@ dir = \"/home/mason/.config/monitor-profiles\"
         assert_eq!(config.lock.warning.frost_alpha, 0.8);
         assert_eq!(config.lock.warning.easing, WarningEasing::Linear);
         assert_eq!(config.output["DP-1"].scale, Some(2.0));
+        // Merged per connector: the operator's other output survives.
+        assert_eq!(
+            config.output["eDP-1"].background,
+            Some(PathBuf::from("/etc/greetd/internal.png"))
+        );
         assert_eq!(
             config.profiles.dir,
             Some(PathBuf::from("/home/mason/.config/monitor-profiles"))
@@ -1493,6 +1652,72 @@ dir = \"/home/mason/.config/monitor-profiles\"
             Some(PathBuf::from("/etc/greetd/system.png"))
         );
         assert_eq!(config.lock.warning.frost_in_ms, 1_500);
+    }
+
+    #[test]
+    fn overlay_names_unknown_keys_inside_a_whole_table_take() {
+        // gui and output are taken whole, so walk_overlay cannot name what
+        // they drop — serde has to. Without deny_unknown_fields both of
+        // these read as accepted.
+        let (config, ignored) = overlay("[lock.warning.gui]\nwallpaper_hold_max_ms = 0\n");
+        assert_eq!(config.lock.warning.wallpaper_hold_max_ms, 5_000);
+        assert_eq!(
+            config.lock.warning.gui,
+            parse(SYSTEM).unwrap().lock.warning.gui
+        );
+        assert_eq!(ignored.len(), 1);
+        assert_eq!(ignored[0].key, "lock.warning.gui");
+        assert!(
+            matches!(&ignored[0].refusal, OverlayRefusal::Invalid(reason)
+                if reason.contains("wallpaper_hold_max_ms")),
+            "{:?}",
+            ignored[0].refusal
+        );
+
+        // Also inside the nested element array.
+        let (_, ignored) =
+            overlay("[[lock.warning.gui.element]]\nselector = \"clock\"\ngrace_secs = 99\n");
+        assert_eq!(ignored.len(), 1);
+        assert!(
+            matches!(&ignored[0].refusal, OverlayRefusal::Invalid(reason)
+                if reason.contains("grace_secs")),
+            "{:?}",
+            ignored[0].refusal
+        );
+
+        let (_, ignored) = overlay("[output.\"DP-1\"]\nscael = 2.0\n");
+        assert_eq!(ignored.len(), 1);
+        assert_eq!(ignored[0].key, "output");
+        assert!(
+            matches!(&ignored[0].refusal, OverlayRefusal::Invalid(reason)
+                if reason.contains("scael")),
+            "{:?}",
+            ignored[0].refusal
+        );
+    }
+
+    #[test]
+    fn overlay_output_merges_per_connector_and_per_field() {
+        // One [output."DP-1"] in a user file used to erase every system
+        // [output.*]: the map was assigned, not merged.
+        let (config, ignored) = overlay("[output.\"DP-1\"]\nscale = 2.0\n");
+        assert_eq!(ignored, Vec::new());
+        assert_eq!(
+            config.output["eDP-1"].background,
+            Some(PathBuf::from("/etc/greetd/internal.png")),
+            "the operator's other connector was erased"
+        );
+        assert_eq!(config.output["DP-1"].scale, Some(2.0));
+
+        // And within one connector: setting scale must not drop the
+        // operator's background for the same output.
+        let (config, ignored) = overlay("[output.\"eDP-1\"]\nscale = 1.5\n");
+        assert_eq!(ignored, Vec::new());
+        assert_eq!(config.output["eDP-1"].scale, Some(1.5));
+        assert_eq!(
+            config.output["eDP-1"].background,
+            Some(PathBuf::from("/etc/greetd/internal.png"))
+        );
     }
 
     #[test]
