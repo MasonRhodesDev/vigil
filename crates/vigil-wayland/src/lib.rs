@@ -431,6 +431,9 @@ struct App<S: LockSession + 'static> {
     /// still mapped after its ramp ended holds the final value.
     overlay_progress: (f32, f32),
     frost_alpha: f32,
+    /// The opt-in reveal blurs the uncovered desktop (frost_out_ms > 0). Off
+    /// by default: the reveal carries no blur region and no tint.
+    reveal_blur: bool,
     /// Pre-lock overlays should exist (a ramp is running and cleanup has
     /// not retired them).
     pre_lock_overlays: bool,
@@ -826,9 +829,14 @@ impl<S: LockSession> App<S> {
                 },
             )
         });
-        let Some((layer, effect, opacity)) =
-            self.create_overlay(qh, &surface, &output, "vigil-reveal", true, false)
-        else {
+        let Some((layer, effect, opacity)) = self.create_overlay(
+            qh,
+            &surface,
+            &output,
+            "vigil-reveal",
+            true,
+            self.reveal_blur,
+        ) else {
             return;
         };
         self.entries.push(Entry {
@@ -1064,7 +1072,15 @@ impl<S: LockSession> App<S> {
             // (the surface opacity carries the ramp there), so a nonzero
             // frost_alpha would still bake a gray tint even with frost
             // pinned 0. Zero the tint explicitly for the reveal role.
-            let frost_alpha = if is_reveal { 0.0 } else { self.frost_alpha };
+            // A blur-free reveal renders zero tint: pixel_frost() forces full
+            // frost on lever surfaces, so a nonzero frost_alpha would bake a
+            // gray tint even with frost pinned 0. A blurring reveal keeps the
+            // configured alpha so its frost fade carries a tint like the lock.
+            let frost_alpha = if is_reveal && !self.reveal_blur {
+                0.0
+            } else {
+                self.frost_alpha
+            };
             overlay_blend(canvas, frost, wallpaper, frost_alpha, surface_opacity);
         }
         // Captured after the overlay blend: the full-buffer premultiply is
@@ -1352,6 +1368,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
 
     let warning_enabled = warning_ms_override.unwrap_or(lock_config.warning.duration_ms) > 0;
     let frost_alpha = lock_config.warning.frost_alpha.clamp(0.0, 1.0);
+    let reveal_blur = lock_config.transition.reveal_blurs();
     let started = std::time::Instant::now();
     let mut policy = lock_config.clone();
     let layer_shell = match LayerShell::bind(&globals, &qh) {
@@ -1421,6 +1438,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
         started,
         overlay_progress: (0.0, 0.0),
         frost_alpha,
+        reveal_blur,
         pre_lock_overlays,
         scene_ids: BTreeSet::new(),
         initial_outputs_added: false,

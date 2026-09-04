@@ -621,15 +621,21 @@ impl LockFlow {
         if self.transition.reveals() {
             self.reveal = Some(Reveal::new(
                 self.transition.reveal_ms(),
+                self.transition.reveal_frost_ms(),
                 self.transition.easing,
             ));
             self.reveal_entered = Some(now.elapsed);
-            // frost 0 from the first reveal frame: no blur/tint on unlock,
-            // even on the opt-in reveal (wallpaper_out_ms > 0).
-            self.progress = (0.0, 1.0);
+            // The reveal is blur-free by default (frost 0); it opts into a
+            // fading blur when frost_out_ms > 0, which starts at full frost.
+            let frost = if self.transition.reveal_blurs() {
+                1.0
+            } else {
+                0.0
+            };
+            self.progress = (frost, 1.0);
             cmds.push(FlowCmd::ShowPanel(false));
             cmds.push(FlowCmd::OverlayProgress {
-                frost: 0.0,
+                frost,
                 wallpaper: 1.0,
             });
             cmds.push(FlowCmd::CreateRevealOverlays);
@@ -735,6 +741,13 @@ pub(crate) mod tests {
     pub(crate) fn revealing_lock() -> Lock {
         let mut lock = Lock::default();
         lock.transition.wallpaper_out_ms = 250;
+        lock
+    }
+
+    /// A reveal that opts into the fading blur (frost_out_ms > 0).
+    pub(crate) fn blurring_reveal_lock() -> Lock {
+        let mut lock = revealing_lock();
+        lock.transition.frost_out_ms = 200;
         lock
     }
 
@@ -1592,6 +1605,45 @@ pub(crate) mod tests {
             changed < position(&cmds, &FlowCmd::ReleaseSessionLock),
             "releasing the lock is what entering Revealing means: {cmds:?}"
         );
+    }
+
+    #[test]
+    fn blur_free_reveal_starts_at_zero_frost() {
+        // The default opt-in reveal (wallpaper_out only): its first overlay
+        // frame carries no frost, so unlock has no blur or tint.
+        let lock = revealing_lock();
+        let mut flow = locked_flow(&lock);
+        let cmds = flow.step(at(10_000), FlowEvent::AuthOk);
+        assert!(
+            has(
+                &cmds,
+                &FlowCmd::OverlayProgress {
+                    frost: 0.0,
+                    wallpaper: 1.0
+                }
+            ),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn blurring_reveal_starts_at_full_frost() {
+        // Opt-in blur (frost_out_ms > 0): the first reveal frame starts at
+        // full frost, which then clears over the fade.
+        let lock = blurring_reveal_lock();
+        let mut flow = locked_flow(&lock);
+        let cmds = flow.step(at(10_000), FlowEvent::AuthOk);
+        assert!(
+            has(
+                &cmds,
+                &FlowCmd::OverlayProgress {
+                    frost: 1.0,
+                    wallpaper: 1.0
+                }
+            ),
+            "{cmds:?}"
+        );
+        assert!(has(&cmds, &FlowCmd::CreateRevealOverlays), "{cmds:?}");
     }
 }
 

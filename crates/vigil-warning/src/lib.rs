@@ -482,21 +482,24 @@ pub struct RevealSample {
 }
 
 /// Post-unlock fade: the lock wallpaper's opacity fades out, uncovering the
-/// desktop. Deliberately NO frost - blur is a pre-lock warning signal only,
-/// so unlocking reveals a sharp desktop (the reveal overlay carries no blur
-/// region and `frost` stays 0, so no tint and no compositor blur). The
-/// `(frost, wallpaper)` contract is shared with the warning's [`Sample`];
-/// here `frost` is pinned 0 and `wallpaper` is the fading opacity.
+/// desktop. Blur-free by default (`frost_fade` zero, `frost` pinned 0 - no
+/// tint, no compositor blur), so unlocking reveals a sharp desktop. When
+/// `frost_fade` is non-zero the reveal opts into a fading blur: `frost` starts
+/// at 1.0 and clears over `frost_fade`. The `(frost, wallpaper)` contract is
+/// shared with the warning's [`Sample`]; here `wallpaper` is the fading
+/// opacity and `frost` the fading blur.
 pub struct Reveal {
     fade: Duration,
+    frost_fade: Duration,
     easing: WarningEasing,
     start: Option<Duration>,
 }
 
 impl Reveal {
-    pub fn new(fade_ms: u64, easing: WarningEasing) -> Self {
+    pub fn new(fade_ms: u64, frost_fade_ms: u64, easing: WarningEasing) -> Self {
         Self {
             fade: Duration::from_millis(fade_ms),
+            frost_fade: Duration::from_millis(frost_fade_ms),
             easing,
             start: None,
         }
@@ -513,12 +516,19 @@ impl Reveal {
         self.start.is_some()
     }
 
+    /// The blur that a reveal frame carries before the fade starts: full when
+    /// the reveal opts into blur, zero otherwise.
+    fn resting_frost(&self) -> f32 {
+        if self.frost_fade.is_zero() { 0.0 } else { 1.0 }
+    }
+
     pub fn sample(&self, now: Duration) -> RevealSample {
         let Some(start) = self.start else {
-            // Not started: the lock wallpaper still fully covers, but frost
-            // is 0 - the reveal never blurs.
+            // Not started: the lock wallpaper still fully covers. frost is 0
+            // for a blur-free reveal, or full for a blurring one (it clears
+            // once the fade starts).
             return RevealSample {
-                frost: 0.0,
+                frost: self.resting_frost(),
                 wallpaper: 1.0,
                 done: false,
                 next_frame: None,
@@ -526,12 +536,17 @@ impl Reveal {
         };
         let elapsed = now.saturating_sub(start);
         let grid = quantize(elapsed);
-        // The lock wallpaper fades out uniformly; the sharp desktop appears
-        // through it. frost stays 0 - no tint, no blur on unlock.
+        // The lock wallpaper fades out uniformly; the desktop appears through
+        // it. frost clears over frost_fade (0 for a blur-free unlock).
         let wallpaper = 1.0 - graded(elapsed, grid, Duration::ZERO, self.fade, self.easing);
-        let done = elapsed >= self.fade;
+        let frost = if self.frost_fade.is_zero() {
+            0.0
+        } else {
+            1.0 - graded(elapsed, grid, Duration::ZERO, self.frost_fade, self.easing)
+        };
+        let done = elapsed >= self.fade.max(self.frost_fade);
         RevealSample {
-            frost: 0.0,
+            frost,
             wallpaper,
             done,
             next_frame: (!done).then(|| Duration::from_millis(FRAME_INTERVAL_MS)),
@@ -836,7 +851,7 @@ mod tests {
     fn reveal_fades_the_wallpaper_out_with_zero_frost() {
         // Unlock has no blur or tint: frost is 0 at every sample and the
         // lock wallpaper's opacity fades to reveal the sharp desktop.
-        let mut reveal = Reveal::new(250, WarningEasing::Linear);
+        let mut reveal = Reveal::new(250, 0, WarningEasing::Linear);
         assert_eq!(
             reveal.sample(Duration::from_secs(5)),
             RevealSample {
@@ -868,7 +883,7 @@ mod tests {
         // The invariant the fix rests on, across the whole fade: not one
         // sample carries frost, so nothing can blur or tint the desktop
         // during unlock.
-        let mut reveal = Reveal::new(400, WarningEasing::EaseOut);
+        let mut reveal = Reveal::new(400, 0, WarningEasing::EaseOut);
         reveal.start(Duration::ZERO);
         for ms in (0..=500).step_by(FRAME_INTERVAL_MS as usize) {
             assert_eq!(
@@ -877,6 +892,27 @@ mod tests {
                 "frost at {ms} ms must be 0"
             );
         }
+    }
+
+    #[test]
+    fn reveal_blur_starts_full_and_clears() {
+        // Opt-in blur (frost_out_ms > 0): frost starts full before the fade
+        // and clears to 0 over frost_fade, independent of the wallpaper fade.
+        let mut reveal = Reveal::new(100, 300, WarningEasing::Linear);
+        // Before start, the reveal rests at full blur (the locked desktop is
+        // still covered; the blur clears once the fade begins).
+        assert_eq!(reveal.sample(Duration::from_secs(5)).frost, 1.0);
+        reveal.start(Duration::ZERO);
+        // Mid frost-fade: 132 ms of 300 have cleared (linear, on the grid).
+        let mid = reveal.sample(Duration::from_millis(4 * FRAME_INTERVAL_MS));
+        assert!((mid.frost - (1.0 - 132.0 / 300.0)).abs() < 1e-6, "{mid:?}");
+        // The wallpaper (100 ms) has fully faded while the blur is still
+        // clearing, so the reveal is not done until the longer frost fade.
+        assert_eq!(mid.wallpaper, 0.0);
+        assert!(!mid.done);
+        let end = reveal.sample(Duration::from_millis(300));
+        assert_eq!(end.frost, 0.0);
+        assert!(end.done);
     }
 
     #[test]
@@ -1050,7 +1086,7 @@ mod tests {
         let c = timeline.sample(Duration::from_millis(3 * FRAME_INTERVAL_MS));
         assert_ne!((a.frost, a.wallpaper), (c.frost, c.wallpaper));
 
-        let mut reveal = Reveal::new(250, WarningEasing::Linear);
+        let mut reveal = Reveal::new(250, 0, WarningEasing::Linear);
         reveal.start(Duration::ZERO);
         let a = reveal.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS));
         let b = reveal.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS + 10));
@@ -1097,7 +1133,7 @@ mod tests {
 
     #[test]
     fn zero_length_reveal_is_done_immediately() {
-        let mut reveal = Reveal::new(0, WarningEasing::EaseOut);
+        let mut reveal = Reveal::new(0, 0, WarningEasing::EaseOut);
         reveal.start(Duration::ZERO);
         let sample = reveal.sample(Duration::ZERO);
         assert!(sample.done);
