@@ -131,13 +131,14 @@ s1_probe=$(probe_state)
 }
 tap
 teardown_check S1
-# --handoff-gap bounds how long the output has no lock buffer at all: from
-# the warning's last commit (or the lock request) to the lock surface's
-# first commit-with-buffer. 250 ms against a measured ~3 ms is deliberately
-# loose — it catches a whole scheduling round being added to the handoff,
-# which is the regression worth a gate, and does not pretend this tier's
-# timing predicts the seat's. The gaps are printed either way.
-python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --handoff-gap 250 --no-reveal || fail "S1: trace check"
+# --locked-to-commit-ms bounds the interval this output is actually
+# uncovered: `locked` (where the compositor stops drawing normal surfaces)
+# to that output's first lock-surface commit-with-buffer. 100 ms against a
+# measured ~3 ms is deliberately loose — it catches a whole scheduling round
+# being added before the first commit and does not pretend this tier's
+# timing predicts the seat's. It is NOT the #86 check: the black-committing
+# code passed this too, fast. S4's --first-frame-not-black is that check.
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --locked-to-commit-ms 100 --no-reveal || fail "S1: trace check"
 pass "S1"
 
 echo "S2: second locker joins the in-flight warning"

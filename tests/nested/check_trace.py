@@ -11,9 +11,11 @@ and asserts:
   --handoff            every warning surface teardown happens only after
                        every lock surface's first commit-with-buffer
                        (the handoff never exposes the desktop)
-  --handoff-gap MS     every output's warn-to-lock handoff gap is under MS
-                       (see "Handoff gap" below); the measured gaps are
-                       printed whether or not a bound is given
+  --locked-to-commit-ms N
+                       every output that went through the handoff committed
+                       its first lock buffer within N ms of the `locked`
+                       event (see "The black window" below); the per-output
+                       numbers print on every run either way
   --first-frame-not-black
                        with VIGIL_FRAME_HASH=1 in the environment of the
                        traced locker: the first lock-surface frame of any
@@ -38,23 +40,36 @@ get_layer_surface: "vigil-warning" (pre-lock overlay, --handoff) versus
 The capture check always runs: binding any screencopy/image-capture/
 export-dmabuf global is forbidden (capture-free warning, ADR).
 
-Handoff gap (issue #86)
------------------------
-The compositor stops rendering normal surfaces the instant it grants the
-session lock, and shows nothing on an output until that output's lock
-surface commits a buffer. So per output:
+The black window (issue #86)
+----------------------------
+The compositor stops rendering normal surfaces at the `locked` event, and
+shows nothing on an output until that output's lock surface commits a
+buffer. So the interval that is actually uncovered is, per output:
 
-    gap = first lock-surface commit-with-buffer
-          - max(last warning-surface commit before it, the lock request)
+    locked_to_commit = first lock-surface commit-with-buffer - `locked`
 
-That window is the black flash. WAYLAND_DEBUG stamps every line with a
-monotonic `[ ms.us ]`, so the gap is measured, not inferred.
+That is what --locked-to-commit-ms gates. WAYLAND_DEBUG stamps every line
+with a monotonic `[ ms.us ]`, so it is measured, not inferred. Only outputs
+that went through the handoff are eligible: an output hotplugged into an
+already-locked session has no relationship to a `locked` event that fired
+before it existed, and including it would gate a number that means nothing.
 
-Read the number for what it is: sway-tier timing is NOT Hyprland-tier
+A second, looser number is printed but NOT gated: from the warning
+surface's last commit (or the lock request) to the same first lock commit.
+It is an upper bound on the same window rather than the window itself,
+because the warning surface keeps being *displayed* after it stops
+committing - the ramp's commit-only ticks (`ramp_commit_only`) mean it can
+stop committing buffers hundreds of milliseconds before `locked`. Gating it
+made a flake, not a check: S9 measured 258 ms against a 250 ms bound on one
+machine and 249 ms on another, and the black-committing code it was meant
+to catch passed it at 3 ms.
+
+Read either number for what it is: sway-tier timing is NOT Hyprland-tier
 timing. This harness runs a headless pixman wlroots against an unoptimized
-debug build, and its numbers say nothing about the seat's. What it can do is
-catch a regression that adds a whole scheduling round to the handoff, which
-is the failure mode worth a gate.
+debug build, and its numbers say nothing about the seat's. What a bound can
+catch is a regression that adds a whole scheduling round before the first
+commit. What it cannot catch is #86 itself - the broken handoff committed
+*fast*, and committed black. That is --first-frame-not-black's job.
 
 Frame hashes (issue #86)
 ------------------------
@@ -109,6 +124,23 @@ def parse_record(line):
             fields[key] = value
     return fields
 
+def locked_to_commit(locked_ms, first_lock_commit_ms, handoff_outputs):
+    """{wl_output: ms} from the `locked` event to that output's first buffer.
+
+    Restricted to outputs that carried a warning surface, i.e. the ones that
+    were on screen when the lock was granted. An output hotplugged into an
+    already-locked session commits whenever it is configured, which is not a
+    handoff and not a measurement of one.
+    """
+    if locked_ms is None:
+        return {}
+    return {
+        output: commit_ms - locked_ms
+        for output, commit_ms in first_lock_commit_ms.items()
+        if output in handoff_outputs and commit_ms >= locked_ms
+    }
+
+
 def handoff_gaps(lock_request_ms, first_lock_commit_ms, warning_commits_ms):
     """{wl_output: (gap_ms, start_ms, commit_ms)} for every output that locked.
 
@@ -142,7 +174,7 @@ def main():
     ap.add_argument("trace")
     ap.add_argument("--expect", choices=["locked", "cancelled"])
     ap.add_argument("--handoff", action="store_true")
-    ap.add_argument("--handoff-gap", type=float, metavar="MS")
+    ap.add_argument("--locked-to-commit-ms", type=float, metavar="N")
     ap.add_argument("--first-frame-not-black", action="store_true")
     ap.add_argument("--outputs", type=int, default=0)
     ap.add_argument("--reveal", action="store_true")
@@ -277,6 +309,9 @@ def main():
                     reveal_configured.setdefault(m.group(3), lineno)
 
     gaps = handoff_gaps(lock_request_ms, first_lock_commit_ms, warning_commits_ms)
+    uncovered = locked_to_commit(
+        locked_ms, first_lock_commit_ms, set(warning_surface_output.values())
+    )
     failures = []
     if capture_binds:
         for lineno, line in capture_binds:
@@ -305,17 +340,18 @@ def main():
                         f"every lock surface had committed (last first-commit at {last_commit})"
                     )
 
-        if args.handoff_gap is not None:
-            if not gaps:
+        if args.locked_to_commit_ms is not None:
+            if not uncovered:
                 failures.append(
-                    "--handoff-gap: no output had both a lock request and a "
-                    "lock-surface buffer commit"
+                    "--locked-to-commit-ms: no output went through the handoff "
+                    "(needs a locked event and a warning surface that also got "
+                    "a lock surface)"
                 )
-            for output, (gap, _, _) in sorted(gaps.items()):
-                if gap > args.handoff_gap:
+            for output, ms in sorted(uncovered.items()):
+                if ms > args.locked_to_commit_ms:
                     failures.append(
-                        f"--handoff-gap: output {output} was uncovered for {gap:.1f} ms "
-                        f"(bound {args.handoff_gap:.1f} ms)"
+                        f"--locked-to-commit-ms: output {output} was uncovered for "
+                        f"{ms:.1f} ms after locked (bound {args.locked_to_commit_ms:.1f} ms)"
                     )
         if args.first_frame_not_black:
             if not first_lock_hash:
@@ -381,6 +417,8 @@ def main():
     # because the compositor stops rendering normal surfaces at that event,
     # not at the request, so it bounds the part of the gap that is actually
     # black on a strict compositor.
+    for output, ms in sorted(uncovered.items()):
+        print(f"check_trace: black window output {output}: {ms:.1f}ms (locked -> first lock commit)")
     for output, (gap, start, commit) in sorted(gaps.items()):
         since_locked = "" if locked_ms is None else f" since_locked={commit - locked_ms:.1f}ms"
         # The gap above ends at the first buffer; this one ends at the first
