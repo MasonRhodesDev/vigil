@@ -1,6 +1,7 @@
 //! Shared config for the vigil pair (/etc/greetd/vigil.toml; DESIGN.md §9 G1). Parse-only, snake_case keys, every key optional; a broken config must never block login — load() always returns a usable Config.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -733,17 +734,73 @@ fn refuse(path: &str) -> OverlayRefusal {
 }
 
 /// The merge with both paths named, so it is testable without $HOME.
+/// The most a user overlay may be. The real file is a few hundred bytes;
+/// this only has to be too small to hurt and far larger than any honest
+/// config.
+const MAX_OVERLAY_BYTES: u64 = 256 * 1024;
+
+/// Read the overlay, or say why not. `Ok(None)` is "no overlay here",
+/// which is the ordinary case and silent.
+///
+/// The overlay path is session-writable, so it is not necessarily a file.
+/// A FIFO there blocks `open(2)` for ever and vigil-lock never reaches the
+/// singleton guard, let alone the lock — a hang is a lock defeat that
+/// needs no privileges at all. A symlink to /dev/zero reads until the
+/// machine dies. So: stat before opening (stat does not block on a FIFO
+/// and follows symlinks, so the check sees the real target), demand a
+/// regular file, and cap the read.
+fn read_overlay(path: &Path) -> Result<Option<String>, String> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > MAX_OVERLAY_BYTES {
+        return Err(format!(
+            "{} bytes exceeds the {MAX_OVERLAY_BYTES} byte overlay limit",
+            meta.len()
+        ));
+    }
+    let file = std::fs::File::open(path).map_err(|err| err.to_string())?;
+    // Re-check on the descriptor actually opened: the path could have been
+    // swapped between the stat and the open. That race can still block in
+    // open(2) itself, which only O_NONBLOCK would close and which needs
+    // libc; the persistent FIFO — the exploitable case, since it does not
+    // need to win a race on every lock — is closed by the stat above.
+    match file.metadata() {
+        Ok(meta) if !meta.is_file() => return Err("not a regular file".into()),
+        Ok(_) => {}
+        Err(err) => return Err(err.to_string()),
+    }
+    // Capped even though the size was checked: a file may grow between the
+    // stat and the read, and some pseudo-files report zero length and then
+    // read for ever.
+    let mut source = String::new();
+    std::io::Read::take(file, MAX_OVERLAY_BYTES + 1)
+        .read_to_string(&mut source)
+        .map_err(|err| err.to_string())?;
+    if source.len() as u64 > MAX_OVERLAY_BYTES {
+        return Err(format!(
+            "larger than the {MAX_OVERLAY_BYTES} byte overlay limit"
+        ));
+    }
+    Ok(Some(source))
+}
+
 fn load_layered_from(system: &Path, user: Option<&Path>) -> (Config, Vec<IgnoredOverlayKey>) {
     let mut config = load_file(system).unwrap_or_default();
     let Some(user) = user else {
         return (config, Vec::new());
     };
-    let source = match std::fs::read_to_string(user) {
-        Ok(source) => source,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (config, Vec::new()),
-        Err(err) => {
+    let source = match read_overlay(user) {
+        Ok(Some(source)) => source,
+        Ok(None) => return (config, Vec::new()),
+        Err(reason) => {
             eprintln!(
-                "vigil-config: {}: {err}; ignoring the user overlay",
+                "vigil-config: {}: overlay refused: {reason}",
                 user.display()
             );
             return (config, Vec::new());
@@ -1444,6 +1501,59 @@ not_a_key = 1
     fn layered_ignores_an_unparsable_user_file() {
         let system = TempFile::new("broken-system", SYSTEM);
         let user = TempFile::new("broken-user", "[lock\ngrace_secs = ");
+        assert_eq!(
+            load_layered_from(system.path(), Some(user.path())),
+            (parse(SYSTEM).unwrap(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_non_regular_overlay_path_is_refused_not_opened() {
+        // The overlay path is session-writable and need not be a file. A
+        // FIFO there blocks open(2) for ever, so vigil-lock never reaches
+        // the singleton guard and the screen never locks — a lock defeat
+        // that costs nothing to mount and survives a reboot. read_overlay
+        // stats first (stat does not block on a FIFO) and demands a
+        // regular file, which covers the FIFO, the directory and the
+        // device node alike.
+        let system = TempFile::new("nonregular-system", SYSTEM);
+        let expected = parse(SYSTEM).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("vigil-overlay-dir-{}.toml", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_overlay(&dir), Err("not a regular file".into()));
+        assert_eq!(
+            load_layered_from(system.path(), Some(&dir)),
+            (expected.clone(), Vec::new())
+        );
+        std::fs::remove_dir(&dir).unwrap();
+
+        // metadata() follows the link, so the check sees the device, not
+        // the symlink — the /dev/zero case (an unbounded read) with a
+        // target that cannot block the test.
+        let link =
+            std::env::temp_dir().join(format!("vigil-overlay-link-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        assert_eq!(read_overlay(&link), Err("not a regular file".into()));
+        assert_eq!(
+            load_layered_from(system.path(), Some(&link)),
+            (expected, Vec::new())
+        );
+        std::fs::remove_file(&link).unwrap();
+    }
+
+    #[test]
+    fn an_oversize_overlay_is_refused() {
+        let system = TempFile::new("oversize-system", SYSTEM);
+        let user = TempFile::new(
+            "oversize-user",
+            &format!(
+                "# {}\n[look]\nclock_format = \"%S\"\n",
+                "x".repeat(MAX_OVERLAY_BYTES as usize)
+            ),
+        );
+        assert!(read_overlay(user.path()).is_err());
         assert_eq!(
             load_layered_from(system.path(), Some(user.path())),
             (parse(SYSTEM).unwrap(), Vec::new())
