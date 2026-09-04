@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.3.5
+Version:        0.3.6
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -119,6 +119,18 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Thu Sep 04 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.6-1
+- A correct password is no longer intermittently rejected. Every PAM
+  worker shared one event channel with no attempt identity, so a
+  superseded or detached worker's late "conversation failed" retired the
+  LIVE attempt, cascading into repeated failures and a faillock lockout.
+  Each attempt now owns its channel; a retired worker's events are
+  unreachable. A conversation loss (vigil's own transport error, which
+  pam_unix reports identically to a wrong password) is classified apart
+  from a real denial and reopened quietly, never surfaced as a failure.
+- The lockscreen now names a faillock lockout and counts down to release
+  ("Account locked - try again in Nm Ss") instead of showing a bare
+  authentication failure, read from the user's own faillock tally.
 * Thu Sep 04 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.5-1
 - The warn-to-lock handoff is one continuous image. The first lock frame
   was an opaque black placeholder (canvas.fill(0)) even though the fully
