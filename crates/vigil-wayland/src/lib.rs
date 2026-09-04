@@ -116,12 +116,17 @@ pub trait LockSession {
     /// and only the freshly acquired buffer is empty.
     ///
     /// Split from `force_repaint` because the handoff calls it from inside
-    /// a configure callback (issue #86): the first lock buffer must cost a
-    /// shadow copy-out and never a scene draw there (issue #37). The
-    /// default is the conservative one — correct, just costlier.
-    fn force_copy_out(&mut self, id: OutputId) {
-        self.force_repaint(id);
-    }
+    /// a configure callback (issue #86): re-arming there must not also ask
+    /// the scene to redraw, which is what `force_repaint` does and what
+    /// issue #37 forbids in a protocol callback.
+    ///
+    /// Required, not defaulted. A default delegating to `force_repaint`
+    /// would be the #37 violation wearing the name of the fix for it — the
+    /// one call site is the callback — and "correct, just costlier" was the
+    /// wrong description of it. There is one implementor in tree and vigil
+    /// is alpha, so an implementor that has not thought about this gets a
+    /// compile error rather than a silent redraw.
+    fn force_copy_out(&mut self, id: OutputId);
     fn output_gone(&mut self, id: OutputId);
     /// A pre-lock warning surface is ready. The default creates the same scene
     /// as a lock surface; implementations can keep authentication controls

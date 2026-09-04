@@ -338,8 +338,19 @@ impl OutputWindow {
         self.component.window().request_redraw();
     }
 
-    /// Re-arm rendering without waking immediately. Presenters use this with
-    /// a bounded retry deadline after a device error.
+    /// Re-arm the copy-out without requesting a redraw.
+    ///
+    /// The difference from [`Self::request_present`] is the missing
+    /// `request_redraw`: this says "the buffer is stale", not "the scene is
+    /// stale". A settled scene therefore stays settled and the next render
+    /// copies the shadow out as it stands.
+    ///
+    /// Two callers, both of which want exactly that. A presenter retrying
+    /// after a device error, on a bounded deadline, must not wake the loop
+    /// to do it. And the warn→lock handoff (vigil#86) arms this from inside
+    /// the lock surface's configure callback, where the retained scene is
+    /// already the picture on screen and asking Slint to draw would be the
+    /// scene work vigil#37 forbids there.
     pub fn request_present_deferred(&mut self) {
         self.backend.request_present();
     }
