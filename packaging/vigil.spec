@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.3.3
+Version:        0.3.4
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -119,6 +119,14 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Wed Sep 03 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.4-1
+- Unlock is instant and blur-free by default: the lock wallpaper is released
+  the moment authentication succeeds, with no reveal fade, tint, or scheduled
+  frames. Blur is now strictly the pre-lock warning (the frost ramp that
+  signals the device is about to lock) and never touches unlock.
+- The reveal is an opt-in modular slot: lock.transition.wallpaper_out_ms > 0
+  fades the wallpaper out on unlock, and frost_out_ms > 0 adds a fading blur
+  to it (both default off).
 * Tue Aug 26 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.3-1
 - A locked, idle session no longer burns CPU. present() acquired a wl_shm
   buffer before testing whether the scene was dirty and dropped it
