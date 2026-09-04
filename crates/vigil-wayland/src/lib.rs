@@ -16,8 +16,9 @@
 //! journald stream beside `frame.present`. It answers "was that first lock
 //! frame actually the picture, or was it black" — the question issue #86
 //! came down to — from a capture-free trace. Off by default and free when
-//! off; hashing walks the whole buffer, so a hashed run's timings are not
-//! comparable with an unhashed one's.
+//! off. The hash is taken *after* the attach and commit, so it cannot
+//! lengthen the interval an output is uncovered; it still costs a pass over
+//! the buffer per frame, so a hashed run's frame cadence is its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -48,7 +49,10 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
@@ -416,7 +420,26 @@ fn frame_hash(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-/// Record what this frame looks like, beside the `frame.present` span.
+/// Record what the frame that was *just committed* looks like.
+///
+/// Called after the attach and the commit, never before. Hashing is a full
+/// pass over the buffer; done ahead of the commit it lands inside the window
+/// where the compositor is showing nothing — measured at 16.7-121 ms per
+/// output unoptimized (4.6-28.6 optimized), serialized across outputs, which
+/// is exactly the issue #37 shape smuggled back in by a diagnostic. After
+/// the commit it cannot extend that window at all.
+///
+/// Reading the slot once it is attached is why this takes the pool and the
+/// buffer rather than a canvas: `SlotPool::canvas` refuses an active slot,
+/// correctly, because it hands out a slice to *write* through. Nothing
+/// writes here, and the compositor does not write to a client buffer, so
+/// the bytes are stable while we read them.
+///
+/// Exactly `stride * height` bytes: `new_slot` rounds its allocation up to
+/// 64, and the padding beyond the last row is whatever the slot held
+/// before. Hashing it would make the fingerprint depend on allocator
+/// history, and would break the closed-form all-black hash that
+/// `check_trace.py` computes from `width * height * 4`.
 ///
 /// INFO, not DEBUG like `frame.present` itself: the span-lines layer hints
 /// `LevelFilter::INFO` at the default detail, so a DEBUG record would need
@@ -427,10 +450,23 @@ fn frame_hash(bytes: &[u8]) -> String {
 /// Capture-free: this hashes vigil's own buffer. ADR 0004 binds only
 /// vigil's registry globals, and nothing here reads the compositor's
 /// framebuffer.
-fn emit_frame_hash(id: OutputId, role: &'static str, px: (u32, u32), canvas: &[u8]) {
+fn emit_committed_frame_hash(
+    id: OutputId,
+    role: &'static str,
+    px: (u32, u32),
+    stride: usize,
+    pool: &mut SlotPool,
+    buffer: &Buffer,
+) {
     if !frame_hash_enabled() {
         return;
     }
+    let raw = pool.raw_data_mut(&buffer.slot());
+    // Empty when the slot does not belong to this pool (a resize raced the
+    // commit): no frame to fingerprint, and no reason to hash padding.
+    let Some(bytes) = raw.get(..stride * px.1 as usize) else {
+        return;
+    };
     tracing::event!(
         name: "frame.hash",
         target: "vigil",
@@ -439,7 +475,7 @@ fn emit_frame_hash(id: OutputId, role: &'static str, px: (u32, u32), canvas: &[u
         role = role,
         width = px.0,
         height = px.1,
-        hash = frame_hash(canvas).as_str()
+        hash = frame_hash(bytes).as_str()
     );
 }
 
@@ -1083,13 +1119,21 @@ impl<S: LockSession> App<S> {
         } else {
             canvas.fill(0);
         }
-        emit_frame_hash(id, role, px, canvas);
         let surface = &self.entries[idx].surface;
         let _ = buffer.attach_to(surface);
         surface.damage_buffer(0, 0, w as i32, h as i32);
         surface.commit();
         self.metrics.record_commit();
         self.entries[idx].committed = true;
+        // Fingerprint after the commit. This is the one frame whose latency
+        // the whole issue is about; a full hash pass ahead of the attach
+        // would put the diagnostic inside the black window it exists to
+        // measure.
+        if frame_hash_enabled()
+            && let Some(pool) = self.entries[idx].pool.as_mut()
+        {
+            emit_committed_frame_hash(id, role, px, stride, pool, &buffer);
+        }
     }
 
     /// Render if the scene is dirty and commit the new buffer.
@@ -1146,7 +1190,7 @@ impl<S: LockSession> App<S> {
         // when `present` returns, on every path including the early ones,
         // so a failed buffer acquisition still reads as a frame that cost
         // time.
-        let _frame = tracing::debug_span!(
+        let frame_span = tracing::debug_span!(
             target: "vigil",
             "frame.present",
             output = id.0,
@@ -1223,11 +1267,6 @@ impl<S: LockSession> App<S> {
         if !drew {
             eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
         }
-        // After the blend, before the attach: this is the fingerprint of the
-        // bytes the compositor is about to show, not of an intermediate.
-        // Outside the timing capture above so the diagnostic never inflates
-        // the number the diagnostic above reports.
-        emit_frame_hash(id, role, (w, h), canvas);
         if let Some((frost, wallpaper)) = overlay_progress {
             // The warning fades via frost (surface opacity ramps the blur
             // strength in); the reveal fades via the lock wallpaper's
@@ -1254,6 +1293,18 @@ impl<S: LockSession> App<S> {
                 "vigil-lock: output {id:?} present: render {:?}, commit {:?}",
                 render_elapsed, commit_elapsed
             );
+        }
+        // Close the span before fingerprinting. `frame.present` must measure
+        // the frame, not the frame plus an opt-in diagnostic — a span whose
+        // duration changes when you turn on tracing is worse than no span.
+        // The hash record then lands beside it as a sibling rather than a
+        // child, which is also what it is: a fact about a frame already
+        // committed.
+        drop(frame_span);
+        if frame_hash_enabled()
+            && let Some(pool) = self.entries[idx].pool.as_mut()
+        {
+            emit_committed_frame_hash(id, role, (w, h), stride, pool, &buffer);
         }
     }
 
