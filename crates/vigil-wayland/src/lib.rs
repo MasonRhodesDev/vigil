@@ -455,6 +455,15 @@ fn frame_hash(bytes: &[u8]) -> String {
 /// Capture-free: this hashes vigil's own buffer. ADR 0004 binds only
 /// vigil's registry globals, and nothing here reads the compositor's
 /// framebuffer.
+///
+/// It is therefore a fingerprint of *what vigil drew*, not of what the
+/// screen shows. On a lever surface (warning, reveal) the alpha-modifier is
+/// applied by the compositor after this, so the pixels on screen are a
+/// function of these bytes and a surface opacity this record does not
+/// carry. Two frames with the same hash can look different; two frames that
+/// look the same can hash differently. For the lock surface — the one issue
+/// #86 is about — there is no lever and the buffer is opaque XRGB, so the
+/// hash does describe the picture.
 fn emit_committed_frame_hash(
     id: OutputId,
     role: &'static str,
@@ -1321,7 +1330,9 @@ impl<S: LockSession> App<S> {
         // duration changes when you turn on tracing is worse than no span.
         // The hash record then lands beside it as a sibling rather than a
         // child, which is also what it is: a fact about a frame already
-        // committed.
+        // committed. On an overlay it fingerprints what vigil drew, not what
+        // the screen shows — the surface's opacity lever is applied after
+        // this and is not in the bytes.
         drop(frame_span);
         if frame_hash_enabled()
             && let Some(pool) = self.entries[idx].pool.as_mut()
