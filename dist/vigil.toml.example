@@ -1,8 +1,30 @@
 # vigil example configuration — copy to /etc/greetd/vigil.toml.
 # Every key is optional; a missing file or broken value falls back to the
 # built-in default and can never block login. CLI flags override config.
-# The lockscreen reads ~/.config/vigil/config.toml first, then this file
-# (shared [look] = one visual identity for greeter and lock).
+# The lockscreen loads this file, then MERGES ~/.config/vigil/config.toml
+# over it key by key (shared [look] = one visual identity for greeter and
+# lock). The user file is a whitelisted overlay, not a replacement: it may
+# only restyle the lock.
+#
+#   overlay-allowed  look.theme/background/fit/clock_format, the whole
+#                    [output."NAME"] table, profiles.dir, the
+#                    [lock.transition] ramp shape and easing, and
+#                    lock.warning frost_in_ms / wallpaper_in_ms /
+#                    frost_alpha / easing / the [lock.warning.gui] table.
+#
+#   security floor   lock.grace_secs, lock.warning.duration_ms,
+#                    lock.warning.cancel_on_motion_px and
+#                    lock.warning.wallpaper_hold_max_ms come from this file
+#                    ALONE. A session that could write them could grant
+#                    itself an unlock-without-auth window or a warning that
+#                    waits for ever — a one-file disarm of the lock.
+#
+# Greeter-scope keys ([keyboard], [sessions], [users], [power], [greeter],
+# [render]) are ignored in the user file: the greeter reads only this one.
+# Every ignored user key is named on stderr with its reason.
+#
+# `vigil-lock --config PATH` is the exception and stays whole-file — an
+# operator and test affordance, already a root-or-owner choice.
 
 [look]
 # Runtime theme; falls back to the compiled-in default on any error.
