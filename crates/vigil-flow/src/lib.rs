@@ -46,9 +46,9 @@ pub use vigil_warning::{ElementSample, WALLPAPER_READY_DEFAULT};
 use vigil_warning::{Phase as RampPhase, Reveal, Timeline};
 
 /// Before releasing the session lock, wait this long for the reveal
-/// overlays' first buffer commit so the desktop is never exposed un-frosted.
-/// A compositor that refuses to configure a layer surface while locked falls
-/// through to the plain unlock.
+/// overlays' first buffer commit so the desktop is never exposed before an
+/// overlay is mapped over it. A compositor that refuses to configure a layer
+/// surface while locked falls through to the plain unlock.
 pub const REVEAL_MAP_DEADLINE: Duration = Duration::from_millis(250);
 /// The reveal fade is cosmetic: whatever state it is in, the flow exits this
 /// long after the fade started.
@@ -620,15 +620,22 @@ impl LockFlow {
         cmds.push(FlowCmd::SetLockedHint(false));
         if self.transition.reveals() {
             self.reveal = Some(Reveal::new(
-                self.transition.wallpaper_out_ms,
-                self.transition.frost_out_ms,
+                self.transition.reveal_ms(),
+                self.transition.reveal_frost_ms(),
                 self.transition.easing,
             ));
             self.reveal_entered = Some(now.elapsed);
-            self.progress = (1.0, 1.0);
+            // The reveal is blur-free by default (frost 0); it opts into a
+            // fading blur when frost_out_ms > 0, which starts at full frost.
+            let frost = if self.transition.reveal_blurs() {
+                1.0
+            } else {
+                0.0
+            };
+            self.progress = (frost, 1.0);
             cmds.push(FlowCmd::ShowPanel(false));
             cmds.push(FlowCmd::OverlayProgress {
-                frost: 1.0,
+                frost,
                 wallpaper: 1.0,
             });
             cmds.push(FlowCmd::CreateRevealOverlays);
@@ -725,6 +732,23 @@ pub(crate) mod tests {
         // The hypr-DE production shape: --no-warn (no cancelable warning),
         // default transition.
         Lock::default()
+    }
+
+    /// A lock whose transition opts into the reveal slot (unlock fade), for
+    /// tests of the reveal machinery. The shipped default is instant unlock
+    /// (wallpaper_out_ms = 0); a fade is opt-in and, per fix/no-blur, still
+    /// carries no blur.
+    pub(crate) fn revealing_lock() -> Lock {
+        let mut lock = Lock::default();
+        lock.transition.wallpaper_out_ms = 250;
+        lock
+    }
+
+    /// A reveal that opts into the fading blur (frost_out_ms > 0).
+    pub(crate) fn blurring_reveal_lock() -> Lock {
+        let mut lock = revealing_lock();
+        lock.transition.frost_out_ms = 200;
+        lock
     }
 
     pub(crate) fn warning_lock(duration_ms: u64) -> Lock {
@@ -833,6 +857,41 @@ pub(crate) mod tests {
         let end = flow.step(at(400), FlowEvent::Tick);
         assert!(has(&end, &FlowCmd::RequestSessionLock));
         assert_eq!(flow.phase(), FlowPhase::Committing);
+    }
+
+    #[test]
+    fn unlock_is_instant_by_default_with_no_reveal() {
+        // Default transition: wallpaper_out_ms = 0, so reveals() is false.
+        // Auth success must release the lock and exit at once - no
+        // RevealPending, no reveal overlays, no OverlayProgress. This is the
+        // "instantaneous feedback" default; the reveal is an opt-in slot.
+        let lock = manual_lock();
+        let mut flow = locked_flow(&lock);
+        let cmds = flow.step(at(10_000), FlowEvent::AuthOk);
+        assert!(has(&cmds, &FlowCmd::ReleaseSessionLock), "{cmds:?}");
+        assert!(
+            has(&cmds, &FlowCmd::Exit(LockOutcome::Unlocked)),
+            "unlock exits immediately: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, FlowCmd::CreateRevealOverlays)),
+            "no reveal overlays on an instant unlock: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, FlowCmd::OverlayProgress { .. })),
+            "no reveal animation frames on an instant unlock: {cmds:?}"
+        );
+        assert!(
+            !transitions(&cmds)
+                .iter()
+                .any(|(_, to)| *to == FlowPhase::RevealPending),
+            "no RevealPending phase: {cmds:?}"
+        );
+        assert_eq!(flow.phase(), FlowPhase::Done(LockOutcome::Unlocked));
     }
 
     #[test]
@@ -1100,7 +1159,7 @@ pub(crate) mod tests {
 
     #[test]
     fn auth_failure_reprompts_auth_success_exits() {
-        let mut flow = locked_flow(&manual_lock());
+        let mut flow = locked_flow(&revealing_lock());
         let cmds = flow.step(at(600), FlowEvent::AuthErr("denied".into()));
         assert!(has(&cmds, &FlowCmd::ShowAuthError("denied".into())));
         assert!(has(&cmds, &FlowCmd::StartAuth));
@@ -1115,7 +1174,7 @@ pub(crate) mod tests {
     fn unlock_during_gui_window_still_reveals_and_exits_by_deadline() {
         // Unlock while the post-lock GUI animation is mid-flight (issue #54
         // review: the reveal must never be starved by the warning timeline).
-        let mut flow = locked_flow(&manual_lock());
+        let mut flow = locked_flow(&revealing_lock());
         let cmds = flow.step(at(500), FlowEvent::AuthOk);
         assert!(has(&cmds, &FlowCmd::CreateRevealOverlays));
         let cmds = flow.step(at(520), FlowEvent::RevealOverlaysMapped);
@@ -1129,7 +1188,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reveal_map_timeout_releases_lock_anyway() {
-        let mut flow = locked_flow(&manual_lock());
+        let mut flow = locked_flow(&revealing_lock());
         flow.step(at(500), FlowEvent::AuthOk);
         assert_eq!(flow.phase(), FlowPhase::RevealPending);
         // No RevealOverlaysMapped ever arrives; the deadline unlocks.
@@ -1145,7 +1204,7 @@ pub(crate) mod tests {
     fn grace_dismissal_reveals_without_auth() {
         let lock = Lock {
             grace_secs: 5,
-            ..manual_lock()
+            ..revealing_lock()
         };
         let mut flow = locked_flow(&lock);
         let cmds = flow.step(at(600), FlowEvent::Input(key()));
@@ -1181,7 +1240,7 @@ pub(crate) mod tests {
         // loginctl unlock racing the ramp: releasing is the whole point, so
         // showing the card and starting an auth we abandon microseconds
         // later is pure churn (and issue #36's failed-conversation pattern).
-        let (mut flow, _) = LockFlow::new(at(0), &manual_lock(), Some(0));
+        let (mut flow, _) = LockFlow::new(at(0), &revealing_lock(), Some(0));
         flow.step(at(100), FlowEvent::LogindUnlock);
         flow.step(at(400), FlowEvent::Tick);
         let cmds = flow.step(at(410), FlowEvent::LockConfirmed);
@@ -1216,7 +1275,7 @@ pub(crate) mod tests {
 
     #[test]
     fn logind_unlock_racing_the_ramp_is_honored_at_confirmation() {
-        let (mut flow, _) = LockFlow::new(at(0), &manual_lock(), Some(0));
+        let (mut flow, _) = LockFlow::new(at(0), &revealing_lock(), Some(0));
         flow.step(at(100), FlowEvent::LogindUnlock);
         assert_eq!(flow.phase(), FlowPhase::PreLock);
         flow.step(at(400), FlowEvent::Tick);
@@ -1227,7 +1286,7 @@ pub(crate) mod tests {
 
     #[test]
     fn late_invalidation_after_authorization_still_exits_unlocked() {
-        let mut flow = locked_flow(&manual_lock());
+        let mut flow = locked_flow(&revealing_lock());
         flow.step(at(500), FlowEvent::AuthOk);
         flow.step(at(520), FlowEvent::RevealOverlaysMapped);
         assert_eq!(flow.phase(), FlowPhase::Revealing);
@@ -1356,7 +1415,7 @@ pub(crate) mod tests {
     fn resume_leaves_a_running_flow_alone() {
         let lock = Lock {
             grace_secs: 5,
-            ..manual_lock()
+            ..revealing_lock()
         };
         let mut flow = locked_flow(&lock);
         flow.step(at(600), FlowEvent::PrepareForSleep(false));
@@ -1517,7 +1576,7 @@ pub(crate) mod tests {
     fn the_unlock_path_reports_its_transitions_before_what_they_cause() {
         // The three sites that used to push the transition last:
         // RevealPending, Revealing, and the non-reveal unlock.
-        let lock = manual_lock();
+        let lock = revealing_lock();
         let mut flow = locked_flow(&lock);
         let cmds = flow.step(at(10_000), FlowEvent::AuthOk);
         let changed = cmds
@@ -1546,6 +1605,45 @@ pub(crate) mod tests {
             changed < position(&cmds, &FlowCmd::ReleaseSessionLock),
             "releasing the lock is what entering Revealing means: {cmds:?}"
         );
+    }
+
+    #[test]
+    fn blur_free_reveal_starts_at_zero_frost() {
+        // The default opt-in reveal (wallpaper_out only): its first overlay
+        // frame carries no frost, so unlock has no blur or tint.
+        let lock = revealing_lock();
+        let mut flow = locked_flow(&lock);
+        let cmds = flow.step(at(10_000), FlowEvent::AuthOk);
+        assert!(
+            has(
+                &cmds,
+                &FlowCmd::OverlayProgress {
+                    frost: 0.0,
+                    wallpaper: 1.0
+                }
+            ),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn blurring_reveal_starts_at_full_frost() {
+        // Opt-in blur (frost_out_ms > 0): the first reveal frame starts at
+        // full frost, which then clears over the fade.
+        let lock = blurring_reveal_lock();
+        let mut flow = locked_flow(&lock);
+        let cmds = flow.step(at(10_000), FlowEvent::AuthOk);
+        assert!(
+            has(
+                &cmds,
+                &FlowCmd::OverlayProgress {
+                    frost: 1.0,
+                    wallpaper: 1.0
+                }
+            ),
+            "{cmds:?}"
+        );
+        assert!(has(&cmds, &FlowCmd::CreateRevealOverlays), "{cmds:?}");
     }
 }
 

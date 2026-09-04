@@ -18,6 +18,8 @@ and asserts:
                        buffer commit whenever the compositor configured it
                        before the unlock), and reveal teardown only after
                        unlock_and_destroy
+  --no-reveal          no vigil-reveal overlay was ever created (the
+                       instant-unlock default: reveal is opt-in only)
   --no-layer           no layer surface at all (`--immediate` path)
   --no-capture-only    only run the capture-bind check
 
@@ -51,6 +53,7 @@ def main():
     ap.add_argument("--handoff", action="store_true")
     ap.add_argument("--outputs", type=int, default=0)
     ap.add_argument("--reveal", action="store_true")
+    ap.add_argument("--no-reveal", action="store_true")
     ap.add_argument("--no-layer", action="store_true")
     ap.add_argument("--no-capture-only", action="store_true")
     args = ap.parse_args()
@@ -180,6 +183,11 @@ def main():
                 early = [t for t in reveal_teardowns if t < unlock_line]
                 if early:
                     failures.append(f"--reveal: reveal surface destroyed at line {early[0]} before unlock")
+        if args.no_reveal and reveal_surfaces:
+            failures.append(
+                f"--no-reveal: {len(reveal_surfaces)} vigil-reveal surface(s) created; "
+                "instant unlock must not create a reveal overlay"
+            )
 
     if failures:
         for failure in failures:

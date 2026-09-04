@@ -215,19 +215,32 @@ pub struct LockTransition {
     /// Lock: tint ramps in over this, then the wallpaper.
     pub frost_in_ms: u64,
     pub wallpaper_in_ms: u64,
-    /// Unlock: the wallpaper fades out over this, then the tint.
+    /// Unlock: the lock wallpaper's opacity fades out over this, uncovering
+    /// the desktop.
     pub wallpaper_out_ms: u64,
+    /// Unlock blur: the reveal blurs the uncovered desktop and clears the
+    /// blur over this duration. 0 (the default) is a blur-free, tint-free
+    /// unlock - the desktop is sharp the instant it shows. Set > 0 to opt the
+    /// reveal into a fading blur.
     pub frost_out_ms: u64,
     pub easing: WarningEasing,
 }
 
 impl Default for LockTransition {
     fn default() -> Self {
+        // On lock: the blur ramps up (frost_in) and the wallpaper fades in to
+        // opaque (wallpaper_in) over the lock clock - blur IS the warning that
+        // the device is about to lock, and the wallpaper covers the desktop
+        // before the lock commits. On unlock: instant. wallpaper_out = 0, so
+        // reveals() is false and auth success releases the lock at once - no
+        // blur, no tint, no fade. The reveal is a modular opt-in slot: set
+        // wallpaper_out_ms > 0 for an unlock fade, and frost_out_ms > 0 to add
+        // a fading blur to it (both default off).
         Self {
             frost_in_ms: 150,
             wallpaper_in_ms: 250,
-            wallpaper_out_ms: 250,
-            frost_out_ms: 150,
+            wallpaper_out_ms: 0,
+            frost_out_ms: 0,
             easing: WarningEasing::EaseOut,
         }
     }
@@ -252,8 +265,20 @@ impl LockTransition {
         self.frost_in_ms + self.wallpaper_in_ms
     }
 
+    /// The reveal's wallpaper opacity-fade duration.
+    pub fn reveal_ms(&self) -> u64 {
+        self.wallpaper_out_ms
+    }
+
+    /// The reveal's blur-fade duration. 0 = a blur-free unlock.
+    pub fn reveal_frost_ms(&self) -> u64 {
+        self.frost_out_ms
+    }
+
+    /// The whole reveal span: a reveal exists (and the unlock is not instant)
+    /// if either the wallpaper fades or the blur fades.
     pub fn out_ms(&self) -> u64 {
-        self.wallpaper_out_ms + self.frost_out_ms
+        self.wallpaper_out_ms.max(self.frost_out_ms)
     }
 
     pub fn ramps_in(&self) -> bool {
@@ -262,6 +287,11 @@ impl LockTransition {
 
     pub fn reveals(&self) -> bool {
         self.out_ms() > 0
+    }
+
+    /// Whether the opt-in reveal blurs the uncovered desktop.
+    pub fn reveal_blurs(&self) -> bool {
+        self.frost_out_ms > 0
     }
 
     /// The non-cancelable timeline for the frost-in ramp, sharing the tint
@@ -295,9 +325,20 @@ impl LockTransition {
             *second = LockTransition::MAX_RAMP_MS - *first;
             true
         }
+        fn clamp_one(value: &mut u64) -> bool {
+            if *value > LockTransition::MAX_RAMP_MS {
+                *value = LockTransition::MAX_RAMP_MS;
+                true
+            } else {
+                false
+            }
+        }
         let changed_in = clamp_pair(&mut self.frost_in_ms, &mut self.wallpaper_in_ms);
-        let changed_out = clamp_pair(&mut self.wallpaper_out_ms, &mut self.frost_out_ms);
-        changed_in || changed_out
+        // The reveal's wallpaper fade and blur fade run concurrently, not as
+        // two halves of one budget, so each clamps to the ceiling on its own.
+        let changed_wallpaper_out = clamp_one(&mut self.wallpaper_out_ms);
+        let changed_frost_out = clamp_one(&mut self.frost_out_ms);
+        changed_in || changed_wallpaper_out || changed_frost_out
     }
 }
 
@@ -688,9 +729,13 @@ easing = "linear"
     #[test]
     fn transition_defaults_are_short() {
         let transition = LockTransition::default();
+        // On lock: blur ramp + wallpaper fade-in (the warning). On unlock:
+        // instant - out 0, so reveals() is false and the reveal is opt-in.
         assert_eq!(transition.in_ms(), 400);
-        assert_eq!(transition.out_ms(), 400);
-        assert!(transition.ramps_in() && transition.reveals());
+        assert_eq!(transition.out_ms(), 0);
+        assert!(transition.ramps_in());
+        assert!(!transition.reveals(), "unlock is instant by default");
+        assert!(!transition.reveal_blurs(), "unlock is blur-free by default");
         assert_eq!(parse("").unwrap().lock.transition, transition);
     }
 
@@ -722,13 +767,61 @@ easing = "linear"
         let mut transition = LockTransition {
             frost_in_ms: 3_000,
             wallpaper_in_ms: 3_000,
+            wallpaper_out_ms: 3_000,
             ..LockTransition::default()
         };
         assert!(transition.clamp());
         assert_eq!(transition.in_ms(), LockTransition::MAX_RAMP_MS);
         assert_eq!(transition.frost_in_ms, 1_000);
-        assert_eq!(transition.out_ms(), 400);
+        // The opt-in out ramp clamps to the same ceiling as the in ramps.
+        assert_eq!(transition.out_ms(), LockTransition::MAX_RAMP_MS);
         assert!(!LockTransition::default().clone().clamp());
+    }
+
+    #[test]
+    fn reveal_blur_is_an_independent_opt_in() {
+        // frost_out_ms opts the reveal into a fading blur, default off.
+        let blurring = LockTransition {
+            wallpaper_out_ms: 300,
+            frost_out_ms: 200,
+            ..LockTransition::default()
+        };
+        assert!(blurring.reveals());
+        assert!(blurring.reveal_blurs());
+        assert_eq!(blurring.reveal_ms(), 300);
+        assert_eq!(blurring.reveal_frost_ms(), 200);
+        // A blur-only reveal (no wallpaper fade) still counts as a reveal.
+        let blur_only = LockTransition {
+            wallpaper_out_ms: 0,
+            frost_out_ms: 200,
+            ..LockTransition::default()
+        };
+        assert!(blur_only.reveals());
+        assert!(blur_only.reveal_blurs());
+    }
+
+    #[test]
+    fn clamp_bounds_the_reveal_fades_independently() {
+        // The wallpaper fade and the blur fade run concurrently, not as two
+        // halves of one budget: a within-limit pair must not clamp, and an
+        // over-limit fade clamps only itself.
+        let mut ok = LockTransition {
+            wallpaper_out_ms: LockTransition::MAX_RAMP_MS,
+            frost_out_ms: LockTransition::MAX_RAMP_MS,
+            ..LockTransition::default()
+        };
+        assert!(!ok.clamp(), "each fade alone is within the ceiling");
+        assert_eq!(ok.wallpaper_out_ms, LockTransition::MAX_RAMP_MS);
+        assert_eq!(ok.frost_out_ms, LockTransition::MAX_RAMP_MS);
+
+        let mut over = LockTransition {
+            wallpaper_out_ms: 300,
+            frost_out_ms: 5_000,
+            ..LockTransition::default()
+        };
+        assert!(over.clamp());
+        assert_eq!(over.wallpaper_out_ms, 300, "the in-limit fade is untouched");
+        assert_eq!(over.frost_out_ms, LockTransition::MAX_RAMP_MS);
     }
 
     #[test]

@@ -431,6 +431,9 @@ struct App<S: LockSession + 'static> {
     /// still mapped after its ramp ended holds the final value.
     overlay_progress: (f32, f32),
     frost_alpha: f32,
+    /// The opt-in reveal blurs the uncovered desktop (frost_out_ms > 0). Off
+    /// by default: the reveal carries no blur region and no tint.
+    reveal_blur: bool,
     /// Pre-lock overlays should exist (a ramp is running and cleanup has
     /// not retired them).
     pre_lock_overlays: bool,
@@ -666,6 +669,7 @@ impl<S: LockSession> App<S> {
         output: &wl_output::WlOutput,
         namespace: &str,
         pass_through: bool,
+        blur: bool,
     ) -> Option<(
         LayerSurface,
         Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
@@ -693,10 +697,15 @@ impl<S: LockSession> App<S> {
             surface.set_input_region(Some(&region));
             region.destroy();
         }
-        let effect = self
-            .background_effects
-            .get_background_effect(surface, qh)
-            .ok();
+        // Blur is a pre-lock warning signal only: the reveal overlay carries
+        // no blur region, so unlocking uncovers a sharp desktop.
+        let effect = blur
+            .then(|| {
+                self.background_effects
+                    .get_background_effect(surface, qh)
+                    .ok()
+            })
+            .flatten();
         if let Some(effect) = &effect {
             let region = self.compositor_proxy.create_region(qh, ());
             region.add(0, 0, i32::MAX, i32::MAX);
@@ -754,7 +763,7 @@ impl<S: LockSession> App<S> {
         });
         let (role, background_effect, opacity) = if adding_warning {
             let Some((layer, effect, opacity)) =
-                self.create_overlay(qh, &surface, &output, "vigil-warning", false)
+                self.create_overlay(qh, &surface, &output, "vigil-warning", false, true)
             else {
                 return;
             };
@@ -820,9 +829,14 @@ impl<S: LockSession> App<S> {
                 },
             )
         });
-        let Some((layer, effect, opacity)) =
-            self.create_overlay(qh, &surface, &output, "vigil-reveal", true)
-        else {
+        let Some((layer, effect, opacity)) = self.create_overlay(
+            qh,
+            &surface,
+            &output,
+            "vigil-reveal",
+            true,
+            self.reveal_blur,
+        ) else {
             return;
         };
         self.entries.push(Entry {
@@ -969,6 +983,7 @@ impl<S: LockSession> App<S> {
         let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
         let overlay = !self.entries[idx].role.is_lock();
         let surface_opacity = self.entries[idx].opacity.is_some();
+        let is_reveal = self.entries[idx].role.is_reveal();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             eprintln!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
             self.schedule_present_retry(id);
@@ -1052,7 +1067,21 @@ impl<S: LockSession> App<S> {
             return;
         }
         if let Some((frost, wallpaper)) = overlay_progress {
-            overlay_blend(canvas, frost, wallpaper, self.frost_alpha, surface_opacity);
+            // The reveal is blur- AND tint-free: its buffer is pure
+            // wallpaper. pixel_frost() forces full frost on lever surfaces
+            // (the surface opacity carries the ramp there), so a nonzero
+            // frost_alpha would still bake a gray tint even with frost
+            // pinned 0. Zero the tint explicitly for the reveal role.
+            // A blur-free reveal renders zero tint: pixel_frost() forces full
+            // frost on lever surfaces, so a nonzero frost_alpha would bake a
+            // gray tint even with frost pinned 0. A blurring reveal keeps the
+            // configured alpha so its frost fade carries a tint like the lock.
+            let frost_alpha = if is_reveal && !self.reveal_blur {
+                0.0
+            } else {
+                self.frost_alpha
+            };
+            overlay_blend(canvas, frost, wallpaper, frost_alpha, surface_opacity);
         }
         // Captured after the overlay blend: the full-buffer premultiply is
         // the cost this diagnostic exists to surface on slow compositors.
@@ -1063,8 +1092,16 @@ impl<S: LockSession> App<S> {
         if !drew {
             eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
         }
-        if let Some((frost, _)) = overlay_progress {
-            self.entries[idx].opacity.set(frost);
+        if let Some((frost, wallpaper)) = overlay_progress {
+            // The warning fades via frost (surface opacity ramps the blur
+            // strength in); the reveal fades via the lock wallpaper's
+            // opacity, with frost pinned 0 - so unlock has no blur or tint.
+            let opacity = if self.entries[idx].role.is_reveal() {
+                wallpaper
+            } else {
+                frost
+            };
+            self.entries[idx].opacity.set(opacity);
         }
         let surface = &self.entries[idx].surface;
         let commit_started = std::time::Instant::now();
@@ -1331,6 +1368,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
 
     let warning_enabled = warning_ms_override.unwrap_or(lock_config.warning.duration_ms) > 0;
     let frost_alpha = lock_config.warning.frost_alpha.clamp(0.0, 1.0);
+    let reveal_blur = lock_config.transition.reveal_blurs();
     let started = std::time::Instant::now();
     let mut policy = lock_config.clone();
     let layer_shell = match LayerShell::bind(&globals, &qh) {
@@ -1400,6 +1438,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
         started,
         overlay_progress: (0.0, 0.0),
         frost_alpha,
+        reveal_blur,
         pre_lock_overlays,
         scene_ids: BTreeSet::new(),
         initial_outputs_added: false,
