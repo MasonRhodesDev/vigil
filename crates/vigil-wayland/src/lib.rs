@@ -107,6 +107,17 @@ pub trait LockSession {
     /// Slint state changed. Called before a forced present would otherwise
     /// commit an empty buffer (issue #35).
     fn force_repaint(&mut self, _id: OutputId) {}
+    /// Re-arm this output's next present *without* asking the scene to
+    /// redraw: the retained scene is already what the user is looking at,
+    /// and only the freshly acquired buffer is empty.
+    ///
+    /// Split from `force_repaint` because the handoff calls it from inside
+    /// a configure callback (issue #86): the first lock buffer must cost a
+    /// shadow copy-out and never a scene draw there (issue #37). The
+    /// default is the conservative one — correct, just costlier.
+    fn force_copy_out(&mut self, id: OutputId) {
+        self.force_repaint(id);
+    }
     fn output_gone(&mut self, id: OutputId);
     /// A pre-lock warning surface is ready. The default creates the same scene
     /// as a lock surface; implementations can keep authentication controls
@@ -982,9 +993,11 @@ impl<S: LockSession> App<S> {
                 // blanks an output until a buffer matching this configure
                 // arrives, and building the Slint scene inline here
                 // serialized the reveal across outputs. Satisfy the
-                // configure with a solid buffer now; the scene is built on
-                // the next tick and paints over it.
-                self.commit_solid(idx);
+                // configure now with a copy-out of the retained scene (the
+                // warning's last frame) — or black if there is none; the
+                // scene is built or rebound on the next tick and paints
+                // over it.
+                self.commit_first_frame(idx);
             }
             self.pending_scenes.push((id, is_lock));
         } else if resized {
@@ -998,8 +1011,10 @@ impl<S: LockSession> App<S> {
             self.session.output_rebound(id, &info);
         }
         // Invariant: a configured lock surface gets a buffer in this event-loop
-        // iteration. Presentation stays outside protocol callbacks so redraws
-        // coalesce and buffer acquisition has one audited entry point.
+        // iteration. Repainting stays outside protocol callbacks so redraws
+        // coalesce and no scene is ever constructed here (issue #37); the
+        // first-frame commit above is the bounded exception, a copy-out of a
+        // scene that already exists.
         self.dirty.mark(id);
         self.wake.wake();
         let elapsed = configure_started.elapsed();
@@ -1008,25 +1023,67 @@ impl<S: LockSession> App<S> {
         }
     }
 
-    /// Commit a solid black buffer to satisfy a lock-surface configure
-    /// before its scene exists. Kept next to present() so buffer
-    /// acquisition has exactly two audited entry points.
-    fn commit_solid(&mut self, idx: usize) {
-        let (w, h) = self.entries[idx].px;
+    /// Satisfy a lock-surface configure with its first buffer, before the
+    /// tick that builds or rebinds the scene has run.
+    ///
+    /// The warning overlay and the lock surface of one output share a single
+    /// retained `OutputWindow` (`output_rebound`), so when a warning ran
+    /// here the window's shadow already holds a fully rendered scene — the
+    /// exact picture on screen at this instant. Copy it out and the
+    /// warn→lock cut has no black frame in it (issue #86). Black is the
+    /// fallback, for the cases where no scene exists yet (`--immediate`, a
+    /// hotplug while locked, a warning that never painted) and for a
+    /// configure at a size the retained scene cannot fill — `render`
+    /// answers false for both.
+    ///
+    /// Kept next to present() so buffer acquisition stays auditable in one
+    /// place. The invariant is not "exactly two call sites": it is that a
+    /// protocol callback constructs no scene and does no unbounded work
+    /// (issue #37 — building the Slint scene inline here serialized the
+    /// reveal across outputs). Copying an already-built scene's shadow into
+    /// an already-sized buffer is a bounded memcpy (2.2 ms at 4K) and does
+    /// neither. Committing at the acked configure size is DESIGN §12
+    /// invariant 1; `px` is that size, set by the caller.
+    fn commit_first_frame(&mut self, idx: usize) {
+        let px @ (w, h) = self.entries[idx].px;
         let id = self.entries[idx].id;
+        let role = self.entries[idx].role.name();
+        // Re-arm the copy-out before asking for it: a settled scene reports
+        // it owes nothing, and the shadow is settled precisely when the
+        // warning left a finished frame in it. `force_copy_out`, not
+        // `force_repaint` — the scene is already correct, only the freshly
+        // acquired buffer is empty, and a redraw request here would put
+        // scene work back inside the configure callback.
+        self.session.force_copy_out(id);
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             self.schedule_present_retry(id);
             return;
         };
         let stride = w as usize * 4;
+        // XRGB: a lock surface is opaque, and the compositor composites
+        // nothing under it.
         let Ok((buffer, canvas)) =
             pool.create_buffer(w as i32, h as i32, stride as i32, wl_shm::Format::Xrgb8888)
         else {
             self.schedule_present_retry(id);
             return;
         };
-        canvas.fill(0);
         self.metrics.record_buffer_acquire();
+        let drew = self.session.render(
+            id,
+            FrameTarget {
+                buffer: &mut *canvas,
+                width: w,
+                height: h,
+                stride,
+            },
+        );
+        if drew {
+            self.metrics.record_render();
+        } else {
+            canvas.fill(0);
+        }
+        emit_frame_hash(id, role, px, canvas);
         let surface = &self.entries[idx].surface;
         let _ = buffer.attach_to(surface);
         surface.damage_buffer(0, 0, w as i32, h as i32);

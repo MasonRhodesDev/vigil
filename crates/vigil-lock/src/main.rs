@@ -884,6 +884,15 @@ impl LockSession for Locker {
         }
     }
 
+    fn force_copy_out(&mut self, id: OutputId) {
+        // Deferred: arms the backend's copy-out without a Slint redraw
+        // request. Called from the configure callback during the handoff,
+        // where the scene is already correct and scene work is forbidden.
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.window.request_present_deferred();
+        }
+    }
+
     fn output_gone(&mut self, id: OutputId) {
         if let Some(e) = self.entries.iter().find(|e| e.id == id) {
             eprintln!("vigil-lock: output {} gone", e.connector);
