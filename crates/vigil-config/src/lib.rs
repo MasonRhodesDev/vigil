@@ -468,17 +468,39 @@ impl Config {
         let mut allowed = Vec::new();
         let mut ignored = Vec::new();
         walk_overlay("", user, &mut allowed, &mut ignored);
+        // An overlay key may never take a valid config and make it invalid.
+        // vigil-lock exits 2 on a config that fails validate_warning, before
+        // it takes the singleton guard, so adopting (say) a gui table with
+        // an unknown selector would hand the session a kill switch: one
+        // key in a session-writable file and no lock starts again. The
+        // hard exit stays for the system config and --config, where an
+        // operator wrote it and a loud failure is the right answer.
+        //
+        // Only enforced if the base validated: a system config that is
+        // already invalid must not turn every overlay key into a refusal.
+        let enforce_valid = self.validate_warning().is_ok();
         for (key, value) in allowed {
             let apply = OVERLAY
                 .iter()
                 .find(|(path, _)| *path == key)
                 .map(|(_, apply)| apply)
                 .expect("walk_overlay only yields OVERLAY keys");
-            if let Err(err) = apply(self, value) {
-                ignored.push(IgnoredOverlayKey {
-                    key,
-                    refusal: OverlayRefusal::Invalid(err.message().trim().replace('\n', "; ")),
-                });
+            let restore = enforce_valid.then(|| self.clone());
+            let refusal = match apply(self, value) {
+                Err(err) => Some(OverlayRefusal::Invalid(
+                    err.message().trim().replace('\n', "; "),
+                )),
+                Ok(()) => match self.validate_warning() {
+                    Ok(()) => None,
+                    Err(reason) if enforce_valid => Some(OverlayRefusal::Invalid(reason)),
+                    Err(_) => None,
+                },
+            };
+            if let Some(refusal) = refusal {
+                if let Some(restore) = restore {
+                    *self = restore;
+                }
+                ignored.push(IgnoredOverlayKey { key, refusal });
             }
         }
         ignored.sort_by(|a, b| a.key.cmp(&b.key));
@@ -1284,6 +1306,36 @@ cancel_on_motion_px = 100000.0
                 },
             ]
         );
+    }
+
+    #[test]
+    fn overlay_with_invalid_gui_selector_is_refused_not_fatal() {
+        // vigil-lock exits 2 when validate_warning fails, before it even
+        // takes the singleton guard. Adopting an overlay gui that fails
+        // validation would hand the session a kill switch: one unknown
+        // selector in a session-writable file and no lock ever starts
+        // again. The overlay is refused instead; the hard exit stays for
+        // the system config and --config, where an operator wrote it.
+        let mut config = parse(SYSTEM).unwrap();
+        config.lock.warning.gui.element = vec![WarningElement {
+            selector: "clock".into(),
+            ..WarningElement::default()
+        }];
+        let system_gui = config.lock.warning.gui.clone();
+        let table: toml::Table =
+            toml::from_str("[[lock.warning.gui.element]]\nselector = \"pwn\"\n").unwrap();
+        let ignored = config.overlay(&table);
+        assert_eq!(
+            config.lock.warning.gui, system_gui,
+            "adopted the kill switch"
+        );
+        assert!(config.validate_warning().is_ok());
+        assert_eq!(ignored.len(), 1);
+        assert_eq!(ignored[0].key, "lock.warning.gui");
+        let OverlayRefusal::Invalid(reason) = &ignored[0].refusal else {
+            panic!("expected Invalid, got {:?}", ignored[0].refusal);
+        };
+        assert!(reason.contains("pwn"), "{reason}");
     }
 
     #[test]

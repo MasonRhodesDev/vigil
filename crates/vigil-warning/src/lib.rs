@@ -981,7 +981,10 @@ mod tests {
         timeline.set_wallpaper_ready(false, Duration::ZERO);
         let long_after_every_deadline = timeline.sample(Duration::from_secs(600));
         assert!(!long_after_every_deadline.should_commit);
-        assert!(!long_after_every_deadline.forced_commit, "the cap moved too");
+        assert!(
+            !long_after_every_deadline.forced_commit,
+            "the cap moved too"
+        );
     }
 
     #[test]
