@@ -10,6 +10,14 @@
 //! The binary supplies a [`LockSession`] (its composition of vigil-ui
 //! windows + auth) and calls [`run`]; the event loop lives here because the
 //! Wayland connection *is* the loop for a lock client.
+//!
+//! `VIGIL_FRAME_HASH=1` adds an `event=frame.hash` record (output, role,
+//! size, FNV-1a of the pixels) for every frame this crate commits, on the
+//! journald stream beside `frame.present`. It answers "was that first lock
+//! frame actually the picture, or was it black" — the question issue #86
+//! came down to — from a capture-free trace. Off by default and free when
+//! off; hashing walks the whole buffer, so a hashed run's timings are not
+//! comparable with an unhashed one's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -194,6 +202,16 @@ impl SurfaceRole {
     fn is_reveal(&self) -> bool {
         matches!(self, SurfaceRole::Reveal(_))
     }
+    /// Stable label for trace records. A frame fingerprint is only readable
+    /// next to which surface produced it: during the handoff two roles share
+    /// one output id and the hashes interleave.
+    fn name(&self) -> &'static str {
+        match self {
+            SurfaceRole::Warning(_) => "warning",
+            SurfaceRole::Lock { .. } => "lock",
+            SurfaceRole::Reveal(_) => "reveal",
+        }
+    }
     fn layer(&self) -> Option<&LayerSurface> {
         match self {
             SurfaceRole::Warning(layer) | SurfaceRole::Reveal(layer) => Some(layer),
@@ -357,6 +375,61 @@ fn pixel_frost(frost: f32, surface_opacity_available: bool) -> f32 {
 /// §12 invariant 4 (issue #35 hotplug case).
 fn surface_role_is_warning(warning_active: bool, lock_taken: bool) -> bool {
     warning_active && !lock_taken
+}
+
+/// Whether `VIGIL_FRAME_HASH=1` asked for a fingerprint of every committed
+/// frame.
+///
+/// Read once. This sits on the present path, and `var_os` takes the env lock
+/// and scans the whole environment per call — the cost of the diagnostic
+/// must be zero when nobody asked for it.
+fn frame_hash_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VIGIL_FRAME_HASH").is_some_and(|value| value == "1"))
+}
+
+/// FNV-1a over the pixels about to be committed.
+///
+/// Stable rather than `DefaultHasher`, whose algorithm is deliberately
+/// unspecified across builds — the same rationale (and the same constants)
+/// as `vigil-sim`'s `frame_hash`. The question this answers is "is the lock
+/// surface's first frame the same picture the warning surface last showed",
+/// and two runs of two binaries have to agree on the answer. Fingerprint,
+/// not a security digest.
+fn frame_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Record what this frame looks like, beside the `frame.present` span.
+///
+/// INFO, not DEBUG like `frame.present` itself: the span-lines layer hints
+/// `LevelFilter::INFO` at the default detail, so a DEBUG record would need
+/// `SPAN_LINES=frames` as well and `VIGIL_FRAME_HASH=1` alone would print
+/// nothing. One opt-in knob, or the diagnostic is a trap. Volume is bounded
+/// by the operator having asked for it.
+///
+/// Capture-free: this hashes vigil's own buffer. ADR 0004 binds only
+/// vigil's registry globals, and nothing here reads the compositor's
+/// framebuffer.
+fn emit_frame_hash(id: OutputId, role: &'static str, px: (u32, u32), canvas: &[u8]) {
+    if !frame_hash_enabled() {
+        return;
+    }
+    tracing::event!(
+        name: "frame.hash",
+        target: "vigil",
+        tracing::Level::INFO,
+        output = id.0,
+        role = role,
+        width = px.0,
+        height = px.1,
+        hash = frame_hash(canvas).as_str()
+    );
 }
 
 struct Entry {
@@ -984,6 +1057,7 @@ impl<S: LockSession> App<S> {
         let overlay = !self.entries[idx].role.is_lock();
         let surface_opacity = self.entries[idx].opacity.is_some();
         let is_reveal = self.entries[idx].role.is_reveal();
+        let role = self.entries[idx].role.name();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             eprintln!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
             self.schedule_present_retry(id);
@@ -1092,6 +1166,11 @@ impl<S: LockSession> App<S> {
         if !drew {
             eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
         }
+        // After the blend, before the attach: this is the fingerprint of the
+        // bytes the compositor is about to show, not of an intermediate.
+        // Outside the timing capture above so the diagnostic never inflates
+        // the number the diagnostic above reports.
+        emit_frame_hash(id, role, (w, h), canvas);
         if let Some((frost, wallpaper)) = overlay_progress {
             // The warning fades via frost (surface opacity ramps the blur
             // strength in); the reveal fades via the lock wallpaper's
@@ -1949,6 +2028,23 @@ mod tests {
     fn surface_opacity_lever_bakes_full_tint() {
         assert_eq!(pixel_frost(0.25, true), 1.0);
         assert_eq!(pixel_frost(0.25, false), 0.25);
+    }
+
+    #[test]
+    fn the_frame_fingerprint_is_the_published_fnv_1a_constants() {
+        // Pinned to the algorithm, not to whatever this build's hasher does:
+        // the point of the record is comparing a warning frame's hash to a
+        // lock frame's hash, possibly from two different binaries. Vectors
+        // from the FNV-1a 64-bit reference.
+        assert_eq!(super::frame_hash(b""), "cbf29ce484222325");
+        assert_eq!(super::frame_hash(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(super::frame_hash(b"foobar"), "85944171f73967e8");
+        // A one-byte difference anywhere must move it: a black first frame
+        // and a copied-out warning frame must never fingerprint alike.
+        let black = vec![0_u8; 4096];
+        let mut nearly_black = black.clone();
+        nearly_black[4095] = 1;
+        assert_ne!(super::frame_hash(&black), super::frame_hash(&nearly_black));
     }
 }
 
