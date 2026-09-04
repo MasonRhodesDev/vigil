@@ -33,6 +33,15 @@ cleanup() {
     # Reap any harness locker that survived a failed scenario. Matching the
     # target/debug path never touches a system /usr/bin/vigil-lock.
     pkill -f "$VLOCK" 2>/dev/null || true
+    # Give the developer their account back (issue #91). Every scenario that
+    # tears down a held lock aborts a live PAM conversation, and an aborted
+    # `pam_authenticate` returns AUTH_ERR, which pam_faillock counts. Three
+    # scenarios is `deny`, so a clean run of this suite locks the user who
+    # ran it out of their own machine -- measured, twice, on the reference
+    # box. The strikes are the harness's own, so the harness clears them.
+    # No privilege needed: /run/faillock/$USER is owned by the user.
+    command -v faillock >/dev/null 2>&1 &&
+        faillock --user "$(id -un)" --reset >/dev/null 2>&1 || true
     if [ -n "${VIGIL_NESTED_KEEP:-}" ]; then
         echo "workdir kept: $WORK"
     else
