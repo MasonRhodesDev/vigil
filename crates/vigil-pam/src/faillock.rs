@@ -97,14 +97,17 @@ pub enum Lockout {
 /// ignored rather than rejected: the file is appended to in place, and a
 /// reader has no lock against a writer mid-write.
 pub fn parse_tally(bytes: &[u8]) -> Vec<Record> {
-    bytes
-        .chunks_exact(RECORD_LEN)
+    // `as_chunks` over a const size (clippy prefers it to `chunks_exact`);
+    // the remainder is a trailing partial record, ignored as documented.
+    let (records, _partial) = bytes.as_chunks::<RECORD_LEN>();
+    records
+        .iter()
         .map(|record| Record {
             status: u16::from_le_bytes([record[STATUS_OFFSET], record[STATUS_OFFSET + 1]]),
             time: u64::from_le_bytes(
                 record[TIME_OFFSET..TIME_OFFSET + 8]
                     .try_into()
-                    .expect("chunks_exact yields RECORD_LEN bytes"),
+                    .expect("record is RECORD_LEN bytes"),
             ),
         })
         .collect()
