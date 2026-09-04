@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.3.6
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -119,6 +119,24 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Thu Sep 04 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.4.0-1
+- Security floor for the user overlay. ~/.config/vigil/config.toml is
+  session-writable, and vigil-lock loaded it in place of the system
+  config, so that file could set lock.grace_secs (an unlock-without-auth
+  window) or lock.warning.wallpaper_hold_max_ms = 0 (wait for the
+  wallpaper for ever instead of locking) and durably disarm the lock from
+  inside the very session it guards. The user file is now a whitelisted
+  cosmetic overlay MERGED onto the system config, not a replacement: theme,
+  background, per-output and ramp-shape keys apply; grace_secs, the
+  wallpaper-hold cap, the warning duration, cancel-on-motion and
+  wallpaper_in_ms are system-config-only and refused with a named reason;
+  greeter-scope keys are named and ignored. The behaviour change (merge,
+  not replace) is why this is a minor bump.
+- vigil-sim warning --config PATH previews the warning ramp against a real
+  config, so an overlay's effect can be seen before it ships.
+- crates/vigil-config is relicensed MIT (the workspace binaries stay
+  GPL-3.0-only) so the MIT configurator can share the one parse-only crate;
+  it links no GPL code.
 * Thu Sep 04 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.6-1
 - A correct password is no longer intermittently rejected. Every PAM
   worker shared one event channel with no attempt identity, so a

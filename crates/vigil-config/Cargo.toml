@@ -3,7 +3,10 @@ name = "vigil-config"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true
-license.workspace = true
+# MIT, not the workspace's GPL-3.0-only: this parse-only config crate is
+# shared with the MIT `dials` configurator. It links no GPL code (deps are
+# serde/toml/xdg-paths, all MIT/Apache). The workspace binaries stay GPL.
+license = "MIT"
 repository.workspace = true
 
 [dependencies]
