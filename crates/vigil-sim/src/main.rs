@@ -122,6 +122,30 @@ impl SimArgs {
     }
 }
 
+/// Resolve `--config PATH` for the preview, loudly.
+///
+/// Whole-file, like `vigil-lock --config`: an explicit path is an
+/// operator choice, and the simulator reads no ambient config either way.
+/// A missing or unparsable file is fatal here rather than a silent
+/// fallback to defaults — you asked to preview a config, and showing you
+/// the built-in ramp while implying it was yours is the one answer that
+/// is worse than not running.
+fn load_preview_config(path: &std::path::Path) -> vigil_config::Lock {
+    let source = fs::read_to_string(path).unwrap_or_else(|error| {
+        eprintln!("vigil-sim: {}: {error}", path.display());
+        std::process::exit(2);
+    });
+    let config = vigil_config::parse(&source).unwrap_or_else(|error| {
+        eprintln!("vigil-sim: {}: {error}", path.display());
+        std::process::exit(2);
+    });
+    if let Err(error) = config.validate_warning() {
+        eprintln!("vigil-sim: {}: {error}", path.display());
+        std::process::exit(2);
+    }
+    config.lock
+}
+
 fn usage(error: &str) -> ! {
     if !error.is_empty() {
         eprintln!("error: {error}");
@@ -167,11 +191,11 @@ struct Simulator {
     warning_panel: bool,
     warning_power: bool,
     state_file: Option<std::path::PathBuf>,
-    /// Config the warning ramp previews, from `--config`. `None` is the
-    /// built-in preview policy: the simulator never reads an ambient
-    /// /etc/greetd/vigil.toml or ~/.config/vigil/config.toml, so a scenario
-    /// run stays byte-identical on a machine that has one.
-    config: Option<std::path::PathBuf>,
+    /// Lock policy the warning ramp previews, resolved from `--config`.
+    /// `None` is the built-in preview policy: the simulator never reads an
+    /// ambient /etc/greetd/vigil.toml or ~/.config/vigil/config.toml, so a
+    /// scenario run stays byte-identical on a machine that has one.
+    config: Option<vigil_config::Lock>,
     accept_warning_input: bool,
     warning_pointer_origin: Option<PhysicalPosition<f64>>,
     warning_input_after: Instant,
@@ -239,7 +263,7 @@ impl Simulator {
         paused: bool,
         at: Duration,
         state_file: Option<std::path::PathBuf>,
-        config: Option<std::path::PathBuf>,
+        config: Option<vigil_config::Lock>,
     ) -> Self {
         let desktop_sharp = Arc::new(fake_desktop());
         let desktop_blurred = Arc::new(blur_rgba(&desktop_sharp, WIDTH, HEIGHT));
@@ -379,10 +403,7 @@ impl Simulator {
                 // without one the built-in preview policy stands, so the
                 // simulator reads no ambient config and a scenario run is
                 // reproducible on any machine.
-                let mut policy = match self.config.as_deref() {
-                    Some(path) => vigil_config::Config::load_layered(Some(path)).lock,
-                    None => vigil_config::Lock::default(),
-                };
+                let mut policy = self.config.clone().unwrap_or_default();
                 // A config with no idle warning configured still has a ramp
                 // to look at: 0 ms would render nothing at all.
                 if policy.warning.duration_ms == 0 {
@@ -1403,6 +1424,9 @@ fn render_scenario_frame(simulator: &mut Simulator) -> Result<(), String> {
 
 fn main() {
     let args = SimArgs::parse();
+    // Resolved before anything is installed or opened: a --config the user
+    // mistyped should say so at once, not after a window appears.
+    let preview = args.config.as_deref().map(load_preview_config);
     let platform = VigilPlatform::install().expect("install Vigil Slint platform");
     if let Some(path) = args.scenario.as_deref() {
         if let Err(error) = run_scenario(platform, path) {
@@ -1423,7 +1447,7 @@ fn main() {
         args.paused,
         args.at,
         args.state_file,
-        args.config,
+        preview,
     );
     event_loop.run_app(&mut simulator).expect("run simulator");
 }
