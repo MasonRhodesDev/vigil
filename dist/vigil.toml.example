@@ -6,18 +6,25 @@
 # lock). The user file is a whitelisted overlay, not a replacement: it may
 # only restyle the lock.
 #
-#   overlay-allowed  look.theme/background/fit/clock_format, the whole
-#                    [output."NAME"] table, profiles.dir, the
+#   overlay-allowed  look.theme/background/fit/clock_format, the
+#                    [output."NAME"] tables, profiles.dir, the whole
 #                    [lock.transition] ramp shape and easing, and
-#                    lock.warning frost_in_ms / wallpaper_in_ms /
-#                    frost_alpha / easing / the [lock.warning.gui] table.
+#                    lock.warning frost_in_ms / frost_alpha / easing /
+#                    the [lock.warning.gui] table.
 #
 #   security floor   lock.grace_secs, lock.warning.duration_ms,
-#                    lock.warning.cancel_on_motion_px and
-#                    lock.warning.wallpaper_hold_max_ms come from this file
+#                    lock.warning.cancel_on_motion_px,
+#                    lock.warning.wallpaper_hold_max_ms and
+#                    lock.warning.wallpaper_in_ms come from this file
 #                    ALONE. A session that could write them could grant
-#                    itself an unlock-without-auth window or a warning that
-#                    waits for ever — a one-file disarm of the lock.
+#                    itself an unlock-without-auth window, or a warning
+#                    that waits for ever — a one-file disarm of the lock.
+#                    lock.warning.wallpaper_in_ms is on this list because
+#                    the cancelable warning commits at the END of that
+#                    fade: a fade as long as the warning postpones both
+#                    the lock and the hold cap that backstops it. Its
+#                    [lock.transition] namesake is a ramp shape, not a
+#                    deadline, and stays overlay-able.
 #
 # Greeter-scope keys ([keyboard], [sessions], [users], [power], [greeter],
 # [render]) are ignored in the user file: the greeter reads only this one.

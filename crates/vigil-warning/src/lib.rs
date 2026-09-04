@@ -957,6 +957,34 @@ mod tests {
     }
 
     #[test]
+    fn a_wallpaper_fade_at_least_as_long_as_the_warning_owns_the_commit() {
+        // Why `lock.warning.wallpaper_in_ms` sits on vigil-config's overlay
+        // SECURITY_FLOOR and not among the ramp shapes (issue #88).
+        //
+        // `scheduled_wallpaper_start = duration - wallpaper_in` saturates to
+        // zero once the fade is as long as the warning, so `wallpaper_start`
+        // is just `ready` and `commit_at = ready + wallpaper_in`. The hold
+        // cap is measured from that same commit, so the #56 failsafe moves
+        // out with it: a fade of u32::MAX ms is a 49-day unlocked screen,
+        // held by a config value and no timer at all.
+        //
+        // This is correct for an operator (a long fade should not be cut
+        // short — see the test below) and a lock-defeat lever for anyone
+        // who can write the file. Hence: system config only.
+        let mut timeline = Timeline::new(LockWarning {
+            duration_ms: 10_000,
+            wallpaper_in_ms: u32::MAX as u64,
+            wallpaper_hold_max_ms: 5_000,
+            ..LockWarning::default()
+        });
+        timeline.start(Duration::ZERO);
+        timeline.set_wallpaper_ready(false, Duration::ZERO);
+        let long_after_every_deadline = timeline.sample(Duration::from_secs(600));
+        assert!(!long_after_every_deadline.should_commit);
+        assert!(!long_after_every_deadline.forced_commit, "the cap moved too");
+    }
+
+    #[test]
     fn a_fade_longer_than_its_warning_is_not_cut_short() {
         // commit_at is max(duration, wallpaper_in), so a cap derived from
         // duration alone fires during a perfectly healthy run.

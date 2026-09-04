@@ -568,10 +568,6 @@ const OVERLAY: &[(&str, OverlaySetter)] = &[
         config.lock.warning.frost_in_ms = value.try_into()?;
         Ok(())
     }),
-    ("lock.warning.wallpaper_in_ms", |config, value| {
-        config.lock.warning.wallpaper_in_ms = value.try_into()?;
-        Ok(())
-    }),
     ("lock.warning.frost_alpha", |config, value| {
         config.lock.warning.frost_alpha = value.try_into()?;
         Ok(())
@@ -607,6 +603,19 @@ const SECURITY_FLOOR: &[&str] = &[
     "lock.warning.cancel_on_motion_px",
     "lock.warning.duration_ms",
     "lock.warning.wallpaper_hold_max_ms",
+    // Not a ramp shape: the cancelable warning commits at
+    // `wallpaper_start + wallpaper_in_ms`, and `wallpaper_start` is at
+    // least `duration_ms - wallpaper_in_ms` — so a fade at least as long
+    // as the warning collapses the scheduled start to zero and the commit
+    // follows the fade instead of the warning. The hold cap is measured
+    // from that same commit, so it moves out too and the #56 failsafe goes
+    // with it. `wallpaper_in_ms = u32::MAX` is a 49-day unlocked screen.
+    // Pinned by vigil-warning's
+    // `a_wallpaper_fade_at_least_as_long_as_the_warning_owns_the_commit`.
+    // `lock.transition.wallpaper_in_ms` is unaffected and stays
+    // overlay-able: the transition never waits on the wallpaper, and
+    // LockTransition::clamp bounds every one of its ramps.
+    "lock.warning.wallpaper_in_ms",
 ];
 
 /// Top-level tables only the greeter reads. The greeter loads the system
@@ -1224,6 +1233,31 @@ dir = \"/home/mason/.config/monitor-profiles\"
                 refusal: OverlayRefusal::SecurityFloor,
             }]
         );
+    }
+
+    #[test]
+    fn overlay_cannot_postpone_the_commit_with_a_long_wallpaper_fade() {
+        // `wallpaper_in_ms` looks like a ramp shape and is a commit
+        // deadline: the cancelable warning commits at
+        // `wallpaper_start + wallpaper_in_ms`, so a fade at least as long
+        // as the warning makes the commit — and the hold cap measured from
+        // it — track the fade. See vigil-warning's
+        // `a_wallpaper_fade_at_least_as_long_as_the_warning_owns_the_commit`.
+        let (config, ignored) = overlay("[lock.warning]\nwallpaper_in_ms = 4294967295\n");
+        assert_eq!(config.lock.warning.wallpaper_in_ms, 1_500);
+        assert_eq!(
+            ignored,
+            vec![IgnoredOverlayKey {
+                key: "lock.warning.wallpaper_in_ms".into(),
+                refusal: OverlayRefusal::SecurityFloor,
+            }]
+        );
+        // The transition's fade of the same name is not a deadline — it
+        // never waits on the wallpaper and clamp() bounds it — so it stays
+        // overlay-able.
+        let (config, ignored) = overlay("[lock.transition]\nwallpaper_in_ms = 400\n");
+        assert_eq!(ignored, Vec::new());
+        assert_eq!(config.lock.transition.wallpaper_in_ms, 400);
     }
 
     #[test]
