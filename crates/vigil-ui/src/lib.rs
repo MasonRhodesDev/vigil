@@ -205,6 +205,10 @@ pub struct OutputWindow {
     /// there covers the lot.
     revision: std::cell::Cell<u64>,
     component: ComponentInstance,
+    /// Scanout (panel) dimensions. Equal to the scene except on a
+    /// quarter-turn transform, which swaps them - so this is the quantity a
+    /// compositor's configure is in, and the scene is not.
+    panel: (u32, u32),
 }
 
 /// The software baseline: Slint's `SoftwareRenderer` into a persistent
@@ -246,7 +250,9 @@ impl OutputWindow {
     /// this crate cannot name without depending on it.
     ///
     /// `width`/`height` are *scene* dimensions here: a caller with its own
-    /// adapter has already sized it, so there is nothing left to swap.
+    /// adapter has already sized it, so there is nothing left to swap. Such
+    /// a caller also owns its own transform, so [`Self::panel_size`] reports
+    /// the scene size for these windows - this type is not told otherwise.
     pub fn with_backend(
         id: OutputId,
         width: u32,
@@ -273,6 +279,7 @@ impl OutputWindow {
             cursor_visible: false,
             revision: std::cell::Cell::new(0),
             component,
+            panel: (width, height),
         })
     }
 
@@ -324,6 +331,7 @@ impl OutputWindow {
             cursor_visible: false,
             revision: std::cell::Cell::new(0),
             component,
+            panel: (panel_width, panel_height),
         })
     }
 
@@ -338,8 +346,19 @@ impl OutputWindow {
         self.component.window().request_redraw();
     }
 
-    /// Re-arm rendering without waking immediately. Presenters use this with
-    /// a bounded retry deadline after a device error.
+    /// Re-arm the copy-out without requesting a redraw.
+    ///
+    /// The difference from [`Self::request_present`] is the missing
+    /// `request_redraw`: this says "the buffer is stale", not "the scene is
+    /// stale". A settled scene therefore stays settled and the next render
+    /// copies the shadow out as it stands.
+    ///
+    /// Two callers, both of which want exactly that. A presenter retrying
+    /// after a device error, on a bounded deadline, must not wake the loop
+    /// to do it. And the warn→lock handoff (vigil#86) arms this from inside
+    /// the lock surface's configure callback, where the retained scene is
+    /// already the picture on screen and asking Slint to draw would be the
+    /// scene work vigil#37 forbids there.
     pub fn request_present_deferred(&mut self) {
         self.backend.request_present();
     }
@@ -514,6 +533,18 @@ impl OutputWindow {
     /// from the panel's scanout size on a quarter-turn transform.
     pub fn scene_size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Scanout dimensions — what a compositor's configure and every
+    /// [`FrameTarget`] for this output are expressed in. Same as
+    /// [`Self::scene_size`] except on a quarter turn, which swaps them.
+    ///
+    /// Compare a configure against this one, never against the scene: they
+    /// agree only while the transform is 0, so a comparison written against
+    /// the scene is correct by coincidence and silently wrong the day an
+    /// output is rotated.
+    pub fn panel_size(&self) -> (u32, u32) {
+        self.panel
     }
 
     /// Current pointer position in scene pixels.
@@ -1507,6 +1538,44 @@ mod tests {
             "a scene asked to repaint must still report it owes a present"
         );
 
+        // A target that disagrees with the panel renders NOTHING, and asking
+        // again never helps — the window has to be rebuilt at the new size.
+        // This is why a warning→lock rebind at a changed pixel size is not a
+        // rebind: vigil-lock's `rebound_needs_resize` exists because keeping
+        // the retained window here would leave that output black for the
+        // whole locked session (issue #40 geometry, issue #86 handoff). The
+        // integration itself only shows up on a compositor that configures
+        // the lock surface differently from the layer surface, so the seam
+        // is asserted from both sides instead.
+        //
+        // The quantity being compared is the PANEL size, which is what a
+        // configure carries and what a FrameTarget is measured in. It
+        // coincides with the scene here because this window is untransformed;
+        // the rotated case below pins that they are different quantities.
+        assert_eq!(window.panel_size(), (2, 2));
+        assert_eq!(window.scene_size(), (2, 2));
+        let mut wrong = vec![0_u8; 36];
+        assert!(
+            !window.render_if_needed(FrameTarget {
+                buffer: &mut wrong,
+                width: 3,
+                height: 3,
+                stride: 12,
+            }),
+            "a mismatched target must be refused, not partially painted"
+        );
+        assert_eq!(wrong, vec![0_u8; 36], "a refused render must not write");
+        assert!(
+            window.scene_needs_present(),
+            "a refused render must leave the present still owed"
+        );
+        assert!(window.render_if_needed(FrameTarget {
+            buffer: &mut buffer,
+            width: 2,
+            height: 2,
+            stride: 8,
+        }));
+
         let source = r#"
             export component Native inherits Window {
                 in property <bool> native-background: false;
@@ -1551,6 +1620,41 @@ mod tests {
             stride: 8,
         }));
         assert_eq!(buffer, [0xff, 0, 0, 0].repeat(4));
+
+        // A quarter turn separates the panel from the scene, and a
+        // FrameTarget follows the panel. vigil-lock compares a compositor's
+        // configure against `panel_size` for exactly this reason: written
+        // against `scene_size` it is correct only until an output is
+        // rotated, and would then call every unchanged configure a resize
+        // and rebuild the scene on every rebind. Last in this test because
+        // instantiating a scene arms its output's dirty flag, and the
+        // assertions above read the dirty set.
+        let source = r#"
+            export component Rotated inherits Window {
+                background: #204060;
+            }
+        "#;
+        let result = block_on(
+            slint_interpreter::Compiler::default()
+                .build_from_source(source.to_owned(), "rotated.slint".into()),
+        );
+        assert!(!result.has_errors());
+        platform.set_next_output(OutputId(3));
+        let component = result.component("Rotated").unwrap().create().unwrap();
+        platform.clear_next_output();
+        let adapter = platform.claim_last_adapter().unwrap();
+        let rotated =
+            OutputWindow::with_transform(OutputId(3), 4, 2, 1.0, 1, adapter, component).unwrap();
+        assert_eq!(
+            rotated.panel_size(),
+            (4, 2),
+            "panel_size is the scanout size the compositor configured"
+        );
+        assert_eq!(
+            rotated.scene_size(),
+            (2, 4),
+            "a quarter turn lays the scene out transposed"
+        );
     }
 
     struct ThreadWaker(std::thread::Thread);

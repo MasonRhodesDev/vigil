@@ -44,6 +44,25 @@ trap cleanup EXIT INT TERM
 export XDG_RUNTIME_DIR=$WORK/run
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
+
+# Config isolation. The locker layers $XDG_CONFIG_HOME/vigil/config.toml
+# over /etc/greetd/vigil.toml over its defaults, and both layers change what
+# these scenarios measure: the reference machine's system config sets
+# [lock.warning] wallpaper_in_ms = 10000, which moves every handoff timing
+# the gates read. Without pinning, CI and a workstation run different
+# scenarios under the same names, and a developer's own config decides
+# whether a gate passes.
+#
+# An empty file rather than an unset path: --config takes an explicit file
+# and skips both layers, so the scenarios exercise the shipped defaults plus
+# whatever they pass on the command line, and nothing else. XDG_CONFIG_HOME
+# is redirected too, for anything that reads it without going through
+# Config::load_layered.
+export XDG_CONFIG_HOME=$WORK/config
+mkdir -p "$XDG_CONFIG_HOME"
+CFG=$WORK/vigil.toml
+: >"$CFG"
+
 export WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
 
 sway -c "$REPO/tests/nested/sway.cfg" >"$WORK/sway.log" 2>&1 &
@@ -114,7 +133,7 @@ echo "S1: readiness — locked event precedes --wait success"
 # opt-in modular slot (LockTransition.wallpaper_out_ms > 0), covered by
 # vigil-flow and vigil-warning unit tests rather than a nested scenario.
 [ "$(probe_state)" = 0 ] || fail "S1: fresh session reports locked"
-WAYLAND_DEBUG=1 timeout 30 "$VLOCK" --wait --no-warn --grace 300 2>"$WORK/s1.trace" && rc=0 || rc=$?
+WAYLAND_DEBUG=1 timeout 30 "$VLOCK" --config "$CFG" --wait --no-warn --grace 300 2>"$WORK/s1.trace" && rc=0 || rc=$?
 [ "$rc" = 0 ] || { grep -v '^\[' "$WORK/s1.trace" | tail -5; fail "S1: --wait exited $rc"; }
 s1_probe=$(probe_state)
 [ "$s1_probe" = 10 ] || {
@@ -131,15 +150,22 @@ s1_probe=$(probe_state)
 }
 tap
 teardown_check S1
-python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --no-reveal || fail "S1: trace check"
+# --locked-to-commit-ms bounds the interval this output is actually
+# uncovered: `locked` (where the compositor stops drawing normal surfaces)
+# to that output's first lock-surface commit-with-buffer. 100 ms against a
+# measured ~3 ms is deliberately loose — it catches a whole scheduling round
+# being added before the first commit and does not pretend this tier's
+# timing predicts the seat's. It is NOT the #86 check: the black-committing
+# code passed this too, fast. S4's --first-frame-not-black is that check.
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --locked-to-commit-ms 100 --no-reveal || fail "S1: trace check"
 pass "S1"
 
 echo "S2: second locker joins the in-flight warning"
-timeout 60 env WAYLAND_DEBUG=1 "$VLOCK" --wait --warn 30 --grace 300 2>"$WORK/s2a.trace" &
+timeout 60 env WAYLAND_DEBUG=1 "$VLOCK" --config "$CFG" --wait --warn 30 --grace 300 2>"$WORK/s2a.trace" &
 A=$!
 wait_held S2
 start=$(date +%s)
-timeout 25 "$VLOCK" --wait 2>"$WORK/s2b.log" && rcb=0 || rcb=$?
+timeout 25 "$VLOCK" --config "$CFG" --wait 2>"$WORK/s2b.log" && rcb=0 || rcb=$?
 end=$(date +%s)
 [ "$rcb" = 0 ] || { tail -3 "$WORK/s2b.log"; fail "S2: joiner exited $rcb"; }
 [ $((end - start)) -lt 20 ] || fail "S2: join took $((end - start))s — commit request ignored"
@@ -152,7 +178,7 @@ teardown_check S2
 pass "S2"
 
 echo "S3: cancel before commitment never acquires the lock"
-timeout 60 env WAYLAND_DEBUG=1 "$VLOCK" --wait --warn 30 2>"$WORK/s3.trace" &
+timeout 60 env WAYLAND_DEBUG=1 "$VLOCK" --config "$CFG" --wait --warn 30 2>"$WORK/s3.trace" &
 A=$!
 wait_held S3
 sleep 1
@@ -165,9 +191,15 @@ pass "S3"
 
 echo "S4: two-output warning handoff never exposes the desktop"
 sm create_output >/dev/null
-timeout 60 env WAYLAND_DEBUG=1 "$VLOCK" --wait --warn 2 --grace 300 2>"$WORK/s4.trace" && rc=0 || rc=$?
+# VIGIL_FRAME_HASH=1 fingerprints every committed frame into this trace, so
+# --first-frame-not-black can assert the positive: an output whose warning
+# painted must not get an all-black first lock frame (issue #86 — the old
+# handoff committed instantly and committed black). Hashing walks the whole
+# buffer per frame, so this trace's timings are inflated; the gap gate lives
+# on the unhashed S1 and the numbers here are printed, not gated.
+timeout 60 env WAYLAND_DEBUG=1 VIGIL_FRAME_HASH=1 "$VLOCK" --config "$CFG" --wait --warn 2 --grace 300 2>"$WORK/s4.trace" && rc=0 || rc=$?
 [ "$rc" = 0 ] || fail "S4: exited $rc"
-python3 "$REPO/tests/nested/check_trace.py" "$WORK/s4.trace" --expect locked --handoff --outputs 2 || fail "S4: trace check"
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s4.trace" --expect locked --handoff --first-frame-not-black --outputs 2 || fail "S4: trace check"
 tap
 wait_free S4
 sm output HEADLESS-2 unplug >/dev/null 2>&1 || echo "  note: sway cannot unplug outputs; leaving HEADLESS-2"
@@ -175,7 +207,7 @@ teardown_check S4
 pass "S4"
 
 echo "S7a: hotplug during the warning cancels before commitment"
-timeout 60 env WAYLAND_DEBUG=1 "$VLOCK" --wait --warn 30 2>"$WORK/s7a.trace" &
+timeout 60 env WAYLAND_DEBUG=1 "$VLOCK" --config "$CFG" --wait --warn 30 2>"$WORK/s7a.trace" &
 A=$!
 wait_held S7a
 sleep 1
@@ -188,7 +220,7 @@ teardown_check S7a
 pass "S7a"
 
 echo "S7b: an output hotplugged while locked gets a lock surface"
-timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --wait --no-warn --grace 300 2>"$WORK/s7b.trace" || fail "S7b: lock failed"
+timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --config "$CFG" --wait --no-warn --grace 300 2>"$WORK/s7b.trace" || fail "S7b: lock failed"
 sm create_output >/dev/null
 sleep 2
 # The detached child appends to the same trace fd; assert the new output's
@@ -201,7 +233,7 @@ teardown_check S7b
 pass "S7b"
 
 echo "S8: --immediate is the pre-0.4 path: no overlay on lock or unlock"
-timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --wait --no-warn --immediate --grace 300 2>"$WORK/s8.trace" || fail "S8: lock failed"
+timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --config "$CFG" --wait --no-warn --immediate --grace 300 2>"$WORK/s8.trace" || fail "S8: lock failed"
 [ "$(probe_state)" = 10 ] || fail "S8: session not locked"
 tap
 teardown_check S8
@@ -209,7 +241,7 @@ python3 "$REPO/tests/nested/check_trace.py" "$WORK/s8.trace" --expect locked --n
 pass "S8"
 
 echo "S9: hotplug during the transition commits instead of cancelling"
-timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --wait --no-warn --grace 300 2>"$WORK/s9.trace" &
+timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --config "$CFG" --wait --no-warn --grace 300 2>"$WORK/s9.trace" &
 A=$!
 # Race the 400 ms ramp; whichever side of the commit the new output lands
 # on, the locker must end up locked (never exit 3) with both outputs covered.

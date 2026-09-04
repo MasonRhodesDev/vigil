@@ -10,6 +10,15 @@
 //! The binary supplies a [`LockSession`] (its composition of vigil-ui
 //! windows + auth) and calls [`run`]; the event loop lives here because the
 //! Wayland connection *is* the loop for a lock client.
+//!
+//! `VIGIL_FRAME_HASH=1` adds an `event=frame.hash` record (output, role,
+//! size, FNV-1a of the pixels) for every frame this crate commits, on the
+//! journald stream beside `frame.present`. It answers "was that first lock
+//! frame actually the picture, or was it black" — the question issue #86
+//! came down to — from a capture-free trace. Off by default and free when
+//! off. The hash is taken *after* the attach and commit, so it cannot
+//! lengthen the interval an output is uncovered; it still costs a pass over
+//! the buffer per frame, so a hashed run's frame cadence is its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -40,7 +49,10 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
@@ -99,6 +111,22 @@ pub trait LockSession {
     /// Slint state changed. Called before a forced present would otherwise
     /// commit an empty buffer (issue #35).
     fn force_repaint(&mut self, _id: OutputId) {}
+    /// Re-arm this output's next present *without* asking the scene to
+    /// redraw: the retained scene is already what the user is looking at,
+    /// and only the freshly acquired buffer is empty.
+    ///
+    /// Split from `force_repaint` because the handoff calls it from inside
+    /// a configure callback (issue #86): re-arming there must not also ask
+    /// the scene to redraw, which is what `force_repaint` does and what
+    /// issue #37 forbids in a protocol callback.
+    ///
+    /// Required, not defaulted. A default delegating to `force_repaint`
+    /// would be the #37 violation wearing the name of the fix for it — the
+    /// one call site is the callback — and "correct, just costlier" was the
+    /// wrong description of it. There is one implementor in tree and vigil
+    /// is alpha, so an implementor that has not thought about this gets a
+    /// compile error rather than a silent redraw.
+    fn force_copy_out(&mut self, id: OutputId);
     fn output_gone(&mut self, id: OutputId);
     /// A pre-lock warning surface is ready. The default creates the same scene
     /// as a lock surface; implementations can keep authentication controls
@@ -193,6 +221,16 @@ impl SurfaceRole {
     }
     fn is_reveal(&self) -> bool {
         matches!(self, SurfaceRole::Reveal(_))
+    }
+    /// Stable label for trace records. A frame fingerprint is only readable
+    /// next to which surface produced it: during the handoff two roles share
+    /// one output id and the hashes interleave.
+    fn name(&self) -> &'static str {
+        match self {
+            SurfaceRole::Warning(_) => "warning",
+            SurfaceRole::Lock { .. } => "lock",
+            SurfaceRole::Reveal(_) => "reveal",
+        }
     }
     fn layer(&self) -> Option<&LayerSurface> {
         match self {
@@ -357,6 +395,102 @@ fn pixel_frost(frost: f32, surface_opacity_available: bool) -> f32 {
 /// §12 invariant 4 (issue #35 hotplug case).
 fn surface_role_is_warning(warning_active: bool, lock_taken: bool) -> bool {
     warning_active && !lock_taken
+}
+
+/// Whether `VIGIL_FRAME_HASH=1` asked for a fingerprint of every committed
+/// frame.
+///
+/// Read once. This sits on the present path, and `var_os` takes the env lock
+/// and scans the whole environment per call — the cost of the diagnostic
+/// must be zero when nobody asked for it.
+fn frame_hash_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VIGIL_FRAME_HASH").is_some_and(|value| value == "1"))
+}
+
+/// FNV-1a over the pixels about to be committed.
+///
+/// Stable rather than `DefaultHasher`, whose algorithm is deliberately
+/// unspecified across builds — the same rationale (and the same constants)
+/// as `vigil-sim`'s `frame_hash`. The question this answers is "is the lock
+/// surface's first frame the same picture the warning surface last showed",
+/// and two runs of two binaries have to agree on the answer. Fingerprint,
+/// not a security digest.
+fn frame_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Record what the frame that was *just committed* looks like.
+///
+/// Called after the attach and the commit, never before. Hashing is a full
+/// pass over the buffer; done ahead of the commit it lands inside the window
+/// where the compositor is showing nothing — measured at 16.7-121 ms per
+/// output unoptimized (4.6-28.6 optimized), serialized across outputs, which
+/// is exactly the issue #37 shape smuggled back in by a diagnostic. After
+/// the commit it cannot extend that window at all.
+///
+/// Reading the slot once it is attached is why this takes the pool and the
+/// buffer rather than a canvas: `SlotPool::canvas` refuses an active slot,
+/// correctly, because it hands out a slice to *write* through. Nothing
+/// writes here, and the compositor does not write to a client buffer, so
+/// the bytes are stable while we read them.
+///
+/// Exactly `stride * height` bytes: `new_slot` rounds its allocation up to
+/// 64, and the padding beyond the last row is whatever the slot held
+/// before. Hashing it would make the fingerprint depend on allocator
+/// history, and would break the closed-form all-black hash that
+/// `check_trace.py` computes from `width * height * 4`.
+///
+/// INFO, not DEBUG like `frame.present` itself: the span-lines layer hints
+/// `LevelFilter::INFO` at the default detail, so a DEBUG record would need
+/// `SPAN_LINES=frames` as well and `VIGIL_FRAME_HASH=1` alone would print
+/// nothing. One opt-in knob, or the diagnostic is a trap. Volume is bounded
+/// by the operator having asked for it.
+///
+/// Capture-free: this hashes vigil's own buffer. ADR 0004 binds only
+/// vigil's registry globals, and nothing here reads the compositor's
+/// framebuffer.
+///
+/// It is therefore a fingerprint of *what vigil drew*, not of what the
+/// screen shows. On a lever surface (warning, reveal) the alpha-modifier is
+/// applied by the compositor after this, so the pixels on screen are a
+/// function of these bytes and a surface opacity this record does not
+/// carry. Two frames with the same hash can look different; two frames that
+/// look the same can hash differently. For the lock surface — the one issue
+/// #86 is about — there is no lever and the buffer is opaque XRGB, so the
+/// hash does describe the picture.
+fn emit_committed_frame_hash(
+    id: OutputId,
+    role: &'static str,
+    px: (u32, u32),
+    stride: usize,
+    pool: &mut SlotPool,
+    buffer: &Buffer,
+) {
+    if !frame_hash_enabled() {
+        return;
+    }
+    let raw = pool.raw_data_mut(&buffer.slot());
+    // Empty when the slot does not belong to this pool (a resize raced the
+    // commit): no frame to fingerprint, and no reason to hash padding.
+    let Some(bytes) = raw.get(..stride * px.1 as usize) else {
+        return;
+    };
+    tracing::event!(
+        name: "frame.hash",
+        target: "vigil",
+        tracing::Level::INFO,
+        output = id.0,
+        role = role,
+        width = px.0,
+        height = px.1,
+        hash = frame_hash(bytes).as_str()
+    );
 }
 
 struct Entry {
@@ -909,9 +1043,11 @@ impl<S: LockSession> App<S> {
                 // blanks an output until a buffer matching this configure
                 // arrives, and building the Slint scene inline here
                 // serialized the reveal across outputs. Satisfy the
-                // configure with a solid buffer now; the scene is built on
-                // the next tick and paints over it.
-                self.commit_solid(idx);
+                // configure now with a copy-out of the retained scene (the
+                // warning's last frame) — or black if there is none; the
+                // scene is built or rebound on the next tick and paints
+                // over it.
+                self.commit_first_frame(idx);
             }
             self.pending_scenes.push((id, is_lock));
         } else if resized {
@@ -925,8 +1061,10 @@ impl<S: LockSession> App<S> {
             self.session.output_rebound(id, &info);
         }
         // Invariant: a configured lock surface gets a buffer in this event-loop
-        // iteration. Presentation stays outside protocol callbacks so redraws
-        // coalesce and buffer acquisition has one audited entry point.
+        // iteration. Repainting stays outside protocol callbacks so redraws
+        // coalesce and no scene is ever *constructed* here (issue #37); the
+        // first-frame commit above is the bounded exception, which draws an
+        // existing scene if it is dirty and otherwise only copies it out.
         self.dirty.mark(id);
         self.wake.wake();
         let elapsed = configure_started.elapsed();
@@ -935,31 +1073,98 @@ impl<S: LockSession> App<S> {
         }
     }
 
-    /// Commit a solid black buffer to satisfy a lock-surface configure
-    /// before its scene exists. Kept next to present() so buffer
-    /// acquisition has exactly two audited entry points.
-    fn commit_solid(&mut self, idx: usize) {
-        let (w, h) = self.entries[idx].px;
+    /// Satisfy a lock-surface configure with its first buffer, before the
+    /// tick that builds or rebinds the scene has run.
+    ///
+    /// The warning overlay and the lock surface of one output share a single
+    /// retained `OutputWindow` (`output_rebound`), so when a warning ran
+    /// here the window's shadow already holds a fully rendered scene — the
+    /// exact picture on screen at this instant. Copy it out and the
+    /// warn→lock cut has no black frame in it (issue #86). Black is the
+    /// fallback, for the cases where no scene exists yet (`--immediate`, a
+    /// hotplug while locked, a warning that never painted) and for a
+    /// configure at a size the retained scene cannot fill — `render`
+    /// answers false for both.
+    ///
+    /// Kept next to present() so buffer acquisition stays auditable in one
+    /// place. The invariant is not "exactly two call sites": it is that a
+    /// protocol callback constructs no scene (issue #37 — building the Slint
+    /// scene inline here serialized the reveal across outputs). This
+    /// constructs none. Committing at the acked configure size is DESIGN §12
+    /// invariant 1; `px` is that size, set by the caller.
+    ///
+    /// What it costs, stated honestly: `render` goes through
+    /// `draw_into_shadow`, which asks Slint to draw if the scene is dirty.
+    /// The warning leaves the scene settled, so in the handoff this is
+    /// typically the copy-out alone (2.2 ms at 4K, vigil-ui's measurement) —
+    /// but "typically" is the word. Anything that dirtied the scene between
+    /// the warning's last frame and this configure (a panel toggle, a
+    /// property set from the flow) makes it a layout and raster first. That
+    /// is bounded by the lock scene's own complexity, never by desktop
+    /// content, and it is work this output owed anyway; it is not free, and
+    /// calling it a memcpy would be a claim the code does not support.
+    /// Stage 2's prebuilt buffers remove even this.
+    fn commit_first_frame(&mut self, idx: usize) {
+        let px @ (w, h) = self.entries[idx].px;
         let id = self.entries[idx].id;
+        let role = self.entries[idx].role.name();
+        // Re-arm the copy-out before asking for it: a settled scene reports
+        // it owes nothing, and the shadow is settled precisely when the
+        // warning left a finished frame in it. `force_copy_out`, not
+        // `force_repaint` — the scene is already correct, only the freshly
+        // acquired buffer is empty, and a redraw request here would put
+        // scene work back inside the configure callback.
+        self.session.force_copy_out(id);
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             self.schedule_present_retry(id);
             return;
         };
         let stride = w as usize * 4;
+        // XRGB: a lock surface is opaque, and the compositor composites
+        // nothing under it.
         let Ok((buffer, canvas)) =
             pool.create_buffer(w as i32, h as i32, stride as i32, wl_shm::Format::Xrgb8888)
         else {
             self.schedule_present_retry(id);
             return;
         };
-        canvas.fill(0);
         self.metrics.record_buffer_acquire();
+        // Zero first, unconditionally, exactly as present() does. A slot
+        // handed back by the pool holds whatever the last frame in it held,
+        // and `render` answering true is not a promise that it wrote: the
+        // software backend returns true after bailing on a misaligned buffer
+        // under a rotating transform (vigil-ui, `try_cast_slice_mut`). This
+        // is the surface the compositor shows while nothing else is on
+        // screen, so it never attaches memory nobody wrote. Next to a
+        // full-buffer copy-out the fill is noise.
+        canvas.fill(0);
+        let drew = self.session.render(
+            id,
+            FrameTarget {
+                buffer: &mut *canvas,
+                width: w,
+                height: h,
+                stride,
+            },
+        );
+        if drew {
+            self.metrics.record_render();
+        }
         let surface = &self.entries[idx].surface;
         let _ = buffer.attach_to(surface);
         surface.damage_buffer(0, 0, w as i32, h as i32);
         surface.commit();
         self.metrics.record_commit();
         self.entries[idx].committed = true;
+        // Fingerprint after the commit. This is the one frame whose latency
+        // the whole issue is about; a full hash pass ahead of the attach
+        // would put the diagnostic inside the black window it exists to
+        // measure.
+        if frame_hash_enabled()
+            && let Some(pool) = self.entries[idx].pool.as_mut()
+        {
+            emit_committed_frame_hash(id, role, px, stride, pool, &buffer);
+        }
     }
 
     /// Render if the scene is dirty and commit the new buffer.
@@ -984,6 +1189,7 @@ impl<S: LockSession> App<S> {
         let overlay = !self.entries[idx].role.is_lock();
         let surface_opacity = self.entries[idx].opacity.is_some();
         let is_reveal = self.entries[idx].role.is_reveal();
+        let role = self.entries[idx].role.name();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             eprintln!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
             self.schedule_present_retry(id);
@@ -1015,7 +1221,7 @@ impl<S: LockSession> App<S> {
         // when `present` returns, on every path including the early ones,
         // so a failed buffer acquisition still reads as a frame that cost
         // time.
-        let _frame = tracing::debug_span!(
+        let frame_span = tracing::debug_span!(
             target: "vigil",
             "frame.present",
             output = id.0,
@@ -1118,6 +1324,20 @@ impl<S: LockSession> App<S> {
                 "vigil-lock: output {id:?} present: render {:?}, commit {:?}",
                 render_elapsed, commit_elapsed
             );
+        }
+        // Close the span before fingerprinting. `frame.present` must measure
+        // the frame, not the frame plus an opt-in diagnostic — a span whose
+        // duration changes when you turn on tracing is worse than no span.
+        // The hash record then lands beside it as a sibling rather than a
+        // child, which is also what it is: a fact about a frame already
+        // committed. On an overlay it fingerprints what vigil drew, not what
+        // the screen shows — the surface's opacity lever is applied after
+        // this and is not in the bytes.
+        drop(frame_span);
+        if frame_hash_enabled()
+            && let Some(pool) = self.entries[idx].pool.as_mut()
+        {
+            emit_committed_frame_hash(id, role, (w, h), stride, pool, &buffer);
         }
     }
 
@@ -1949,6 +2169,23 @@ mod tests {
     fn surface_opacity_lever_bakes_full_tint() {
         assert_eq!(pixel_frost(0.25, true), 1.0);
         assert_eq!(pixel_frost(0.25, false), 0.25);
+    }
+
+    #[test]
+    fn the_frame_fingerprint_is_the_published_fnv_1a_constants() {
+        // Pinned to the algorithm, not to whatever this build's hasher does:
+        // the point of the record is comparing a warning frame's hash to a
+        // lock frame's hash, possibly from two different binaries. Vectors
+        // from the FNV-1a 64-bit reference.
+        assert_eq!(super::frame_hash(b""), "cbf29ce484222325");
+        assert_eq!(super::frame_hash(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(super::frame_hash(b"foobar"), "85944171f73967e8");
+        // A one-byte difference anywhere must move it: a black first frame
+        // and a copied-out warning frame must never fingerprint alike.
+        let black = vec![0_u8; 4096];
+        let mut nearly_black = black.clone();
+        nearly_black[4095] = 1;
+        assert_ne!(super::frame_hash(&black), super::frame_hash(&nearly_black));
     }
 }
 
