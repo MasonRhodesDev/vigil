@@ -757,6 +757,7 @@ impl<S: LockSession> App<S> {
                 | FlowCmd::DispatchInput(_)
                 | FlowCmd::StartAuth
                 | FlowCmd::ShowAuthError(_)
+                | FlowCmd::ShowAccountLocked { .. }
                 | FlowCmd::DetachAuth
                 | FlowCmd::SetLockedHint(_)
                 | FlowCmd::SignalReady) => self.session.flow_command(session_cmd),

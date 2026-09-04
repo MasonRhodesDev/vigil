@@ -121,6 +121,21 @@ pub enum FlowEvent {
     RevealOverlaysMapped,
     AuthOk,
     AuthErr(String),
+    /// The conversation broke before PAM could judge the credential — the
+    /// locker's own transport, not a wrong password (issue #91). Reopen the
+    /// conversation, but do NOT run it through the failure path: what the
+    /// user reads as "wrong password" is [`FlowCmd::ShowAuthError`], and
+    /// teaching them to retype a password that was never wrong is how a
+    /// self-inflicted glitch turns into a faillock lockout.
+    AuthConversationLost,
+    /// PAM refused because the account is faillocked, with the time left
+    /// before it clears (`None` = it will not clear on its own). Issue #92:
+    /// "authentication failed" is a lie to a user holding the right
+    /// password, and the one it is told to is the one least able to work out
+    /// why their password stopped working.
+    AuthLocked {
+        remaining: Option<Duration>,
+    },
     /// logind `Unlock`: release without authentication.
     LogindUnlock,
     /// logind `PrepareForSleep`. `true` commits a pending ramp (lock before
@@ -153,6 +168,13 @@ pub enum FlowCmd {
     DispatchInput(InputEvent),
     StartAuth,
     ShowAuthError(String),
+    /// Show the faillock lockout and its countdown. Typed rather than prose
+    /// for the same reason `Journal` is: the wording is the adapter's, and a
+    /// test can assert the number of seconds left rather than a sentence.
+    /// Re-emitted on every whole second the countdown changes.
+    ShowAccountLocked {
+        remaining: Option<Duration>,
+    },
     DetachAuth,
     SetLockedHint(bool),
     /// Compositor-confirmed readiness: write the ready byte and answer
@@ -283,6 +305,26 @@ pub struct LockFlow {
     unlock_latched: bool,
     /// Earliest next wakeup computed by the last step.
     wait: Option<Duration>,
+    /// A faillock countdown being displayed. Only ever `Some` for a lockout
+    /// that clears on its own — one that does not is a static message with
+    /// nothing to tick.
+    lockout: Option<Lockout>,
+}
+
+/// A faillock countdown in progress (issue #92).
+#[derive(Debug, Clone, Copy)]
+struct Lockout {
+    /// Monotonic deadline. Wall time is deliberately not consulted: this is
+    /// a display, and a clock step must not make it jump.
+    clears_at: Instant,
+    /// Whole seconds last shown, so the command is emitted only on change.
+    shown: Duration,
+}
+
+/// Countdowns round up: a lockout with 8.4 s left reads "9s" and only shows
+/// zero once it has actually cleared.
+fn ceil_secs(remaining: Duration) -> Duration {
+    Duration::from_secs(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
 }
 
 impl LockFlow {
@@ -326,6 +368,7 @@ impl LockFlow {
             grace_forbidden: false,
             unlock_latched: false,
             wait: None,
+            lockout: None,
         };
         let mut cmds = Vec::new();
         if let Some(timeline) = flow.timeline.as_mut() {
@@ -359,7 +402,7 @@ impl LockFlow {
     /// `next_wake()` directly -- so it exists to make the invariant
     /// assertable rather than implied.
     pub fn settled(&self) -> bool {
-        self.phase == FlowPhase::Locked && self.timeline.is_none()
+        self.phase == FlowPhase::Locked && self.timeline.is_none() && self.lockout.is_none()
     }
 
     pub fn step(&mut self, now: Now, event: FlowEvent) -> Vec<FlowCmd> {
@@ -452,14 +495,40 @@ impl LockFlow {
             }
             FlowEvent::AuthOk => {
                 if self.phase == FlowPhase::Locked {
+                    self.lockout = None;
                     self.unlock_authorized(now, &mut cmds);
                 }
             }
             FlowEvent::AuthErr(message) => {
                 if self.phase == FlowPhase::Locked {
+                    // Whatever this failure is, it replaces the countdown.
+                    self.lockout = None;
                     cmds.push(FlowCmd::ShowAuthError(message));
                     // A fresh PAM transaction per attempt (hyprlock's
                     // model): the new conversation re-prompts.
+                    cmds.push(FlowCmd::StartAuth);
+                }
+            }
+            FlowEvent::AuthLocked { remaining } => {
+                if self.phase == FlowPhase::Locked {
+                    let shown = remaining.map(ceil_secs);
+                    cmds.push(FlowCmd::ShowAccountLocked { remaining: shown });
+                    self.lockout = remaining.map(|remaining| Lockout {
+                        clears_at: now.mono + remaining,
+                        shown: ceil_secs(remaining),
+                    });
+                    // A fresh transaction all the same, so the moment the
+                    // lockout clears the user's next attempt is answered by
+                    // PAM instead of by a card with nothing behind it.
+                    cmds.push(FlowCmd::StartAuth);
+                }
+            }
+            FlowEvent::AuthConversationLost => {
+                if self.phase == FlowPhase::Locked {
+                    self.lockout = None;
+                    // Reopen only. No ShowAuthError: the card keeps whatever
+                    // it was showing and the user is never told they failed
+                    // an authentication they never attempted.
                     cmds.push(FlowCmd::StartAuth);
                 }
             }
@@ -490,12 +559,38 @@ impl LockFlow {
         cmds
     }
 
+    /// Advance a faillock countdown, emitting a fresh
+    /// [`FlowCmd::ShowAccountLocked`] on every whole second it changes and
+    /// returning when to wake for the next one (issue #92).
+    ///
+    /// The wake is the time to the next second boundary of the countdown,
+    /// not a flat one second: a lockout read 9.4 s before it clears must
+    /// step 10 -> 9 after 0.4 s, or the display drifts a fraction further
+    /// behind on every tick.
+    fn tick_lockout(&mut self, now: Now, cmds: &mut Vec<FlowCmd>) -> Option<Duration> {
+        let lockout = self.lockout.as_mut()?;
+        let remaining = lockout.clears_at.saturating_duration_since(now.mono);
+        let shown = ceil_secs(remaining);
+        if shown != lockout.shown {
+            lockout.shown = shown;
+            cmds.push(FlowCmd::ShowAccountLocked {
+                remaining: Some(shown),
+            });
+        }
+        if remaining.is_zero() {
+            self.lockout = None;
+            return None;
+        }
+        Some(remaining - Duration::from_secs(shown.as_secs() - 1))
+    }
+
     /// Time-driven progress: ramp sampling, commit scheduling, reveal
     /// deadlines. Runs after every event so a wake of any kind advances the
     /// machine.
     fn advance(&mut self, now: Now, cmds: &mut Vec<FlowCmd>) {
         match self.phase {
             FlowPhase::PreLock | FlowPhase::Committing | FlowPhase::Locked => {
+                let lockout_wake = self.tick_lockout(now, cmds);
                 let Some((sample, gui_wake, elements, gui_done)) =
                     self.timeline.as_mut().map(|timeline| {
                         (
@@ -506,13 +601,15 @@ impl LockFlow {
                         )
                     })
                 else {
-                    self.wait = None;
+                    // The static locked idle state stays frame-quiet unless a
+                    // countdown is running.
+                    self.wait = lockout_wake;
                     return;
                 };
-                self.wait = match (sample.next_frame, gui_wake) {
-                    (Some(left), Some(right)) => Some(left.min(right)),
-                    (left, right) => left.or(right),
-                };
+                self.wait = [sample.next_frame, gui_wake, lockout_wake]
+                    .into_iter()
+                    .flatten()
+                    .min();
 
                 let progress = (sample.frost, sample.wallpaper);
                 if self.progress != progress {
@@ -543,7 +640,7 @@ impl LockFlow {
                 }
                 if self.phase == FlowPhase::Locked && gui_done {
                     self.timeline = None;
-                    self.wait = None;
+                    self.wait = lockout_wake;
                 }
             }
             FlowPhase::RevealPending => {
@@ -1168,6 +1265,205 @@ pub(crate) mod tests {
         assert!(has(&cmds, &FlowCmd::SetLockedHint(false)));
         assert!(has(&cmds, &FlowCmd::CreateRevealOverlays));
         assert_eq!(flow.phase(), FlowPhase::RevealPending);
+    }
+
+    /// One wrong password re-prompts exactly once — one error shown, one
+    /// fresh transaction opened. A second attempt is the user's to make.
+    #[test]
+    fn a_wrong_password_reprompts_exactly_once() {
+        let mut flow = locked_flow(&revealing_lock());
+        let cmds = flow.step(at(600), FlowEvent::AuthErr("denied".into()));
+        assert_eq!(
+            cmds.iter()
+                .filter(|cmd| matches!(cmd, FlowCmd::ShowAuthError(_)))
+                .count(),
+            1,
+            "{cmds:?}"
+        );
+        assert_eq!(
+            cmds.iter()
+                .filter(|cmd| matches!(cmd, FlowCmd::StartAuth))
+                .count(),
+            1,
+            "{cmds:?}"
+        );
+        // Nothing re-fires on a bare wake.
+        let cmds = flow.step(at(700), FlowEvent::Tick);
+        assert!(!has(&cmds, &FlowCmd::StartAuth), "{cmds:?}");
+    }
+
+    /// Issue #91. A conversation vigil broke reopens the transaction without
+    /// ever telling the user they failed an authentication: `ShowAuthError`
+    /// is the failure the user reads, and a self-inflicted transport glitch
+    /// is not one.
+    #[test]
+    fn a_lost_conversation_reopens_without_showing_a_failure() {
+        let mut flow = locked_flow(&revealing_lock());
+        let cmds = flow.step(at(600), FlowEvent::AuthConversationLost);
+        assert!(has(&cmds, &FlowCmd::StartAuth), "{cmds:?}");
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, FlowCmd::ShowAuthError(_))),
+            "a broken conversation was shown to the user as an auth failure: {cmds:?}"
+        );
+    }
+
+    /// Past the lock, a straggling conversation must not reopen anything —
+    /// the transaction it would open is one nobody answers.
+    #[test]
+    fn a_lost_conversation_after_unlock_reopens_nothing() {
+        let mut flow = locked_flow(&revealing_lock());
+        flow.step(at(700), FlowEvent::AuthOk);
+        let cmds = flow.step(at(800), FlowEvent::AuthConversationLost);
+        assert!(!has(&cmds, &FlowCmd::StartAuth), "{cmds:?}");
+    }
+
+    /// A locked flow with every ramp retired, on a clock the test drives:
+    /// `settled()` here means the only thing that can arm a wake is what the
+    /// test arms.
+    fn settled_locked_flow(base: Instant) -> LockFlow {
+        let mut flow = locked_flow(&revealing_lock());
+        flow.step(
+            Now {
+                elapsed: Duration::from_millis(10_000),
+                mono: base,
+                wall: SystemTime::now(),
+            },
+            FlowEvent::Tick,
+        );
+        assert!(flow.settled(), "the fixture must start frame-quiet");
+        flow
+    }
+
+    /// Issue #92. A faillock lockout says so, with a countdown, and never
+    /// through `ShowAuthError` — the user's password is not the problem.
+    #[test]
+    fn a_faillock_lockout_counts_down_instead_of_blaming_the_password() {
+        let base = Instant::now();
+        let now = |ms: u64| Now {
+            elapsed: Duration::from_millis(10_000 + ms),
+            mono: base + Duration::from_millis(ms),
+            wall: SystemTime::now(),
+        };
+        let mut flow = settled_locked_flow(base);
+
+        let cmds = flow.step(
+            now(0),
+            FlowEvent::AuthLocked {
+                remaining: Some(Duration::from_millis(9_400)),
+            },
+        );
+        assert!(
+            has(
+                &cmds,
+                &FlowCmd::ShowAccountLocked {
+                    remaining: Some(Duration::from_secs(10))
+                }
+            ),
+            "{cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, FlowCmd::ShowAuthError(_))),
+            "a lockout was shown as an authentication failure: {cmds:?}"
+        );
+        // The card must still have a transaction behind it for the moment
+        // the lockout clears.
+        assert!(has(&cmds, &FlowCmd::StartAuth), "{cmds:?}");
+
+        // Counting down is not settled: the flow owes a wake, and it lands on
+        // the boundary rather than a flat second later.
+        assert!(!flow.settled());
+        assert_eq!(flow.next_wake(), Some(Duration::from_millis(400)));
+
+        let cmds = flow.step(now(400), FlowEvent::Tick);
+        assert!(
+            has(
+                &cmds,
+                &FlowCmd::ShowAccountLocked {
+                    remaining: Some(Duration::from_secs(9))
+                }
+            ),
+            "{cmds:?}"
+        );
+        assert_eq!(flow.next_wake(), Some(Duration::from_secs(1)));
+
+        // A wake that changes nothing repeats nothing.
+        let cmds = flow.step(now(600), FlowEvent::Tick);
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, FlowCmd::ShowAccountLocked { .. })),
+            "{cmds:?}"
+        );
+
+        // ...and it stops, exactly once, when the lockout clears.
+        let cmds = flow.step(now(9_400), FlowEvent::Tick);
+        assert!(
+            has(
+                &cmds,
+                &FlowCmd::ShowAccountLocked {
+                    remaining: Some(Duration::ZERO)
+                }
+            ),
+            "{cmds:?}"
+        );
+        assert!(flow.settled(), "a cleared lockout kept the flow awake");
+        assert_eq!(flow.next_wake(), None);
+        let cmds = flow.step(now(12_000), FlowEvent::Tick);
+        assert!(cmds.is_empty(), "{cmds:?}");
+    }
+
+    /// A lockout that does not clear on its own is a message, not a
+    /// countdown: shown once, and it arms no wake.
+    #[test]
+    fn an_indefinite_lockout_arms_no_countdown() {
+        let base = Instant::now();
+        let mut flow = settled_locked_flow(base);
+        let cmds = flow.step(
+            Now {
+                elapsed: Duration::from_millis(10_000),
+                mono: base,
+                wall: SystemTime::now(),
+            },
+            FlowEvent::AuthLocked { remaining: None },
+        );
+        assert!(
+            has(&cmds, &FlowCmd::ShowAccountLocked { remaining: None }),
+            "{cmds:?}"
+        );
+        assert!(flow.settled());
+        assert_eq!(flow.next_wake(), None);
+    }
+
+    /// The countdown is not sticky: a later verdict of any kind replaces it,
+    /// and the flow goes quiet again.
+    #[test]
+    fn a_later_verdict_retires_the_countdown() {
+        for event in [
+            FlowEvent::AuthErr("denied".into()),
+            FlowEvent::AuthConversationLost,
+        ] {
+            let base = Instant::now();
+            let now = |ms: u64| Now {
+                elapsed: Duration::from_millis(10_000 + ms),
+                mono: base + Duration::from_millis(ms),
+                wall: SystemTime::now(),
+            };
+            let mut flow = settled_locked_flow(base);
+            flow.step(
+                now(0),
+                FlowEvent::AuthLocked {
+                    remaining: Some(Duration::from_secs(60)),
+                },
+            );
+            assert!(!flow.settled());
+            flow.step(now(100), event.clone());
+            assert!(flow.settled(), "{event:?} left the countdown running");
+            assert_eq!(flow.next_wake(), None);
+        }
     }
 
     #[test]

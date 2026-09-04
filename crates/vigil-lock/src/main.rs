@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use vigil_config::{Config, LockTransition};
 use vigil_core::{
-    AppearanceEvent, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget, LoginEvent,
-    OutputId, OutputInfo, UiMessage,
+    AppearanceEvent, AuthError, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget,
+    LoginEvent, OutputId, OutputInfo, UiMessage,
 };
 use vigil_flow::{FlowCmd, FlowEvent};
 use vigil_login::{AppearanceWatcher, LoginSession};
@@ -322,6 +322,187 @@ impl BackgroundWorker {
     }
 }
 
+/// The half of a PAM attempt the locker drives. A trait purely so the event
+/// pump can be exercised without libpam: issue #91 was a pump bug in the one
+/// place that had no harness.
+trait AuthAttempt {
+    fn respond(&self, text: String);
+    fn cancel(&mut self);
+    fn detach(&mut self);
+}
+
+impl AuthAttempt for PamAttempt {
+    fn respond(&self, text: String) {
+        PamAttempt::respond(self, text);
+    }
+    fn cancel(&mut self) {
+        PamAttempt::cancel(self);
+    }
+    fn detach(&mut self) {
+        PamAttempt::detach(self);
+    }
+}
+
+/// The live attempt bound to the channel its worker emits into.
+struct LiveAttempt<A> {
+    attempt: A,
+    events: mpsc::Receiver<AuthEvent>,
+}
+
+/// Which PAM attempt the locker is listening to — issue #91's fix.
+///
+/// Every worker used to emit into one shared channel with no attempt
+/// identity, so a superseded or detached worker's late `Done(Err)` retired
+/// whatever attempt was live at the time. That dropped the live attempt's
+/// response sender, which failed *its* blocked conversation, which produced
+/// another late `Done(Err)`: the "conversation failed" cascade that ran the
+/// user into a faillock lockout with the right password in their hands.
+///
+/// The identity here is the channel itself. A worker emits into the receiver
+/// that was created with it, and starting or retiring an attempt drops that
+/// receiver — so a stale worker's events have nowhere to go. There is no
+/// generation counter to keep in step and no comparison the pump can forget:
+/// events cannot outlive the attempt that owns them. Workers are still never
+/// joined (issue #49); they just talk into a dead channel now.
+struct AuthTrack<A = PamAttempt> {
+    live: Option<LiveAttempt<A>>,
+}
+
+impl<A: AuthAttempt> AuthTrack<A> {
+    fn new() -> Self {
+        Self { live: None }
+    }
+
+    /// Start an attempt, handing `spawn` the sender its worker must emit
+    /// into. Any previous attempt is retired by the assignment: its receiver
+    /// drops here, which is exactly what makes it unable to speak again.
+    fn start(&mut self, spawn: impl FnOnce(mpsc::Sender<AuthEvent>) -> A) {
+        let (tx, events) = mpsc::channel();
+        self.live = Some(LiveAttempt {
+            attempt: spawn(tx),
+            events,
+        });
+    }
+
+    fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Retire the attempt: the worker unwinds on its own and nothing it says
+    /// from here on is heard.
+    fn retire(&mut self) {
+        self.live = None;
+    }
+
+    fn respond(&self, text: String) {
+        if let Some(live) = &self.live {
+            live.attempt.respond(text);
+        }
+    }
+
+    fn cancel(&mut self) {
+        if let Some(live) = &mut self.live {
+            live.attempt.cancel();
+        }
+    }
+
+    /// Abandon the worker without retiring the slot: unlock must never wait
+    /// on PAM (issue #49), and the detached conversation's inevitable
+    /// `Done(Err)` is still delivered so the pump can recognise and ignore
+    /// it rather than treat it as a failed unlock.
+    fn detach(&mut self) {
+        if let Some(live) = &mut self.live {
+            live.attempt.detach();
+        }
+    }
+
+    /// Everything the *current* attempt has said since the last drain.
+    /// Collected rather than iterated in place because handling an event
+    /// mutates the track.
+    fn drain(&mut self) -> Vec<AuthEvent> {
+        self.live
+            .as_ref()
+            .map(|live| live.events.try_iter().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// How many consecutive conversation failures the locker will paper over
+/// before it stops hiding them.
+///
+/// Not zero: after the identity fix a conversation failure is a genuine
+/// anomaly the user should not be blamed for, and reopening silently is the
+/// right answer to a one-off. Not unbounded either: each reopened
+/// transaction is another `pam_authenticate` that can end in a faillock
+/// strike, so a stack that fails every time must surface rather than burn
+/// the user's remaining attempts invisibly (issue #91).
+const MAX_SILENT_CONVERSATION_RETRIES: u32 = 3;
+
+/// What a finished attempt means. Split out of the pump so the policy is
+/// testable without a compositor (issue #91).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoneOutcome {
+    /// Authenticated.
+    Authorized,
+    /// A conversation abandoned at unlock, finishing late. Not a failure.
+    Ignore,
+    /// PAM judged the credential: show it, re-prompt.
+    Denied(String),
+    /// PAM refused because faillock has the account locked. Say so, with the
+    /// time left, instead of blaming the password (issue #92).
+    LockedOut {
+        message: String,
+        remaining: Option<Duration>,
+    },
+    /// Our own conversation broke: reopen it without blaming the user.
+    ReopenQuietly(String),
+    /// Conversations keep breaking. Stop hiding it.
+    Surface(String),
+}
+
+/// `unlocked`: the lock is already released, so any straggling conversation
+/// is one we abandoned. `losses`: consecutive conversation failures so far,
+/// this one included.
+fn done_outcome(result: Result<(), AuthError>, unlocked: bool, losses: u32) -> DoneOutcome {
+    match result {
+        Ok(()) => DoneOutcome::Authorized,
+        // A detached conversation (grace / loginctl unlock) finishing late is
+        // not an auth failure: opening another PAM transaction here means a
+        // conversation nobody answers — a logged failure per unlock, and a
+        // pam_faillock strike against the user.
+        Err(_) if unlocked => DoneOutcome::Ignore,
+        Err(AuthError::Denied(message)) => DoneOutcome::Denied(message),
+        Err(AuthError::Locked { message, remaining }) => {
+            DoneOutcome::LockedOut { message, remaining }
+        }
+        Err(AuthError::Conversation(message)) => {
+            if losses > MAX_SILENT_CONVERSATION_RETRIES {
+                DoneOutcome::Surface(message)
+            } else {
+                DoneOutcome::ReopenQuietly(message)
+            }
+        }
+    }
+}
+
+/// The lockout line the user reads (issue #92).
+///
+/// Deliberately not "authentication failed": the whole point is that this
+/// user's password is probably fine and the account is the problem. The
+/// countdown is what turns a mystery into a wait.
+fn account_locked_message(remaining: Option<Duration>) -> String {
+    let Some(remaining) = remaining else {
+        // unlock_time = 0: nothing but `faillock --reset` clears it.
+        return "Account locked \u{2014} it will not unlock on its own".into();
+    };
+    let seconds = remaining.as_secs();
+    match (seconds / 60, seconds % 60) {
+        (0, 0) => "Account unlocked \u{2014} try again".into(),
+        (0, s) => format!("Account locked \u{2014} try again in {s}s"),
+        (m, s) => format!("Account locked \u{2014} try again in {m}m {s:02}s"),
+    }
+}
+
 struct Locker {
     platform: VigilPlatform,
     theme: Theme,
@@ -335,9 +516,10 @@ struct Locker {
     clock_format: String,
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
-    auth_rx: mpsc::Receiver<AuthEvent>,
-    auth_tx: mpsc::Sender<AuthEvent>,
-    attempt: Option<PamAttempt>,
+    auth: AuthTrack,
+    /// Consecutive conversation failures with no PAM verdict and no user
+    /// input in between; reset by either.
+    conversation_losses: u32,
     login: Option<LoginSession>,
     login_rx: mpsc::Receiver<LoginEvent>,
     login_tx: mpsc::Sender<LoginEvent>,
@@ -418,7 +600,6 @@ impl Locker {
         let theme = Theme::load_or_default(cli.theme.as_deref());
         let clock_format = config.look.clock_format.clone();
         let event_waker = Arc::new(Mutex::new(None));
-        let (auth_tx, auth_rx) = mpsc::channel();
         let (login_tx, login_rx) = forwarded_channel(event_waker.clone());
         let (appearance_tx, appearance_rx) = forwarded_channel(event_waker.clone());
         let monitor_profiles = config
@@ -464,9 +645,8 @@ impl Locker {
             clock_format: clock_format.clone(),
             caps_lock: false,
             queue: Rc::default(),
-            auth_rx,
-            auth_tx,
-            attempt: None,
+            auth: AuthTrack::new(),
+            conversation_losses: 0,
             login: LoginSession::connect(),
             login_rx,
             login_tx,
@@ -516,14 +696,16 @@ impl Locker {
             self.lock_ipc.lock().expect("lock IPC poisoned").locked,
             "PAM conversation must not start before the compositor grants the lock"
         );
-        let tx = self.auth_tx.clone();
         let waker = self.event_waker.clone();
-        self.attempt = Some(PamAttempt::start(&self.user, move |event| {
-            let _ = tx.send(event);
-            if let Some(wake) = waker.lock().expect("event waker poisoned").as_ref() {
-                wake.wake();
-            }
-        }));
+        let user = self.user.clone();
+        self.auth.start(move |tx| {
+            PamAttempt::start(&user, move |event| {
+                let _ = tx.send(event);
+                if let Some(wake) = waker.lock().expect("event waker poisoned").as_ref() {
+                    wake.wake();
+                }
+            })
+        });
     }
 
     /// Executor for [`FlowCmd::SignalReady`]: the compositor holds the lock
@@ -566,7 +748,11 @@ impl Locker {
     }
 
     fn pump_auth(&mut self) {
-        while let Ok(event) = self.auth_rx.try_recv() {
+        // Only the live attempt's channel is drained. A worker that was
+        // superseded or detached talks into a receiver that no longer
+        // exists, so it cannot retire the attempt the user is typing into
+        // (issue #91).
+        for event in self.auth.drain() {
             match event {
                 AuthEvent::Prompt { text, secret } => {
                     self.snapshot.on_prompt(&text, secret);
@@ -580,27 +766,57 @@ impl Locker {
                     self.snapshot.error = text.clone();
                     self.each_window(|w| w.show_error(&text));
                 }
-                AuthEvent::Done(Ok(())) => {
-                    self.pending.push(FlowEvent::AuthOk);
+                // Exactly one Done ends an attempt, and nothing it emitted
+                // can follow it; the pump stops rather than reasoning about
+                // events that belong to an attempt it just retired.
+                AuthEvent::Done(result) => {
+                    self.finish_attempt(result);
                     return;
                 }
-                AuthEvent::Done(Err(_)) if self.unlocked => {
-                    // A detached conversation (grace / loginctl unlock)
-                    // finishing late is not an auth failure: starting
-                    // another PAM transaction here opened a conversation
-                    // nobody answers — a logged failure per unlock, and a
-                    // pam_faillock strike against the user.
-                }
-                AuthEvent::Done(Err(message)) => {
-                    // Retire the dead conversation here, not when the
-                    // controller's reply arrives: pump_ui runs later in this
-                    // same tick and would otherwise respond() into it and
-                    // silently lose the submission.
-                    self.attempt = None;
-                    // The controller decides the retry (a fresh PAM
-                    // transaction per attempt, hyprlock's model).
-                    self.pending.push(FlowEvent::AuthErr(message));
-                }
+            }
+        }
+    }
+
+    /// Apply a finished attempt's verdict. Retires the conversation here
+    /// rather than when the controller's reply arrives: pump_ui runs later
+    /// in this same tick and would otherwise respond() into a dead
+    /// conversation and silently lose the submission.
+    fn finish_attempt(&mut self, result: Result<(), AuthError>) {
+        let conversation = result
+            .as_ref()
+            .err()
+            .is_some_and(AuthError::is_conversation);
+        self.conversation_losses = if conversation {
+            self.conversation_losses + 1
+        } else {
+            0
+        };
+        match done_outcome(result, self.unlocked, self.conversation_losses) {
+            DoneOutcome::Authorized => self.pending.push(FlowEvent::AuthOk),
+            DoneOutcome::Ignore => {}
+            DoneOutcome::Denied(message) => {
+                self.auth.retire();
+                // The controller decides the retry (a fresh PAM transaction
+                // per attempt, hyprlock's model).
+                self.pending.push(FlowEvent::AuthErr(message));
+            }
+            DoneOutcome::LockedOut { message, remaining } => {
+                eprintln!("vigil-lock: account is faillocked ({message})");
+                self.auth.retire();
+                self.pending.push(FlowEvent::AuthLocked { remaining });
+            }
+            DoneOutcome::ReopenQuietly(message) => {
+                eprintln!("vigil-lock: PAM conversation lost ({message}); reopening");
+                self.auth.retire();
+                self.pending.push(FlowEvent::AuthConversationLost);
+            }
+            DoneOutcome::Surface(message) => {
+                eprintln!(
+                    "vigil-lock: {} conversation failures in a row; surfacing the last ({message})",
+                    self.conversation_losses
+                );
+                self.auth.retire();
+                self.pending.push(FlowEvent::AuthErr(message));
             }
         }
     }
@@ -611,19 +827,16 @@ impl Locker {
             let Some(msg) = msg else { break };
             match msg {
                 UiMessage::Respond(text) => {
-                    if self.attempt.is_some() {
+                    if self.auth.is_live() {
                         self.snapshot.busy = true;
                         self.each_window(|w| w.set_busy(true));
+                        // The user is driving again: whatever ran the quiet
+                        // reopen budget down was transient.
+                        self.conversation_losses = 0;
                     }
-                    if let Some(attempt) = &self.attempt {
-                        attempt.respond(text);
-                    }
+                    self.auth.respond(text);
                 }
-                UiMessage::Cancel => {
-                    if let Some(attempt) = &mut self.attempt {
-                        attempt.cancel();
-                    }
-                }
+                UiMessage::Cancel => self.auth.cancel(),
                 // A locker has no session picker; power actions are policy
                 // for L2.
                 // A locker has no session or user picker; power actions are
@@ -704,9 +917,7 @@ impl Locker {
         // while a conversation is mid-flight (or a module is wedged outside
         // it — pam_fprintd waiting on a finger), and the teardown drop of a
         // joining attempt was exactly issue #49's immortal-locker hang.
-        if let Some(attempt) = &mut self.attempt {
-            attempt.detach();
-        }
+        self.auth.detach();
         self.unlocked = true;
         // Belt and braces: teardown after this point should be milliseconds
         // (roundtrip + drops). If anything else wedges — a stuck D-Bus
@@ -1004,7 +1215,7 @@ impl LockSession for Locker {
                 }
             }
             FlowCmd::StartAuth => {
-                if self.attempt.is_none() {
+                if !self.auth.is_live() {
                     self.start_attempt();
                 }
             }
@@ -1016,9 +1227,21 @@ impl LockSession for Locker {
                     window.show_error(&message);
                     window.set_busy(false);
                 });
-                // The controller pairs this with StartAuth: a fresh PAM
-                // transaction per attempt re-prompts.
-                self.attempt = None;
+                // Deliberately does NOT retire the attempt. `finish_attempt`
+                // already did, before it raised the AuthErr this command
+                // answers, and the controller pairs the command with
+                // StartAuth — so retiring here could only ever hit an
+                // attempt started *since*, which is issue #91's whole
+                // failure mode. Retiring belongs where the verdict arrives.
+            }
+            FlowCmd::ShowAccountLocked { remaining } => {
+                let message = account_locked_message(*remaining);
+                self.snapshot.error = message.clone();
+                self.snapshot.busy = false;
+                self.each_window(move |window| {
+                    window.show_error(&message);
+                    window.set_busy(false);
+                });
             }
             FlowCmd::DetachAuth => self.detach_auth(),
             FlowCmd::SetLockedHint(on) => {
@@ -1427,6 +1650,237 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// Stands in for `PamAttempt` so the event pump's identity rules can be
+    /// tested without libpam, a compositor, or a real password.
+    #[derive(Default)]
+    struct FakeAttempt {
+        answered: Rc<RefCell<Vec<String>>>,
+        cancelled: Rc<std::cell::Cell<bool>>,
+        detached: Rc<std::cell::Cell<bool>>,
+    }
+
+    impl AuthAttempt for FakeAttempt {
+        fn respond(&self, text: String) {
+            self.answered.borrow_mut().push(text);
+        }
+        fn cancel(&mut self) {
+            self.cancelled.set(true);
+        }
+        fn detach(&mut self) {
+            self.detached.set(true);
+        }
+    }
+
+    /// Start an attempt and hand back the sender its "worker" would emit on.
+    fn start(track: &mut AuthTrack<FakeAttempt>) -> mpsc::Sender<AuthEvent> {
+        let mut sender = None;
+        track.start(|tx| {
+            sender = Some(tx);
+            FakeAttempt::default()
+        });
+        sender.expect("start must hand the worker a sender")
+    }
+
+    /// **Issue #91's regression test** — the race that locked the user out of
+    /// their own machine.
+    ///
+    /// A superseded worker keeps running (vigil-pam never joins it, issue
+    /// #49) and errors out late. While every worker emitted into one shared
+    /// channel with no attempt identity, that late `Done(Err)` retired
+    /// whatever attempt was live *at the time it arrived* — dropping the
+    /// response sender of the conversation the user was typing into, which
+    /// failed that conversation, which produced another late `Done(Err)`.
+    /// Six lockers and three faillock strikes later the correct password
+    /// stopped working.
+    #[test]
+    fn a_superseded_worker_cannot_touch_the_live_attempt() {
+        let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
+        let stale = start(&mut track);
+        // A retry supersedes it. The first worker is still running.
+        let live = start(&mut track);
+
+        // Exactly what a dying vigil-pam worker emits, in order.
+        let _ = stale.send(AuthEvent::Error("conversation failed".into()));
+        let _ = stale.send(AuthEvent::Done(Err(AuthError::Conversation(
+            "Authentication failure".into(),
+        ))));
+
+        assert_eq!(
+            track.drain(),
+            Vec::new(),
+            "a superseded worker was heard by the live attempt"
+        );
+        assert!(
+            track.is_live(),
+            "a superseded worker retired the attempt the user is typing into"
+        );
+
+        // ...and the live attempt is still able to speak for itself.
+        let _ = live.send(AuthEvent::Prompt {
+            text: "Password:".into(),
+            secret: true,
+        });
+        assert_eq!(
+            track.drain(),
+            vec![AuthEvent::Prompt {
+                text: "Password:".into(),
+                secret: true
+            }]
+        );
+    }
+
+    /// The other half of the identity rule: once an attempt is retired,
+    /// nothing it says afterwards is heard either. Retiring is what the
+    /// wrong-password path does before the controller starts the next
+    /// attempt, and the retired worker's `Done(Err)` always arrives after.
+    #[test]
+    fn a_retired_attempt_is_deaf() {
+        let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
+        let worker = start(&mut track);
+        track.retire();
+        let _ = worker.send(AuthEvent::Done(Err(AuthError::Conversation("late".into()))));
+        assert!(track.drain().is_empty());
+        assert!(!track.is_live());
+    }
+
+    /// Detaching (issue #49: unlock must never wait on PAM) leaves the slot
+    /// in place on purpose, so the abandoned conversation's inevitable
+    /// `Done(Err)` is still delivered — and recognised as the non-event it
+    /// is rather than logged as a failed unlock.
+    #[test]
+    fn a_detached_attempt_still_reports_so_the_pump_can_ignore_it() {
+        let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
+        let worker = start(&mut track);
+        track.detach();
+        let err = AuthError::Conversation("Authentication failure".into());
+        let _ = worker.send(AuthEvent::Done(Err(err.clone())));
+        assert_eq!(track.drain(), vec![AuthEvent::Done(Err(err.clone()))]);
+        assert_eq!(done_outcome(Err(err), true, 1), DoneOutcome::Ignore);
+    }
+
+    #[test]
+    fn responses_and_cancellation_reach_the_live_attempt_only() {
+        let answered: Rc<RefCell<Vec<String>>> = Rc::default();
+        let cancelled: Rc<std::cell::Cell<bool>> = Rc::default();
+        let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
+        let (answered_probe, cancelled_probe) = (answered.clone(), cancelled.clone());
+        track.start(move |_tx| FakeAttempt {
+            answered: answered_probe,
+            cancelled: cancelled_probe,
+            detached: Rc::default(),
+        });
+        track.respond("hunter2".into());
+        track.cancel();
+        assert_eq!(*answered.borrow(), vec!["hunter2".to_owned()]);
+        assert!(cancelled.get());
+
+        // Nothing to talk to once retired, and no panic for trying.
+        track.retire();
+        track.respond("hunter2".into());
+        assert_eq!(answered.borrow().len(), 1);
+    }
+
+    /// A genuine wrong password is still a genuine wrong password: the user
+    /// sees it and the controller re-prompts. Nothing about the conversation
+    /// classification may soften that.
+    #[test]
+    fn a_rejected_credential_is_still_shown_and_reprompted() {
+        assert_eq!(
+            done_outcome(
+                Err(AuthError::Denied("Authentication failure".into())),
+                false,
+                0
+            ),
+            DoneOutcome::Denied("Authentication failure".into())
+        );
+        assert_eq!(done_outcome(Ok(()), false, 0), DoneOutcome::Authorized);
+    }
+
+    /// Stage 2. A conversation vigil broke is not a credential failure, so it
+    /// must not travel the path the user reads as one — but it cannot be
+    /// hidden forever either, because every quiet reopen is another
+    /// `pam_authenticate` that faillock can strike.
+    #[test]
+    fn a_broken_conversation_reopens_quietly_but_not_forever() {
+        let broken = || AuthError::Conversation("Authentication failure".into());
+        for losses in 1..=MAX_SILENT_CONVERSATION_RETRIES {
+            assert_eq!(
+                done_outcome(Err(broken()), false, losses),
+                DoneOutcome::ReopenQuietly("Authentication failure".into()),
+                "loss {losses}"
+            );
+        }
+        assert_eq!(
+            done_outcome(Err(broken()), false, MAX_SILENT_CONVERSATION_RETRIES + 1),
+            DoneOutcome::Surface("Authentication failure".into())
+        );
+    }
+
+    /// Issue #92. The lockout line has to be legible at a glance and never
+    /// read as "you typed it wrong".
+    #[test]
+    fn the_lockout_line_says_locked_and_counts_down() {
+        let line = |secs| account_locked_message(Some(Duration::from_secs(secs)));
+        assert_eq!(line(581), "Account locked \u{2014} try again in 9m 41s");
+        assert_eq!(line(600), "Account locked \u{2014} try again in 10m 00s");
+        assert_eq!(line(41), "Account locked \u{2014} try again in 41s");
+        assert_eq!(line(0), "Account unlocked \u{2014} try again");
+        assert_eq!(
+            account_locked_message(None),
+            "Account locked \u{2014} it will not unlock on its own"
+        );
+        for secs in [1u64, 59, 60, 600] {
+            assert!(line(secs).starts_with("Account locked"), "{}", line(secs));
+        }
+    }
+
+    /// A lockout, a denial and a broken conversation are three different
+    /// things and must stay three different things: the #91 bug was two of
+    /// them sharing a path, and #92 is the third hiding inside the second.
+    #[test]
+    fn a_lockout_is_neither_a_denial_nor_a_conversation_failure() {
+        let remaining = Some(Duration::from_secs(581));
+        assert_eq!(
+            done_outcome(
+                Err(AuthError::Locked {
+                    message: "Authentication failure".into(),
+                    remaining,
+                }),
+                false,
+                0
+            ),
+            DoneOutcome::LockedOut {
+                message: "Authentication failure".into(),
+                remaining,
+            }
+        );
+        // A conversation failure can never be dressed up as a lockout, no
+        // matter how many of them there have been.
+        for losses in [1, MAX_SILENT_CONVERSATION_RETRIES + 1] {
+            assert!(!matches!(
+                done_outcome(
+                    Err(AuthError::Conversation("Authentication failure".into())),
+                    false,
+                    losses
+                ),
+                DoneOutcome::LockedOut { .. }
+            ));
+        }
+        // ...and a lockout past the release is still nothing to act on.
+        assert_eq!(
+            done_outcome(
+                Err(AuthError::Locked {
+                    message: "no".into(),
+                    remaining
+                }),
+                true,
+                0
+            ),
+            DoneOutcome::Ignore
+        );
+    }
 
     #[test]
     fn wait_requests_blocking_lock_readiness() {

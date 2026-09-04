@@ -679,6 +679,7 @@ impl Simulator {
                 // being silently swallowed into a green scenario baseline.
                 FlowCmd::StartAuth
                 | FlowCmd::ShowAuthError(_)
+                | FlowCmd::ShowAccountLocked { .. }
                 | FlowCmd::DetachAuth
                 | FlowCmd::SetLockedHint(_)
                 | FlowCmd::SignalReady

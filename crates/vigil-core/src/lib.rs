@@ -399,6 +399,57 @@ pub enum UiMessage {
     Power(PowerAction),
 }
 
+/// Why an attempt ended without authenticating.
+///
+/// The split is load-bearing, not cosmetic (issue #91). A locker that shows
+/// "authentication failed" for its own broken conversation teaches the user
+/// to retype a password that was never wrong, and every retype is another
+/// `pam_authenticate` that `pam_faillock` can strike — three strikes and the
+/// correct password stops working. Only PAM's verdict on a credential may
+/// drive the failure the user sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthError {
+    /// PAM evaluated the credential and said no. A real, countable
+    /// authentication failure.
+    Denied(String),
+    /// PAM said no because `pam_faillock` has the account locked, not
+    /// because this password was wrong (issue #92). Indistinguishable from
+    /// `Denied` by return code — the tally is what tells them apart — and
+    /// worth telling apart, because "wrong password" is a lie to someone
+    /// holding the right one. `remaining` is `None` when the lockout does
+    /// not clear on its own.
+    Locked {
+        message: String,
+        remaining: Option<std::time::Duration>,
+    },
+    /// The conversation or transport broke before PAM could judge anything:
+    /// the response channel was dropped (the attempt was superseded,
+    /// cancelled or detached), or the transaction could not be built at all.
+    /// vigil's fault, not the user's.
+    Conversation(String),
+}
+
+impl AuthError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Denied(message) | Self::Locked { message, .. } | Self::Conversation(message) => {
+                message
+            }
+        }
+    }
+
+    /// True when nothing judged the credential — the failure is ours.
+    pub fn is_conversation(&self) -> bool {
+        matches!(self, Self::Conversation(_))
+    }
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 /// Events flowing from an auth backend's worker (PAM conversation thread)
 /// to the UI loop. The greetd backend drives `AuthUi` in-loop and does not
 /// need these; the PAM backend crosses a thread boundary and does.
@@ -410,8 +461,8 @@ pub enum AuthEvent {
     },
     Info(String),
     Error(String),
-    /// The attempt finished: `Ok` = authenticated, `Err` = failure message.
-    Done(Result<(), String>),
+    /// The attempt finished: `Ok` = authenticated, `Err` = why not.
+    Done(Result<(), AuthError>),
 }
 
 /// logind session events (org.freedesktop.login1), delivered from
