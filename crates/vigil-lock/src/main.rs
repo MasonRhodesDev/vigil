@@ -168,6 +168,19 @@ fn appearance_fit(fit: appearance_profiles::Fit) -> BackgroundFit {
     }
 }
 
+/// Whether a warning→lock rebind at `configured` pixels can keep the scene
+/// laid out at `scene`, or has to rebuild it.
+///
+/// "Rebind" means the same output's scene moving from the warning layer
+/// surface to the session-lock surface. It is only a rebind while the
+/// geometry holds: the software backend refuses a target whose dimensions
+/// disagree with the scene, so a mismatched rebind renders nothing, forever
+/// — the output would stay black for the whole locked session (issue #40's
+/// mixed-fractional-scale case, found while fixing issue #86).
+fn rebound_needs_resize(scene: (u32, u32), configured: (u32, u32)) -> bool {
+    scene != configured
+}
+
 struct Entry {
     id: OutputId,
     connector: String,
@@ -872,10 +885,23 @@ impl LockSession for Locker {
         self.output_ready(id, info);
     }
 
-    fn output_rebound(&mut self, id: OutputId, _info: &OutputInfo) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
-            entry.window.request_present();
+    fn output_rebound(&mut self, id: OutputId, info: &OutputInfo) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return;
+        };
+        if rebound_needs_resize(entry.window.scene_size(), (info.width, info.height)) {
+            // The rebind is only free at unchanged geometry. Under mixed
+            // fractional scale (issue #40) the lock surface's configure can
+            // land at a different pixel size than the warning's, and the
+            // retained scene cannot fill that buffer: SoftwareBackend::render
+            // rejects a target whose dimensions disagree with the scene, so
+            // every present for this output answers false and the output
+            // stays black for the whole session. Rebuild at the size the
+            // compositor actually acked.
+            self.output_resized(id, info);
+            return;
         }
+        entry.window.request_present();
     }
 
     fn force_repaint(&mut self, id: OutputId) {
@@ -1430,6 +1456,23 @@ mod tests {
     fn user_resolution_fails_closed_without_any_source() {
         let error = resolve_user(None, None, None).unwrap_err();
         assert!(error.contains("pass --user"), "{error}");
+    }
+
+    #[test]
+    fn a_rebind_at_a_new_size_rebuilds_the_scene() {
+        // Unchanged geometry is the whole point of the rebind: the decoded
+        // wallpaper and the laid-out scene survive the move from the warning
+        // layer surface to the lock surface.
+        assert!(!rebound_needs_resize((3840, 2160), (3840, 2160)));
+        // A configure at any other size is not a rebind. vigil-ui's software
+        // backend refuses a target that disagrees with the scene (asserted
+        // over there), so keeping the old scene means every present for this
+        // output answers false — black for the whole locked session, not one
+        // frame. Mixed fractional scale is how the sizes come to disagree
+        // (issue #40).
+        assert!(rebound_needs_resize((3840, 2160), (3200, 1800)));
+        assert!(rebound_needs_resize((3840, 2160), (2160, 3840)));
+        assert!(rebound_needs_resize((3840, 2160), (3841, 2160)));
     }
 
     #[test]

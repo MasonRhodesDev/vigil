@@ -1507,6 +1507,38 @@ mod tests {
             "a scene asked to repaint must still report it owes a present"
         );
 
+        // A target that disagrees with the scene renders NOTHING, and asking
+        // again never helps — the scene has to be rebuilt at the new size.
+        // This is why a warning→lock rebind at a changed pixel size is not a
+        // rebind: vigil-lock's `rebound_needs_resize` exists because keeping
+        // the retained scene here would leave that output black for the
+        // whole locked session (issue #40 geometry, issue #86 handoff). The
+        // integration itself only shows up on a compositor that configures
+        // the lock surface differently from the layer surface, so the seam
+        // is asserted from both sides instead.
+        assert_eq!(window.scene_size(), (2, 2));
+        let mut wrong = vec![0_u8; 36];
+        assert!(
+            !window.render_if_needed(FrameTarget {
+                buffer: &mut wrong,
+                width: 3,
+                height: 3,
+                stride: 12,
+            }),
+            "a mismatched target must be refused, not partially painted"
+        );
+        assert_eq!(wrong, vec![0_u8; 36], "a refused render must not write");
+        assert!(
+            window.scene_needs_present(),
+            "a refused render must leave the present still owed"
+        );
+        assert!(window.render_if_needed(FrameTarget {
+            buffer: &mut buffer,
+            width: 2,
+            height: 2,
+            stride: 8,
+        }));
+
         let source = r#"
             export component Native inherits Window {
                 in property <bool> native-background: false;
