@@ -5245,6 +5245,7 @@ name = "vigil-wayland"
 version = "0.4.0"
 dependencies = [
  "calloop-wayland-source 0.4.1",
+ "libc",
  "slint-idle-runtime",
  "smithay-client-toolkit 0.21.1",
  "tracing",

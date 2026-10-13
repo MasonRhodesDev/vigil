@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# sigaction and the self-pipe that turn SIGTERM/SIGINT/SIGHUP into a flow
+# event (issue #79); nothing else here is unsafe or platform-specific.
+libc.workspace = true
 slint-idle-runtime.workspace = true
 tracing.workspace = true
 vigil-core.workspace = true

@@ -1548,8 +1548,11 @@ fn main() {
     // is insurance, not the active mechanism: every span lives inside
     // `run_with_lock`, which returns before any of the exit calls below
     // run, so their open set is empty - no captured trace has ever carried
-    // a `status=exit` record. It pays off on future exit paths, and for
-    // signal handling (vigil#79), where spans genuinely are still open.
+    // a `status=exit` record. SIGTERM, SIGINT and SIGHUP are not the
+    // exception they used to be: vigil-wayland turns them into a flow
+    // event (vigil#79), so a signalled locker leaves through the same match
+    // at the bottom of this function with its spans already closed. Only
+    // SIGKILL and a crash still lose what is open.
     //
     // The allowlist is "vigil" and nothing else. Installing a subscriber
     // makes this process collect every instrumented crate in its tree, and
@@ -1649,22 +1652,29 @@ fn main() {
         }
     };
     let _lock_ipc_socket = lock_ipc_socket;
-    match vigil_wayland::run_with_lock(locker, &lock_policy, None) {
-        Ok(LockOutcome::Unlocked) => span_lines::exit(0),
-        Ok(LockOutcome::Denied) => {
-            eprintln!("vigil-lock: lock denied (another locker running?)");
-            span_lines::exit(2);
-        }
-        Ok(LockOutcome::Invalidated) => {
-            eprintln!("vigil-lock: lock invalidated by the compositor");
-            span_lines::exit(1);
-        }
-        Ok(LockOutcome::Cancelled) => span_lines::exit(3),
+    let outcome = match vigil_wayland::run_with_lock(locker, &lock_policy, None) {
+        Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("vigil-lock: {e}");
             span_lines::exit(1);
         }
+    };
+    match outcome {
+        LockOutcome::Unlocked | LockOutcome::Cancelled => {}
+        LockOutcome::Denied => eprintln!("vigil-lock: lock denied (another locker running?)"),
+        LockOutcome::Invalidated => eprintln!("vigil-lock: lock invalidated by the compositor"),
+        // Said in words because the exit code alone (128 + signal) reads
+        // like a crash. The compositor keeps a lock whose client goes away,
+        // so a locked session stays locked; nothing here released it.
+        LockOutcome::Terminated(signal) => eprintln!(
+            "vigil-lock: {} received; exiting, a held session lock stays held by the compositor",
+            signal.name()
+        ),
     }
+    // The exit code is the outcome's (vigil-flow owns the table): 0, 1, 2,
+    // 3 as before, and 128 + the signal number for a termination, which is
+    // what the parent saw when the signal killed the process outright.
+    span_lines::exit(outcome.exit_code());
 }
 
 #[cfg(test)]

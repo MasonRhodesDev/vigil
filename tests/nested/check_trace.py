@@ -31,7 +31,35 @@ and asserts:
   --no-reveal          no vigil-reveal overlay was ever created (the
                        instant-unlock default: reveal is opt-in only)
   --no-layer           no layer surface at all (`--immediate` path)
+  --session-outcome V  the span-lines trace on the same stderr is complete:
+                       exactly one `span=lock.session` record, carrying
+                       `outcome=V`, and no record names a parent that was
+                       never written (see "Closing the trace" below)
+  --no-unlock          the lock object was never released or destroyed by
+                       the client: no ext_session_lock_v1.unlock_and_destroy
+                       and no ext_session_lock_v1.destroy request
   --no-capture-only    only run the capture-bind check
+
+Closing the trace (issue #79)
+-----------------------------
+vigil-lock writes span-lines records (`span=... id=... parent=...`) onto the
+stderr this harness captures, beside the protocol lines. The root is the
+`lock.session` span, written when the run ends with its outcome; every
+phase, loop iteration and frame names it (or a child of it) as parent. A
+locker that dies from a signal writes none of it: no destructor runs, so the
+root is simply absent and every record that pointed at it dangles. The
+measurement that opened #79 was 33 `loop.iteration` records with a missing
+parent after SIGTERM, against zero after a clean exit. `--session-outcome`
+is that measurement as a gate: the root exists, once, says how the run
+ended, and nothing dangles. `SPAN_LINES=frames` in the locker's environment
+is what makes the per-wake records exist to be checked.
+
+`--no-unlock` is the other half of the same scenario. A signal must leave the
+compositor's lock exactly as the process dying would have, and the protocol
+says what that is: "if the client dies while the session is locked, the
+compositor must not unlock the session in response". WAYLAND_DEBUG prints a
+request when it is marshalled, flushed or not, so a trace with neither
+unlock_and_destroy nor destroy is proof the client never asked for either.
 
 Layer surfaces are classified by the namespace passed to
 get_layer_surface: "vigil-warning" (pre-lock overlay, --handoff) versus
@@ -124,6 +152,31 @@ def parse_record(line):
             fields[key] = value
     return fields
 
+
+def dangling_parents(records):
+    """Records naming a parent id no span record carries, and a summary.
+
+    The root has `parent=-`. Everything else points at a span that must have
+    been written by the time the process ended; a span still open when the
+    process dies is never written, and every child it had dangles. The
+    summary groups them as the issue did (`33x loop.iteration -> missing
+    parent <id>`), so a failure reads as a shape rather than a count.
+    """
+    ids = {r["id"] for r in records if "id" in r}
+    dangling = [
+        r for r in records
+        if r.get("parent", "-") != "-" and r["parent"] not in ids
+    ]
+    counts = {}
+    for record in dangling:
+        key = (record.get("span") or record.get("event") or "?", record["parent"])
+        counts[key] = counts.get(key, 0) + 1
+    summary = "; ".join(
+        f"{n}x {name} -> missing parent {parent}"
+        for (name, parent), n in sorted(counts.items(), key=lambda kv: -kv[1])
+    )
+    return dangling, summary
+
 def locked_to_commit(locked_ms, first_lock_commit_ms, handoff_outputs):
     """{wl_output: ms} from the `locked` event to that output's first buffer.
 
@@ -180,6 +233,8 @@ def main():
     ap.add_argument("--reveal", action="store_true")
     ap.add_argument("--no-reveal", action="store_true")
     ap.add_argument("--no-layer", action="store_true")
+    ap.add_argument("--session-outcome", metavar="OUTCOME")
+    ap.add_argument("--no-unlock", action="store_true")
     ap.add_argument("--no-capture-only", action="store_true")
     args = ap.parse_args()
 
@@ -187,6 +242,8 @@ def main():
     locked_seen = False
     locked_line = None
     unlock_line = None
+    lock_destroy_line = None  # ext_session_lock_v1.destroy (never after locked)
+    span_records = []       # every span-lines record, parsed (issue #79)
     lock_surfaces = {}      # ext_session_lock_surface id -> wl_surface id
     warning_surfaces = {}   # zwlr_layer_surface id -> wl_surface id
     pending_attach = {}     # wl_surface id -> has non-null buffer attached
@@ -229,6 +286,10 @@ def main():
 
     with open(args.trace, errors="replace") as fh:
         for lineno, line in enumerate(fh):
+            if line.startswith(("span=", "event=")):
+                # A span-lines record: kept whole for the completeness check,
+                # then frame.hash falls through to its own handling below.
+                span_records.append(parse_record(line))
             if HASH.match(line):
                 record = parse_record(line)
                 output, role = record.get("output"), record.get("role")
@@ -285,6 +346,8 @@ def main():
                             handoff_outputs.add(output.group(1))
                 elif iface == "ext_session_lock_v1" and req == "unlock_and_destroy":
                     unlock_line = lineno
+                elif iface == "ext_session_lock_v1" and req == "destroy":
+                    lock_destroy_line = lineno
                 elif iface == "wl_surface" and req == "attach":
                     pending_attach[oid] = ("wl_buffer#" in req_args or "wl_buffer@" in req_args) or re.match(r"\s*\d+", req_args or "")
                 elif iface == "wl_surface" and req == "commit":
@@ -336,6 +399,8 @@ def main():
 
     gaps = handoff_gaps(lock_request_ms, first_lock_commit_ms, warning_commits_ms)
     uncovered = locked_to_commit(locked_ms, first_lock_commit_ms, handoff_outputs)
+    sessions = [r for r in span_records if r.get("span") == "lock.session"]
+    dangling, dangling_summary = dangling_parents(span_records)
     failures = []
     if capture_binds:
         for lineno, line in capture_binds:
@@ -435,6 +500,56 @@ def main():
                 f"--no-reveal: {len(reveal_surfaces)} vigil-reveal surface(s) created; "
                 "instant unlock must not create a reveal overlay"
             )
+        if args.session_outcome is not None:
+            if len(sessions) != 1:
+                died = (
+                    " (no root at all: the locker left without closing its trace, #79)"
+                    if not sessions
+                    else ""
+                )
+                failures.append(
+                    f"--session-outcome: expected exactly one lock.session record, "
+                    f"found {len(sessions)}{died}"
+                )
+            elif sessions[0].get("outcome") != args.session_outcome:
+                failures.append(
+                    f"--session-outcome: lock.session carries "
+                    f"outcome={sessions[0].get('outcome', '<absent>')}, "
+                    f"expected {args.session_outcome}"
+                )
+            if dangling:
+                failures.append(
+                    f"--session-outcome: {len(dangling)} record(s) name a parent that "
+                    f"was never written: {dangling_summary}"
+                )
+        if args.no_unlock:
+            if unlock_line is not None:
+                failures.append(
+                    f"--no-unlock: unlock_and_destroy sent at line {unlock_line}; "
+                    "a signal must not release the session lock"
+                )
+            if lock_destroy_line is not None:
+                failures.append(
+                    f"--no-unlock: ext_session_lock_v1.destroy sent at line "
+                    f"{lock_destroy_line}; the lock object must be left to the compositor"
+                )
+
+    # The span-lines side of the trace: how many records, how many per-wake
+    # spans, whether the root arrived and what it said, and what dangles.
+    # Printed pass or fail for the same reason the gap numbers are: it is the
+    # number #79 was measured in. Only when the completeness gate is asked
+    # for, though: a capture read while the detached locker is still running
+    # (S2, S7b) dangles by construction, and printing that beside "ok" would
+    # read as a defect nobody is gating.
+    if args.session_outcome is not None:
+        outcomes = ",".join(s.get("outcome", "<absent>") for s in sessions) or "<none>"
+        print(
+            f"check_trace: trace records={len(span_records)} "
+            f"loop_iterations={sum(1 for r in span_records if r.get('span') == 'loop.iteration')} "
+            f"lock_session={len(sessions)} outcome={outcomes} "
+            f"dangling={len(dangling)}"
+            + (f" ({dangling_summary})" if dangling else "")
+        )
 
     # Printed on every run that measured one, pass or fail: a gate nobody
     # can read the number behind is a gate nobody retunes. `locked` is here

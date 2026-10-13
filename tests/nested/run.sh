@@ -7,7 +7,8 @@
 # XDG_RUNTIME_DIR. Every vigil-lock run is traced with WAYLAND_DEBUG=1 and
 # check_trace.py asserts protocol ordering: locked precedes readiness, no
 # capture global is ever bound, the warning-to-lock handoff never exposes
-# the desktop, and a cancel never requests the lock.
+# the desktop, a cancel never requests the lock, and a locker told to
+# terminate closes its trace without touching the lock (issue #79).
 #
 # Opt-in locally (skips cleanly without sway); gates release in CI.
 # Every scenario runs under timeout: a hang IS the failure (issue #49).
@@ -19,8 +20,12 @@ command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 not installed"; exit
 command -v flock >/dev/null 2>&1 || { echo "SKIP: flock (util-linux) not installed"; exit 0; }
 command -v wtype >/dev/null 2>&1 || { echo "SKIP: wtype not installed (virtual keyboard — the headless seat has no real inputs)"; exit 0; }
 
-VLOCK=$REPO/target/debug/vigil-lock
-PROBE=$REPO/target/debug/examples/lock_probe
+# Wherever cargo put the build: a box that shares one target directory
+# between checkouts sets CARGO_TARGET_DIR, and the harness must find the
+# same binaries cargo just wrote rather than demand a second build.
+TARGET=${CARGO_TARGET_DIR:-$REPO/target}
+VLOCK=$TARGET/debug/vigil-lock
+PROBE=$TARGET/debug/examples/lock_probe
 [ -x "$VLOCK" ] && [ -x "$PROBE" ] || {
     echo "build first: cargo build -p vigil-lock && cargo build -p vigil-wayland --example lock_probe"
     exit 2
@@ -266,6 +271,42 @@ sleep 1
 tap
 teardown_check S9
 pass "S9"
+
+echo "S10: SIGTERM closes the trace and leaves the lock to the compositor (issue #79)"
+# No --wait: the locker is timeout's direct child, so its own exit status
+# comes back through `wait`. SPAN_LINES=frames turns on the per-wake
+# loop.iteration spans the issue counted dangling: 33 of them, every one
+# parented to a lock.session that was never written.
+timeout 30 env WAYLAND_DEBUG=1 SPAN_LINES=frames "$VLOCK" --config "$CFG" --no-warn --grace 300 2>"$WORK/s10.trace" &
+A=$!
+# Wait for the compositor's `locked` in the trace itself, not via the probe:
+# during the 400 ms transition the probe would win the race and take the
+# lock the scenario is about to signal.
+i=0
+while ! grep -q 'ext_session_lock_v1.*\.locked' "$WORK/s10.trace" 2>/dev/null; do
+    i=$((i + 1))
+    [ $i -gt 100 ] && fail "S10: the locker never got locked"
+    sleep 0.1
+done
+sleep 1
+# The signal goes to the locker, not to timeout (which would also raise it
+# on itself and return before the locker has finished writing). `pgrep -P`
+# is exact: without --wait the locker forks nothing of its own.
+LOCKER=$(pgrep -P "$A") || fail "S10: no locker under timeout"
+kill -TERM "$LOCKER"
+wait $A && rc=0 || rc=$?
+# 128 + SIGTERM, the code the parent saw before the locker learned to exit
+# on its own. It reads 143 whether the locker exited 143 or SIGTERM killed
+# it (timeout re-raises a child's fatal signal), so the exit code checks the
+# contract and the trace check below is what tells the two apart.
+[ "$rc" = 143 ] || fail "S10: expected exit 143 (128 + SIGTERM), got $rc"
+python3 "$REPO/tests/nested/check_trace.py" "$WORK/s10.trace" --expect locked --session-outcome Terminated:SIGTERM --no-unlock || fail "S10: trace check"
+# Teardown: sway hands an abandoned lock to the next client that asks, and
+# in teardown_check that client is the probe, which unlocks. That is the
+# harness restoring the session, not evidence the locker released anything;
+# --no-unlock above is that evidence.
+teardown_check S10
+pass "S10"
 
 echo "S5: no capture global was bound in any scenario"
 for t in "$WORK"/s*.trace; do
