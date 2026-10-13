@@ -55,12 +55,12 @@ impl Scene {
 // Geometry at 1280x800 with no user row (the theme fixes every row height,
 // so none of this depends on host font metrics):
 //   clock 88px font in a 105px row, then a 33px gap;
-//   card 360 wide x 144 tall (24 pad + 16 label + 8 + 44 field + 8 + 20
+//   card 360 wide x 140 tall (24 pad + 16 label + 6 + 44 field + 6 + 20
 //   status + 24 pad), the clock+card column centered over the 736px above
-//   the footer less a 32px lift -> column top 211, card x 460..820, y 349..493.
-const CLOCK: (u32, u32, u32, u32) = (440, 211, 840, 316);
+//   the footer less a 32px lift -> column top 213, card x 460..820, y 351..491.
+const CLOCK: (u32, u32, u32, u32) = (440, 213, 840, 318);
 const CARD: (u32, u32, u32, u32) = (465, 354, 815, 488);
-// Input field interior row: card top 349 + 24 + 16 + 8, plus half the field.
+// Input field interior row: card top 351 + 24 + 16 + 6, plus half the field.
 const FIELD_Y: u32 = 419;
 // The field's text area: field x 484..796 less 12px left padding and the
 // reveal toggle (742..790) on the right.
@@ -190,7 +190,8 @@ fn default_theme_state_matrix() {
     scene.window.set_status_banner("");
 
     // --- session picker: appears in the footer, bottom-left, once there is
-    // more than one session (footer row y 736..772, picker x 28..300) ---
+    // more than one session (footer row y 736..772, picker from x 28; its
+    // right end follows the session name, 254..358) ---
     let footer_left = |s: &Scene| -> Vec<(u8, u8, u8)> {
         (738..772)
             .step_by(2)

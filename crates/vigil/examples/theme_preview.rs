@@ -68,9 +68,10 @@ fn main() {
         pressed: true,
     });
 
-    // Click where the e2e driver aims for the session picker's "›" button;
-    // a `ui-message: SelectSession(1)` line proves the coordinates are right.
-    window.dispatch(vigil_core::InputEvent::PointerAbsolute { x: 284.0, y: 754.0 });
+    // Click where the e2e driver aims for the session picker's "‹" button;
+    // with two sessions it wraps to the second, so a
+    // `ui-message: SelectSession(1)` line proves the coordinates are right.
+    window.dispatch(vigil_core::InputEvent::PointerAbsolute { x: 98.0, y: 754.0 });
     window.dispatch(vigil_core::InputEvent::PointerButton {
         button: 0x110,
         pressed: true,
@@ -82,7 +83,7 @@ fn main() {
 
     // And the Restart power button bottom-right: expect Power(Reboot).
     window.dispatch(vigil_core::InputEvent::PointerAbsolute {
-        x: 1072.0,
+        x: 1118.0,
         y: 754.0,
     });
     window.dispatch(vigil_core::InputEvent::PointerButton {

@@ -19,11 +19,47 @@ import { KitTitle, KitMuted, KitLabel } from "ui/typography.slint";
 
 export { Theme }
 
+// Outlined control with no fill until hovered: footer and cycler actions
+// sit on the wallpaper, so a filled tile would read as a second card.
+component GhostButton inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+
+    private property <length> o-shift: Theme.optical-shift(label.font-metrics);
+    min-width: label.preferred-width + 2 * Theme.control-pad-x;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.border-width;
+    border-color: Theme.border;
+    background: ta.pressed ? Theme.selection-bg : ta.has-hover ? Theme.panel-bg-high : transparent;
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    label := Text {
+        y: root.o-shift;
+        width: 100%;
+        height: 100%;
+        text: root.text;
+        color: Theme.fg;
+        font-size: Theme.font-body;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
 export component DefaultTheme inherits Window {
     // ---- inputs (set by vigil) ------------------------------------------
     in property <string> output-name;
     // Who this screen belongs to (lock: the session user). Empty = hidden.
     in property <string> user-name;
+    // Optional: the first letter of `user-name`, for the avatar.
+    in property <string> user-initial;
     in property <bool> panel-visible: true;
     in property <bool> power-visible: true;
     in property <float> warning-frost: 0;
@@ -41,6 +77,8 @@ export component DefaultTheme inherits Window {
     in property <bool> prompt-is-secret: true;
     in property <string> info-message;
     in property <string> error-message;
+    // Optional: bumped by vigil each time it shows an error.
+    in property <int> error-serial;
     in property <[string]> sessions;
     in property <int> selected-session;
     in property <[string]> users;
@@ -70,6 +108,18 @@ export component DefaultTheme inherits Window {
     changed prompt-text => { input.text = ""; root.reveal = false; }
     changed prompt-is-secret => { input.text = ""; root.reveal = false; }
 
+    // A failed attempt shakes the password group once. A repeat failure can
+    // leave every other input unchanged, hence `error-serial`. Errors raised
+    // together arrive as one change, so the local count steps once per
+    // batch; a finite animation chases it and nothing keeps the frame clock
+    // running after.
+    property <int> shake-count;
+    changed error-serial => { root.shake-count += 1; }
+    property <float> shake-phase: root.shake-count;
+    animate shake-phase { duration: 300ms; easing: linear; }
+    property <float> shake-t: 1 - (root.shake-count - root.shake-phase);
+    property <length> shake-dx: root.snap(sin(root.shake-t * 720deg) * 8px * (1 - root.shake-t));
+
     // ---- geometry -------------------------------------------------------
     // Whole logical pixels only: fractional Y blurs glyphs.
     pure function snap(l: length) -> length { floor(l / 1px) * 1px }
@@ -87,10 +137,15 @@ export component DefaultTheme inherits Window {
     property <length> footer-y: root.height - root.edge - Theme.control-height;
     // Room the session picker and power buttons each take in the footer.
     property <length> footer-side: 280px;
+    // Footer rows: one in landscape; in portrait power, the session picker
+    // and the banner stack.
+    property <int> footer-rows: !root.portrait ? 1
+        : 1 + (root.has-sessions ? 1 : 0) + (root.status-banner != "" ? 1 : 0);
+    property <length> footer-top: root.footer-y - (root.footer-rows - 1) * (Theme.control-height + Theme.space-md);
     // The clock + card column, centered over the space above the footer
     // and lifted slightly toward the optical center.
     property <length> column-height: root.clock-height + (root.panel-visible ? root.clock-gap + card.height : 0);
-    property <length> column-y: root.snap(max(root.edge, (root.footer-y - root.height * 0.04 - root.column-height) / 2));
+    property <length> column-y: root.snap(max(root.edge, (root.footer-top - root.height * 0.04 - root.column-height) / 2));
 
     // Manual entry ("Other…" in the picker): no account is known yet.
     property <bool> manual-user: root.users.length > 1 && root.user-name == "";
@@ -114,6 +169,7 @@ export component DefaultTheme inherits Window {
         text: root.clock-text;
         color: Theme.fg;
         font-size: root.clock-size;
+        letter-spacing: -0.02 * root.clock-size;
         x: 0;
         y: root.column-y;
         width: root.width;
@@ -152,144 +208,202 @@ export component DefaultTheme inherits Window {
                 opacity: root.warning-user-selector-progress * card.arrive;
 
                 HorizontalLayout {
-                    spacing: Theme.space-sm;
+                    spacing: Theme.space-md;
+
+                    // Avatar: the initial, or a hollow "+" when no account
+                    // is chosen yet.
+                    Rectangle {
+                        width: Theme.row-height;
+                        border-radius: self.width / 2;
+                        background: root.manual-user ? transparent : Theme.primary-container;
+                        border-width: root.manual-user ? Theme.border-width : 0px;
+                        border-color: Theme.border;
+                        Text {
+                            text: root.manual-user ? "+" : root.user-initial;
+                            color: root.manual-user ? Theme.fg-muted : Theme.on-primary-container;
+                            font-size: Theme.font-title;
+                            font-weight: Theme.font-weight-semibold;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
 
                     KitTitle {
                         text: root.manual-user ? "Another user"
                             : root.users.length > 1 ? root.users[root.selected-user] : root.user-name;
                         color: root.manual-user ? Theme.fg-muted : Theme.fg;
+                        font-weight: root.manual-user ? 400 : Theme.font-weight-semibold;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
 
-                    if root.users.length > 1: KitLabel {
-                        text: (root.selected-user + 1) + "/" + root.users.length;
-                        vertical-alignment: center;
-                    }
-                    if root.users.length > 1: VerticalLayout {
-                        alignment: center;
-                        KitIconButton {
-                            text: "‹";
-                            small: true;
-                            clicked => {
-                                root.user-changed(root.selected-user <= 0
-                                    ? root.users.length - 1
-                                    : root.selected-user - 1);
+                    if root.users.length > 1: HorizontalLayout {
+                        spacing: 6px;
+                        HorizontalLayout {
+                            padding-right: Theme.space-xs;
+                            KitLabel {
+                                text: (root.selected-user + 1) + "/" + root.users.length;
+                                vertical-alignment: center;
                             }
                         }
-                    }
-                    if root.users.length > 1: VerticalLayout {
-                        alignment: center;
-                        KitIconButton {
-                            text: "›";
-                            small: true;
-                            clicked => {
-                                root.user-changed(root.selected-user >= root.users.length - 1
-                                    ? 0
-                                    : root.selected-user + 1);
+                        VerticalLayout {
+                            alignment: center;
+                            GhostButton {
+                                width: Theme.control-height-sm;
+                                height: Theme.control-height-sm;
+                                text: "‹";
+                                clicked => {
+                                    root.user-changed(root.selected-user <= 0
+                                        ? root.users.length - 1
+                                        : root.selected-user - 1);
+                                }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            GhostButton {
+                                width: Theme.control-height-sm;
+                                height: Theme.control-height-sm;
+                                text: "›";
+                                clicked => {
+                                    root.user-changed(root.selected-user >= root.users.length - 1
+                                        ? 0
+                                        : root.selected-user + 1);
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // The question, the answer, and one status line.
-            VerticalLayout {
-                spacing: Theme.space-sm;
+            // The question, the answer, and one status line. The group
+            // shakes on a failed attempt; the wrapper keeps its place in the
+            // card while it moves.
+            Rectangle {
+                min-height: group.min-height;
+                preferred-height: group.preferred-height;
 
-                KitLabel {
-                    opacity: root.warning-password-progress * card.arrive;
-                    height: 16px;
-                    text: root.prompt-text == "" ? "Password" : root.prompt-text;
-                    vertical-alignment: center;
-                }
+                group := VerticalLayout {
+                    x: root.shake-dx;
+                    width: parent.width;
+                    height: parent.height;
+                    spacing: 6px;
 
-                Rectangle {
-                    opacity: root.warning-password-progress * card.arrive;
-                    height: Theme.row-height;
-                    background: Theme.tile-bg;
-                    border-radius: Theme.radius-md;
-                    border-width: Theme.border-width;
-                    border-color: root.auth-state == "error" ? Theme.danger
-                        : root.auth-state == "busy" ? Theme.border : root.accent-color;
+                    KitLabel {
+                        opacity: root.warning-password-progress * card.arrive;
+                        height: 16px;
+                        text: root.prompt-text == "" ? "Password" : root.prompt-text;
+                        vertical-alignment: center;
+                    }
 
-                    HorizontalLayout {
-                        padding-left: Theme.control-pad-x;
-                        padding-right: 6px;
-                        padding-top: 6px;
-                        padding-bottom: 6px;
-                        spacing: 6px;
+                    Rectangle {
+                        opacity: root.warning-password-progress * card.arrive;
+                        height: Theme.row-height;
+                        background: Theme.tile-bg;
+                        border-radius: Theme.radius-md;
+                        border-width: Theme.border-width;
+                        border-color: root.auth-state == "error" ? Theme.danger
+                            : root.auth-state == "busy" ? Theme.border : root.accent-color;
 
-                        input := TextInput {
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                            color: Theme.fg;
-                            font-size: Theme.font-body;
-                            single-line: true;
-                            input-type: root.prompt-is-secret && !root.reveal
-                                ? InputType.password : InputType.text;
-                            // The platform pins cursor_flash_cycle to zero (no
-                            // animation clock on an hours-idle prompt), which pins
-                            // Slint's cursor bar permanently solid. Next to masked
-                            // bullets it reads as furniture; flush against a
-                            // revealed password it reads as a stray trailing "|".
-                            text-cursor-width: root.prompt-is-secret && root.reveal ? 0px : 1px;
-                            accepted => {
-                                root.submit(self.text);
-                                self.text = "";
+                        HorizontalLayout {
+                            padding-left: Theme.control-pad-x;
+                            padding-right: 6px;
+                            padding-top: 6px;
+                            padding-bottom: 6px;
+                            spacing: 6px;
+
+                            input := TextInput {
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                color: Theme.fg;
+                                font-size: Theme.font-body;
+                                single-line: true;
+                                input-type: root.prompt-is-secret && !root.reveal
+                                    ? InputType.password : InputType.text;
+                                // The platform pins cursor_flash_cycle to zero (no
+                                // animation clock on an hours-idle prompt), which pins
+                                // Slint's cursor bar permanently solid. Next to masked
+                                // bullets it reads as furniture; flush against a
+                                // revealed password it reads as a stray trailing "|".
+                                text-cursor-width: root.prompt-is-secret && root.reveal ? 0px : 1px;
+                                accepted => {
+                                    root.submit(self.text);
+                                    self.text = "";
+                                }
+                            }
+
+                            // Caps Lock, where the typing happens.
+                            if root.caps-lock: VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: caps.preferred-width + 12px;
+                                    height: caps.preferred-height + 2px;
+                                    border-radius: Theme.radius-xs;
+                                    border-width: Theme.border-width;
+                                    border-color: Theme.warning-fg;
+                                    caps := Text {
+                                        text: "CAPS";
+                                        color: Theme.warning-fg;
+                                        font-size: 11px;
+                                        font-weight: Theme.font-weight-bold;
+                                        letter-spacing: 1px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            // Reveal toggle, secret prompts only.
+                            if root.prompt-is-secret: Rectangle {
+                                width: 48px;
+                                background: root.reveal ? Theme.accent : transparent;
+                                border-radius: Theme.radius-sm;
+                                Text {
+                                    text: root.reveal ? "hide" : "show";
+                                    color: root.reveal ? Theme.on-accent : Theme.fg-muted;
+                                    font-size: Theme.font-label;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                TouchArea {
+                                    clicked => { root.reveal = !root.reveal; }
+                                }
                             }
                         }
 
-                        // Caps Lock, where the typing happens.
-                        if root.caps-lock: Rectangle {
-                            width: 48px;
-                            background: Theme.warning-fg;
-                            border-radius: Theme.radius-xs;
-                            Text {
-                                text: "CAPS";
-                                color: Theme.on-secondary;
-                                font-size: 11px;
-                                font-weight: Theme.font-weight-bold;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        // Reveal toggle, secret prompts only.
-                        if root.prompt-is-secret: Rectangle {
-                            width: 48px;
-                            background: root.reveal ? Theme.accent : transparent;
-                            border-radius: Theme.radius-sm;
-                            Text {
-                                text: root.reveal ? "hide" : "show";
-                                color: root.reveal ? Theme.on-accent : Theme.fg-muted;
-                                font-size: Theme.font-label;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            TouchArea {
-                                clicked => { root.reveal = !root.reveal; }
-                            }
+                        // A thin bar sweeps while a check runs. `if` keeps the
+                        // frame clock out of every other state: the tick is
+                        // only read while this element exists.
+                        if root.auth-state == "busy": Rectangle {
+                            property <float> t: mod(animation-tick() / 1100ms, 2);
+                            property <float> sweep: (1 - cos((self.t < 1 ? self.t : 2 - self.t) * 180deg)) / 2;
+                            property <length> track: parent.width - 16px;
+                            x: root.snap(8px + self.sweep * self.track * 0.7);
+                            y: parent.height - 6px;
+                            width: root.snap(self.track * 0.3);
+                            height: 2px;
+                            border-radius: 1px;
+                            background: root.accent-color;
                         }
                     }
-                }
 
-                // Reserved so the card does not jump between states; a long
-                // message wraps and grows it.
-                Text {
-                    opacity: root.warning-password-progress * card.arrive;
-                    min-height: 20px;
-                    font-size: 13px;
-                    wrap: word-wrap;
-                    vertical-alignment: center;
-                    text: root.auth-state == "busy" ? "Checking…"
-                        : root.error-message != "" ? root.error-message
-                        : root.info-message != "" ? root.info-message
-                        : "Press Enter to continue";
-                    color: root.auth-state == "busy" ? Theme.fg-muted
-                        : root.error-message != "" ? Theme.danger
-                        : root.info-message != "" ? Theme.fg-muted
-                        : Theme.fg-muted.with-alpha(0.7);
+                    // Reserved so the card does not jump between states; a long
+                    // message wraps and grows it.
+                    Text {
+                        opacity: root.warning-password-progress * card.arrive;
+                        min-height: 20px;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        text: root.auth-state == "busy" ? "Checking…"
+                            : root.error-message != "" ? root.error-message
+                            : root.info-message != "" ? root.info-message
+                            : "Press Enter to continue";
+                        color: root.auth-state == "busy" ? Theme.fg-muted
+                            : root.error-message != "" ? Theme.danger
+                            : root.info-message != "" ? Theme.fg-muted
+                            : Theme.fg-muted.with-alpha(0.7);
+                    }
                 }
             }
         }
@@ -297,26 +411,33 @@ export component DefaultTheme inherits Window {
 
     // ---- footer ---------------------------------------------------------
 
-    // Session picker, bottom-left, once there is a choice. Fixed widths keep
-    // the arrows in one place whatever the session name or font.
-    if root.panel-visible && root.sessions.length > 1: HorizontalLayout {
-        opacity: root.warning-user-selector-progress;
-        x: root.edge;
-        y: root.footer-y;
-        height: Theme.control-height;
-        spacing: Theme.space-sm;
-        alignment: start;
+    // In landscape the footer is one row: session picker (left), status
+    // banner (center), power (right). In portrait the three stack, centered,
+    // power at the bottom.
+    property <length> session-y: root.portrait ? root.footer-y - Theme.control-height - Theme.space-md : root.footer-y;
+    property <bool> has-sessions: root.panel-visible && root.sessions.length > 1;
 
+    // Session picker, once there is a choice.
+    if root.has-sessions: HorizontalLayout {
+        opacity: root.warning-user-selector-progress;
+        x: root.portrait ? root.snap((root.width - self.preferred-width) / 2) : root.edge;
+        y: root.session-y;
+        width: self.preferred-width;
+        height: Theme.control-height;
+        spacing: 6px;
+
+        // Fixed width: the e2e driver clicks "‹" by coordinate.
         KitLabel {
-            width: 64px;
+            width: 48px;
             text: "Session";
             vertical-alignment: center;
         }
         VerticalLayout {
             alignment: center;
-            KitIconButton {
+            GhostButton {
+                width: Theme.control-height-sm;
+                height: Theme.control-height-sm;
                 text: "‹";
-                small: true;
                 clicked => {
                     root.session-changed(root.selected-session <= 0
                         ? root.sessions.length - 1
@@ -324,18 +445,21 @@ export component DefaultTheme inherits Window {
                 }
             }
         }
-        KitMuted {
-            width: 120px;
+        Text {
+            width: max(96px, min(200px, self.preferred-width));
             text: root.sessions[root.selected-session];
             color: Theme.fg;
+            font-size: Theme.font-body;
             horizontal-alignment: center;
             vertical-alignment: center;
+            overflow: elide;
         }
         VerticalLayout {
             alignment: center;
-            KitIconButton {
+            GhostButton {
+                width: Theme.control-height-sm;
+                height: Theme.control-height-sm;
                 text: "›";
-                small: true;
                 clicked => {
                     root.session-changed(root.selected-session >= root.sessions.length - 1
                         ? 0
@@ -345,31 +469,28 @@ export component DefaultTheme inherits Window {
         }
     }
 
-    // Power actions, bottom-right.
+    // Power actions.
     HorizontalLayout {
         visible: root.power-visible;
         opacity: root.warning-power-progress;
-        x: root.width - root.edge - self.width;
+        x: root.portrait ? root.snap((root.width - self.width) / 2) : root.width - root.edge - self.width;
         y: root.footer-y;
-        width: 232px;
+        width: self.preferred-width;
         height: Theme.control-height;
         spacing: Theme.space-sm;
 
-        KitButton {
-            width: 104px;
+        GhostButton {
             text: "Restart";
             clicked => { root.power-action("reboot"); }
         }
-        KitButton {
-            width: 120px;
+        GhostButton {
             text: "Shut Down";
             clicked => { root.power-action("poweroff"); }
         }
     }
 
-    // Host-integration status banner, bottom-center (reserved contract
-    // surface: empty = hidden). In portrait it gets its own row above the
-    // footer; in landscape it stays clear of the two footer sides.
+    // Host-integration status banner (reserved contract surface: empty =
+    // hidden). In landscape it stays clear of the two footer sides.
     if root.status-banner != "": Rectangle {
         property <length> room: root.width - 2 * root.edge
             - (root.portrait ? 0px : 2 * (root.footer-side + Theme.space-md));
@@ -377,7 +498,8 @@ export component DefaultTheme inherits Window {
         height: Theme.control-height;
         width: min(banner.preferred-width + 2 * Theme.space-lg + 16px, self.room);
         x: root.snap((root.width - self.width) / 2);
-        y: root.portrait ? root.footer-y - Theme.control-height - Theme.space-md : root.footer-y;
+        y: !root.portrait ? root.footer-y
+            : (root.has-sessions ? root.session-y : root.footer-y) - Theme.control-height - Theme.space-md;
         background: Theme.panel-bg.with-alpha(Theme.overlay-alpha);
         border-radius: Theme.control-height / 2;
         border-width: Theme.border-width;

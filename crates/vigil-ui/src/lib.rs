@@ -656,10 +656,13 @@ impl OutputWindow {
         self.set_property("status-banner", Value::String(text.into()));
     }
 
-    /// Optional theme property `user-name` (not in contract v1): set
-    /// best-effort, silently skipped on themes that lack it.
+    /// Optional theme properties `user-name` and `user-initial` (not in
+    /// contract v1): set best-effort, silently skipped on themes that lack
+    /// them. Slint has no substring, so the initial is computed here.
     pub fn set_user_name(&mut self, name: &str) {
         self.set_optional_property("user-name", Value::String(name.into()));
+        let initial: String = name.chars().take(1).flat_map(char::to_uppercase).collect();
+        self.set_optional_property("user-initial", Value::String(initial.into()));
     }
 
     /// Theme contract `sessions`: display names of the launchable sessions.
@@ -778,6 +781,11 @@ impl AuthUi for OutputWindow {
     fn show_error(&mut self, text: &str) {
         self.set_property("error-message", Value::String(text.into()));
         self.set_property("auth-state", Value::String("error".into()));
+        // Optional `error-serial`: counts errors shown, so a theme can react
+        // to a repeat failure that leaves every other property unchanged.
+        if let Ok(Value::Number(serial)) = self.component.get_property("error-serial") {
+            self.set_optional_property("error-serial", Value::Number(serial + 1.0));
+        }
     }
     fn set_busy(&mut self, busy: bool) {
         let state = if busy { "busy" } else { "idle" };
