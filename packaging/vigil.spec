@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.4.0
+Version:        0.4.1
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -119,6 +119,24 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Tue Oct 13 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.4.1-1
+- A signal no longer kills the locker without closing its trace (#79, #98).
+  SIGTERM, SIGINT and SIGHUP wake the event loop through a self-pipe and the
+  lock exits through its normal path, so span_lines::exit closes every span
+  and the lock.session record carries outcome=Terminated:<signal>. The exit
+  code is 128 plus the signal number, exactly what a shell reported for a
+  signal-killed locker before, so lock-cmd.sh is unchanged. The compositor
+  session lock itself is untouched: nothing is sent, the connection closes,
+  and ext-session-lock-v1 keeps the session locked. Nested scenario S10
+  asserts the complete trace and the absence of any unlock.
+- The lock formats its clock in process with strftime instead of forking
+  /usr/bin/date once a minute for the life of every lock, and reports what
+  a lock actually cost (wakes, frames, rate) on the way out (#69, #73).
+- A present retry can no longer outlive the output it was scheduled for;
+  output destroy and the unlock early return both prune it, and the retry
+  scan derives its answer from live outputs, so a stale entry no longer
+  spins the loop with a zero timeout (#70, #72).
+
 * Thu Sep 04 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.4.0-1
 - Security floor for the user overlay. ~/.config/vigil/config.toml is
   session-writable, and vigil-lock loaded it in place of the system
