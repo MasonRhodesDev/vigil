@@ -43,6 +43,8 @@ fn main() {
     }
     window.set_users(&["mason".into(), "Other…".into()]);
     window.set_user_index(0);
+    // As the greeter does: the selected row's name, "" for Other….
+    window.set_user_name("mason");
     window.set_sessions(&["Other DE".into(), "Test DE".into()]);
     window.set_session_index(0);
     use vigil_core::AuthUi;
@@ -66,9 +68,10 @@ fn main() {
         pressed: true,
     });
 
-    // Click where the e2e driver aims for the session picker's "›" button;
-    // a `ui-message: SelectSession(1)` line proves the coordinates are right.
-    window.dispatch(vigil_core::InputEvent::PointerAbsolute { x: 797.0, y: 387.0 });
+    // Click where the e2e driver aims for the session picker's "‹" button;
+    // with two sessions it wraps to the second, so a
+    // `ui-message: SelectSession(1)` line proves the coordinates are right.
+    window.dispatch(vigil_core::InputEvent::PointerAbsolute { x: 98.0, y: 754.0 });
     window.dispatch(vigil_core::InputEvent::PointerButton {
         button: 0x110,
         pressed: true,
@@ -78,8 +81,11 @@ fn main() {
         pressed: false,
     });
 
-    // And the Restart power button bottom-left: expect Power(Reboot).
-    window.dispatch(vigil_core::InputEvent::PointerAbsolute { x: 70.0, y: 745.0 });
+    // And the Restart power button bottom-right: expect Power(Reboot).
+    window.dispatch(vigil_core::InputEvent::PointerAbsolute {
+        x: 1118.0,
+        y: 754.0,
+    });
     window.dispatch(vigil_core::InputEvent::PointerButton {
         button: 0x110,
         pressed: true,

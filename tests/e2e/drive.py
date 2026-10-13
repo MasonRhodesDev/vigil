@@ -112,11 +112,12 @@ cmd("screendump", filename=f"{outdir}/4-username-again.ppm")
 typestr("demo")
 sendkey("ret"); time.sleep(1.5)
 
-# Cycle the session picker: "›" button center at 1280x800 with the default
-# theme. The user cycler (issue #21) sits above the password field, so the
-# session row moved down — verify with the theme_preview example if the
-# card layout changes again.
-click(797, 433)
+# Cycle the session picker: "‹" button center at 1280x800 with the default
+# theme (with two sessions it wraps to the second). The picker sits in the
+# footer at a fixed offset (edge 28 + label 48 + 6px gap), so neither the
+# card above it nor the session name moves it — verify with the
+# theme_preview example if the footer layout changes.
+click(98, 754)
 cmd("screendump", filename=f"{outdir}/5-picker.ppm")
 
 # Correct password.

@@ -47,10 +47,11 @@ def distinct_colors(img, step=8):
 
 
 def card_rect(img):
-    """Card interior, from the 1280x800 geometry in theme_states.rs,
-    recentered on the actual frame."""
+    """The card's field and status rows, recentered on the actual frame
+    (1280x800 geometry in theme_states.rs). It starts below where either
+    clock size ends, so the clock alone cannot pass for a rendered card."""
     w, h, _ = img
-    return (w // 2 - 195, h // 2 - 145, w // 2 + 195, h // 2 + 145)
+    return (w // 2 - 175, h // 2 + 25, w // 2 + 175, h // 2 + 88)
 
 
 def sample(img, rect, step=4):
