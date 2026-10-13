@@ -231,6 +231,11 @@ pub struct SoftwareBackend {
     /// Scanout-ready scene pixels copied below a transparent Slint overlay.
     native_background: Option<std::sync::Arc<[u8]>>,
     native_overlay: Vec<u8>,
+    /// The next render must repaint and composite the whole scene: the
+    /// buffer Slint draws into was just swapped (overlay <-> shadow) or the
+    /// background under the overlay changed, so its partial-repaint history
+    /// describes pixels that are no longer there.
+    full_repaint: bool,
 }
 
 impl OutputWindow {
@@ -322,6 +327,7 @@ impl OutputWindow {
                 transform,
                 native_background: None,
                 native_overlay: Vec::new(),
+                full_repaint: true,
             }),
             width,
             height,
@@ -1075,18 +1081,40 @@ impl SoftwareBackend {
         // contract: same buffer, contents preserved between renders).
         let shadow_stride = view.scene_size.0 as usize;
         let native_background = self.native_background.clone();
+        let full = self.full_repaint;
         if self.adapter.draw_if_needed(|renderer| {
-            if let Some(background) = &native_background {
-                renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
-                let overlay = bytemuck::cast_slice_mut::<u8, Argb8888>(&mut self.native_overlay);
-                renderer.render(overlay, shadow_stride);
-                composite_native_background(background, overlay, &mut self.shadow);
+            renderer.set_repaint_buffer_type(if full {
+                RepaintBufferType::NewBuffer
             } else {
-                renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+                RepaintBufferType::ReusedBuffer
+            });
+            if let Some(background) = &native_background {
+                // The overlay persists too: Slint clears and redraws only
+                // the regions that changed (to transparent, the window
+                // background), and only those are blended back over the
+                // background. A keystroke costs the field, not the screen.
+                let overlay = bytemuck::cast_slice_mut::<u8, Argb8888>(&mut self.native_overlay);
+                let region = renderer.render(overlay, shadow_stride);
+                if full {
+                    composite_native_background(background, overlay, &mut self.shadow);
+                } else {
+                    for (origin, size) in region.iter() {
+                        composite_native_rect(
+                            background,
+                            overlay,
+                            &mut self.shadow,
+                            shadow_stride,
+                            (origin.x.max(0) as usize, origin.y.max(0) as usize),
+                            (size.width as usize, size.height as usize),
+                        );
+                    }
+                }
+            } else {
                 let shadow_pixels = bytemuck::cast_slice_mut::<u8, Xrgb8888>(&mut self.shadow);
                 renderer.render(shadow_pixels, shadow_stride);
             }
         }) {
+            self.full_repaint = false;
             self.needs_present = true;
         }
         self.needs_present
@@ -1117,6 +1145,8 @@ impl RenderBackend for SoftwareBackend {
         }
         self.native_background = Some(pixels);
         self.native_overlay.resize(self.shadow.len(), 0);
+        self.full_repaint = true;
+        self.adapter.request_redraw();
         self.needs_present = true;
         true
     }
@@ -1128,6 +1158,8 @@ impl RenderBackend for SoftwareBackend {
     fn clear_native_background(&mut self) {
         self.native_background = None;
         self.native_overlay.clear();
+        self.full_repaint = true;
+        self.adapter.request_redraw();
         self.needs_present = true;
     }
 
@@ -1193,8 +1225,41 @@ impl RenderBackend for SoftwareBackend {
 }
 
 fn composite_native_background(background: &[u8], overlay: &[Argb8888], output: &mut [u8]) {
+    composite_native_span(
+        bytemuck::cast_slice::<u8, Xrgb8888>(background),
+        overlay,
+        bytemuck::cast_slice_mut::<u8, Xrgb8888>(output),
+    );
+}
+
+/// Composite one rectangle of the scene (`stride` pixels per row), clamped
+/// to the buffers.
+fn composite_native_rect(
+    background: &[u8],
+    overlay: &[Argb8888],
+    output: &mut [u8],
+    stride: usize,
+    (x, y): (usize, usize),
+    (width, height): (usize, usize),
+) {
     let background = bytemuck::cast_slice::<u8, Xrgb8888>(background);
     let output = bytemuck::cast_slice_mut::<u8, Xrgb8888>(output);
+    if stride == 0 || x >= stride {
+        return;
+    }
+    let width = width.min(stride - x);
+    let rows = output.len() / stride;
+    for row in y..(y + height).min(rows) {
+        let span = row * stride + x..row * stride + x + width;
+        composite_native_span(
+            &background[span.clone()],
+            &overlay[span.clone()],
+            &mut output[span],
+        );
+    }
+}
+
+fn composite_native_span(background: &[Xrgb8888], overlay: &[Argb8888], output: &mut [Xrgb8888]) {
     for ((background, overlay), output) in background.iter().zip(overlay).zip(output) {
         let alpha = overlay.0 >> 24;
         output.0 = if alpha == 0 {

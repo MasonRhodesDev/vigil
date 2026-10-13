@@ -297,3 +297,94 @@ fn pointer_motion_without_scene_cursor_does_not_present() {
         "motion with no scene cursor must not force a present"
     );
 }
+
+/// Over a native background, a frame repaints only what changed and blends
+/// only that back over the background. Whatever the partial path produced
+/// must be exactly what a full repaint of the same scene produces: a stale
+/// overlay region, or one blended twice, shows up as a difference here.
+#[test]
+fn native_background_partial_repaint_matches_full() {
+    let platform = VigilPlatform::install().expect("platform");
+    let theme = Theme::load_or_default(None);
+    let component = theme.instantiate().expect("instantiate");
+    let adapter = platform.claim_last_adapter().expect("adapter");
+    let window = OutputWindow::new(OutputId(4), W, H, 1.0, adapter, component).expect("window");
+    let mut scene = Scene {
+        window,
+        buf: vec![0u8; (W * H * 4) as usize],
+    };
+    // A background with structure everywhere, so a region composited from
+    // the wrong place cannot match by accident.
+    let background: std::sync::Arc<[u8]> = (0..W * H * 4)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect::<Vec<_>>()
+        .into();
+
+    scene.window.set_panel_visible(true);
+    scene.window.set_user_name("mason");
+    scene.window.set_clock("12:34");
+    scene.window.show_prompt("Password:", true);
+    assert!(
+        scene
+            .window
+            .set_native_background_xrgb(background.clone(), W, H)
+    );
+    assert!(scene.render(), "first frame draws");
+
+    let full_repaint_of_same_scene = |scene: &mut Scene| -> Vec<u8> {
+        // Setting the background again forces the full path.
+        assert!(
+            scene
+                .window
+                .set_native_background_xrgb(background.clone(), W, H)
+        );
+        let mut buf = vec![0u8; (W * H * 4) as usize];
+        assert!(scene.window.render_if_needed(FrameTarget {
+            buffer: &mut buf,
+            width: W,
+            height: H,
+            stride: (W * 4) as usize,
+        }));
+        buf
+    };
+
+    type Step<'a> = (&'a str, &'a dyn Fn(&mut OutputWindow));
+    let steps: [Step; 5] = [
+        ("clock", &|w| w.set_clock("12:35")),
+        ("typing", &|w| {
+            for pressed in [true, false] {
+                w.dispatch(InputEvent::Key {
+                    keysym: 'a' as u32,
+                    utf8: Some("a".into()),
+                    pressed,
+                });
+            }
+        }),
+        ("caps", &|w| w.set_caps_lock(true)),
+        ("banner", &|w| {
+            w.set_status_banner("Approval sent to your phone…")
+        }),
+        ("caps off", &|w| w.set_caps_lock(false)),
+    ];
+    for (name, step) in steps {
+        step(&mut scene.window);
+        // No timer advance between the two renders: same animation instant.
+        assert!(
+            scene.window.render_if_needed(FrameTarget {
+                buffer: &mut scene.buf,
+                width: W,
+                height: H,
+                stride: (W * 4) as usize,
+            }),
+            "{name}: change must draw"
+        );
+        let partial = scene.buf.clone();
+        let full = full_repaint_of_same_scene(&mut scene);
+        let differing = partial
+            .chunks(4)
+            .zip(full.chunks(4))
+            .filter(|(a, b)| a[..3] != b[..3])
+            .count();
+        assert_eq!(differing, 0, "{name}: partial repaint differs from full");
+    }
+}

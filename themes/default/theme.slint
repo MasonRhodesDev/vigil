@@ -158,9 +158,11 @@ export component DefaultTheme inherits Window {
     }
 
     // A flat scrim keeps the large clock readable over a busy wallpaper
-    // (no drop shadows on the software renderer).
+    // (no drop shadows on the software renderer). A native background is
+    // always a wallpaper, so the lock gets it too; it is drawn once and only
+    // blended again where something above it changes.
     Rectangle {
-        visible: !root.native-background && root.background-source.width > 0;
+        visible: root.native-background || root.background-source.width > 0;
         background: Theme.page-bg.with-alpha(0.28);
     }
 
