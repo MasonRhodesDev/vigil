@@ -21,7 +21,11 @@
 //! the buffer per frame, so a hashed run's frame cadence is its own.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::Read as _;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use calloop_wayland_source::WaylandSource;
@@ -30,7 +34,7 @@ use smithay_client_toolkit::{
     background_effect::{BackgroundEffectHandler, BackgroundEffectState},
     compositor::{CompositorHandler, CompositorState},
     output::{OutputHandler, OutputState},
-    reexports::calloop::EventLoop,
+    reexports::calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -79,7 +83,7 @@ use wayland_protocols::wp::viewporter::client::{
 use vigil_config::Lock;
 use vigil_core::{FrameTarget, InputEvent, OutputId, OutputInfo};
 pub use vigil_flow::LockOutcome;
-use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now};
+use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now, Signal};
 
 mod hyprland_surface;
 use hyprland_surface::hyprland_surface_manager_v1::HyprlandSurfaceManagerV1;
@@ -197,6 +201,9 @@ fn flow_event_kind(event: &FlowEvent) -> &'static str {
         FlowEvent::AuthOk => "AuthOk",
         FlowEvent::LogindUnlock => "LogindUnlock",
         FlowEvent::RevealOverlaysMapped => "RevealOverlaysMapped",
+        FlowEvent::Terminate(Signal::Hangup) => "Terminate:SIGHUP",
+        FlowEvent::Terminate(Signal::Interrupt) => "Terminate:SIGINT",
+        FlowEvent::Terminate(Signal::Terminate) => "Terminate:SIGTERM",
         FlowEvent::Tick => "Tick",
         _ => "other",
     }
@@ -600,7 +607,8 @@ struct App<S: LockSession + 'static> {
     /// record is still written (measured: two `flow.phase` records at both
     /// tiers either way, over repeated runs; an earlier "frames lost them"
     /// observation had compared a clean exit against a killed run, and a
-    /// kill loses whatever is still open at every tier). What entering
+    /// kill the loop never sees - SIGKILL today, any signal before #79 -
+    /// loses whatever is still open at every tier). What entering
     /// does corrupt is frames-detail parentage: an entered phase becomes
     /// the contextual parent of every `loop.iteration`, and the
     /// replacement phase created inside `tick` nests under whichever
@@ -1544,6 +1552,125 @@ impl<S: LockSession> App<S> {
     }
 }
 
+/// Write end of the self-pipe the termination handler writes to; -1 until
+/// [`arm_termination`] runs. An atomic rather than a `OnceLock` because a
+/// signal handler reads it, and a plain load is all a handler may do.
+static TERMINATION_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+/// The handler for SIGTERM, SIGINT and SIGHUP: one `write(2)` of the signal
+/// number and nothing else. `write` is async-signal-safe; formatting a trace
+/// record or taking the sink's lock is not (issue #79), so the record is
+/// written by the event loop once it has read this byte. The result is
+/// ignored on purpose: a full pipe means a wake is already pending, and a
+/// closed one means the loop is gone and the process is on its way out.
+extern "C" fn on_termination_signal(signal: libc::c_int) {
+    let fd = TERMINATION_PIPE.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let byte = signal as u8;
+    // SAFETY: a one-byte buffer that outlives the call, on a descriptor this
+    // process opened and never closes; write(2) is async-signal-safe.
+    unsafe {
+        libc::write(fd, (&byte as *const u8).cast(), 1);
+    }
+}
+
+/// Turn SIGTERM, SIGINT and SIGHUP into [`FlowEvent::Terminate`] (#79).
+///
+/// A self-pipe rather than a flag, because of what the loop is: calloop over
+/// epoll, blocked with nothing to do for up to the clock interval, which is
+/// a minute when the clock shows no seconds. A flag is noticed at the next
+/// wake; a byte on a pipe the loop polls wakes it now, and from whichever
+/// thread the kernel delivered the signal to (the join-socket acceptor, a
+/// PAM worker, zbus). `SA_RESTART` keeps those threads' blocking calls from
+/// failing with EINTR; `epoll_wait` is never restarted, and calloop retries
+/// it. The byte carries the signal number so the outcome can name it.
+///
+/// Process-wide and once per process, like the singleton guard: the write
+/// end lives in a static the handler reads, and the read end belongs to the
+/// loop. The handler stays installed for the rest of the process, so a
+/// second signal after the loop has ended is a byte nobody reads, and the
+/// exit that is already under way finishes it.
+fn arm_termination<'l, S: LockSession + 'static>(
+    handle: &LoopHandle<'l, App<S>>,
+) -> Result<(), LockError> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 fills the two-element array it is given.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(err(format!(
+            "termination pipe: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: both descriptors were just returned by pipe2 and nothing else
+    // owns them.
+    let (read_end, write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    if TERMINATION_PIPE
+        .compare_exchange(
+            -1,
+            write_end.as_raw_fd(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Err(err("termination handling armed twice in one process"));
+    }
+    // The handler may run at any moment from now on, so the write end is
+    // never closed.
+    std::mem::forget(write_end);
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: a zeroed sigaction is a valid starting point, the handler
+        // is `extern "C"` and does only async-signal-safe work, and the
+        // struct outlives the call.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            let handler: extern "C" fn(libc::c_int) = on_termination_signal;
+            action.sa_sigaction = handler as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(err(format!(
+                    "sigaction({signal}): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+    }
+    handle
+        .insert_source(
+            Generic::new(File::from(read_end), Interest::READ, Mode::Level),
+            |_, pipe, app: &mut App<S>| {
+                // Drain everything queued; the flow is terminal after the
+                // first and ignores the rest. Raised, not stepped: the same
+                // deferral every protocol callback observes, so the exit
+                // runs from `tick` like every other command.
+                let mut reader: &File = pipe;
+                let mut bytes = [0_u8; 8];
+                loop {
+                    match reader.read(&mut bytes) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            for byte in &bytes[..n] {
+                                if let Some(signal) = Signal::from_number(i32::from(*byte)) {
+                                    app.raise(FlowEvent::Terminate(signal));
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        // WouldBlock: drained.
+                        Err(_) => break,
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(err)?;
+    Ok(())
+}
+
 /// Lock the session immediately and run until unlocked/denied/invalidated.
 pub fn run<S: LockSession + 'static>(session: S) -> Result<LockOutcome, LockError> {
     let lock = Lock {
@@ -1583,8 +1710,11 @@ pub fn run_with_lock<S: LockSession + 'static>(
     );
     let _root = root.clone().entered();
     let result = run_with_lock_body(session, lock_config, warning_ms_override);
+    // `display`, not `debug`: LockOutcome's Display is the inert, tested
+    // spelling (`Terminated:SIGTERM`), and Debug would put parentheses or
+    // braces into a value this record promises is a single token.
     match &result {
-        Ok(outcome) => root.record("outcome", tracing::field::debug(outcome)),
+        Ok(outcome) => root.record("outcome", tracing::field::display(outcome)),
         Err(error) => root.record("error", tracing::field::display(error)),
     };
     result
@@ -1605,6 +1735,20 @@ fn run_with_lock_body<S: LockSession + 'static>(
     let (globals, event_queue) = registry_queue_init(&conn).map_err(err)?;
     let qh: QueueHandle<App<S>> = event_queue.handle();
     let mut event_loop: EventLoop<App<S>> = EventLoop::try_new().map_err(err)?;
+    // From here on a termination signal is an event the loop handles, so the
+    // flow reaches a terminal phase and the trace closes (issue #79). Armed
+    // before anything that takes time (binding globals, building the
+    // controller, the immediate path's lock request), so the window in which
+    // a signal still kills the process outright is connect_to_env and the
+    // registry round trip above, which no loop can cover. A `--wait` parent
+    // never enters this function and stays killable the ordinary way.
+    // Failure degrades the way an absent layer-shell or join socket does:
+    // the lock is worth more than its trace.
+    if let Err(error) = arm_termination(&event_loop.handle()) {
+        eprintln!(
+            "vigil-lock: {error}; a signal will still end the process, without closing its trace"
+        );
+    }
     let signal = event_loop.get_signal();
     let wake_signal = signal.clone();
     let wake = WakeHandle::new(move || wake_signal.wakeup());
@@ -1760,6 +1904,20 @@ fn run_with_lock_body<S: LockSession + 'static>(
     // happened rather than by whatever order the fields drop in.
     app.phase_span = None;
     report_idle_cost(&metrics_at_start, &app.metrics, started);
+    if matches!(app.outcome, Some(LockOutcome::Terminated(_))) {
+        // A signal must leave the compositor's lock state exactly as the
+        // process dying would have, and the protocol settles what that is:
+        // "if the client dies while the session is locked, the compositor
+        // must not unlock the session in response". sctk's SessionLock
+        // sends a plain `destroy` from Drop, which after `locked` is a
+        // protocol error and, either way, a request this path has no
+        // business marshalling. Leak the object instead: nothing about the
+        // lock is sent, and the connection closing at exit is the whole
+        // story the compositor sees, as it was before #79.
+        if let Some(lock) = app.lock.take() {
+            std::mem::forget(lock);
+        }
+    }
     match (&app.error, app.outcome) {
         (Some(_), _) => Err(app.error.take().expect("checked above")),
         (None, Some(outcome)) => Ok(outcome),
@@ -2256,6 +2414,23 @@ mod tests {
     fn lock_handoff_inherits_fractional_output_scale() {
         assert_eq!(initial_scale120(Some(150)), 150);
         assert_eq!(initial_scale120(None), 120);
+    }
+
+    #[test]
+    fn the_pure_signal_table_matches_libc() {
+        // vigil-flow names no platform constant (it is pure), so this is
+        // where its numbers meet the ones the handler is installed for and
+        // the byte the self-pipe carries (issue #79).
+        use vigil_flow::Signal;
+        assert_eq!(Signal::Hangup.number(), libc::SIGHUP);
+        assert_eq!(Signal::Interrupt.number(), libc::SIGINT);
+        assert_eq!(Signal::Terminate.number(), libc::SIGTERM);
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            assert_eq!(
+                Signal::from_number(signal).map(Signal::number),
+                Some(signal)
+            );
+        }
     }
 
     #[test]
