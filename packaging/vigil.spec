@@ -120,6 +120,18 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 
 %changelog
 * Tue Oct 13 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.4.1-1
+- The default theme is laid out by output size (#100). The clock scales
+  with the output and sits centered above a card sized to its content: an
+  avatar with the user's initial, the name and a user cycler, the field with
+  an inline Caps Lock chip, and one status line. The field shakes once on a
+  failed attempt and a thin bar sweeps under it while a check runs. Session,
+  banner and power share the footer, stacked and centered in portrait, and
+  a flat scrim sits over the wallpaper. Themes may read two new optional
+  inputs, user-initial and error-serial; the contract is otherwise unchanged
+  and themes without them are unaffected.
+- Over a native background the lock repaints and composites only the
+  regions that changed instead of the whole output: at 4K a clock tick costs
+  9.4ms instead of 49.6ms, and a keystroke 4.5ms (#100).
 - A signal no longer kills the locker without closing its trace (#79, #98).
   SIGTERM, SIGINT and SIGHUP wake the event loop through a self-pipe and the
   lock exits through its normal path, so span_lines::exit closes every span
