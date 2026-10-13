@@ -65,6 +65,88 @@ pub enum LockOutcome {
     Invalidated,
     /// Input or output topology cancelled the warning before session-lock.
     Cancelled,
+    /// SIGTERM, SIGINT or SIGHUP reached the process (issue #79). The locker
+    /// ends the way the signal's default disposition would have ended it,
+    /// but through the event loop, so every open span closes and the
+    /// `lock.session` record says why in words. A held session lock is left
+    /// exactly as a dead client leaves it: locked.
+    Terminated(Signal),
+}
+
+impl LockOutcome {
+    /// The process exit code this outcome ends with. This is the contract
+    /// hypr-DE's lock-cmd.sh reads: 3 is a cancelled idle lock that must not
+    /// be retried, and any other non-zero code is "not locked", at which
+    /// point the script fails closed. A signal maps to 128 plus its number,
+    /// the code a shell reports for a process the signal killed, so the
+    /// parent sees the same number it saw before the locker exited on its
+    /// own.
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            Self::Unlocked => 0,
+            Self::Invalidated => 1,
+            Self::Denied => 2,
+            Self::Cancelled => 3,
+            Self::Terminated(signal) => 128 + signal.number(),
+        }
+    }
+}
+
+impl std::fmt::Display for LockOutcome {
+    /// Stable, inert names. These reach a journal record as an attribute
+    /// value (`lock.session ... outcome=`), so they avoid whitespace and `=`
+    /// deliberately. The signal is written as its name, not its number,
+    /// because the record exists to be read.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlocked => f.write_str("Unlocked"),
+            Self::Denied => f.write_str("Denied"),
+            Self::Invalidated => f.write_str("Invalidated"),
+            Self::Cancelled => f.write_str("Cancelled"),
+            Self::Terminated(signal) => write!(f, "Terminated:{}", signal.name()),
+        }
+    }
+}
+
+/// A termination signal the locker turns into [`LockOutcome::Terminated`]
+/// instead of dying from. Data only: this crate installs no handler and
+/// names no platform constant. The numbers are signal(7)'s and identical on
+/// every Linux architecture for these three; vigil-wayland pins them to
+/// libc's constants in a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Hangup,
+    Interrupt,
+    Terminate,
+}
+
+impl Signal {
+    pub const fn number(self) -> i32 {
+        match self {
+            Self::Hangup => 1,
+            Self::Interrupt => 2,
+            Self::Terminate => 15,
+        }
+    }
+
+    /// The inverse of [`Signal::number`]; `None` for anything the locker
+    /// does not handle.
+    pub const fn from_number(number: i32) -> Option<Self> {
+        match number {
+            1 => Some(Self::Hangup),
+            2 => Some(Self::Interrupt),
+            15 => Some(Self::Terminate),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Hangup => "SIGHUP",
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
 }
 
 /// The three clocks a step may consult. `elapsed` is the app-monotonic ramp
@@ -143,6 +225,13 @@ pub enum FlowEvent {
     /// resume and leaves grace alone (the dual-clock deadline already
     /// handled it).
     PrepareForSleep(bool),
+    /// SIGTERM, SIGINT or SIGHUP reached the process (issue #79). The host
+    /// turned the signal into an event instead of letting it kill the
+    /// process, so the flow can end in a terminal phase and the trace can
+    /// close. The flow answers with [`LockOutcome::Terminated`] and nothing
+    /// else: it never releases a held lock, because a signal must leave the
+    /// compositor's lock state exactly as a dead client would.
+    Terminate(Signal),
     /// Timer wakeup or any event-loop pass with nothing more specific.
     Tick,
 }
@@ -268,14 +357,12 @@ impl std::fmt::Display for FlowPhase {
             Self::Locked => f.write_str("Locked"),
             Self::RevealPending => f.write_str("RevealPending"),
             Self::Revealing => f.write_str("Revealing"),
-            // Matched rather than `{outcome:?}`: Debug is not a stability
-            // guarantee, so a future `Denied { reason: String }` would
-            // silently start emitting braces, quotes and spaces into a
-            // value this impl promises is inert.
-            Self::Done(LockOutcome::Unlocked) => f.write_str("Done:Unlocked"),
-            Self::Done(LockOutcome::Denied) => f.write_str("Done:Denied"),
-            Self::Done(LockOutcome::Invalidated) => f.write_str("Done:Invalidated"),
-            Self::Done(LockOutcome::Cancelled) => f.write_str("Done:Cancelled"),
+            // LockOutcome's Display, never `{outcome:?}`: Debug is not a
+            // stability guarantee, so a future `Denied { reason: String }`
+            // would silently start emitting braces, quotes and spaces into
+            // a value this impl promises is inert. The outcome's Display
+            // makes the same promise and is tested for it.
+            Self::Done(outcome) => write!(f, "Done:{outcome}"),
         }
     }
 }
@@ -550,6 +637,13 @@ impl LockFlow {
                 }
             }
             FlowEvent::PrepareForSleep(false) => {}
+            // From any phase, a held lock included. `finish` emits
+            // PhaseChanged and Exit only, never ReleaseSessionLock, so a
+            // signal cannot be used to unlock; the executor then leaves the
+            // lock object untouched for the compositor to keep.
+            FlowEvent::Terminate(signal) => {
+                self.finish(LockOutcome::Terminated(signal), &mut cmds);
+            }
             FlowEvent::Tick => {}
         }
         if matches!(self.phase, FlowPhase::Done(_)) {
@@ -1606,6 +1700,107 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn exit_codes_are_the_contract_lock_cmd_reads() {
+        // To hypr-DE's lock-cmd.sh, 3 is "cancelled, do not retry" and any
+        // other non-zero code is "not locked". A signal reports 128 plus its
+        // number: the code the parent saw back when the signal killed the
+        // process outright (issue #79).
+        assert_eq!(LockOutcome::Unlocked.exit_code(), 0);
+        assert_eq!(LockOutcome::Invalidated.exit_code(), 1);
+        assert_eq!(LockOutcome::Denied.exit_code(), 2);
+        assert_eq!(LockOutcome::Cancelled.exit_code(), 3);
+        assert_eq!(LockOutcome::Terminated(Signal::Hangup).exit_code(), 129);
+        assert_eq!(LockOutcome::Terminated(Signal::Interrupt).exit_code(), 130);
+        assert_eq!(LockOutcome::Terminated(Signal::Terminate).exit_code(), 143);
+    }
+
+    #[test]
+    fn signal_numbers_and_names_follow_signal_7() {
+        for (signal, number, name) in [
+            (Signal::Hangup, 1, "SIGHUP"),
+            (Signal::Interrupt, 2, "SIGINT"),
+            (Signal::Terminate, 15, "SIGTERM"),
+        ] {
+            assert_eq!(signal.number(), number);
+            assert_eq!(signal.name(), name);
+            assert_eq!(Signal::from_number(number), Some(signal));
+        }
+        assert_eq!(Signal::from_number(9), None, "SIGKILL cannot be handled");
+    }
+
+    #[test]
+    fn a_signal_while_locked_exits_without_releasing_the_lock() {
+        let mut flow = locked_flow(&manual_lock());
+        let cmds = flow.step(at(600), FlowEvent::Terminate(Signal::Terminate));
+        let outcome = LockOutcome::Terminated(Signal::Terminate);
+        assert!(has(&cmds, &FlowCmd::Exit(outcome)), "{cmds:?}");
+        assert!(
+            !cmds.iter().any(|cmd| matches!(
+                cmd,
+                FlowCmd::ReleaseSessionLock
+                    | FlowCmd::SetLockedHint(false)
+                    | FlowCmd::CreateRevealOverlays
+                    | FlowCmd::DetachAuth
+            )),
+            "a signal must never unlock: {cmds:?}"
+        );
+        assert_eq!(flow.phase(), FlowPhase::Done(outcome));
+        assert!(flow.next_wake().is_none(), "nothing is left to wake for");
+        let later = flow.step(at(700), FlowEvent::AuthOk);
+        assert!(later.is_empty(), "terminal: {later:?}");
+    }
+
+    #[test]
+    fn a_signal_during_the_warning_never_requests_the_lock() {
+        let (mut flow, _) = LockFlow::new(at(0), &warning_lock(3_000), None);
+        let cmds = flow.step(at(500), FlowEvent::Terminate(Signal::Interrupt));
+        assert!(!has(&cmds, &FlowCmd::RequestSessionLock), "{cmds:?}");
+        assert!(has(
+            &cmds,
+            &FlowCmd::Exit(LockOutcome::Terminated(Signal::Interrupt))
+        ));
+        // The scheduled commit must not fire from a terminal phase.
+        let later = flow.step(at(4_000), FlowEvent::Tick);
+        assert!(later.is_empty(), "{later:?}");
+    }
+
+    #[test]
+    fn terminal_names_stay_inert() {
+        // Journal attribute values: no whitespace, no `=`. The pre-existing
+        // names are pinned too, so no record anyone has captured moves.
+        let all = [
+            LockOutcome::Unlocked,
+            LockOutcome::Denied,
+            LockOutcome::Invalidated,
+            LockOutcome::Cancelled,
+            LockOutcome::Terminated(Signal::Hangup),
+            LockOutcome::Terminated(Signal::Interrupt),
+            LockOutcome::Terminated(Signal::Terminate),
+        ];
+        for outcome in all {
+            for text in [outcome.to_string(), FlowPhase::Done(outcome).to_string()] {
+                assert!(
+                    !text.contains(char::is_whitespace) && !text.contains('='),
+                    "{text:?}"
+                );
+            }
+        }
+        assert_eq!(LockOutcome::Unlocked.to_string(), "Unlocked");
+        assert_eq!(
+            FlowPhase::Done(LockOutcome::Cancelled).to_string(),
+            "Done:Cancelled"
+        );
+        assert_eq!(
+            LockOutcome::Terminated(Signal::Terminate).to_string(),
+            "Terminated:SIGTERM"
+        );
+        assert_eq!(
+            FlowPhase::Done(LockOutcome::Terminated(Signal::Hangup)).to_string(),
+            "Done:Terminated:SIGHUP"
+        );
+    }
+
+    #[test]
     fn construction_arms_a_wake_for_the_ramp() {
         // An adapter that sleeps until next_wake() must never block with no
         // deadline armed, or the ramp never samples and the lock never
@@ -1830,6 +2025,12 @@ pub(crate) mod tests {
             (
                 "invalidated",
                 Box::new(|flow: &mut LockFlow| flow.step(at(10), FlowEvent::LockInvalidated)),
+            ),
+            (
+                "terminated",
+                Box::new(|flow: &mut LockFlow| {
+                    flow.step(at(10), FlowEvent::Terminate(Signal::Terminate))
+                }),
             ),
         ] {
             let (mut flow, _) = LockFlow::new(at(0), &warning_lock(3_000), None);
