@@ -1723,6 +1723,8 @@ fn run_with_lock_body<S: LockSession + 'static>(
         .map_err(err)?;
     app.session.set_runtime(wake, dirty, metrics);
 
+    let started = std::time::Instant::now();
+    let metrics_at_start = app.metrics.snapshot();
     while app.outcome.is_none() && app.error.is_none() {
         let mut timeout = match app.session.wait_decision() {
             WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
@@ -1757,11 +1759,40 @@ fn run_with_lock_body<S: LockSession + 'static>(
     // Close the phase before the session, so the tree nests the way it
     // happened rather than by whatever order the fields drop in.
     app.phase_span = None;
+    report_idle_cost(&metrics_at_start, &app.metrics, started);
     match (&app.error, app.outcome) {
         (Some(_), _) => Err(app.error.take().expect("checked above")),
         (None, Some(outcome)) => Ok(outcome),
         (None, None) => unreachable!(),
     }
+}
+
+/// One line per lock, on the way out: how much work the session actually
+/// did, and at what rate.
+///
+/// ADR 0002 required these counters and they have been recorded since --
+/// but never reported anywhere, which is why a locked session burning most
+/// of a core with nothing on screen (#65) was invisible until someone
+/// thought to run pidstat. A settled lock should show a handful of wakes
+/// per minute and commits only when something changed; anything in the
+/// thousands is the shape of a loop feeding itself.
+fn report_idle_cost(
+    start: &slint_idle_runtime::MetricsSnapshot,
+    metrics: &Metrics,
+    started: std::time::Instant,
+) {
+    let end = metrics.snapshot();
+    let secs = started.elapsed().as_secs_f64().max(0.001);
+    let per_min = |a: u64, b: u64| (b.saturating_sub(a) as f64) * 60.0 / secs;
+    eprintln!(
+        "vigil-lock: idle cost over {:.0}s: {:.0} wakes/min, {:.0} renders/min, \
+         {:.0} commits/min, {:.0} buffer acquires/min",
+        secs,
+        per_min(start.wake_requests, end.wake_requests),
+        per_min(start.renders, end.renders),
+        per_min(start.commits, end.commits),
+        per_min(start.buffer_acquires, end.buffer_acquires),
+    );
 }
 
 impl<S: LockSession> SessionLockHandler for App<S> {
