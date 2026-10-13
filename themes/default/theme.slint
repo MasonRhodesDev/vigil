@@ -5,10 +5,17 @@
 // Colors and density come from slint-kit `Theme` (LMTT Material You).
 // Renderer limits (software baseline): no Path, no drop-shadow, no
 // border-radius combined with clip, western-script text only.
+//
+// Layout: a scaled clock with the login card under it, centered as one
+// column; a footer row with the session picker (left), the status banner
+// (center) and power (right). Sizes follow the output, so a 4K or portrait
+// screen is laid out, not just a 1080p one with more empty space. Rows that
+// position things carry fixed heights so geometry does not depend on the
+// host's font metrics (tests and the e2e driver click by coordinate).
 
 import { Theme } from "ui/theme.slint";
 import { KitButton, KitIconButton } from "ui/controls.slint";
-import { KitTitle, KitMuted, KitDisplay, KitWarning } from "ui/typography.slint";
+import { KitTitle, KitMuted, KitLabel } from "ui/typography.slint";
 
 export { Theme }
 
@@ -63,6 +70,31 @@ export component DefaultTheme inherits Window {
     changed prompt-text => { input.text = ""; root.reveal = false; }
     changed prompt-is-secret => { input.text = ""; root.reveal = false; }
 
+    // ---- geometry -------------------------------------------------------
+    // Whole logical pixels only: fractional Y blurs glyphs.
+    pure function snap(l: length) -> length { floor(l / 1px) * 1px }
+
+    property <length> short-side: min(root.width, root.height);
+    property <bool> portrait: root.height > root.width;
+    // Screen-edge margin: the kit's page pad, growing a little on big outputs.
+    property <length> edge: root.snap(max(Theme.page-pad, min(48px, root.short-side * 0.03)));
+    // The clock carries the screen. It is larger on outputs without the
+    // panel, where it is the only thing in the middle.
+    property <length> clock-size: root.snap(max(64px, min(200px, root.short-side * (root.panel-visible ? 0.11 : 0.14))));
+    property <length> clock-height: root.snap(root.clock-size * 1.2);
+    property <length> clock-gap: root.snap(root.clock-size * 0.38);
+    property <length> card-width: min(root.width - 2 * root.edge, max(360px, min(440px, root.width * 0.22)));
+    property <length> footer-y: root.height - root.edge - Theme.control-height;
+    // Room the session picker and power buttons each take in the footer.
+    property <length> footer-side: 280px;
+    // The clock + card column, centered over the space above the footer
+    // and lifted slightly toward the optical center.
+    property <length> column-height: root.clock-height + (root.panel-visible ? root.clock-gap + card.height : 0);
+    property <length> column-y: root.snap(max(root.edge, (root.footer-y - root.height * 0.04 - root.column-height) / 2));
+
+    // Manual entry ("Other…" in the picker): no account is known yet.
+    property <bool> manual-user: root.users.length > 1 && root.user-name == "";
+
     Image {
         visible: !root.native-background;
         source: root.background-source;
@@ -70,187 +102,258 @@ export component DefaultTheme inherits Window {
         height: 100%;
     }
 
-    // Clock, top-right.
-    KitDisplay {
-        opacity: root.warning-clock-progress;
-        text: root.clock-text;
-        x: parent.width - self.width - Theme.page-pad - Theme.space-sm;
-        y: Theme.page-pad;
+    // A flat scrim keeps the large clock readable over a busy wallpaper
+    // (no drop shadows on the software renderer).
+    Rectangle {
+        visible: !root.native-background && root.background-source.width > 0;
+        background: Theme.page-bg.with-alpha(0.28);
     }
 
-    // Login card, centered, only on the panel output. `visible` (not `if`)
-    // keeps the TextInput alive so keyboard focus survives panel moves.
-    Rectangle {
+    clock := Text {
+        opacity: root.warning-clock-progress;
+        text: root.clock-text;
+        color: Theme.fg;
+        font-size: root.clock-size;
+        x: 0;
+        y: root.column-y;
+        width: root.width;
+        height: root.clock-height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // Login card, only on the panel output. `visible` (not `if`) keeps the
+    // TextInput alive so keyboard focus survives panel moves. Its height
+    // comes from its content. The card fill fades with the larger of the
+    // two warning groups it holds; each group fades on its own.
+    card := Rectangle {
         visible: root.panel-visible;
-        opacity: max(root.warning-user-selector-progress, root.warning-password-progress);
-        width: 400px;
-        height: 300px;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        background: Theme.panel-bg.with-alpha(Theme.overlay-alpha);
-        border-radius: Theme.radius-md;
+        // Eases the card in when the panel arrives on this output.
+        property <float> arrive: root.panel-visible ? 1 : 0;
+        animate arrive { duration: 180ms; easing: ease-out; }
+        property <float> fill: max(root.warning-user-selector-progress, root.warning-password-progress) * self.arrive;
+
+        width: root.card-width;
+        height: card-layout.preferred-height;
+        x: root.snap((root.width - self.width) / 2);
+        y: root.snap(root.column-y + root.clock-height + root.clock-gap + (1 - self.arrive) * 8px);
+        background: Theme.panel-bg.with-alpha(Theme.overlay-alpha * self.fill);
+        border-radius: 12px;
         border-width: Theme.border-width;
-        border-color: Theme.border;
+        border-color: Theme.border.with-alpha(self.fill);
 
-        VerticalLayout {
-            padding: Theme.page-pad;
-            spacing: Theme.space-md;
-            alignment: start;
+        card-layout := VerticalLayout {
+            padding: Theme.space-xl;
+            spacing: Theme.space-lg;
 
-            // With a list, the top row becomes a user cycler; without one
-            // it stays the plain name (or nothing, when unknown).
-            if root.users.length > 1: HorizontalLayout {
-                spacing: Theme.space-sm;
-                height: Theme.control-height-sm;
-
-                KitIconButton {
-                    text: "‹";
-                    small: true;
-                    clicked => {
-                        root.user-changed(root.selected-user <= 0
-                            ? root.users.length - 1
-                            : root.selected-user - 1);
-                    }
-                }
-                KitTitle {
-                    text: root.users[root.selected-user];
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                }
-                KitIconButton {
-                    text: "›";
-                    small: true;
-                    clicked => {
-                        root.user-changed(root.selected-user >= root.users.length - 1
-                            ? 0
-                            : root.selected-user + 1);
-                    }
-                }
-            }
-
-            if root.users.length <= 1 && root.user-name != "": KitMuted {
-                text: root.user-name;
-            }
-
-            KitTitle {
-                text: root.prompt-text == "" ? "Password" : root.prompt-text;
-            }
-
-            Rectangle {
+            // Who: the plain name, or the user picker when there is a list.
+            if root.users.length > 1 || root.user-name != "": Rectangle {
                 height: Theme.row-height;
-                background: Theme.tile-bg;
-                border-radius: Theme.radius-md;
-                border-width: Theme.border-width;
-                border-color: root.auth-state == "error" ? Theme.danger : root.accent-color;
+                opacity: root.warning-user-selector-progress * card.arrive;
 
-                input := TextInput {
-                    x: Theme.control-pad-x;
-                    width: parent.width - 2 * Theme.control-pad-x - (root.prompt-is-secret ? 56px : 0px);
-                    vertical-alignment: center;
-                    color: Theme.fg;
-                    font-size: Theme.font-body;
-                    single-line: true;
-                    input-type: root.prompt-is-secret && !root.reveal
-                        ? InputType.password : InputType.text;
-                    // The platform pins cursor_flash_cycle to zero (no
-                    // animation clock on an hours-idle prompt), which pins
-                    // Slint's cursor bar permanently solid. Next to masked
-                    // bullets it reads as furniture; flush against a
-                    // revealed password it reads as a stray trailing "|".
-                    text-cursor-width: root.prompt-is-secret && root.reveal ? 0px : 1px;
-                    accepted => {
-                        root.submit(self.text);
-                        self.text = "";
+                HorizontalLayout {
+                    spacing: Theme.space-sm;
+
+                    KitTitle {
+                        text: root.manual-user ? "Another user"
+                            : root.users.length > 1 ? root.users[root.selected-user] : root.user-name;
+                        color: root.manual-user ? Theme.fg-muted : Theme.fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
                     }
-                }
 
-                // Reveal toggle, secret prompts only.
-                if root.prompt-is-secret: Rectangle {
-                    x: parent.width - 56px;
-                    width: 48px;
-                    height: parent.height - 12px;
-                    y: 6px;
-                    background: root.reveal ? Theme.accent : transparent;
-                    border-radius: Theme.radius-sm;
-                    Text {
-                        text: root.reveal ? "hide" : "show";
-                        color: root.reveal ? Theme.on-accent : Theme.fg-muted;
-                        font-size: Theme.font-label;
-                        width: 100%;
-                        height: 100%;
-                        horizontal-alignment: center;
+                    if root.users.length > 1: KitLabel {
+                        text: (root.selected-user + 1) + "/" + root.users.length;
                         vertical-alignment: center;
                     }
-                    TouchArea {
-                        clicked => { root.reveal = !root.reveal; }
+                    if root.users.length > 1: VerticalLayout {
+                        alignment: center;
+                        KitIconButton {
+                            text: "‹";
+                            small: true;
+                            clicked => {
+                                root.user-changed(root.selected-user <= 0
+                                    ? root.users.length - 1
+                                    : root.selected-user - 1);
+                            }
+                        }
+                    }
+                    if root.users.length > 1: VerticalLayout {
+                        alignment: center;
+                        KitIconButton {
+                            text: "›";
+                            small: true;
+                            clicked => {
+                                root.user-changed(root.selected-user >= root.users.length - 1
+                                    ? 0
+                                    : root.selected-user + 1);
+                            }
+                        }
                     }
                 }
             }
 
-            // Session picker: a cycler, shown once there is a choice.
-            if root.sessions.length > 1: HorizontalLayout {
+            // The question, the answer, and one status line.
+            VerticalLayout {
                 spacing: Theme.space-sm;
-                height: Theme.control-height-sm;
 
-                KitIconButton {
-                    text: "‹";
-                    small: true;
-                    clicked => {
-                        root.session-changed(root.selected-session <= 0
-                            ? root.sessions.length - 1
-                            : root.selected-session - 1);
-                    }
-                }
-                KitMuted {
-                    text: root.sessions[root.selected-session];
-                    horizontal-alignment: center;
+                KitLabel {
+                    opacity: root.warning-password-progress * card.arrive;
+                    height: 16px;
+                    text: root.prompt-text == "" ? "Password" : root.prompt-text;
                     vertical-alignment: center;
-                    horizontal-stretch: 1;
                 }
-                KitIconButton {
-                    text: "›";
-                    small: true;
-                    clicked => {
-                        root.session-changed(root.selected-session >= root.sessions.length - 1
-                            ? 0
-                            : root.selected-session + 1);
+
+                Rectangle {
+                    opacity: root.warning-password-progress * card.arrive;
+                    height: Theme.row-height;
+                    background: Theme.tile-bg;
+                    border-radius: Theme.radius-md;
+                    border-width: Theme.border-width;
+                    border-color: root.auth-state == "error" ? Theme.danger
+                        : root.auth-state == "busy" ? Theme.border : root.accent-color;
+
+                    HorizontalLayout {
+                        padding-left: Theme.control-pad-x;
+                        padding-right: 6px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        spacing: 6px;
+
+                        input := TextInput {
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            color: Theme.fg;
+                            font-size: Theme.font-body;
+                            single-line: true;
+                            input-type: root.prompt-is-secret && !root.reveal
+                                ? InputType.password : InputType.text;
+                            // The platform pins cursor_flash_cycle to zero (no
+                            // animation clock on an hours-idle prompt), which pins
+                            // Slint's cursor bar permanently solid. Next to masked
+                            // bullets it reads as furniture; flush against a
+                            // revealed password it reads as a stray trailing "|".
+                            text-cursor-width: root.prompt-is-secret && root.reveal ? 0px : 1px;
+                            accepted => {
+                                root.submit(self.text);
+                                self.text = "";
+                            }
+                        }
+
+                        // Caps Lock, where the typing happens.
+                        if root.caps-lock: Rectangle {
+                            width: 48px;
+                            background: Theme.warning-fg;
+                            border-radius: Theme.radius-xs;
+                            Text {
+                                text: "CAPS";
+                                color: Theme.on-secondary;
+                                font-size: 11px;
+                                font-weight: Theme.font-weight-bold;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // Reveal toggle, secret prompts only.
+                        if root.prompt-is-secret: Rectangle {
+                            width: 48px;
+                            background: root.reveal ? Theme.accent : transparent;
+                            border-radius: Theme.radius-sm;
+                            Text {
+                                text: root.reveal ? "hide" : "show";
+                                color: root.reveal ? Theme.on-accent : Theme.fg-muted;
+                                font-size: Theme.font-label;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                clicked => { root.reveal = !root.reveal; }
+                            }
+                        }
                     }
                 }
-            }
 
-            if root.caps-lock: KitWarning {
-                text: "Caps Lock is on";
-            }
-
-            if root.error-message != "": Text {
-                text: root.error-message;
-                color: Theme.danger;
-                font-size: Theme.font-body;
-                wrap: word-wrap;
-            }
-
-            if root.error-message == "" && root.info-message != "": KitMuted {
-                text: root.info-message;
-                wrap-text: true;
-            }
-
-            if root.auth-state == "busy": KitMuted {
-                text: "Checking…";
+                // Reserved so the card does not jump between states; a long
+                // message wraps and grows it.
+                Text {
+                    opacity: root.warning-password-progress * card.arrive;
+                    min-height: 20px;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                    text: root.auth-state == "busy" ? "Checking…"
+                        : root.error-message != "" ? root.error-message
+                        : root.info-message != "" ? root.info-message
+                        : "Press Enter to continue";
+                    color: root.auth-state == "busy" ? Theme.fg-muted
+                        : root.error-message != "" ? Theme.danger
+                        : root.info-message != "" ? Theme.fg-muted
+                        : Theme.fg-muted.with-alpha(0.7);
+                }
             }
         }
     }
 
-    // Power actions, bottom-left.
+    // ---- footer ---------------------------------------------------------
+
+    // Session picker, bottom-left, once there is a choice. Fixed widths keep
+    // the arrows in one place whatever the session name or font.
+    if root.panel-visible && root.sessions.length > 1: HorizontalLayout {
+        opacity: root.warning-user-selector-progress;
+        x: root.edge;
+        y: root.footer-y;
+        height: Theme.control-height;
+        spacing: Theme.space-sm;
+        alignment: start;
+
+        KitLabel {
+            width: 64px;
+            text: "Session";
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            alignment: center;
+            KitIconButton {
+                text: "‹";
+                small: true;
+                clicked => {
+                    root.session-changed(root.selected-session <= 0
+                        ? root.sessions.length - 1
+                        : root.selected-session - 1);
+                }
+            }
+        }
+        KitMuted {
+            width: 120px;
+            text: root.sessions[root.selected-session];
+            color: Theme.fg;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            alignment: center;
+            KitIconButton {
+                text: "›";
+                small: true;
+                clicked => {
+                    root.session-changed(root.selected-session >= root.sessions.length - 1
+                        ? 0
+                        : root.selected-session + 1);
+                }
+            }
+        }
+    }
+
+    // Power actions, bottom-right.
     HorizontalLayout {
         visible: root.power-visible;
         opacity: root.warning-power-progress;
-        x: Theme.page-pad + Theme.space-sm;
-        y: parent.height - Theme.page-pad - Theme.control-height;
-        width: 240px;
+        x: root.width - root.edge - self.width;
+        y: root.footer-y;
+        width: 232px;
         height: Theme.control-height;
-        spacing: Theme.space-md;
-        alignment: start;
+        spacing: Theme.space-sm;
 
         KitButton {
             width: 104px;
@@ -265,25 +368,37 @@ export component DefaultTheme inherits Window {
     }
 
     // Host-integration status banner, bottom-center (reserved contract
-    // surface: empty = hidden).
+    // surface: empty = hidden). In portrait it gets its own row above the
+    // footer; in landscape it stays clear of the two footer sides.
     if root.status-banner != "": Rectangle {
+        property <length> room: root.width - 2 * root.edge
+            - (root.portrait ? 0px : 2 * (root.footer-side + Theme.space-md));
         opacity: root.warning-status-progress;
         height: Theme.control-height;
-        width: banner.width + 2 * Theme.page-pad;
-        x: (parent.width - self.width) / 2;
-        y: parent.height - Theme.page-pad - Theme.control-height;
+        width: min(banner.preferred-width + 2 * Theme.space-lg + 16px, self.room);
+        x: root.snap((root.width - self.width) / 2);
+        y: root.portrait ? root.footer-y - Theme.control-height - Theme.space-md : root.footer-y;
         background: Theme.panel-bg.with-alpha(Theme.overlay-alpha);
-        border-radius: Theme.radius-md;
+        border-radius: Theme.control-height / 2;
         border-width: Theme.border-width;
         border-color: Theme.border;
 
+        Rectangle {
+            x: Theme.space-lg;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.warning-fg;
+        }
         banner := Text {
             text: root.status-banner;
             color: Theme.fg;
             font-size: Theme.font-body;
-            x: Theme.page-pad;
-            vertical-alignment: center;
+            x: Theme.space-lg + 16px;
+            width: parent.width - 2 * Theme.space-lg - 16px;
             height: 100%;
+            vertical-alignment: center;
+            overflow: elide;
         }
     }
 }

@@ -52,11 +52,20 @@ impl Scene {
     }
 }
 
-// Card geometry at 1280x800: 400x300 centered -> x 440..840, y 250..550.
-const CARD: (u32, u32, u32, u32) = (445, 255, 835, 545);
-// Input field interior row (card top 250 + 28 padding + prompt line + 14
-// spacing + half the 44px field).
-const FIELD_Y: u32 = 336;
+// Geometry at 1280x800 with no user row (the theme fixes every row height,
+// so none of this depends on host font metrics):
+//   clock 88px font in a 105px row, then a 33px gap;
+//   card 360 wide x 144 tall (24 pad + 16 label + 8 + 44 field + 8 + 20
+//   status + 24 pad), the clock+card column centered over the 736px above
+//   the footer less a 32px lift -> column top 211, card x 460..820, y 349..493.
+const CLOCK: (u32, u32, u32, u32) = (440, 211, 840, 316);
+const CARD: (u32, u32, u32, u32) = (465, 354, 815, 488);
+// Input field interior row: card top 349 + 24 + 16 + 8, plus half the field.
+const FIELD_Y: u32 = 419;
+// The field's text area: field x 484..796 less 12px left padding and the
+// reveal toggle (742..790) on the right.
+const TEXT_X: std::ops::Range<u32> = 500..735;
+const REVEAL_X: f64 = 766.0;
 
 #[test]
 fn default_theme_state_matrix() {
@@ -80,14 +89,13 @@ fn default_theme_state_matrix() {
         "login card must render when panel-visible"
     );
     assert!(
-        scene.any_in((400, 20, 1270, 90), |p| p != BG),
-        "clock must render top-right"
+        scene.any_in(CLOCK, |p| p != BG),
+        "clock must render above the card"
     );
 
     // --- typed secret input shows bullets in the field ---
-    let sample = |s: &Scene| -> Vec<(u8, u8, u8)> {
-        (475..805).step_by(2).map(|x| s.px(x, FIELD_Y)).collect()
-    };
+    let sample =
+        |s: &Scene| -> Vec<(u8, u8, u8)> { TEXT_X.step_by(2).map(|x| s.px(x, FIELD_Y)).collect() };
     let field_before = sample(&scene);
     for _ in 0..4 {
         scene.window.dispatch(InputEvent::Key {
@@ -111,7 +119,7 @@ fn default_theme_state_matrix() {
     let masked = sample(&scene);
     let click_reveal = |scene: &mut Scene| {
         scene.window.dispatch(InputEvent::PointerAbsolute {
-            x: 780.0,
+            x: REVEAL_X,
             y: FIELD_Y as f64,
         });
         scene.window.dispatch(InputEvent::PointerButton {
@@ -139,9 +147,9 @@ fn default_theme_state_matrix() {
         });
     }
     assert!(scene.render(), "clearing the field must dirty the scene");
-    // 475..740 stays inside the text area: the reveal toggle occupies the
-    // field's right 56px and would break uniformity legitimately.
-    let dense: Vec<(u8, u8, u8)> = (475..740).map(|x| scene.px(x, FIELD_Y)).collect();
+    // TEXT_X stays inside the text area: the reveal toggle occupies the
+    // field's right end and would break uniformity legitimately.
+    let dense: Vec<(u8, u8, u8)> = TEXT_X.map(|x| scene.px(x, FIELD_Y)).collect();
     assert!(
         dense.windows(2).all(|pair| pair[0] == pair[1]),
         "an empty revealed field must show nothing — a lone caret bar breaks row uniformity"
@@ -166,7 +174,7 @@ fn default_theme_state_matrix() {
     assert!(scene.render());
     assert!(
         scene.any_in(CARD, |(r, g, b)| r > 200 && g > 150 && b > 150),
-        "caps-lock warning must surface Theme.warning-fg in the card"
+        "caps-lock chip must surface Theme.warning-fg in the card"
     );
     scene.window.set_caps_lock(false);
 
@@ -181,34 +189,41 @@ fn default_theme_state_matrix() {
     );
     scene.window.set_status_banner("");
 
-    // --- session picker: appears once there is more than one session ---
-    let below_field = |s: &Scene| -> Vec<(u8, u8, u8)> {
-        (365..415)
+    // --- session picker: appears in the footer, bottom-left, once there is
+    // more than one session (footer row y 736..772, picker x 28..300) ---
+    let footer_left = |s: &Scene| -> Vec<(u8, u8, u8)> {
+        (738..772)
             .step_by(2)
-            .flat_map(|y| (455..825).step_by(2).map(move |x| (x, y)))
+            .flat_map(|y| (28..310).step_by(2).map(move |x| (x, y)))
             .map(|(x, y)| s.px(x, y))
             .collect()
     };
     scene.window.set_sessions(&["Hyprland".into()]);
     scene.window.set_session_index(0);
     assert!(scene.render());
-    let single = below_field(&scene);
+    let single = footer_left(&scene);
     scene
         .window
         .set_sessions(&["Hyprland".into(), "Sway".into()]);
     assert!(scene.render(), "second session must dirty the scene");
     assert_ne!(
         single,
-        below_field(&scene),
-        "session picker must render below the input field"
+        footer_left(&scene),
+        "session picker must render bottom-left"
     );
 
-    // --- panel hidden: card region collapses to pure background ---
+    // --- panel hidden: the card goes, and the clock (now 112px in a 134px
+    // row, centered: y 285..419) takes the middle alone. The card's lower
+    // part, below the clock, collapses to pure background ---
     scene.window.set_panel_visible(false);
     assert!(scene.render());
     assert!(
-        scene.uniform_bg(CARD),
+        scene.uniform_bg((465, 430, 815, 488)),
         "card region must be background-only when panel-hidden"
+    );
+    assert!(
+        scene.any_in((440, 285, 840, 419), |p| p != BG),
+        "clock must take the middle of an output without the panel"
     );
 }
 

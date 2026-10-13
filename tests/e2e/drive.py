@@ -113,10 +113,10 @@ typestr("demo")
 sendkey("ret"); time.sleep(1.5)
 
 # Cycle the session picker: "›" button center at 1280x800 with the default
-# theme. The user cycler (issue #21) sits above the password field, so the
-# session row moved down — verify with the theme_preview example if the
-# card layout changes again.
-click(797, 433)
+# theme. The picker sits in the footer at fixed widths (edge 28 + label 64 +
+# ‹ 32 + name 120, 8px gaps), so the card above it can change height freely
+# — verify with the theme_preview example if the footer layout changes.
+click(284, 754)
 cmd("screendump", filename=f"{outdir}/5-picker.ppm")
 
 # Correct password.
