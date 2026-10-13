@@ -282,6 +282,24 @@ Inputs (set by vigil):
 | `caps-lock` | bool | modifier indicator |
 | `status-banner` | string | reserved: host integration status line (empty = hidden) |
 
+Optional inputs. vigil sets each one only if the theme declares it, so a
+theme written against the table above keeps loading:
+
+| Property | Type | Meaning |
+|---|---|---|
+| `user-name` / `user-initial` | string | who the panel is for (lock: session user; greeter: selected user) and its first letter |
+| `user-display-name` | string | full name for `user-name` (AccountsService, else GECOS); empty = unknown |
+| `user-icon` | image | account picture, already cut to a circle; zero-size = none |
+| `users` / `selected-user` | [string] / int | greeter user list (`Other…` last) and the selection; `user-changed(int)` reports a pick |
+| `power-visible` | bool | power actions offered |
+| `native-background` | bool | the host draws the background; the theme should not |
+| `warning-*` | float | pre-lock warning timeline progress (vigil-lock) |
+| `error-serial` | int | bumped each time an error is shown |
+| `color-scheme` / `accent-color` | string / color | portal appearance |
+
+The greeter hides accounts AccountsService marks `SystemAccount` from
+`users`; "Other…" still reaches them.
+
 Outputs (invoked by the theme):
 
 | Callback | Meaning |

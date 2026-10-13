@@ -671,6 +671,21 @@ impl OutputWindow {
         self.set_optional_property("user-initial", Value::String(initial.into()));
     }
 
+    /// Optional theme properties `user-display-name` and `user-icon`: the
+    /// full name and picture of whoever `user-name` names, empty/blank when
+    /// unknown. Skipped on themes that lack them.
+    pub fn set_user_profile(&mut self, display_name: &str, avatar: Option<&Avatar>) {
+        self.set_optional_property("user-display-name", Value::String(display_name.into()));
+        let image = avatar
+            .map(|a| {
+                Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                    &a.rgba, a.size, a.size,
+                ))
+            })
+            .unwrap_or_default();
+        self.set_optional_property("user-icon", Value::Image(image));
+    }
+
     /// Theme contract `sessions`: display names of the launchable sessions.
     pub fn set_sessions(&mut self, names: &[String]) {
         let model: Vec<Value> = names
@@ -952,6 +967,43 @@ pub fn background(
     }
     let source = load_background(path)?;
     render_background(&source, fit, out_w, out_h)
+}
+
+/// A user picture, decoded and cropped once so switching users or outputs
+/// never touches the disk.
+#[derive(Clone, Debug)]
+pub struct Avatar {
+    rgba: Vec<u8>,
+    size: u32,
+}
+
+/// Square side avatars are scaled to: crisp on HiDPI at the default
+/// theme's row height without holding full-size photos in memory.
+const AVATAR_SIZE: u32 = 128;
+
+/// Decode, crop to a centred square, and cut to a circle (antialiased edge).
+/// The circle is baked in because the software renderer cannot clip to a
+/// border radius (DESIGN.md §6).
+pub fn load_avatar(path: &Path) -> Result<Avatar, String> {
+    let source = image::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let square = source.resize_to_fill(AVATAR_SIZE, AVATAR_SIZE, imageops::FilterType::Triangle);
+    let mut rgba = square.to_rgba8();
+    mask_circle(&mut rgba);
+    Ok(Avatar {
+        rgba: rgba.into_raw(),
+        size: AVATAR_SIZE,
+    })
+}
+
+fn mask_circle(img: &mut RgbaImage) {
+    let r = img.width() as f32 / 2.0;
+    for (x, y, px) in img.enumerate_pixels_mut() {
+        let dx = x as f32 + 0.5 - r;
+        let dy = y as f32 + 0.5 - r;
+        // 1 inside, 0 outside, a one-pixel ramp across the edge.
+        let coverage = (r - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+        px[3] = (px[3] as f32 * coverage).round() as u8;
+    }
 }
 
 /// A source image decoded once and reusable for several output sizes.
@@ -1394,6 +1446,17 @@ mod tests {
     use image::Rgba;
 
     use super::*;
+
+    #[test]
+    fn avatar_mask_is_a_circle() {
+        let mut img = RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255]));
+        mask_circle(&mut img);
+        assert_eq!(img.get_pixel(0, 0)[3], 0, "corner is outside");
+        assert_eq!(img.get_pixel(4, 4)[3], 255, "centre is inside");
+        assert_eq!(img.get_pixel(4, 4)[0], 10, "colour untouched");
+        let edge = img.get_pixel(0, 4)[3];
+        assert!(edge > 0 && edge < 255, "edge pixel partly covered: {edge}");
+    }
 
     const RED: Rgba<u8> = Rgba([255, 0, 0, 255]);
     const BLUE: Rgba<u8> = Rgba([0, 0, 255, 255]);

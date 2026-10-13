@@ -9,7 +9,7 @@ mod sessions;
 mod users;
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -264,6 +264,8 @@ struct App {
     selected_session: usize,
     users: Vec<String>,
     selected_user: usize,
+    /// Display names and pictures by login name (AccountsService / GECOS).
+    user_profiles: UserProfiles,
     remember: bool,
     state_file: PathBuf,
     remembered_user: Option<String>,
@@ -797,11 +799,11 @@ impl App {
         window.set_users(&self.users);
         window.set_user_index(self.selected_user);
         match self.users.get(self.selected_user) {
-            Some(name) if name != OTHER_USER => window.set_user_name(name),
-            Some(_) => window.set_user_name(""),
+            Some(name) if name != OTHER_USER => self.user_profiles.show(&mut window, name),
+            Some(_) => self.user_profiles.show(&mut window, ""),
             None => {
                 if let Some(user) = &self.remembered_user {
-                    window.set_user_name(user);
+                    self.user_profiles.show(&mut window, user);
                 }
             }
         }
@@ -1071,7 +1073,7 @@ impl App {
         let label = default.clone().unwrap_or_default();
         for e in self.entries.iter_mut() {
             e.window.set_user_index(index);
-            e.window.set_user_name(&label);
+            self.user_profiles.show(&mut e.window, &label);
         }
         let mut fan = FanUi {
             entries: &mut self.entries,
@@ -1532,15 +1534,32 @@ fn run() -> Result<i32, String> {
         .then(|| vigil_config::State::load(&config.sessions.state_file))
         .flatten();
     // A pinned --user/[greeter] user is kiosk mode: no list, no choosing.
-    let user_list = if resolved.user.is_none() && config.users.show_list {
-        let mut list = users::enumerate();
-        if !list.is_empty() {
-            list.push(OTHER_USER.to_owned());
-        }
-        list
+    let mut user_list = if resolved.user.is_none() && config.users.show_list {
+        users::enumerate()
     } else {
         Vec::new()
     };
+    // Names and pictures for the list, or for the one user kiosk/remembered
+    // mode shows. Blocking but before the loop, and capped (vigil-login).
+    let mut profile_names = user_list.clone();
+    if user_list.is_empty() {
+        profile_names.extend(resolved.user.clone());
+        profile_names.extend(
+            remembered
+                .as_ref()
+                .map(|s| s.user.clone())
+                .filter(|u| !u.is_empty()),
+        );
+    }
+    let profile_map = users::profiles(&mut profile_names);
+    if !user_list.is_empty() {
+        // `profiles` dropped SystemAccount users from the list.
+        user_list = profile_names;
+        if !user_list.is_empty() {
+            user_list.push(OTHER_USER.to_owned());
+        }
+    }
+    let user_profiles = UserProfiles::new(profile_map);
     let remembered_user = remembered
         .as_ref()
         .map(|s| s.user.clone())
@@ -1622,6 +1641,7 @@ fn run() -> Result<i32, String> {
         sessions: session_list,
         selected_session: initial_session,
         users: user_list,
+        user_profiles,
         selected_user,
         remember,
         state_file: config.sessions.state_file.clone(),
@@ -1764,6 +1784,40 @@ fn main() {
             eprintln!("vigil: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Display names and decoded pictures, looked up by login name.
+struct UserProfiles {
+    names: HashMap<String, String>,
+    avatars: HashMap<String, vigil_ui::Avatar>,
+}
+
+impl UserProfiles {
+    fn new(profiles: HashMap<String, users::Profile>) -> Self {
+        let mut names = HashMap::new();
+        let mut avatars = HashMap::new();
+        for (user, profile) in profiles {
+            if let Some(path) = &profile.icon {
+                match vigil_ui::load_avatar(path) {
+                    Ok(avatar) => {
+                        avatars.insert(user.clone(), avatar);
+                    }
+                    Err(e) => eprintln!("vigil: user picture: {e}"),
+                }
+            }
+            names.insert(user, profile.display_name);
+        }
+        Self { names, avatars }
+    }
+
+    /// `user-name` plus the optional display name and picture.
+    fn show(&self, window: &mut vigil_ui::OutputWindow, user: &str) {
+        window.set_user_name(user);
+        window.set_user_profile(
+            self.names.get(user).map(String::as_str).unwrap_or(""),
+            self.avatars.get(user),
+        );
     }
 }
 
