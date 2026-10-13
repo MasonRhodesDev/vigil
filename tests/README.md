@@ -38,6 +38,7 @@ Checks one entry per record, full field sets, `seq` contiguous from zero,
 `lock.session` carrying its outcome, and no journald suppression. Skips
 cleanly without sway, wtype, systemd-run or a user manager.
 
-Cancels the warning so the locker leaves through `span_lines::exit`; a
-killed locker loses whatever is still open, which is #79 and not what this
-measures.
+Cancels the warning so the locker leaves through `span_lines::exit`. A
+locker that dies from SIGKILL loses whatever is still open; SIGTERM, SIGINT
+and SIGHUP no longer do (#79), and `tests/nested/run.sh` S10 is where that
+is measured, not here.

@@ -79,9 +79,10 @@ XDG_RUNTIME_DIR=$HOST_RUNTIME systemd-run --user --collect --quiet --unit="$UNIT
         --setenv=TRACEPARENT='$TP' \
         -- '$VLOCK' --warn 4000" >/dev/null 2>&1
 
-# Cancel the warning, so the locker leaves through span_lines::exit rather
-# than being killed - a kill loses whatever is still open, which is issue
-# #79 and not what this suite is measuring.
+# Cancel the warning, so the locker leaves through span_lines::exit. A
+# SIGTERM would close the trace too since #79, but through a different path
+# (the nested suite's S10 measures that one); this suite measures the
+# transport, so it takes the ordinary exit.
 sleep 1.5
 WAYLAND_DISPLAY=$NESTED_WD wtype -s 800 x 2>/dev/null || true
 sleep 3
