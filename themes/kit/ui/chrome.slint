@@ -1,6 +1,7 @@
 // Chrome components — list rows, fields, headers, badges, panels.
 import { Theme } from "theme.slint";
 import { KitLabel, KitMuted, KitTitle } from "typography.slint";
+import { KitButton } from "controls.slint";
 
 export component KitTextButton inherits Rectangle {
     in property <string> text;
@@ -145,7 +146,14 @@ export component KitListRow inherits Rectangle {
     in property <bool> matched: false;
     in property <bool> active: false;
     in property <bool> enabled: true;
+    // Leading avatar. Shown when the image has pixels; otherwise `initials`
+    // (if set) on a tinted disc; otherwise nothing.
+    in property <image> icon;
+    in property <string> initials: "";
     callback clicked;
+
+    private property <length> avatar-size: Theme.row-height - 2 * Theme.space-sm;
+    private property <bool> has-icon: root.icon.width > 0;
 
     height: Theme.row-height;
     width: 100%;
@@ -176,6 +184,31 @@ export component KitListRow inherits Rectangle {
             font-size: Theme.font-body;
             vertical-alignment: center;
             horizontal-stretch: 0;
+        }
+        if root.has-icon || root.initials != "": Rectangle {
+            width: root.avatar-size;
+            height: root.avatar-size;
+            horizontal-stretch: 0;
+            border-radius: self.width / 2;
+            clip: true;
+            background: root.has-icon ? transparent : Theme.primary-container;
+
+            if root.has-icon: Image {
+                width: 100%;
+                height: 100%;
+                source: root.icon;
+                image-fit: cover;
+            }
+            if !root.has-icon: Text {
+                width: 100%;
+                height: 100%;
+                text: root.initials;
+                color: Theme.on-primary-container;
+                font-size: Theme.font-body;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
         }
         Text {
             text: root.title;
@@ -257,4 +290,65 @@ export component KitSidePanel inherits Rectangle {
     min-width: Theme.side-panel-min-width;
     // ScrollView inside clips; panel clip would soft-blit labels (Slint #10499).
     horizontal-stretch: 1;
+}
+
+/// Inline confirmation for destructive actions. Render it with `if` where the
+/// action lives; `@children` sits between the message and the buttons (e.g. a
+/// "Remove home directory" checkbox). Not modal — the caller decides placement.
+export component KitConfirm inherits Rectangle {
+    in property <string> title;
+    in property <string> message: "";
+    in property <string> confirm-text: "Delete";
+    in property <string> cancel-text: "Cancel";
+    in property <bool> danger: true;
+    in property <bool> enabled: true;
+    callback confirmed;
+    callback cancelled;
+
+    width: 100%;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    border-radius: Theme.radius-md;
+    border-width: Theme.border-width;
+    border-color: root.danger ? Theme.danger : Theme.border;
+    background: root.danger ? Theme.danger.with-alpha(0.08) : Theme.panel-bg-high;
+
+    VerticalLayout {
+        padding: Theme.space-lg;
+        spacing: Theme.space-sm;
+        alignment: start;
+
+        Text {
+            text: root.title;
+            color: Theme.fg;
+            font-size: Theme.font-title;
+            horizontal-alignment: left;
+            wrap: word-wrap;
+        }
+        if root.message != "": Text {
+            text: root.message;
+            color: Theme.fg-muted;
+            font-size: Theme.font-body;
+            horizontal-alignment: left;
+            wrap: word-wrap;
+        }
+        @children
+        HorizontalLayout {
+            spacing: Theme.space-sm;
+            alignment: end;
+            padding-top: Theme.space-xs;
+
+            KitButton {
+                text: root.cancel-text;
+                clicked => { root.cancelled(); }
+            }
+            KitButton {
+                text: root.confirm-text;
+                danger: root.danger;
+                primary: !root.danger;
+                enabled: root.enabled;
+                clicked => { root.confirmed(); }
+            }
+        }
+    }
 }

@@ -185,7 +185,15 @@ export component KitCheckBox inherits Rectangle {
 export component KitLineEdit inherits Rectangle {
     in-out property <string> text;
     in property <bool> enabled: true;
+    // text | password | number | decimal — forwarded to TextInput.
+    in property <InputType> input-type: InputType.text;
+    // Shown muted while `text` is empty; never part of `text`.
+    in property <string> placeholder: "";
     callback edited(string);
+    // Enter pressed.
+    callback accepted(string);
+
+    public function focus-input() { input.focus(); }
 
     height: Theme.control-height;
     horizontal-stretch: 1;
@@ -209,6 +217,7 @@ export component KitLineEdit inherits Rectangle {
         input := TextInput {
             text <=> root.text;
             enabled: root.enabled;
+            input-type: root.input-type;
             color: root.enabled ? Theme.fg : Theme.fg-muted;
             font-size: Theme.font-body;
             horizontal-alignment: left;
@@ -216,7 +225,22 @@ export component KitLineEdit inherits Rectangle {
             single-line: true;
             horizontal-stretch: 1;
             edited => { root.edited(self.text); }
+            accepted => { root.accepted(self.text); }
         }
+    }
+
+    // Overlay on the input's own geometry, so the caret and layout are untouched.
+    if root.text == "" && root.placeholder != "": Text {
+        x: input.x;
+        y: input.y;
+        width: input.width;
+        height: input.height;
+        text: root.placeholder;
+        color: Theme.fg-muted.with-alpha(0.7);
+        font-size: Theme.font-body;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+        overflow: elide;
     }
 }
 

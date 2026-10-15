@@ -4148,7 +4148,7 @@ dependencies = [
 [[package]]
 name = "slint-kit"
 version = "0.2.0"
-source = "git+https://github.com/MasonRhodesDev/slint-kit?rev=ccd7397c3da83ff835d6295d6ec3841fc32c8bac#ccd7397c3da83ff835d6295d6ec3841fc32c8bac"
+source = "git+https://github.com/MasonRhodesDev/slint-kit?rev=3581f653546ae1e187bc3f2bb20c54019d0a202a#3581f653546ae1e187bc3f2bb20c54019d0a202a"
 dependencies = [
  "lmtt-core",
  "slint",
