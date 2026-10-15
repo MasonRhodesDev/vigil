@@ -3,6 +3,7 @@
 # $VIGIL_E2E_DIR must be a --rwdir for logs; repo root is read from $VIGIL_REPO.
 REPO=${VIGIL_REPO:-/home/mason/repos/vigil}
 DIR=${VIGIL_E2E_DIR:-/tmp}
+BIN=${VIGIL_E2E_BIN:-$REPO/target/debug/vigil}
 LOG=$DIR/vigil.log
 : > "$LOG"
 # Controlled session list so the picker renders and start_session is
@@ -31,8 +32,8 @@ fi
 # $VIGIL_E2E_CONFIG lets a run pick a non-default config -- the GL path is
 # selected that way, so the same flow can be driven on either renderer.
 if [ -n "${VIGIL_E2E_CONFIG:-}" ]; then
-    "$REPO/target/debug/vigil" --socket /tmp/greetd.sock --config "$VIGIL_E2E_CONFIG" 2>>"$LOG"
+    "$BIN" --socket /tmp/greetd.sock --config "$VIGIL_E2E_CONFIG" 2>>"$LOG"
 else
-    "$REPO/target/debug/vigil" --socket /tmp/greetd.sock 2>>"$LOG"
+    "$BIN" --socket /tmp/greetd.sock 2>>"$LOG"
 fi
 echo "VIGIL-EXIT:$?" | tee -a "$LOG"

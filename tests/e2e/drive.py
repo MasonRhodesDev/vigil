@@ -87,6 +87,11 @@ while True:
         sys.exit(f"greeter never appeared on screen after {FIRST_PAINT_TIMEOUT}s")
     time.sleep(1)
 
+# The second output: no card there, so its clock is the larger size (over
+# 92px at 1280x800), which is what femtovg draws from glyph outlines and a
+# stencil-less GL surface fills as boxes (check_frames.py asserts on it).
+cmd("screendump", filename=f"{outdir}/0b-second-output.ppm", device="gpu1")
+
 # Username stage.
 cmd("screendump", filename=f"{outdir}/1-username.ppm")
 typestr("demo")

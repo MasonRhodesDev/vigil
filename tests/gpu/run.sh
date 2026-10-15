@@ -25,6 +25,10 @@
 #
 # Requires: qemu-system-x86-core, virtme-ng; --accel also needs
 # virglrenderer on the host.
+#
+# VIGIL_VM_KERNEL=/boot/vmlinuz-linux boots that kernel instead of the
+# running one, for hosts whose running kernel has no image to hand virtme
+# (a container on someone else's kernel). tests/e2e honours it too.
 set -eu
 
 ACCEL=0
@@ -75,7 +79,7 @@ echo "GPU-EXIT:\$?" >> "$LOG"
 EOF
 chmod +x "$WORK/guest.sh"
 
-timeout "${VIGIL_GPU_TIMEOUT:-300}" vng --run --disable-microvm --user root \
+timeout "${VIGIL_GPU_TIMEOUT:-300}" vng --run ${VIGIL_VM_KERNEL:-} --disable-microvm --user root \
     -m 1G --cpus 2 --rwdir="$WORK" --qemu-opts="$GPU" \
     -e "$WORK/guest.sh" >/dev/null 2>&1 &
 VM=$!
