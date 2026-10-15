@@ -13,7 +13,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.4.1
+Version:        0.4.2
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -121,6 +121,24 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Thu Oct 15 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.4.2-1
+- The GL renderer asks EGL for a stencil buffer (#105). femtovg fills text
+  larger than 92px from glyph outlines with a stencil-then-cover pass, and
+  without a stencil buffer the cover pass painted each glyph's bounding
+  box, so a large clock came out as solid rectangles while the card text
+  looked right. The e2e suite now captures the second output and fails on
+  a clock drawn as rectangles.
+- Monitors are named the way Hyprland names them, so one monitor profile
+  matches the same panel in the session and at the login screen (#107,
+  #109). The make comes from hwdata's pnp.ids (HPN is "HP Inc.", not
+  "HPN"), the serial falls back to the EDID's numeric serial, and commas
+  are erased, all as aquamarine and Hyprland do. A desc: selector that
+  matches hyprctl's description now matches in vigil too. vigil now
+  requires hwdata. A hand-written selector that used the raw PNP id of a
+  vendor hwdata lists (desc:HPN ...) no longer matches.
+- slint-kit 3581f65: word-wrapped kit text inside a conditional or repeated
+  layout cell no longer draws over what follows it (#103, #104).
+
 * Tue Oct 13 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.4.1-1
 - The default theme is laid out by output size (#100). The clock scales
   with the output and sits centered above a card sized to its content: an
