@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
+use std::sync::OnceLock;
 
 use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier};
 use smithay::reexports::drm::control::{
@@ -361,17 +362,59 @@ fn read_edid(device: &DrmDevice, handle: connector::Handle) -> Option<Vec<u8>> {
     None
 }
 
-/// PNP ids whose full vendor name libdisplay-info substitutes. Deliberately
-/// tiny: only ids present in this ecosystem's profiles, so a description
-/// built here prefix-matches a selector written against Hyprland. Any other
-/// id passes through verbatim (BNQ and BOE already do).
-const PNP_VENDORS: &[(&str, &str)] = &[("DEL", "Dell Inc."), ("GSM", "LG Electronics")];
+/// hwdata's PNP registry: the table Hyprland's description comes from.
+/// aquamarine snapshots this file when it is built and substitutes the vendor
+/// name for the EDID's three-letter id; reading the installed copy gives the
+/// same answer on the same distro.
+const PNP_IDS_PATH: &str = "/usr/share/hwdata/pnp.ids";
 
-/// `(make, model)` from an EDID block: the PNP id packed into bytes 8-9
-/// (three 5-bit letters, big-endian) and the display description tail.
+/// Used only when the registry is missing, so the ids that already matched
+/// before vigil read hwdata keep matching on a box without it.
+const PNP_FALLBACK: &[(&str, &str)] = &[("DEL", "Dell Inc."), ("GSM", "LG Electronics")];
+
+/// `pnp.ids` lines are `ID<TAB>Vendor name`.
+fn parse_pnp_ids(text: &str) -> HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(id, vendor)| id.len() == 3 && !vendor.trim().is_empty())
+        .map(|(id, vendor)| (id.to_owned(), vendor.trim().to_owned()))
+        .collect()
+}
+
+/// The vendor name for a PNP id, as Hyprland spells it.
+fn pnp_vendor(id: &str) -> Option<String> {
+    static TABLE: OnceLock<Option<HashMap<String, String>>> = OnceLock::new();
+    match TABLE.get_or_init(|| {
+        std::fs::read_to_string(PNP_IDS_PATH)
+            .ok()
+            .map(|t| parse_pnp_ids(&t))
+    }) {
+        Some(table) => table.get(id).cloned(),
+        None => PNP_FALLBACK
+            .iter()
+            .find(|(pnp, _)| *pnp == id)
+            .map(|(_, name)| (*name).to_owned()),
+    }
+}
+
+/// `(make, model)` from an EDID block, built the way Hyprland builds an
+/// output's description so a `desc:` selector copied from `hyprctl monitors`
+/// matches here: aquamarine's make (the vendor name for the PNP id packed
+/// into bytes 8-9, or the id itself), then libdisplay-info's model and
+/// serial. The serial rides on the model, since vigil keeps two fields.
+/// Hyprland then erases every comma from the description (monitor rules are
+/// comma-separated), so "Red Hat, Inc." matches as "Red Hat Inc."; both
+/// fields only ever feed descriptions, so the commas go here.
 /// Every malformed input yields `None`s rather than panicking — this parses
 /// bytes a monitor supplied.
 fn parse_edid(edid: &[u8]) -> (Option<String>, Option<String>) {
+    parse_edid_with(edid, pnp_vendor)
+}
+
+fn parse_edid_with(
+    edid: &[u8],
+    vendor: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
     if edid.len() < 128 {
         return (None, None);
     }
@@ -383,22 +426,24 @@ fn parse_edid(edid: &[u8]) -> (Option<String>, Option<String>) {
     let make = match (letter(10), letter(5), letter(0)) {
         (Some(a), Some(b), Some(c)) => {
             let pnp = format!("{a}{b}{c}");
-            let vendor = PNP_VENDORS
-                .iter()
-                .find(|(id, _)| *id == pnp)
-                .map(|(_, name)| *name)
-                .unwrap_or(&pnp);
-            Some(vendor.to_owned())
+            Some(vendor(&pnp).unwrap_or(pnp))
         }
         _ => None,
     };
+    // di_info_get_model: the product name descriptor, else the product code.
     let mut model = descriptor(edid, 0xfc)
         .unwrap_or_else(|| format!("0x{:04X}", u16::from_le_bytes([edid[10], edid[11]])));
-    if let Some(serial) = descriptor(edid, 0xff) {
+    // di_info_get_serial: the serial descriptor, else the numeric serial
+    // when it is not zero.
+    let numeric = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
+    let serial =
+        descriptor(edid, 0xff).or_else(|| (numeric != 0).then(|| format!("0x{numeric:08X}")));
+    if let Some(serial) = serial {
         model.push(' ');
         model.push_str(&serial);
     }
-    (make, Some(model))
+    let uncomma = |s: String| s.replace(',', "");
+    (make.map(uncomma), Some(uncomma(model)))
 }
 
 /// Text from one of the four 18-byte display descriptors.
@@ -463,10 +508,52 @@ mod tests {
         block
     }
 
+    /// A slice of hwdata's pnp.ids, tab-separated like the real file.
+    const PNP: &str =
+        "BOE\tBOE\nDEL\tDell Inc.\nGSM\tLG Electronics\nHPN\tHP Inc.\nRHT\tRed Hat, Inc.\n";
+
+    fn parse(edid: &[u8]) -> (Option<String>, Option<String>) {
+        let table = parse_pnp_ids(PNP);
+        parse_edid_with(edid, |id| table.get(id).cloned())
+    }
+
+    fn description(edid: &[u8]) -> String {
+        let (make, model) = parse(edid);
+        [make, model]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// mason-work's desk, read from /sys/class/drm/*/edid, against the
+    /// descriptions `hyprctl monitors` printed for the same panels. The HP
+    /// is the one vigil used to spell "HPN HP E243 ...", which no profile
+    /// written against Hyprland could match.
+    #[test]
+    fn real_edids_match_hyprland_descriptions() {
+        for (edid, hyprland) in [
+            (
+                &include_bytes!("../testdata/mason-work-DP-1.edid")[..],
+                "Dell Inc. DELL S2721HGF 85YFP83",
+            ),
+            (
+                &include_bytes!("../testdata/mason-work-DP-4.edid")[..],
+                "HP Inc. HP E243 CNK7510Y4B",
+            ),
+            (
+                &include_bytes!("../testdata/mason-work-eDP-2.edid")[..],
+                "BOE 0x0BC9",
+            ),
+        ] {
+            assert_eq!(description(edid), hyprland);
+        }
+    }
+
     #[test]
     fn builds_libdisplay_info_description() {
         assert_eq!(
-            parse_edid(&edid(
+            parse(&edid(
                 [0x10, 0xac],
                 [0, 0],
                 Some("DELL S2725QC"),
@@ -482,23 +569,58 @@ mod tests {
     #[test]
     fn falls_back_to_product_code() {
         assert_eq!(
-            parse_edid(&edid([0x09, 0xe5], [0xc9, 0x0b], None, None)),
+            parse(&edid([0x09, 0xe5], [0xc9, 0x0b], None, None)),
             (Some("BOE".to_owned()), Some("0x0BC9".to_owned()))
         );
+    }
+
+    /// No serial descriptor but a numeric serial: libdisplay-info prints it
+    /// as eight hex digits, which is how Hyprland names an LG TV
+    /// ("LG Electronics LG TV 0x01010101").
+    #[test]
+    fn numeric_serial_without_descriptor() {
+        let mut block = edid([0x1e, 0x6d], [0, 0], Some("LG TV"), None);
+        block[12..16].copy_from_slice(&[1, 1, 1, 1]);
+        assert_eq!(description(&block), "LG Electronics LG TV 0x01010101");
+    }
+
+    /// QEMU's virtual monitor, as `hyprctl monitors` prints it in the
+    /// hypr-qa guest: Hyprland erases the comma from "Red Hat, Inc.".
+    #[test]
+    fn commas_are_erased_like_hyprland() {
+        let block = edid([0x49, 0x14], [0x34, 0x12], Some("QEMU Monitor"), None);
+        assert_eq!(description(&block), "Red Hat Inc. QEMU Monitor");
+    }
+
+    /// The serial descriptor wins over a numeric serial (the HP has both).
+    #[test]
+    fn serial_descriptor_beats_numeric_serial() {
+        let mut block = edid([0x22, 0x0e], [0, 0], Some("HP E243"), Some("CNK7510Y4B"));
+        block[12..16].copy_from_slice(&[1, 1, 1, 1]);
+        assert_eq!(description(&block), "HP Inc. HP E243 CNK7510Y4B");
     }
 
     #[test]
     fn unknown_pnp_passes_through() {
         assert_eq!(
-            parse_edid(&edid([0x09, 0xd1], [0, 0], Some("BenQ Monitor"), None)),
+            parse(&edid([0x09, 0xd1], [0, 0], Some("BenQ Monitor"), None)),
             (Some("BNQ".to_owned()), Some("BenQ Monitor".to_owned()))
         );
     }
 
     #[test]
+    fn pnp_ids_parse_skips_comments_and_junk() {
+        let table =
+            parse_pnp_ids("# comment\nHPN\tHP Inc.\nTOOLONG\tx\nAAA\t\n\nDEL\tDell Inc.  \n");
+        assert_eq!(table.len(), 2);
+        assert_eq!(table["HPN"], "HP Inc.");
+        assert_eq!(table["DEL"], "Dell Inc.");
+    }
+
+    #[test]
     fn short_edid_is_none() {
-        assert_eq!(parse_edid(&[0u8; 40]), (None, None));
-        assert_eq!(parse_edid(&[]), (None, None));
+        assert_eq!(parse(&[0u8; 40]), (None, None));
+        assert_eq!(parse(&[]), (None, None));
     }
 
     #[test]
