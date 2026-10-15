@@ -402,6 +402,9 @@ fn pnp_vendor(id: &str) -> Option<String> {
 /// matches here: aquamarine's make (the vendor name for the PNP id packed
 /// into bytes 8-9, or the id itself), then libdisplay-info's model and
 /// serial. The serial rides on the model, since vigil keeps two fields.
+/// Hyprland then erases every comma from the description (monitor rules are
+/// comma-separated), so "Red Hat, Inc." matches as "Red Hat Inc."; both
+/// fields only ever feed descriptions, so the commas go here.
 /// Every malformed input yields `None`s rather than panicking — this parses
 /// bytes a monitor supplied.
 fn parse_edid(edid: &[u8]) -> (Option<String>, Option<String>) {
@@ -439,7 +442,8 @@ fn parse_edid_with(
         model.push(' ');
         model.push_str(&serial);
     }
-    (make, Some(model))
+    let uncomma = |s: String| s.replace(',', "");
+    (make.map(uncomma), Some(uncomma(model)))
 }
 
 /// Text from one of the four 18-byte display descriptors.
@@ -505,7 +509,8 @@ mod tests {
     }
 
     /// A slice of hwdata's pnp.ids, tab-separated like the real file.
-    const PNP: &str = "BOE\tBOE\nDEL\tDell Inc.\nGSM\tLG Electronics\nHPN\tHP Inc.\n";
+    const PNP: &str =
+        "BOE\tBOE\nDEL\tDell Inc.\nGSM\tLG Electronics\nHPN\tHP Inc.\nRHT\tRed Hat, Inc.\n";
 
     fn parse(edid: &[u8]) -> (Option<String>, Option<String>) {
         let table = parse_pnp_ids(PNP);
@@ -577,6 +582,14 @@ mod tests {
         let mut block = edid([0x1e, 0x6d], [0, 0], Some("LG TV"), None);
         block[12..16].copy_from_slice(&[1, 1, 1, 1]);
         assert_eq!(description(&block), "LG Electronics LG TV 0x01010101");
+    }
+
+    /// QEMU's virtual monitor, as `hyprctl monitors` prints it in the
+    /// hypr-qa guest: Hyprland erases the comma from "Red Hat, Inc.".
+    #[test]
+    fn commas_are_erased_like_hyprland() {
+        let block = edid([0x49, 0x14], [0x34, 0x12], Some("QEMU Monitor"), None);
+        assert_eq!(description(&block), "Red Hat Inc. QEMU Monitor");
     }
 
     /// The serial descriptor wins over a numeric serial (the HP has both).

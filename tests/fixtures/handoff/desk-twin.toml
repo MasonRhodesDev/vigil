@@ -1,0 +1,13 @@
+description = "Stale hand-made twin in the old vigil spelling, second monitor still portrait."
+match = ["desc:RHT QEMU Monitor"]
+
+[[monitor]]
+output = "Virtual-1"
+mode = "1280x800@60"
+position = [0, 0]
+
+[[monitor]]
+output = "Virtual-2"
+mode = "1280x800@60"
+position = [1280, 0]
+transform = 1
