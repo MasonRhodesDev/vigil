@@ -1,10 +1,20 @@
 // Typography primitives — Tailwind-ish text recipes on Theme tokens.
+//
+// Every text here binds `min-height: self.preferred-height`. Slint 1.17
+// measures a conditional (`if`) or repeated (`for`) layout child at its
+// preferred width, so a wrapped text inside one would report a single line's
+// height and the items after it would be drawn over it. `preferred-height`
+// is computed from the text's real width, so the minimum keeps the cell
+// honest wherever the text sits; for unwrapped text it equals the implicit
+// height and changes nothing. `min-height` rather than `height` so a text in
+// a row can still stretch and use `vertical-alignment`.
 import { Theme } from "theme.slint";
 
 export component KitLabel inherits Text {
     color: Theme.fg-muted;
     font-size: Theme.font-label;
     vertical-stretch: 0;
+    min-height: self.preferred-height;
     horizontal-alignment: left;
     overflow: elide;
 }
@@ -14,6 +24,7 @@ export component KitMuted inherits Text {
     color: Theme.fg-muted;
     font-size: Theme.font-body;
     vertical-stretch: 0;
+    min-height: self.preferred-height;
     horizontal-alignment: left;
     overflow: elide;
     wrap: root.wrap-text ? word-wrap : no-wrap;
@@ -24,6 +35,7 @@ export component KitTitle inherits Text {
     font-size: Theme.font-title;
     font-weight: Theme.font-weight-semibold;
     vertical-stretch: 0;
+    min-height: self.preferred-height;
     horizontal-alignment: left;
     overflow: elide;
 }
@@ -33,6 +45,7 @@ export component KitDisplay inherits Text {
     font-size: Theme.font-display;
     font-weight: Theme.font-weight-bold;
     vertical-stretch: 0;
+    min-height: self.preferred-height;
     horizontal-alignment: left;
     overflow: elide;
 }
@@ -41,6 +54,7 @@ export component KitWarning inherits Text {
     color: Theme.warning-fg;
     font-size: Theme.font-body;
     vertical-stretch: 0;
+    min-height: self.preferred-height;
     horizontal-alignment: left;
     wrap: word-wrap;
 }
