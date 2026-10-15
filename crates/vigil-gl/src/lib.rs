@@ -137,13 +137,22 @@ impl GlContext {
     /// has to be one the display hardware will scan out. Both constraints
     /// point at the same answer: ask for the format by name rather than
     /// describing it in bit counts and taking what turns up.
-    fn config_for(&self, fourcc: u32) -> Result<ffi::egl::types::EGLConfig, GlError> {
+    ///
+    /// The config must also carry a stencil buffer. femtovg fills every
+    /// concave path stencil-then-cover, and it draws text over 92px as glyph
+    /// outlines rather than from its atlas, so without stencil the cover pass
+    /// paints each glyph's whole bounding box: a large clock turns into solid
+    /// rectangles while small text looks fine. EGL sorts configs by ascending
+    /// stencil size, so leaving it out reliably picks one with none.
+    fn config_for(&self, fourcc: u32) -> Result<ChosenConfig, GlError> {
         let handle = self.display.get_display_handle();
         let attrs = [
             ffi::egl::SURFACE_TYPE as ffi::egl::types::EGLint,
             ffi::egl::WINDOW_BIT as ffi::egl::types::EGLint,
             ffi::egl::RENDERABLE_TYPE as ffi::egl::types::EGLint,
             ffi::egl::OPENGL_ES2_BIT as ffi::egl::types::EGLint,
+            ffi::egl::STENCIL_SIZE as ffi::egl::types::EGLint,
+            MIN_STENCIL_BITS as ffi::egl::types::EGLint,
             ffi::egl::NONE as ffi::egl::types::EGLint,
         ];
         let mut configs = [std::ptr::null(); 64];
@@ -162,25 +171,53 @@ impl GlContext {
         if ok == 0 || found == 0 {
             return Err(GlError("no window-capable EGL configs".into()));
         }
-        for config in configs.iter().take(found as usize) {
-            let mut id: ffi::egl::types::EGLint = 0;
+        let attrib = |config: ffi::egl::types::EGLConfig, name: ffi::egl::types::EGLenum| {
+            let mut value: ffi::egl::types::EGLint = 0;
             // SAFETY: a config just returned by ChooseConfig on this display.
             let ok = unsafe {
                 ffi::egl::GetConfigAttrib(
                     handle.handle,
-                    *config,
-                    ffi::egl::NATIVE_VISUAL_ID as ffi::egl::types::EGLint,
-                    &mut id,
+                    config,
+                    name as ffi::egl::types::EGLint,
+                    &mut value,
                 )
             };
-            if ok != 0 && id as u32 == fourcc {
-                return Ok(*config);
+            (ok != 0).then_some(value)
+        };
+        for config in configs.iter().take(found as usize).copied() {
+            if attrib(config, ffi::egl::NATIVE_VISUAL_ID).map(|id| id as u32) != Some(fourcc) {
+                continue;
             }
+            let stencil_bits = attrib(config, ffi::egl::STENCIL_SIZE).unwrap_or(0);
+            // ChooseConfig already filtered on it; a driver that ignores the
+            // filter must not get a config that draws text as boxes.
+            if stencil_bits < MIN_STENCIL_BITS {
+                continue;
+            }
+            return Ok(ChosenConfig {
+                config,
+                alpha_bits: attrib(config, ffi::egl::ALPHA_SIZE).unwrap_or(0) as u8,
+                depth_bits: attrib(config, ffi::egl::DEPTH_SIZE).unwrap_or(0) as u8,
+                stencil_bits: stencil_bits as u8,
+            });
         }
         Err(GlError(format!(
-            "no EGL config with native visual {fourcc:#x} (of {found})"
+            "no EGL config with native visual {fourcc:#x} and a {MIN_STENCIL_BITS}-bit stencil buffer (of {found})"
         )))
     }
+}
+
+/// femtovg's stencil-then-cover fills use an 8-bit stencil (INCR_WRAP and
+/// DECR_WRAP winding counts).
+const MIN_STENCIL_BITS: i32 = 8;
+
+/// An EGL config and the buffer sizes it actually has, which is what the
+/// surface's [`PixelFormat`] must describe.
+struct ChosenConfig {
+    config: ffi::egl::types::EGLConfig,
+    alpha_bits: u8,
+    depth_bits: u8,
+    stencil_bits: u8,
 }
 
 /// A GBM surface usable as an EGL native window.
@@ -273,7 +310,7 @@ impl GlSurface {
         fourcc: u32,
         format: gbm::Format,
     ) -> Result<Self, GlError> {
-        let config = context.config_for(fourcc)?;
+        let chosen = context.config_for(fourcc)?;
         let gbm_surface = context
             .device
             .create_surface::<()>(
@@ -289,18 +326,24 @@ impl GlSurface {
         let pixel_format = PixelFormat {
             hardware_accelerated: true,
             color_bits: 24,
-            alpha_bits: 0,
-            depth_bits: 0,
-            stencil_bits: 0,
+            alpha_bits: chosen.alpha_bits,
+            depth_bits: chosen.depth_bits,
+            stencil_bits: chosen.stencil_bits,
             stereoscopy: false,
             multisampling: None,
             srgb: false,
         };
-        // SAFETY: `config` came from this display's own ChooseConfig, and the
+        // SAFETY: `chosen.config` came from this display's own ChooseConfig, and the
         // GBM surface was created with the format that config names.
-        let surface =
-            unsafe { EGLSurface::new(&context.display, pixel_format, config, window.clone()) }
-                .map_err(|e| GlError(format!("egl window surface: {e}")))?;
+        let surface = unsafe {
+            EGLSurface::new(
+                &context.display,
+                pixel_format,
+                chosen.config,
+                window.clone(),
+            )
+        }
+        .map_err(|e| GlError(format!("egl window surface: {e}")))?;
         let context = context.clone();
         Ok(Self {
             context,
