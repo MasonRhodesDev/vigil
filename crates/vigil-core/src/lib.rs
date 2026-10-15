@@ -23,7 +23,8 @@ pub struct OutputInfo {
     pub height: u32,
     /// Vertical refresh in millihertz.
     pub refresh_mhz: u32,
-    /// EDID manufacturer PNP id (e.g. `DEL`), when the monitor reports one.
+    /// EDID manufacturer as Hyprland names it: the hwdata vendor name for
+    /// the PNP id (`Dell Inc.` for `DEL`), or the id itself when unlisted.
     pub make: Option<String>,
     /// EDID model name (0xFC descriptor), when present.
     pub model: Option<String>,

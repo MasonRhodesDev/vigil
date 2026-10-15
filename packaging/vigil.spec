@@ -36,6 +36,8 @@ BuildRequires:  clang-devel
 BuildRequires:  fontconfig-devel
 # The greeter runs as greetd's `greeter` user on greetd's socket.
 Requires:       greetd
+# pnp.ids: monitor vendor names, so desc: selectors match Hyprland's.
+Requires:       hwdata
 # groupadd in %pre for the shared monitor-profiles group.
 Requires(pre):  shadow-utils
 # The package creates this shared group in %%pre. Declare the capability so

@@ -139,6 +139,11 @@ are editable by group rather than by root:
 sudo gpasswd -a "$USER" monitor-profiles   # re-login for it to take effect
 ```
 
+Monitors are matched by the description Hyprland gives them, so a
+`desc:` selector copied from `hyprctl monitors` works on both sides of
+login. vigil builds it from the EDID the same way (vendor names from
+hwdata's `pnp.ids`).
+
 No profiles installed is a supported state, not an error: vigil falls back to
 scan order with a DPI-derived scale from the monitor's EDID. A profile that is
 unreadable, unmatched, or nonsensical degrades the same way — a layout file
