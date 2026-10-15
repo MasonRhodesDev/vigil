@@ -9,10 +9,11 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=${1:-$(mktemp -d -p "${XDG_CACHE_HOME:-$HOME/.cache}" vigil-e2e-rot.XXXXXX)}
 case $WORK in /tmp/*) echo "workdir must not be under /tmp (guest tmpfs)"; exit 2;; esac
 mkdir -p "$WORK/profiles"
-# Both VM outputs describe as "RHT QEMU Monitor"; connectors pin the entries.
+# Both VM outputs describe as "Red Hat Inc. QEMU Monitor" (Hyprland's name
+# for QEMU's EDID); connectors pin the entries.
 cat > "$WORK/profiles/rotated.toml" <<EOF
 description="e2e rotated secondary"
-match=["RHT QEMU Monitor"]
+match=["Red Hat Inc. QEMU Monitor"]
 [[monitor]]
 output="Virtual-1"
 position=[0,0]

@@ -1,0 +1,12 @@
+description = "The session's desk, as dials saves it: the monitors as Hyprland names them, the second one back to landscape."
+match = ["desc:Red Hat Inc. QEMU Monitor"]
+
+[[monitor]]
+output = "Virtual-1"
+mode = "1280x800@60"
+position = [0, 0]
+
+[[monitor]]
+output = "Virtual-2"
+mode = "1280x800@60"
+position = [1280, 0]
