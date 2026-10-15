@@ -8,9 +8,9 @@ crates/vigil/tests/theme_states.rs). What is stable: a rendered frame has
 many distinct colours, a dead renderer's frame has almost none, and the
 login card occupies a fixed centered region at every stage.
 
-Only display 0 is asserted: QMP screendump without a device argument
-captures the first virtio-gpu console, and run.sh's `vigil: output` count
-already proves the second card exists.
+The stages are display 0 (QMP screendump without a device argument
+captures the first virtio-gpu console). The second output is captured once,
+by device id, for its large clock.
 
 Usage: check_frames.py WORKDIR
 """
@@ -66,8 +66,45 @@ def sample(img, rect, step=4):
     return out
 
 
+# Clock glyphs fill about a quarter of their bounding box; a GL surface
+# without stencil fills each glyph's whole box (issue: greeter clock as
+# white rectangles), which measured 0.69 here against 0.28 for real text.
+CLOCK_FILL_MAX = 0.5
+
+
+def clock_fill(img):
+    """Fraction of the clock's bounding box that is ink, on an output with
+    no card: the only bright pixels above the footer are the clock's."""
+    w, h, px = img
+    ink = []
+    for y in range(0, h - 120):
+        row = y * w
+        for x in range(w):
+            i = (row + x) * 3
+            if px[i] + px[i + 1] + px[i + 2] > 3 * 160:
+                ink.append((x, y))
+    if not ink:
+        return None
+    xs = [x for x, _ in ink]
+    ys = [y for _, y in ink]
+    area = (max(xs) - min(xs) + 1) * (max(ys) - min(ys) + 1)
+    return len(ink) / area
+
+
 def main(workdir):
     failures = []
+    try:
+        second = load_ppm(f"{workdir}/0b-second-output.ppm")
+    except OSError:
+        failures.append("0b-second-output.ppm: missing")
+    else:
+        fill = clock_fill(second)
+        if fill is None:
+            failures.append("0b-second-output.ppm: no clock drawn")
+        elif fill > CLOCK_FILL_MAX:
+            failures.append(
+                f"0b-second-output.ppm: clock fills {fill:.2f} of its box "
+                f"(over {CLOCK_FILL_MAX}: glyphs drawn as rectangles)")
     imgs = {}
     for name in GREETER_STAGES:
         try:
