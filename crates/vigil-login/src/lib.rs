@@ -224,3 +224,117 @@ impl AppearanceWatcher {
         });
     }
 }
+
+const ACCOUNTS_DEST: &str = "org.freedesktop.Accounts";
+const ACCOUNTS_PATH: &str = "/org/freedesktop/Accounts";
+const ACCOUNTS_USER_IFACE: &str = "org.freedesktop.Accounts.User";
+
+/// What AccountsService knows about one account beyond /etc/passwd.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AccountProfile {
+    /// Empty when unset.
+    pub real_name: String,
+    /// Only when the file exists and is readable by us (the greeter user can
+    /// read /var/lib/AccountsService/icons; it can't read users/).
+    pub icon: Option<std::path::PathBuf>,
+    /// AccountsService's "hide from login screens" flag.
+    pub system_account: bool,
+}
+
+/// Look up `names` in AccountsService on the system bus (which the greeter
+/// user has, unlike a session bus). Blocking, so call it before the event
+/// loop or off it; capped by a short method timeout so a wedged service
+/// can't hold up the greeter. AccountsService missing is normal: the map is
+/// empty and the caller keeps its passwd-only view.
+pub fn account_profiles(
+    component: &str,
+    names: &[String],
+) -> std::collections::HashMap<String, AccountProfile> {
+    let mut out = std::collections::HashMap::new();
+    let conn = match zbus::blocking::connection::Builder::system()
+        .and_then(|b| b.method_timeout(std::time::Duration::from_secs(1)).build())
+    {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("{component}: system bus unavailable ({e}); no account names or pictures");
+            return out;
+        }
+    };
+    let manager = match Proxy::new(&conn, ACCOUNTS_DEST, ACCOUNTS_PATH, ACCOUNTS_DEST) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "{component}: AccountsService unavailable ({e}); no account names or pictures"
+            );
+            return out;
+        }
+    };
+    for name in names {
+        let path: OwnedObjectPath = match manager.call("FindUserByName", &(name.as_str(),)) {
+            Ok(path) => path,
+            // AccountsService's own error ("no such user"): skip this one.
+            Err(zbus::Error::MethodError(err, _, _))
+                if err.as_str().starts_with("org.freedesktop.Accounts.") =>
+            {
+                continue;
+            }
+            // Missing service, timeout, broken bus: the rest would fail the
+            // same way, each after the timeout, so stop here.
+            Err(e) => {
+                if is_service_unknown(&e) {
+                    eprintln!(
+                        "{component}: AccountsService not installed; no account names or pictures"
+                    );
+                } else {
+                    eprintln!(
+                        "{component}: AccountsService lookup failed ({e}); no account names or pictures"
+                    );
+                }
+                return out;
+            }
+        };
+        let Ok(user) = Proxy::new(&conn, ACCOUNTS_DEST, path, ACCOUNTS_USER_IFACE) else {
+            continue;
+        };
+        let icon: String = user.get_property("IconFile").unwrap_or_default();
+        let icon = std::path::PathBuf::from(icon);
+        out.insert(
+            name.clone(),
+            AccountProfile {
+                real_name: user.get_property("RealName").unwrap_or_default(),
+                icon: std::fs::File::open(&icon).is_ok().then_some(icon),
+                system_account: user.get_property("SystemAccount").unwrap_or(false),
+            },
+        );
+    }
+    out
+}
+
+/// zbus reports the bus daemon's well-known errors as `Error::FDO`, others as
+/// `MethodError`; "service not installed" can arrive as either.
+fn is_service_unknown(e: &zbus::Error) -> bool {
+    match e {
+        zbus::Error::FDO(fdo) => matches!(**fdo, zbus::fdo::Error::ServiceUnknown(_)),
+        zbus::Error::MethodError(name, _, _) => name.as_str().ends_with(".ServiceUnknown"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live: look up the current user. With AccountsService absent it must
+    /// return quickly and empty.
+    /// `cargo test -p vigil-login -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_account_profiles() {
+        let user = std::env::var("USER").expect("USER");
+        let started = std::time::Instant::now();
+        let profiles = account_profiles("test", &[user, "no-such-user-xyz".into()]);
+        eprintln!("{profiles:?} in {:?}", started.elapsed());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(!profiles.contains_key("no-such-user-xyz"));
+    }
+}

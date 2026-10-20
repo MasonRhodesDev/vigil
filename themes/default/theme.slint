@@ -60,6 +60,10 @@ export component DefaultTheme inherits Window {
     in property <string> user-name;
     // Optional: the first letter of `user-name`, for the avatar.
     in property <string> user-initial;
+    // Optional: full name and picture of `user-name` (AccountsService, else
+    // GECOS for the name). Empty name / zero-size image = not known.
+    in property <string> user-display-name;
+    in property <image> user-icon;
     in property <bool> panel-visible: true;
     in property <bool> power-visible: true;
     in property <float> warning-frost: 0;
@@ -212,15 +216,23 @@ export component DefaultTheme inherits Window {
                 HorizontalLayout {
                     spacing: Theme.space-md;
 
-                    // Avatar: the initial, or a hollow "+" when no account
-                    // is chosen yet.
+                    // Avatar: the account picture, else the initial, or a
+                    // hollow "+" when no account is chosen yet.
                     Rectangle {
                         width: Theme.row-height;
                         border-radius: self.width / 2;
                         background: root.manual-user ? transparent : Theme.primary-container;
                         border-width: root.manual-user ? Theme.border-width : 0px;
                         border-color: Theme.border;
-                        Text {
+                        // vigil hands the picture over already cut to a circle:
+                        // the software renderer can't clip to a radius.
+                        if !root.manual-user && root.user-icon.width > 0: Image {
+                            width: 100%;
+                            height: 100%;
+                            source: root.user-icon;
+                            image-fit: cover;
+                        }
+                        if root.manual-user || root.user-icon.width == 0: Text {
                             text: root.manual-user ? "+" : root.user-initial;
                             color: root.manual-user ? Theme.fg-muted : Theme.on-primary-container;
                             font-size: Theme.font-title;
@@ -232,6 +244,7 @@ export component DefaultTheme inherits Window {
 
                     KitTitle {
                         text: root.manual-user ? "Another user"
+                            : root.user-display-name != "" ? root.user-display-name
                             : root.users.length > 1 ? root.users[root.selected-user] : root.user-name;
                         color: root.manual-user ? Theme.fg-muted : Theme.fg;
                         font-weight: root.manual-user ? 400 : Theme.font-weight-semibold;

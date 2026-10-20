@@ -1,6 +1,12 @@
-//! Login-user enumeration for the greeter's user list (issue #21). Pure
-//! parsing over /etc/passwd + /etc/login.defs so it works as the `greeter`
-//! user with no D-Bus and no session bus.
+//! Login-user enumeration for the greeter's user list (issue #21). The list
+//! itself is pure parsing over /etc/passwd + /etc/login.defs, so it works
+//! with no D-Bus at all; AccountsService (system bus) only adds display
+//! names and pictures and hides `SystemAccount` users when it is present.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use vigil_login::AccountProfile;
 
 /// Shell basenames that mean "this account cannot log in". A UID in the
 /// login range is not enough on its own: build accounts (nix, jenkins)
@@ -58,9 +64,120 @@ pub fn filter_users(passwd: &str, uid_min: u32, uid_max: u32) -> Vec<String> {
     users
 }
 
+/// How the greeter shows one account.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Profile {
+    /// Full name, or empty to show the login name.
+    pub display_name: String,
+    pub icon: Option<PathBuf>,
+}
+
+/// Full names from the passwd GECOS field (text before the first comma).
+pub fn gecos_names(passwd: &str) -> HashMap<String, String> {
+    passwd
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?;
+            let gecos = fields.nth(3)?; // passwd, uid, gid, gecos
+            let full = gecos.split(',').next().unwrap_or("").trim();
+            (!name.is_empty() && !full.is_empty()).then(|| (name.to_owned(), full.to_owned()))
+        })
+        .collect()
+}
+
+/// AccountsService wins over GECOS (it is what settings apps write). Users
+/// AccountsService marks `SystemAccount` are dropped from `list`; "Other…"
+/// still reaches them.
+pub fn apply_profiles(
+    list: &mut Vec<String>,
+    gecos: &HashMap<String, String>,
+    accounts: &HashMap<String, AccountProfile>,
+) -> HashMap<String, Profile> {
+    list.retain(|name| !accounts.get(name).is_some_and(|a| a.system_account));
+    list.iter()
+        .map(|name| {
+            let account = accounts.get(name);
+            let display_name = account
+                .map(|a| a.real_name.trim())
+                .filter(|n| !n.is_empty())
+                .or_else(|| gecos.get(name).map(String::as_str))
+                .unwrap_or("")
+                .to_owned();
+            let icon = account.and_then(|a| a.icon.clone());
+            (name.clone(), Profile { display_name, icon })
+        })
+        .collect()
+}
+
+/// Profiles for `list` from the live system, filtering it in place.
+pub fn profiles(list: &mut Vec<String>) -> HashMap<String, Profile> {
+    if list.is_empty() {
+        return HashMap::new();
+    }
+    let gecos = std::fs::read_to_string("/etc/passwd")
+        .map(|p| gecos_names(&p))
+        .unwrap_or_default();
+    let accounts = vigil_login::account_profiles("vigil", list);
+    apply_profiles(list, &gecos, &accounts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gecos_names_take_the_full_name_field() {
+        let fixture = "mason:x:1000:1000:Mason Rhodes,,,:/home/mason:/bin/bash
+ada:x:1001:1001::/home/ada:/bin/bash
+bad
+";
+        let names = gecos_names(fixture);
+        assert_eq!(names.get("mason").map(String::as_str), Some("Mason Rhodes"));
+        assert!(!names.contains_key("ada"));
+    }
+
+    #[test]
+    fn profiles_prefer_accountsservice_and_hide_system_accounts() {
+        let mut list = vec!["ada".to_owned(), "build".to_owned(), "mason".to_owned()];
+        let gecos = HashMap::from([
+            ("mason".to_owned(), "Mason R".to_owned()),
+            ("ada".to_owned(), "Ada (gecos)".to_owned()),
+        ]);
+        let accounts = HashMap::from([
+            (
+                "ada".to_owned(),
+                AccountProfile {
+                    real_name: "Ada Lovelace".into(),
+                    icon: Some("/var/lib/AccountsService/icons/ada".into()),
+                    system_account: false,
+                },
+            ),
+            (
+                "build".to_owned(),
+                AccountProfile {
+                    system_account: true,
+                    ..Default::default()
+                },
+            ),
+            // Empty RealName falls back to GECOS.
+            ("mason".to_owned(), AccountProfile::default()),
+        ]);
+        let profiles = apply_profiles(&mut list, &gecos, &accounts);
+        assert_eq!(list, ["ada", "mason"]);
+        assert_eq!(profiles["ada"].display_name, "Ada Lovelace");
+        assert!(profiles["ada"].icon.is_some());
+        assert_eq!(profiles["mason"].display_name, "Mason R");
+        assert!(!profiles.contains_key("build"));
+    }
+
+    #[test]
+    fn profiles_without_accountsservice_are_gecos_only() {
+        let mut list = vec!["ada".to_owned()];
+        let profiles = apply_profiles(&mut list, &HashMap::new(), &HashMap::new());
+        assert_eq!(list, ["ada"]);
+        assert_eq!(profiles["ada"], Profile::default());
+    }
 
     #[test]
     fn filter_users_keeps_only_login_capable() {
