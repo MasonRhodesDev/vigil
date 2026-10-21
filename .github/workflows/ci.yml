@@ -71,7 +71,15 @@ jobs:
         if: steps.vkms.outputs.have == '1'
         run: |
           cargo build -p vigil --example test_pattern
+          # Since Linux 6.15 vkms is a faux-bus device: its card's device path
+          # is .../faux/vkms and device/driver names faux_driver, not vkms.
+          # Match either layout, and list the DRM devices if neither matches.
           card=$(for c in /sys/class/drm/card[0-9]; do \
-            readlink "$c/device/driver" 2>/dev/null | grep -q vkms && basename "$c" && break; done)
-          test -n "$card"
+            { readlink -f "$c/device"; readlink "$c/device/driver"; } 2>/dev/null \
+              | grep -q vkms && basename "$c" && break; done)
+          if [ -z "$card" ]; then
+            uname -r
+            for c in /sys/class/drm/card[0-9]; do echo "$c -> $(readlink -f "$c/device")"; done
+            exit 1
+          fi
           sudo ./target/debug/examples/test_pattern "/dev/dri/$card" 1
