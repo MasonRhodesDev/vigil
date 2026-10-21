@@ -76,7 +76,7 @@ jobs:
           # Match either layout, and list the DRM devices if neither matches.
           card=$(for c in /sys/class/drm/card[0-9]; do \
             { readlink -f "$c/device"; readlink "$c/device/driver"; } 2>/dev/null \
-              | grep -q vkms && basename "$c" && break; done)
+              | grep -q vkms && basename "$c" && break; done || true)
           if [ -z "$card" ]; then
             uname -r
             for c in /sys/class/drm/card[0-9]; do echo "$c -> $(readlink -f "$c/device")"; done
