@@ -16,6 +16,7 @@ pub struct Config {
     pub sessions: Sessions,
     pub profiles: Profiles,
     pub render: Render,
+    pub splash: Splash,
     pub users: Users,
     pub power: Power,
     pub greeter: Greeter,
@@ -69,6 +70,106 @@ impl Default for Sessions {
             remember: true,
             state_file: "/var/lib/vigil/state.toml".into(),
             default: String::new(),
+        }
+    }
+}
+
+/// The boot-splash look vigil shows between taking the screens and the first
+/// real greeter frame, and again between a successful login and its own exit.
+///
+/// One spec for every drawer: the defaults mirror the boot splash's scene
+/// (desktop-boot `lib/scene.py`), so vigil's frame lines up with the one
+/// before it. Every size is a fraction of the screen HEIGHT, so one spec
+/// fits a 1080p screen, a 1440p ultrawide and a 4K portrait screen alike.
+/// Read from the `[splash]` table of the main config, or wholesale from a
+/// standalone file given with `--splash-config` (same keys, no table
+/// header). Colors are `#rrggbb`; a bad color keeps its default rather than
+/// breaking the greeter.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Splash {
+    /// Draw the splash at all. Off means vigil behaves as it did before.
+    pub enabled: bool,
+    /// Ground color of the whole screen.
+    pub ground: String,
+    /// Mark color (the logo silhouette).
+    pub mark: String,
+    /// Glow color behind the mark.
+    pub accent: String,
+    /// Loading line track color, and the highlight that sweeps along it.
+    pub track: String,
+    pub shine: String,
+    /// The mark: an SVG (rendered as a one-colour silhouette, tiny shapes
+    /// such as a trademark sign dropped) or a PNG (its alpha is the shape).
+    /// Unset or unreadable means no mark; ground and line still draw.
+    pub logo: Option<PathBuf>,
+    /// Mark edge (square box), fraction of screen height.
+    pub logo_frac: f64,
+    /// Glow edge as a multiple of the mark edge, and its opacity.
+    pub glow_mult: f64,
+    pub glow_opacity: f64,
+    /// Mark centre from the top, fraction of screen height.
+    pub center_frac: f64,
+    /// Mark bottom to the line, fraction of screen height.
+    pub gap_frac: f64,
+    /// Line width and thickness, fractions of screen height; the thickness
+    /// never drops below `track_h_min` pixels.
+    pub track_w_frac: f64,
+    pub track_h_frac: f64,
+    pub track_h_min: u32,
+    /// Highlight width as a fraction of the line width, and the time one
+    /// sweep takes in milliseconds.
+    pub shine_w_frac: f64,
+    pub sweep_ms: u64,
+    /// Cross-fade from the splash to the greeter, milliseconds (0 cuts).
+    pub fade_ms: u64,
+    /// Longest the splash may hold the screen waiting for the greeter's
+    /// background, milliseconds. A greeter must never stay hidden.
+    pub max_wait_ms: u64,
+}
+
+impl Default for Splash {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ground: "#0b0d10".into(),
+            mark: "#c3c9d0".into(),
+            accent: "#1793d1".into(),
+            track: "#1f2832".into(),
+            shine: "#bee4f7".into(),
+            logo: None,
+            logo_frac: 0.16,
+            glow_mult: 2.0,
+            glow_opacity: 0.30,
+            center_frac: 0.47,
+            gap_frac: 0.05,
+            track_w_frac: 0.26,
+            track_h_frac: 0.0028,
+            track_h_min: 2,
+            shine_w_frac: 0.4,
+            sweep_ms: 2200,
+            fade_ms: 250,
+            max_wait_ms: 4000,
+        }
+    }
+}
+
+impl Splash {
+    /// Read a standalone splash file (top-level keys, no `[splash]` table).
+    /// A missing or broken file yields the defaults and a stderr line.
+    pub fn load_file(path: &Path) -> Splash {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match toml::from_str(&text) {
+                Ok(splash) => splash,
+                Err(e) => {
+                    eprintln!("vigil: splash config {}: {e}", path.display());
+                    Splash::default()
+                }
+            },
+            Err(e) => {
+                eprintln!("vigil: splash config {}: {e}", path.display());
+                Splash::default()
+            }
         }
     }
 }

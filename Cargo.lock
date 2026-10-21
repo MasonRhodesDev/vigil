@@ -5038,6 +5038,7 @@ dependencies = [
  "calloop 0.14.4",
  "image",
  "monitor-profiles",
+ "resvg",
  "slint-idle-runtime",
  "slint-kit",
  "vigil-auth",

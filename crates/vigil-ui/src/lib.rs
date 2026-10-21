@@ -9,7 +9,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use image::{DynamicImage, RgbaImage, imageops};
+#[cfg(test)]
+use image::DynamicImage;
+use image::{RgbaImage, imageops};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType, TargetPixel,
 };
@@ -955,11 +957,14 @@ pub fn background(
 }
 
 /// A source image decoded once and reusable for several output sizes.
-pub struct BackgroundImage(DynamicImage);
+///
+/// Held as RGBA8 so every output scales from the same buffer: converting
+/// per output copied a 6000x4000 wallpaper (96 MB) once per monitor.
+pub struct BackgroundImage(RgbaImage);
 
 pub fn load_background(path: &Path) -> Result<BackgroundImage, String> {
     image::open(path)
-        .map(BackgroundImage)
+        .map(|image| BackgroundImage(image.into_rgba8()))
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
@@ -972,15 +977,19 @@ pub fn render_background(
     if out_w == 0 || out_h == 0 {
         return Err("background dimensions must be non-zero".to_owned());
     }
-    Ok(fit_background(&source.0, fit, out_w, out_h).into_raw())
+    Ok(fit_rgba(&source.0, fit, out_w, out_h).into_raw())
 }
 
+#[cfg(test)]
 fn fit_background(source: &DynamicImage, fit: BackgroundFit, out_w: u32, out_h: u32) -> RgbaImage {
-    let source = source.to_rgba8();
+    fit_rgba(&source.to_rgba8(), fit, out_w, out_h)
+}
+
+fn fit_rgba(source: &RgbaImage, fit: BackgroundFit, out_w: u32, out_h: u32) -> RgbaImage {
     let (in_w, in_h) = source.dimensions();
     let mut output = RgbaImage::from_pixel(out_w, out_h, image::Rgba([0, 0, 0, 255]));
     match fit {
-        BackgroundFit::Stretch => imageops::resize(&source, out_w, out_h, imageops::Lanczos3),
+        BackgroundFit::Stretch => imageops::resize(source, out_w, out_h, imageops::Lanczos3),
         BackgroundFit::Fill | BackgroundFit::Fit => {
             let fill = fit == BackgroundFit::Fill;
             let scale_w = out_w as f64 / in_w as f64;
@@ -992,7 +1001,7 @@ fn fit_background(source: &DynamicImage, fit: BackgroundFit, out_w: u32, out_h: 
             };
             let width = (in_w as f64 * scale).round().max(1.0) as u32;
             let height = (in_h as f64 * scale).round().max(1.0) as u32;
-            let resized = imageops::resize(&source, width, height, imageops::Lanczos3);
+            let resized = imageops::resize(source, width, height, imageops::Lanczos3);
             let x = (i64::from(out_w) - i64::from(width)).div_euclid(2);
             let y = (i64::from(out_h) - i64::from(height)).div_euclid(2);
             imageops::overlay(&mut output, &resized, x, y);
@@ -1001,16 +1010,151 @@ fn fit_background(source: &DynamicImage, fit: BackgroundFit, out_w: u32, out_h: 
         BackgroundFit::Center => {
             let x = (i64::from(out_w) - i64::from(in_w)).div_euclid(2);
             let y = (i64::from(out_h) - i64::from(in_h)).div_euclid(2);
-            imageops::overlay(&mut output, &source, x, y);
+            imageops::overlay(&mut output, source, x, y);
             output
         }
         BackgroundFit::Tile => {
             for y in (0..out_h).step_by(in_h as usize) {
                 for x in (0..out_w).step_by(in_w as usize) {
-                    imageops::overlay(&mut output, &source, i64::from(x), i64::from(y));
+                    imageops::overlay(&mut output, source, i64::from(x), i64::from(y));
                 }
             }
             output
+        }
+    }
+}
+
+/// Scaled-wallpaper cache: the decoded, fitted RGBA for one (file, fit, size)
+/// stored raw under `dir`, so a later boot skips decoding and Lanczos-scaling
+/// a multi-megapixel source on the CPU and just reads the result.
+///
+/// The key covers the source's path, length and mtime, the fit and the output
+/// size, so a changed wallpaper or monitor misses instead of showing stale
+/// pixels. Every failure (no directory, unwritable, short file) degrades to
+/// a miss: a cache must never be why a greeter has no background.
+pub mod bgcache {
+    use super::BackgroundFit;
+    use std::path::{Path, PathBuf};
+
+    /// Files kept per cache directory; the oldest beyond this are removed.
+    const KEEP: usize = 12;
+
+    fn fnv(bytes: &[u8], mut hash: u64) -> u64 {
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// File name for a cache entry, or `None` when the source cannot be
+    /// stat-ed (then there is nothing trustworthy to key on).
+    pub fn entry_path(
+        dir: &Path,
+        source: &Path,
+        fit: BackgroundFit,
+        width: u32,
+        height: u32,
+    ) -> Option<PathBuf> {
+        let meta = std::fs::metadata(source).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        let mut h = 0xcbf2_9ce4_8422_2325_u64;
+        h = fnv(source.as_os_str().as_encoded_bytes(), h);
+        h = fnv(&meta.len().to_le_bytes(), h);
+        h = fnv(&mtime.as_nanos().to_le_bytes(), h);
+        h = fnv(format!("{fit:?}").as_bytes(), h);
+        h = fnv(&width.to_le_bytes(), h);
+        h = fnv(&height.to_le_bytes(), h);
+        Some(dir.join(format!("{h:016x}-{width}x{height}.rgba")))
+    }
+
+    /// The cached pixels, only if the file is exactly `width * height * 4`.
+    pub fn read(path: &Path, width: u32, height: u32) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(path).ok()?;
+        (bytes.len() == width as usize * height as usize * 4).then_some(bytes)
+    }
+
+    /// Best-effort store (temp file then rename, so a reader never sees a
+    /// partial entry), then trim the directory to [`KEEP`] newest files.
+    pub fn write(path: &Path, bytes: &[u8]) {
+        let Some(dir) = path.parent() else { return };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::write(&tmp, bytes).is_err() || std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "rgba"))
+            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+            .collect();
+        files.sort();
+        let excess = files.len().saturating_sub(KEEP);
+        for (_, old) in files.into_iter().take(excess) {
+            if old != path {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn scratch(name: &str) -> PathBuf {
+            let d =
+                std::env::temp_dir().join(format!("vigil-bgcache-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        #[test]
+        fn round_trip_and_size_check() {
+            let d = scratch("rt");
+            let src = d.join("src.png");
+            std::fs::write(&src, b"x").unwrap();
+            let p = entry_path(&d.join("c"), &src, BackgroundFit::Fill, 2, 1).unwrap();
+            write(&p, &[1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(read(&p, 2, 1).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+            assert!(read(&p, 3, 1).is_none(), "wrong size must miss");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn key_changes_with_fit_size_and_source() {
+            let d = scratch("key");
+            let src = d.join("src.png");
+            std::fs::write(&src, b"x").unwrap();
+            let a = entry_path(&d, &src, BackgroundFit::Fill, 4, 4).unwrap();
+            assert_ne!(a, entry_path(&d, &src, BackgroundFit::Fit, 4, 4).unwrap());
+            assert_ne!(a, entry_path(&d, &src, BackgroundFit::Fill, 4, 5).unwrap());
+            std::fs::write(&src, b"longer").unwrap();
+            assert_ne!(a, entry_path(&d, &src, BackgroundFit::Fill, 4, 4).unwrap());
+            assert!(entry_path(&d, &d.join("missing"), BackgroundFit::Fill, 4, 4).is_none());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn trims_to_keep_newest() {
+            let d = scratch("trim");
+            for i in 0..(KEEP + 3) {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                write(&d.join(format!("{i:02}.rgba")), &[0]);
+            }
+            let n = std::fs::read_dir(&d).unwrap().count();
+            assert_eq!(n, KEEP);
+            assert!(d.join(format!("{:02}.rgba", KEEP + 2)).exists());
+            let _ = std::fs::remove_dir_all(&d);
         }
     }
 }

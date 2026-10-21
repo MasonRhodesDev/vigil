@@ -6,6 +6,7 @@
 
 mod layout;
 mod sessions;
+mod splash;
 mod users;
 
 use std::cell::RefCell;
@@ -92,6 +93,7 @@ struct Cli {
     theme_check: Option<PathBuf>,
     background: Option<PathBuf>,
     bg_mode: Option<BackgroundFit>,
+    splash_config: Option<PathBuf>,
     cmd: Vec<String>,
 }
 
@@ -105,6 +107,7 @@ fn parse_cli() -> Result<Cli, String> {
         theme_check: None,
         background: None,
         bg_mode: None,
+        splash_config: None,
         cmd: Vec::new(),
     };
     while let Some(arg) = args.next() {
@@ -120,6 +123,7 @@ fn parse_cli() -> Result<Cli, String> {
                 let v = value("--bg-mode")?;
                 cli.bg_mode = Some(BackgroundFit::parse(&v).ok_or(format!("unknown bg-mode {v}"))?);
             }
+            "--splash-config" => cli.splash_config = Some(PathBuf::from(value("--splash-config")?)),
             "--cmd" => {
                 cli.cmd = args.by_ref().collect();
             }
@@ -198,6 +202,11 @@ struct Entry {
     hw_cursor: bool,
     /// Consecutive failed presents, for throttling the log. Reset on success.
     present_failures: u32,
+    /// The splash for this output (software outputs only), kept for the
+    /// post-login hand-off after the greeter owns the screen.
+    splash: Option<splash::Splash>,
+    /// Present while the splash still covers, or is fading off, this output.
+    cover: Option<splash::Cover>,
 }
 
 #[derive(Clone)]
@@ -296,6 +305,7 @@ struct App {
     /// event fires across it and this is the greeter's only notice that the
     /// kernel may have dropped its display state.
     login_rx: std::sync::mpsc::Receiver<LoginEvent>,
+    #[allow(dead_code)]
     signal: LoopSignal,
     wake: WakeHandle,
     dirty: std::sync::Arc<DirtySet<OutputId>>,
@@ -304,6 +314,13 @@ struct App {
     running: bool,
     present_retry: std::collections::BTreeMap<OutputId, (Instant, u32)>,
     exit_code: i32,
+    splash_cfg: vigil_config::Splash,
+    started: Instant,
+    /// Set when start_session was accepted: the sign-in splash is going up
+    /// and the process exits as soon as every screen has shown it.
+    leaving: Option<Instant>,
+    /// Scaled-wallpaper cache directory, if one can be used.
+    bg_cache_dir: Option<PathBuf>,
 }
 
 impl App {
@@ -327,7 +344,23 @@ impl App {
             .values()
             .map(|(deadline, _)| deadline.saturating_duration_since(Instant::now()))
             .min();
-        [slint, Some(clock), banner, retry]
+        let now = Instant::now();
+        let cover = if self.leaving.is_some() {
+            Some(Duration::from_millis(5))
+        } else {
+            self.entries
+                .iter()
+                .filter_map(|e| e.cover.as_ref())
+                .map(|c| {
+                    if c.released() {
+                        Duration::from_millis(16)
+                    } else {
+                        c.next_in(now)
+                    }
+                })
+                .min()
+        };
+        [slint, Some(clock), banner, retry, cover]
             .into_iter()
             .flatten()
             .min()
@@ -373,8 +406,15 @@ impl App {
                     e.presenter.invalidate();
                     e.window.request_present();
                     e.window.set_panel_visible(false);
+                    if let Some(c) = e.cover.as_mut() {
+                        c.reset_slots();
+                    }
                 }
                 self.apply_panel();
+                // Rebuilt outputs lost their bitmaps with their windows;
+                // the per-user cache (or the scaled-wallpaper cache) refills
+                // them without decoding again.
+                self.refresh_backgrounds_async();
             }
         }
     }
@@ -403,6 +443,9 @@ impl App {
         for entry in self.entries.iter_mut() {
             entry.presenter.invalidate();
             entry.window.request_present();
+            if let Some(c) = entry.cover.as_mut() {
+                c.reset_slots();
+            }
         }
         // The clock is now wrong by however long the machine slept.
         let text = clock_text(&self.clock_format);
@@ -535,6 +578,7 @@ impl App {
             }
         }
         let disabled = self.resolve_profile();
+        let mut added = false;
         for event in events {
             match event {
                 OutputEvent::Added(id, _) => {
@@ -542,8 +586,9 @@ impl App {
                         eprintln!("vigil: output {id:?} disabled by profile");
                         continue;
                     }
-                    if let Err(e) = self.add_output(id) {
-                        eprintln!("vigil: skipping output {id:?}: {e}");
+                    match self.add_output(id) {
+                        Ok(()) => added = true,
+                        Err(e) => eprintln!("vigil: skipping output {id:?}: {e}"),
                     }
                 }
                 OutputEvent::Removed(id) => self.remove_output(id),
@@ -555,6 +600,11 @@ impl App {
             }
         }
         self.rebuild_row();
+        if added {
+            // The cached set of per-output bitmaps predates these outputs.
+            self.background_cache.remove(&self.background_cache_key);
+            self.refresh_backgrounds_async();
+        }
     }
 
     /// The manager owning `id` (its namespace is the vec index).
@@ -719,6 +769,16 @@ impl App {
         // A rendering preference must never be why someone cannot log in, so
         // a GL failure degrades to software with a log line, per output.
         let mut surface_slot = Some(surface);
+        let resolved_background = self.appearance_registry.resolve(
+            &appearance_profiles::OutputIdentity::new(&info.connector, info.description()),
+            None,
+        );
+        let (background, _fit) = self.looks.for_connector_with_fallback(
+            &info.connector,
+            resolved_background.path,
+            Some(appearance_fit(resolved_background.fit)),
+        );
+        let mut splash_slot: Option<(splash::Splash, Option<splash::Cover>)> = None;
         let gl = if want_gl {
             match self.gl_output(id, scale, transform, atomic, &mut surface_slot, device_fd) {
                 Ok(built) => Some(built),
@@ -747,8 +807,18 @@ impl App {
                 let surface = surface_slot
                     .take()
                     .ok_or("DRM surface consumed by a failed GL attempt")?;
-                let presenter: Box<dyn Presenter> =
+                let mut presenter: Box<dyn Presenter> =
                     Box::new(DumbBufferPresenter::new(surface).map_err(|e| e.to_string())?);
+                // Own the screen visibly NOW: the splash goes up before the
+                // theme is instantiated, so the gap between taking the screen
+                // and the first greeter frame is the boot splash, not black.
+                // Hotplugs after startup skip it (the greeter is already up).
+                splash_slot = self.first_frame(
+                    &mut presenter,
+                    (info.width, info.height),
+                    transform,
+                    background.is_some(),
+                );
                 self.platform.set_next_output(id);
                 let component = self.theme.instantiate();
                 self.platform.clear_next_output();
@@ -772,21 +842,9 @@ impl App {
         };
         let (scene_width, scene_height) = window.scene_size();
 
-        let resolved_background = self.appearance_registry.resolve(
-            &appearance_profiles::OutputIdentity::new(&info.connector, info.description()),
-            None,
-        );
-        let (background, fit) = self.looks.for_connector_with_fallback(
-            &info.connector,
-            resolved_background.path,
-            Some(appearance_fit(resolved_background.fit)),
-        );
-        if let Some(path) = &background {
-            match vigil_ui::background(path, fit, scene_width, scene_height) {
-                Ok(rgba) => window.set_background(rgba, scene_width, scene_height),
-                Err(e) => eprintln!("vigil: background: {e}"),
-            }
-        }
+        // The background itself arrives from the async job rescan() starts
+        // (decoded once, cached, scaled off this thread). Decoding it here,
+        // once per output, was most of the sequential output bring-up.
         window.set_clock(&self.last_clock.1);
         window.set_caps_lock(self.caps_lock);
         window.set_status_banner(&self.banner);
@@ -821,6 +879,16 @@ impl App {
                 _ => String::new(),
             }
         );
+        let (splash, mut cover) = match splash_slot {
+            Some((splash, cover)) => (Some(splash), cover),
+            None => (None, None),
+        };
+        if background.is_none()
+            && let Some(cover) = cover.as_mut()
+        {
+            // Nothing to wait for: the greeter is ready as it stands.
+            cover.mark_ready(Instant::now());
+        }
         self.entries.push(Entry {
             id,
             connector: info.connector.clone(),
@@ -833,8 +901,57 @@ impl App {
             present_failures: 0,
             presenter,
             window,
+            splash,
+            cover,
         });
         Ok(())
+    }
+
+    /// Draw the splash on a freshly claimed output, before anything slower
+    /// (theme instantiation, background decode) runs. The modeset commit
+    /// rides this first frame. Returns the splash, and the cover timing
+    /// unless the greeter has been up too long for a cover to make sense
+    /// (a monitor plugged in later).
+    fn first_frame(
+        &self,
+        presenter: &mut Box<dyn Presenter>,
+        size: (u32, u32),
+        transform: u8,
+        _has_background: bool,
+    ) -> Option<(splash::Splash, Option<splash::Cover>)> {
+        if !self.splash_cfg.enabled {
+            return None;
+        }
+        let transform = transform % 4;
+        let scene = if transform % 2 == 1 {
+            (size.1, size.0)
+        } else {
+            size
+        };
+        let splash = splash::Splash::new(&self.splash_cfg, scene, transform);
+        let covering = self.leaving.is_none()
+            && self.started.elapsed() < Duration::from_millis(self.splash_cfg.max_wait_ms);
+        let mut cover = covering.then(|| splash::Cover::new(Instant::now()));
+        if let Some(cover) = cover.as_mut() {
+            let shown = presenter.with_frame(&mut |canvas| match canvas {
+                Canvas::Cpu(mut target) => splash.draw_full(&mut target, 0),
+                _ => false,
+            });
+            match shown {
+                Ok(true) => {
+                    cover.presented(Instant::now());
+                    eprintln!(
+                        "vigil: [t+{}ms] splash first frame on {}x{}",
+                        vigil_core::uptime_ms(),
+                        size.0,
+                        size.1
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("vigil: splash first frame: {e}"),
+            }
+        }
+        Some((splash, cover))
     }
 
     fn remove_output(&mut self, id: OutputId) {
@@ -915,6 +1032,9 @@ impl App {
         const VT_FIRST: u32 = 0x1008_FE01;
         const VT_LAST: u32 = 0x1008_FE0C;
         const ESCAPE: u32 = 0xff1b;
+        if self.leaving.is_some() {
+            return;
+        }
         for event in events {
             match event {
                 InputEvent::Key {
@@ -970,6 +1090,11 @@ impl App {
     }
 
     fn pump_messages(&mut self) {
+        if self.leaving.is_some() {
+            // Signed in: nothing typed from here on can matter.
+            self.queue.borrow_mut().clear();
+            return;
+        }
         loop {
             let msg = self.queue.borrow_mut().pop_front();
             let Some(msg) = msg else { break };
@@ -1003,10 +1128,68 @@ impl App {
                     }
                     .store(&self.state_file);
                 }
-                self.running = false;
-                self.signal.stop();
+                self.begin_leaving();
                 return;
             }
+        }
+    }
+
+    /// start_session was accepted. greetd runs the session only once this
+    /// process exits, so the one job left is to put the sign-in splash on
+    /// every screen and get out of the way, not to tear down gracefully.
+    fn begin_leaving(&mut self) {
+        let now = Instant::now();
+        self.leaving = Some(now);
+        eprintln!(
+            "vigil: [t+{}ms] login accepted; sign-in splash up, exiting once shown",
+            vigil_core::uptime_ms()
+        );
+        for entry in self.entries.iter_mut() {
+            if entry.splash.is_some() {
+                entry.cover = Some(splash::Cover::new(now));
+            }
+        }
+    }
+
+    /// Drive the sign-in splash; exit the process as soon as every screen
+    /// that has one has shown it and the flip had a vblank to land.
+    fn render_leaving(&mut self) {
+        let now = Instant::now();
+        let t_ms = now.duration_since(self.started).as_millis() as u64;
+        let mut pending = false;
+        let mut last: Option<Instant> = None;
+        for entry in self.entries.iter_mut() {
+            let (Some(splash), Some(cover)) = (entry.splash.as_ref(), entry.cover.as_mut()) else {
+                continue;
+            };
+            if cover.last_presented().is_none() {
+                let shown = entry.presenter.with_frame(&mut |canvas| match canvas {
+                    Canvas::Cpu(mut target) => splash.draw_full(&mut target, t_ms),
+                    _ => false,
+                });
+                match shown {
+                    Ok(true) => cover.presented(now),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("vigil: sign-in splash: {e}"),
+                }
+            }
+            match cover.last_presented() {
+                Some(t) => last = Some(last.map_or(t, |l| l.max(t))),
+                None => pending = true,
+            }
+        }
+        let waited = now.duration_since(self.leaving.unwrap_or(now));
+        let settled = last.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(20));
+        if (!pending && settled) || waited >= Duration::from_millis(150) {
+            eprintln!(
+                "vigil: [t+{}ms] exiting (sign-in splash shown, {} ms after login)",
+                vigil_core::uptime_ms(),
+                waited.as_millis()
+            );
+            // No teardown: the kernel closes the DRM and input fds, and
+            // every millisecond here is a millisecond of the session not
+            // starting.
+            std::process::exit(self.exit_code);
         }
     }
 
@@ -1122,25 +1305,32 @@ impl App {
         }
         let tx = self.background_tx.clone();
         let wake = self.wake.clone();
+        let cache_dir = self.bg_cache_dir.clone();
         std::thread::spawn(move || {
             use std::collections::HashMap;
-            use std::sync::Arc;
-            let mut sources = HashMap::new();
+            use std::sync::{Arc, OnceLock};
+            // One lazily decoded source per file, shared by every output
+            // that needs it. Lazy so a full cache hit never decodes at all.
+            type Source = OnceLock<Result<Arc<vigil_ui::BackgroundImage>, String>>;
+            let mut sources: HashMap<PathBuf, Source> = HashMap::new();
             for (_, path, _, _, _, prepared) in &requests {
                 if prepared.is_some() {
                     continue;
                 }
                 if let Some(path) = path {
-                    sources
-                        .entry(path.clone())
-                        .or_insert_with(|| vigil_ui::load_background(path).map(Arc::new));
+                    sources.entry(path.clone()).or_default();
                 }
             }
+            let started = Instant::now();
+            let cache_dir = cache_dir.as_deref();
+            let sources = &sources;
             let outputs = std::thread::scope(|scope| {
                 requests
-                    .into_iter()
+                    .iter()
                     .map(|(id, path, fit, width, height, prepared)| {
-                        let source = path.as_ref().map(|path| &sources[path]);
+                        let (id, fit, width, height) = (*id, *fit, *width, *height);
+                        let prepared = prepared.clone();
+                        let source = path.as_ref().map(|path| (path, &sources[path]));
                         scope.spawn(move || {
                             let decoded = if let Some(prepared) = prepared {
                                 appearance_profiles::read_prepared_asset(&prepared)
@@ -1161,7 +1351,25 @@ impl App {
                                     .map_err(|error| error.to_string())
                             } else {
                                 source
-                                    .map(|source| {
+                                    .map(|(path, source)| {
+                                        let entry = cache_dir.and_then(|dir| {
+                                            vigil_ui::bgcache::entry_path(
+                                                dir, path, fit, width, height,
+                                            )
+                                        });
+                                        if let Some(rgba) = entry
+                                            .as_deref()
+                                            .and_then(|p| vigil_ui::bgcache::read(p, width, height))
+                                        {
+                                            eprintln!(
+                                                "vigil: [t+{}ms] background cache hit {width}x{height}",
+                                                vigil_core::uptime_ms()
+                                            );
+                                            return Ok(BackgroundBitmap::Rgba(rgba, width, height));
+                                        }
+                                        let source = source.get_or_init(|| {
+                                            vigil_ui::load_background(path).map(Arc::new)
+                                        });
                                         source
                                             .as_ref()
                                             .map_err(Clone::clone)
@@ -1170,7 +1378,12 @@ impl App {
                                                     source, fit, width, height,
                                                 )
                                             })
-                                            .map(|rgba| BackgroundBitmap::Rgba(rgba, width, height))
+                                            .map(|rgba| {
+                                                if let Some(p) = entry.as_deref() {
+                                                    vigil_ui::bgcache::write(p, &rgba);
+                                                }
+                                                BackgroundBitmap::Rgba(rgba, width, height)
+                                            })
                                     })
                                     .transpose()
                             };
@@ -1182,6 +1395,11 @@ impl App {
                     .map(|handle| handle.join().expect("background renderer panicked"))
                     .collect()
             });
+            eprintln!(
+                "vigil: [t+{}ms] backgrounds ready ({} ms of work)",
+                vigil_core::uptime_ms(),
+                started.elapsed().as_millis()
+            );
             let _ = tx.send(BackgroundResult {
                 generation,
                 cache_key,
@@ -1205,10 +1423,15 @@ impl App {
     }
 
     fn apply_backgrounds(&mut self, outputs: Vec<(OutputId, DecodedBackground)>) {
+        let now = Instant::now();
         for (id, decoded) in outputs {
             let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
                 continue;
             };
+            // Whatever the outcome, the greeter has stopped waiting for it.
+            if let Some(cover) = entry.cover.as_mut() {
+                cover.mark_ready(now);
+            }
             match decoded {
                 Ok(Some(BackgroundBitmap::Rgba(rgba, width, height))) => {
                     eprintln!("vigil: background applied to {:?}", id);
@@ -1300,6 +1523,10 @@ impl App {
         if !self.active {
             return;
         }
+        if self.leaving.is_some() {
+            self.render_leaving();
+            return;
+        }
         let mut dead = Vec::new();
         // `dirty` is advisory (see vigil-wayland: the software adapter cannot
         // intercept Slint's request_redraw, so gating on it froze animations
@@ -1312,8 +1539,51 @@ impl App {
                 presenter,
                 window,
                 present_failures,
+                splash,
+                cover,
                 ..
             } = entry;
+            // The splash covers a fresh output until the greeter has what
+            // it was waiting for, then cross-fades off.
+            let mut fade: Option<f32> = None;
+            if let Some(c) = cover.as_mut() {
+                let now = Instant::now();
+                match c.phase(now, &self.splash_cfg) {
+                    splash::Phase::Hold => {
+                        if let Some(sp) = splash.as_ref()
+                            && c.due(now)
+                        {
+                            let (full, t) = (c.needs_full(), c.t_ms(now));
+                            let shown = presenter.with_frame(&mut |canvas| match canvas {
+                                Canvas::Cpu(mut target) => {
+                                    if full {
+                                        sp.draw_full(&mut target, t)
+                                    } else {
+                                        sp.draw_track(&mut target, t);
+                                        true
+                                    }
+                                }
+                                _ => false,
+                            });
+                            match shown {
+                                Ok(true) => c.presented(now),
+                                Ok(false) => {}
+                                Err(PresentError::DeviceLost) => dead.push(i),
+                                Err(e) => eprintln!("vigil: splash present: {e}"),
+                            }
+                        }
+                        continue;
+                    }
+                    splash::Phase::Fade(alpha) => {
+                        fade = Some(alpha);
+                        window.request_present();
+                    }
+                    splash::Phase::Done => {
+                        *cover = None;
+                        window.request_present();
+                    }
+                }
+            }
             let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
             // Probe before asking the presenter for a frame. On DRM that
             // costs a dumb-buffer map (ioctl + mmap) or a GBM surface
@@ -1344,6 +1614,17 @@ impl App {
                     height: target.height,
                     stride: target.stride,
                 });
+                if drew && let (Some(alpha), Some(sp)) = (fade, splash.as_ref()) {
+                    sp.blend_over(
+                        &mut FrameTarget {
+                            buffer: &mut target.buffer[..],
+                            width: target.width,
+                            height: target.height,
+                            stride: target.stride,
+                        },
+                        alpha,
+                    );
+                }
                 if drew && debug_frames {
                     let row = &target.buffer[mid..mid + row_len];
                     let sum: u64 = row.iter().map(|&b| b as u64).sum();
@@ -1419,6 +1700,7 @@ fn clock_text(format: &str) -> String {
 }
 
 fn run() -> Result<i32, String> {
+    vigil_core::uptime_ms();
     let cli = parse_cli()?;
 
     // Author/CI tool: validate a theme and exit without touching the seat.
@@ -1609,6 +1891,16 @@ fn run() -> Result<i32, String> {
         .and_then(|name| appearance_profiles::PreparedBundle::load_published(name).ok())
         .flatten();
     let background_cache_key = appearance_user.unwrap_or("<theme>").to_owned();
+    let splash_cfg = match &cli.splash_config {
+        Some(path) => vigil_config::Splash::load_file(path),
+        None => config.splash.clone(),
+    };
+    let bg_cache_dir = config
+        .sessions
+        .state_file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("bg-cache"));
     let (background_tx, background_rx) = std::sync::mpsc::channel();
     let mut app = App {
         session,
@@ -1664,12 +1956,16 @@ fn run() -> Result<i32, String> {
         running: true,
         present_retry: Default::default(),
         exit_code: 1,
+        splash_cfg,
+        started: Instant::now(),
+        leaving: None,
+        bg_cache_dir,
     };
 
+    // Rescan also starts the background job for the outputs it brought up
+    // (decode once, scale in parallel, or read the scaled-wallpaper cache),
+    // so the first greeter frame is not held behind an image decode.
     app.rescan();
-    // Populate the selected user's monitor-sized cache while the greeter is
-    // becoming interactive. Subsequent switches back are memory-only.
-    app.refresh_backgrounds_async();
     app.refresh_banner();
     {
         let mut fan = FanUi {
@@ -1867,6 +2163,7 @@ mod config_tests {
             theme_check: None,
             background: None,
             bg_mode: None,
+            splash_config: None,
             cmd: Vec::new(),
         };
         let config = vigil_config::parse(
@@ -1890,6 +2187,7 @@ mod config_tests {
             theme_check: None,
             background: None,
             bg_mode: None,
+            splash_config: None,
             cmd: Vec::new(),
         };
         let config = vigil_config::parse(
@@ -1912,6 +2210,7 @@ mod config_tests {
             theme_check: None,
             background: None,
             bg_mode: None,
+            splash_config: None,
             cmd: Vec::new(),
         };
         let config = Config::default();
