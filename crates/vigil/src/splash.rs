@@ -118,11 +118,10 @@ fn mask(path: &std::path::Path, edge: u32) -> Result<Vec<u8>, String> {
             resvg::tiny_skia::Transform::from_row(s, 0.0, 0.0, s, ox, oy),
             &mut pixmap.as_mut(),
         );
-        pixmap
-            .data()
-            .chunks_exact(4)
-            .map(|p| p[3])
-            .collect::<Vec<u8>>()
+        // `as_chunks` over a const size (clippy prefers it to `chunks_exact`);
+        // RGBA pixels, so there is never a partial chunk.
+        let (pixels, _partial) = pixmap.data().as_chunks::<4>();
+        pixels.iter().map(|p| p[3]).collect::<Vec<u8>>()
     } else {
         let img = image::load_from_memory(&data)
             .map_err(|e| e.to_string())?
