@@ -683,3 +683,13 @@ mod tests {
         assert_eq!(accent_from_portal((f64::NAN, 0.0, 0.0)), None);
     }
 }
+
+/// Milliseconds since the first call. Called once at process start so log
+/// lines can carry a startup-relative stamp without a clock dependency.
+pub fn uptime_ms() -> u128 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+}

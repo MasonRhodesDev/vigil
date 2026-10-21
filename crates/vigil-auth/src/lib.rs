@@ -268,12 +268,20 @@ impl AuthMachine {
                         self.transact(&Request::PostAuthMessageResponse { response: None }, ui)?;
                 }
                 Response::Success => {
+                    eprintln!(
+                        "vigil: [t+{}ms] auth: greetd accepted the credentials, sending start_session",
+                        vigil_core::uptime_ms()
+                    );
                     let request = Request::StartSession {
                         cmd: self.command.clone(),
                         env: self.env.clone(),
                     };
                     match self.transact(&request, ui)? {
                         Response::Success => {
+                            eprintln!(
+                                "vigil: [t+{}ms] auth: start_session accepted",
+                                vigil_core::uptime_ms()
+                            );
                             self.state = State::Complete;
                             return Ok(());
                         }

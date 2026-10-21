@@ -82,6 +82,36 @@
 # rendering preference must never be why someone cannot log in.
 #backend = "software"
 
+[splash]
+# The frame vigil draws the moment it owns a screen (before the greeter is
+# ready), and again right after a successful login until it exits, so the
+# boot reads as one piece. The same keys, without this table header, can live
+# in their own small file passed with `vigil --splash-config FILE`.
+#
+# Every size is a fraction of the screen HEIGHT; the defaults below mirror
+# the desktop-boot splash scene, so set them in one place for both.
+#enabled = true
+#ground = "#0b0d10"
+#mark = "#c3c9d0"
+#accent = "#1793d1"       # glow behind the mark
+#track = "#1f2832"        # loading line
+#shine = "#bee4f7"        # sweep highlight on the line
+# The mark: an SVG (drawn as a one colour silhouette, tiny shapes such as a
+# trademark sign dropped) or a PNG (its alpha is the shape). Unset: no mark.
+#logo = "/usr/share/pixmaps/archlinux-logo.svg"
+#logo_frac = 0.16         # mark edge
+#glow_mult = 2.0
+#glow_opacity = 0.30
+#center_frac = 0.47       # mark centre from the top
+#gap_frac = 0.05          # mark bottom to the line
+#track_w_frac = 0.26
+#track_h_frac = 0.0028
+#track_h_min = 2          # pixels
+#shine_w_frac = 0.4       # of the line width
+#sweep_ms = 2200
+#fade_ms = 250            # splash to greeter cross-fade, 0 cuts
+#max_wait_ms = 4000       # never hide the greeter longer than this
+
 [profiles]
 # Monitor-layout profiles (monitor-profiles format), shared with the
 # session manager so the login screen and the desktop agree on scale,
