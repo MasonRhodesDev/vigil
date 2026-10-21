@@ -13,6 +13,16 @@ ignore = [
     { id = "RUSTSEC-2026-0192", reason = "unmaintained dep pinned by slint 1.17's renderer tree" },
     { id = "RUSTSEC-2026-0196", reason = "unmaintained dep pinned by slint 1.17's renderer tree" },
     { id = "RUSTSEC-2026-0206", reason = "unmaintained dep pinned by slint 1.17's renderer tree" },
+    # zbus 5 only reaches the lock through slint-interpreter's
+    # cfg(target_arch = "wasm32") dependency on i-slint-backend-winit, which
+    # needs zbus ^5.14 (checked: slint 1.17.1 pinned, 1.18.1 latest still
+    # does). vigil-login uses zbus 6 and no native target builds zbus 5
+    # (`cargo tree -i zbus@5.18.0 -e all` is empty without `--target all`).
+    # Drop all three when slint's winit backend moves to zbus 6 or the
+    # interpreter sheds that dependency.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant, merged into zbus 6; held at zbus 5 by slint 1.17.1/1.18.1 wasm32-only winit backend" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names, merged into zbus 6; held at zbus 5 by slint 1.17.1/1.18.1 wasm32-only winit backend" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, merged into zbus 6; held at zbus 5 by slint 1.17.1/1.18.1 wasm32-only winit backend" },
 ]
 
 [licenses]
