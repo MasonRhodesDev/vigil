@@ -2202,7 +2202,10 @@ fn run() -> Result<i32, String> {
         let manager = session
             .open_device(&path)
             .map_err(|e| e.to_string())
-            .and_then(|fd| OutputManager::new(fd, namespace).map_err(|e| e.to_string()));
+            .and_then(|fd| {
+                OutputManager::with_display_state(fd, namespace, config.render.keep_display_state)
+                    .map_err(|e| e.to_string())
+            });
         match manager {
             Ok((manager, drm_notifier)) => {
                 outputs.push(Some(manager));
