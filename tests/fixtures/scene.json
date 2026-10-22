@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "ref_short_side": null,
   "palette": {
     "bg": "#0b0d10",
     "accent": "#1793d1",
@@ -7,7 +8,8 @@
     "track": "#1f2832"
   },
   "geometry": {
-    "basis": "min(W,H)",
+    "basis": "ref_short_side if set, else min(W,H); physical pixels",
+    "centre": "per screen: H*centre_frac_of_h; fixed: H/2 + (centre_frac_of_h - 0.5)*ref_short_side",
     "logo_frac": 0.16,
     "glow_mult": 2,
     "glow_blur_div": 6,

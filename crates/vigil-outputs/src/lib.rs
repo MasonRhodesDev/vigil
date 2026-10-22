@@ -337,6 +337,24 @@ impl OutputManager {
             .is_ok()
     }
 
+    /// What an exit holder needs from this device: its raw fd and, for every
+    /// CRTC that is scanning a framebuffer out, `(crtc id, framebuffer id)`.
+    /// The fd stays owned by the manager. Call it after the last flip landed,
+    /// so the framebuffer ids are the ones on screen.
+    pub fn hold_snapshot(&self) -> (std::os::fd::RawFd, Vec<(u32, u32)>) {
+        use std::os::fd::{AsFd, AsRawFd};
+        let crtcs = self
+            .entries
+            .values()
+            .filter_map(|e| {
+                let info = self.device.get_crtc(e.crtc).ok()?;
+                let fb: u32 = info.framebuffer()?.into();
+                Some((e.crtc.into(), fb))
+            })
+            .collect();
+        (self.device.as_fd().as_raw_fd(), crtcs)
+    }
+
     /// Live output ids.
     pub fn ids(&self) -> Vec<OutputId> {
         self.entries.keys().copied().collect()

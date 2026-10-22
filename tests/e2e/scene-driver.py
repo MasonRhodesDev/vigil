@@ -70,8 +70,9 @@ while time.monotonic() - start < LIMIT:
             typestr("hunter2"); sendkey("ret")
     if log_has("VIGIL-EXIT"):
         # A few more sweeps: the last screens after the exit are the rest frame.
+        # With a next owner (VIGIL_E2E_NEXT) keep watching until it is done.
         exited = exited or time.monotonic()
-        if time.monotonic() - exited > 0.5:
+        if log_has("NEXT-DONE") if os.environ.get("VIGIL_E2E_NEXT") else time.monotonic() - exited > 0.5:
             break
 json.dump(frames, open(f"{outdir}/capture.json", "w"))
 print(f"captured {len(frames)} frames in {time.monotonic() - start:.1f}s")

@@ -174,6 +174,28 @@ pub struct Render {
     /// that frame is refused, vigil resets the state and retries once, so
     /// the worst case is today's behaviour.
     pub keep_display_state: bool,
+    /// Keep the rest frame on screen after vigil exits (default false).
+    ///
+    /// When vigil leaves after a login, closing its DRM fd removes its
+    /// framebuffer and the kernel blanks the screens, so they stay black
+    /// until the session's first frame. True leaves a detached child holding
+    /// the fd (master dropped, so the session can take it) until the next
+    /// owner has put a different framebuffer on every held screen, or
+    /// `hold_timeout_ms` passes. Any error while setting it up means vigil
+    /// exits as it always did.
+    pub hold_last_frame_on_exit: bool,
+    /// How long the holder waits for the next owner, in milliseconds
+    /// (default 10000, clamped to 1 s .. 60 s).
+    pub hold_timeout_ms: Option<u32>,
+}
+
+impl Render {
+    /// The holder's timeout.
+    pub fn hold_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            u64::from(self.hold_timeout_ms.unwrap_or(10_000)).clamp(1_000, 60_000),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

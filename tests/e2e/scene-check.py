@@ -24,7 +24,9 @@ import numpy as np
 
 work = sys.argv[1]
 HERE = os.path.dirname(os.path.abspath(__file__))
-spec = json.load(open(os.path.join(HERE, "..", "fixtures", "scene.json")))
+# The scene the guest read (run-scene.sh copies it, with VIGIL_E2E_REF applied).
+spec = json.load(open(os.path.join(work, "scene.json")))
+REF = spec.get("ref_short_side")
 BG = tuple(int(spec["palette"]["bg"][i:i + 2], 16) for i in (1, 3, 5))
 MARK = tuple(int(spec["palette"]["mark"][i:i + 2], 16) for i in (1, 3, 5))
 SPLASH = tuple(int(spec["stages"]["greeter-splash"]["debug"][i:i + 2], 16) for i in (1, 3, 5))
@@ -117,6 +119,8 @@ for line in re.findall(r"splash first frame on [^\n]*", log):
 
 # 2. cover and 3. the mark
 norm = {}
+sizes = {}
+offs = {}
 for dev, rows in series.items():
     lit = [r for r in rows if r["stage"] == "splash"]
     if not lit:
@@ -137,14 +141,24 @@ for dev, rows in series.items():
     sx, sy = to_scene(t, w, h)(cx, cy)
     if t % 2:
         bw, bh = bh, bw
-    S = min(sw, sh)
+    S = REF or min(sw, sh)
+    # Expected centre of the mark's box (the fixture mark is not centred in
+    # its box, so compare against the box centre of its own extent).
+    want_cy = sh / 2 + (CENTRE - 0.5) * S if REF else sh * CENTRE
     norm[dev] = (bw / S, bh / S, sx / sw, sy / sh)
-    print(f"      {dev}: mark {bw}x{bh} px on a {sw}x{sh} scene, {bw / S:.4f} x {bh / S:.4f} of the short side, centre ({sx / sw:.3f}, {sy / sh:.3f})")
+    sizes[dev] = (bw, bh)
+    offs[dev] = (sx - sw / 2, sy - want_cy)
+    print(f"      {dev}: mark {bw}x{bh} px on a {sw}x{sh} scene, {bw / S:.4f} x {bh / S:.4f} of the short side, centre ({sx:.1f}, {sy:.1f}) px, wanted y {want_cy:.1f}")
 for dev, (nw, nh, fx, fy) in norm.items():
     check(abs(nw - LOGO_FRAC * MARK_W) < 0.01 and abs(nh - LOGO_FRAC * MARK_H) < 0.01,
-          f"{dev}: mark size is the spec's {LOGO_FRAC} of the short side")
-    check(abs(fx - 0.5) < 0.004 and abs(fy - CENTRE) < 0.02,
-          f"{dev}: mark is centred, {CENTRE} of the height")
+          f"{dev}: mark size is the spec's {LOGO_FRAC} of the {'reference' if REF else 'short'} side")
+    dx, dy = offs[dev]
+    check(abs(dx) <= 1.5 and abs(dy) <= max(3, 0.02 * (REF or 1000)),
+          f"{dev}: mark is centred across, {CENTRE} of the height (off by {dx:.1f}, {dy:.1f} px)")
+if REF and len(sizes) > 1:
+    ref_sz = next(iter(sizes.values()))
+    check(all(abs(a - b) <= 2 for sz in sizes.values() for a, b in zip(sz, ref_sz)),
+          f"ref_short_side {REF}: the mark is the same pixel size on every head {sorted(set(sizes.values()))}")
 
 # 4. glow: a pixel just above the mark gains blue over the ground
 for dev, rows in series.items():
@@ -156,8 +170,9 @@ for dev, rows in series.items():
         im = r["im"]
         h, w = im.shape[:2]
         sw, sh = (h, w) if t % 2 else (w, h)
-        S = min(sw, sh)
-        sx, sy = sw // 2, int(sh * CENTRE - S * LOGO_FRAC * 0.5 - S * LOGO_FRAC * 0.12)
+        S = REF or min(sw, sh)
+        cyy = sh / 2 + (CENTRE - 0.5) * S if REF else sh * CENTRE
+        sx, sy = sw // 2, int(cyy - S * LOGO_FRAC * 0.5 - S * LOGO_FRAC * 0.12)
         px, py = {0: (sx, sy), 1: (sy, sw - 1 - sx), 3: (sh - 1 - sy, sx)}[t]
         best = max(best, int(im[py, px, 2]) - BG[2])
     check(best >= 3, f"{dev}: the glow shows beside the mark (peak +{best} blue over the ground)")
