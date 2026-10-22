@@ -97,6 +97,24 @@ impl OutputManager {
     /// setup) and is folded into every `OutputId`. Returns the notifier the
     /// binary registers for vblank events.
     pub fn new(fd: OwnedFd, namespace: u32) -> Result<(Self, DrmDeviceNotifier), OutputsError> {
+        Self::with_display_state(fd, namespace, false)
+    }
+
+    /// [`Self::new`], choosing what happens to the display state the device
+    /// was handed over in.
+    ///
+    /// `keep_state` false disables every connector and plane when the device
+    /// opens, so vigil starts from a known state: every screen goes dark and
+    /// is modeset again by its first frame, and monitors re-sync. `true`
+    /// leaves what the previous owner (the boot splash) lit exactly as it
+    /// is, so a first frame in the same mode on the same CRTC is a plane
+    /// update, not a modeset. The caller must be ready for a commit to fail
+    /// on leftover state and answer with [`Self::reset_display_state`].
+    pub fn with_display_state(
+        fd: OwnedFd,
+        namespace: u32,
+        keep_state: bool,
+    ) -> Result<(Self, DrmDeviceNotifier), OutputsError> {
         // Virtualized drivers (virtio-gpu, vmwgfx) hide their cursor plane
         // from atomic clients unless the client declares it will supply
         // cursor hotspots (DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, kernel
@@ -118,7 +136,7 @@ impl OutputManager {
             let _ = raw.set_client_capability(ClientCapability::CursorPlaneHotspot, true);
         }
         let fd = DrmDeviceFd::new(DeviceFd::from(fd));
-        let (device, notifier) = DrmDevice::new(fd, true).map_err(err)?;
+        let (device, notifier) = DrmDevice::new(fd, !keep_state).map_err(err)?;
         Ok((
             Self {
                 device,
@@ -202,6 +220,24 @@ impl OutputManager {
         self.device
             .create_surface(entry.crtc, entry.mode, &[entry.connector])
             .map_err(err)
+    }
+
+    /// Disable every connector and plane, the state a device opened with
+    /// `keep_state` false starts from. Outputs already claimed need a fresh
+    /// modeset afterwards.
+    pub fn reset_display_state(&mut self) -> Result<(), OutputsError> {
+        self.device.reset_state().map_err(err)
+    }
+
+    /// Whether the CRTC an output will use already runs exactly the mode the
+    /// output will be given: `Some(true)` means the first commit can be a
+    /// plane update, `Some(false)` that it is a real modeset (the screen
+    /// re-syncs), `None` that the state could not be read. Read before the
+    /// first commit, so it describes what the previous owner left.
+    pub fn first_commit_is_modeset(&self, id: OutputId) -> Option<bool> {
+        let entry = self.entries.get(&id)?;
+        let crtc = self.device.get_crtc(entry.crtc).ok()?;
+        Some(crtc.mode() != Some(entry.mode))
     }
 
     /// Facts about a live output.

@@ -1,0 +1,75 @@
+{
+  "version": 2,
+  "palette": {
+    "bg": "#0b0d10",
+    "accent": "#1793d1",
+    "mark": "#c3c9d0",
+    "track": "#1f2832"
+  },
+  "geometry": {
+    "basis": "min(W,H)",
+    "logo_frac": 0.16,
+    "glow_mult": 2,
+    "glow_blur_div": 6,
+    "centre_frac_of_h": 0.47,
+    "gap_frac": 0.05,
+    "bar_w_frac": 0.26,
+    "bar_h_frac": 0.0028,
+    "bar_h_min": 2,
+    "rounding": "floor(x + 0.5)"
+  },
+  "motion": {
+    "in_s": 0.4,
+    "out_s": 0.3,
+    "ease": "smoothstep",
+    "breath_period_s": 3.2,
+    "breath": "(1 - cos(2*pi*phase/period)) / 2",
+    "glow_min": 0.12,
+    "glow_max": 0.42,
+    "breath_clock": "CLOCK_MONOTONIC",
+    "stage_fade_s": 0.4,
+    "progress_ease_s": 0.25
+  },
+  "stages": {
+    "grub-menu": {
+      "motion": "none",
+      "debug": "#e6194b"
+    },
+    "grub-handoff": {
+      "motion": "none",
+      "debug": "#f58231"
+    },
+    "plymouth-boot": {
+      "motion": "bar",
+      "debug": "#ffe119"
+    },
+    "greeter-splash": {
+      "motion": "glow",
+      "debug": "#3cb44b"
+    },
+    "greeter": {
+      "motion": "none",
+      "debug": "#42d4f4"
+    },
+    "login-splash": {
+      "motion": "bar",
+      "debug": "#4363d8"
+    },
+    "session-exit": {
+      "motion": "glow",
+      "debug": "#911eb4"
+    },
+    "plymouth-shutdown": {
+      "motion": "glow",
+      "debug": "#f032e6"
+    }
+  },
+  "debug": {
+    "env": "DEBUG_STAGE_TAGS",
+    "border_frac": 0.004,
+    "border_min": 4,
+    "margin_frac": 0.012,
+    "pt_frac": 0.018,
+    "label": "STAGE \u00b7 OUTPUT \u00b7 WxH"
+  }
+}

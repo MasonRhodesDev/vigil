@@ -5,12 +5,13 @@
 //! `command =` line carries them).
 
 mod layout;
+mod scene;
 mod sessions;
 mod splash;
 mod users;
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -207,6 +208,28 @@ struct Entry {
     splash: Option<splash::Splash>,
     /// Present while the splash still covers, or is fading off, this output.
     cover: Option<splash::Cover>,
+    /// The stage tag drawn on every frame, when debug tags are on.
+    tag: Option<splash::Tag>,
+    /// A greeter frame has been presented on this output.
+    shown_once: bool,
+}
+
+/// An output the splash already owns: claimed, drawn and shown before the
+/// toolkit loaded, waiting for its greeter window.
+struct Early {
+    presenter: DumbBufferPresenter,
+    splash: splash::Splash,
+    tag: Option<splash::Tag>,
+    /// The first frame reached the CRTC.
+    shown: bool,
+}
+
+/// What the splash bring-up hands to the app.
+#[derive(Default)]
+struct EarlySplash {
+    /// Hotplug events the bring-up scan consumed; the first rescan replays them.
+    events: Vec<OutputEvent>,
+    outputs: BTreeMap<OutputId, Early>,
 }
 
 #[derive(Clone)]
@@ -276,7 +299,8 @@ struct App {
     remember: bool,
     state_file: PathBuf,
     remembered_user: Option<String>,
-    theme: Theme,
+    /// Loaded once the toolkit is up, which is after the splash is on screen.
+    theme: Option<Theme>,
     platform: VigilPlatform,
     entries: Vec<Entry>,
     row: layout::Row,
@@ -315,12 +339,300 @@ struct App {
     present_retry: std::collections::BTreeMap<OutputId, (Instant, u32)>,
     exit_code: i32,
     splash_cfg: vigil_config::Splash,
+    /// The shared scene spec the splash follows.
+    scene: scene::Scene,
+    /// Draw the stage tags.
+    debug_tags: bool,
+    /// The one timeline every covered output follows, until the greeter owns
+    /// the screens.
+    timeline: Option<splash::Timeline>,
+    /// Outputs the splash claimed before the toolkit was up.
+    early: BTreeMap<OutputId, Early>,
+    /// Events the splash bring-up consumed, replayed by the first rescan.
+    pending_events: Vec<OutputEvent>,
+    /// `[splash] on_first_frame` has been considered (run or empty).
+    first_frame_hook_done: bool,
     started: Instant,
-    /// Set when start_session was accepted: the sign-in splash is going up
-    /// and the process exits as soon as every screen has shown it.
+    /// Set when start_session was accepted: the screens cross-fade to the
+    /// rest frame and the process exits as soon as every one has shown it.
     leaving: Option<Instant>,
     /// Scaled-wallpaper cache directory, if one can be used.
     bg_cache_dir: Option<PathBuf>,
+}
+
+/// Match a profile against the connected outputs and choose each output's
+/// mode. Returns the resolved layout and the outputs to skip (profile says
+/// disabled).
+fn apply_profile(
+    gpus: &mut [Option<OutputManager>],
+    profiles: &[Profile],
+) -> (Vec<ResolvedOutput>, Vec<OutputId>) {
+    if profiles.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut connected = Vec::new();
+    for gpu in gpus.iter().flatten() {
+        for id in gpu.ids() {
+            if let Some(info) = gpu.info(id) {
+                connected.push((
+                    id,
+                    ConnectedOutput {
+                        name: info.connector.clone(),
+                        description: match (&info.make, &info.model) {
+                            (Some(make), Some(model)) => format!("{make} {model}"),
+                            _ => info.connector.clone(),
+                        },
+                    },
+                ));
+            }
+        }
+    }
+    let signature: Vec<String> = connected
+        .iter()
+        .map(|(_, c)| c.description.clone())
+        .collect();
+    let outputs: Vec<ConnectedOutput> = connected.iter().map(|(_, c)| c.clone()).collect();
+    let Some(profile) = monitor_profiles::select(&signature, profiles) else {
+        eprintln!("vigil: no monitor profile matches {signature:?}");
+        return (Vec::new(), Vec::new());
+    };
+    let resolved = monitor_profiles::resolve(profile, &outputs);
+    for w in &resolved.warnings {
+        eprintln!("vigil: profile {}: {w}", profile.name);
+    }
+    for u in &resolved.unmatched {
+        eprintln!("vigil: profile {}: no output for {u}", profile.name);
+    }
+    eprintln!("vigil: monitor profile {}", profile.name);
+    let mut disabled = Vec::new();
+    for out in &resolved.outputs {
+        let Some((id, _)) = connected.iter().find(|(_, c)| c.name == out.name) else {
+            continue;
+        };
+        if !out.enabled {
+            disabled.push(*id);
+            continue;
+        }
+        if let Some(mode) = out.mode {
+            let want = (mode.width, mode.height, mode.refresh.round() as u32);
+            if let Some(gpu) = gpus.get_mut((id.0 >> 24) as usize).and_then(Option::as_mut)
+                && let Err(e) = gpu.set_mode(*id, want)
+            {
+                eprintln!("vigil: profile {}: {e}; using preferred mode", profile.name);
+            }
+        }
+    }
+    (resolved.outputs, disabled)
+}
+
+/// Claim every connected output for the splash and show its first frame on
+/// all of them at once.
+///
+/// This runs before anything slow: loading the toolkit alone blocks for about
+/// a second, and the greeter windows come after it. Every output is claimed
+/// and every first frame drawn (in parallel) before any is committed, so the
+/// screens light within a few milliseconds of each other instead of one
+/// output's startup cost after the next's.
+fn splash_bringup(
+    gpus: &mut [Option<OutputManager>],
+    profiles: &[Profile],
+    cfg: &vigil_config::Splash,
+    spec: &scene::Scene,
+    debug_tags: bool,
+    keep_state: bool,
+    claim: bool,
+) -> EarlySplash {
+    let mut events = Vec::new();
+    for gpu in gpus.iter_mut().flatten() {
+        match gpu.scan() {
+            Ok(batch) => events.extend(batch),
+            // Left for the first rescan, which also knows how to retire a
+            // vanished card.
+            Err(e) => eprintln!("vigil: initial scan failed: {e}"),
+        }
+    }
+    let mut out = EarlySplash::default();
+    if !cfg.enabled || !claim {
+        out.events = events;
+        return out;
+    }
+    let (layout, disabled) = apply_profile(gpus, profiles);
+    struct Claimed {
+        id: OutputId,
+        ns: usize,
+        connector: String,
+        scene: (u32, u32),
+        transform: u8,
+        presenter: DumbBufferPresenter,
+        shown: bool,
+        /// Whether the first commit changes the CRTC's mode, as read before
+        /// it (None: unreadable).
+        modeset: Option<bool>,
+    }
+    let mut claimed = Vec::new();
+    for event in &events {
+        let OutputEvent::Added(id, _) = event else {
+            continue;
+        };
+        if disabled.contains(id) {
+            continue;
+        }
+        let ns = (id.0 >> 24) as usize;
+        let Some(gpu) = gpus.get_mut(ns).and_then(Option::as_mut) else {
+            continue;
+        };
+        let Some(info) = gpu.info(*id).cloned() else {
+            continue;
+        };
+        let transform = layout
+            .iter()
+            .find(|o| o.name == info.connector)
+            .map_or(0, |o| o.transform)
+            % 4;
+        let modeset = gpu.first_commit_is_modeset(*id);
+        let presenter = match gpu
+            .create_surface(*id)
+            .map_err(|e| e.to_string())
+            .and_then(|surface| DumbBufferPresenter::new(surface).map_err(|e| e.to_string()))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("vigil: {}: splash claim failed: {e}", info.connector);
+                continue;
+            }
+        };
+        let (pw, ph) = presenter.size();
+        let scene = if transform % 2 == 1 {
+            (ph, pw)
+        } else {
+            (pw, ph)
+        };
+        claimed.push(Claimed {
+            id: *id,
+            ns,
+            connector: info.connector.clone(),
+            scene,
+            transform,
+            presenter,
+            shown: false,
+            modeset,
+        });
+    }
+    out.events = events;
+    if claimed.is_empty() {
+        return out;
+    }
+
+    // Every splash is built at once, off the one thread that would otherwise
+    // pay for them in turn.
+    let t_build = vigil_core::uptime_ms();
+    let splashes: Vec<splash::Splash> = std::thread::scope(|scope| {
+        claimed
+            .iter()
+            .map(|c| scope.spawn(|| splash::Splash::new(cfg, spec, c.scene, c.transform)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("splash builder panicked"))
+            .collect()
+    });
+    eprintln!(
+        "vigil: [t+{}ms] splash built for {} output(s) in {} ms",
+        vigil_core::uptime_ms(),
+        claimed.len(),
+        vigil_core::uptime_ms() - t_build
+    );
+
+    // Draw every first frame into its back buffer, then commit them all.
+    let mut parts: Vec<(Claimed, splash::Splash, Option<splash::Tag>)> = claimed
+        .into_iter()
+        .zip(splashes)
+        .map(|(c, sp)| {
+            let tag =
+                debug_tags.then(|| splash::Tag::new(spec, &c.connector, c.scene, c.transform));
+            (c, sp, tag)
+        })
+        .collect();
+    let draw =
+        |presenter: &mut DumbBufferPresenter, sp: &splash::Splash, tag: &Option<splash::Tag>| {
+            presenter.stage_frame(&mut |canvas| match canvas {
+                Canvas::Cpu(mut target) => {
+                    let ok = sp.draw_full(&mut target, 0.0);
+                    if let (true, Some(tag)) = (ok, tag) {
+                        tag.draw(&mut target, splash::Stage::GreeterSplash);
+                    }
+                    ok
+                }
+                _ => false,
+            })
+        };
+    let mut failed_gpus = Vec::new();
+    for (c, sp, tag) in parts.iter_mut() {
+        if let Err(e) = draw(&mut c.presenter, sp, tag) {
+            eprintln!("vigil: {}: splash first frame: {e}", c.connector);
+        }
+    }
+    for (c, _, _) in parts.iter_mut() {
+        match c.presenter.commit_staged() {
+            Ok(true) => {
+                c.shown = true;
+                eprintln!(
+                    "vigil: [t+{}ms] splash first frame on {}x{} ({})",
+                    vigil_core::uptime_ms(),
+                    c.presenter.size().0,
+                    c.presenter.size().1,
+                    match (keep_state, c.modeset) {
+                        (false, _) => "modeset: display state was reset at open",
+                        (true, Some(true)) => "modeset: the CRTC runs another mode",
+                        (true, Some(false)) => "no modeset: the CRTC already runs this mode",
+                        (true, None) => "modeset unknown",
+                    }
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("vigil: {}: splash first frame: {e}", c.connector);
+                if keep_state && !failed_gpus.contains(&c.ns) {
+                    failed_gpus.push(c.ns);
+                }
+            }
+        }
+    }
+    // The state the boot splash left was refused. Start from nothing, as
+    // vigil always did, and show every frame again.
+    for ns in failed_gpus {
+        eprintln!("vigil: gpu {ns}: kept display state refused; resetting it");
+        if let Some(gpu) = gpus.get_mut(ns).and_then(Option::as_mut)
+            && let Err(e) = gpu.reset_display_state()
+        {
+            eprintln!("vigil: gpu {ns}: reset failed: {e}");
+        }
+        for (c, sp, tag) in parts.iter_mut().filter(|(c, _, _)| c.ns == ns) {
+            c.presenter.invalidate();
+            let shown = draw(&mut c.presenter, sp, tag).and_then(|staged| {
+                if staged {
+                    c.presenter.commit_staged()
+                } else {
+                    Ok(false)
+                }
+            });
+            match shown {
+                Ok(done) => c.shown = done,
+                Err(e) => eprintln!("vigil: {}: splash first frame: {e}", c.connector),
+            }
+        }
+    }
+    for (c, sp, tag) in parts {
+        out.outputs.insert(
+            c.id,
+            Early {
+                presenter: c.presenter,
+                splash: sp,
+                tag,
+                shown: c.shown,
+            },
+        );
+    }
+    out
 }
 
 impl App {
@@ -347,18 +659,19 @@ impl App {
         let now = Instant::now();
         let cover = if self.leaving.is_some() {
             Some(Duration::from_millis(5))
+        } else if let Some(timeline) = &self.timeline {
+            if timeline.is_ready() {
+                // Fading: frames come off the greeter's own render path.
+                Some(splash::FRAME_EVERY)
+            } else {
+                self.entries
+                    .iter()
+                    .filter_map(|e| e.cover.as_ref())
+                    .map(|c| c.next_in(now))
+                    .min()
+            }
         } else {
-            self.entries
-                .iter()
-                .filter_map(|e| e.cover.as_ref())
-                .map(|c| {
-                    if c.released() {
-                        Duration::from_millis(16)
-                    } else {
-                        c.next_in(now)
-                    }
-                })
-                .min()
+            None
         };
         [slint, Some(clock), banner, retry, cover]
             .into_iter()
@@ -459,66 +772,8 @@ impl App {
     /// geometry. Returns the outputs to skip (profile says disabled).
     fn resolve_profile(&mut self) -> Vec<OutputId> {
         self.reload_profiles_from_disk();
-        self.layout.clear();
-        if self.profiles.is_empty() {
-            return Vec::new();
-        }
-        let mut connected = Vec::new();
-        for gpu in self.outputs.iter().flatten() {
-            for id in gpu.ids() {
-                if let Some(info) = gpu.info(id) {
-                    connected.push((
-                        id,
-                        ConnectedOutput {
-                            name: info.connector.clone(),
-                            description: match (&info.make, &info.model) {
-                                (Some(make), Some(model)) => format!("{make} {model}"),
-                                _ => info.connector.clone(),
-                            },
-                        },
-                    ));
-                }
-            }
-        }
-        let signature: Vec<String> = connected
-            .iter()
-            .map(|(_, c)| c.description.clone())
-            .collect();
-        let outputs: Vec<ConnectedOutput> = connected.iter().map(|(_, c)| c.clone()).collect();
-        let Some(profile) = monitor_profiles::select(&signature, &self.profiles) else {
-            eprintln!("vigil: no monitor profile matches {signature:?}");
-            return Vec::new();
-        };
-        let resolved = monitor_profiles::resolve(profile, &outputs);
-        for w in &resolved.warnings {
-            eprintln!("vigil: profile {}: {w}", profile.name);
-        }
-        for u in &resolved.unmatched {
-            eprintln!("vigil: profile {}: no output for {u}", profile.name);
-        }
-        eprintln!("vigil: monitor profile {}", profile.name);
-        let mut disabled = Vec::new();
-        for out in &resolved.outputs {
-            let Some((id, _)) = connected.iter().find(|(_, c)| c.name == out.name) else {
-                continue;
-            };
-            if !out.enabled {
-                disabled.push(*id);
-                continue;
-            }
-            if let Some(mode) = out.mode {
-                let want = (mode.width, mode.height, mode.refresh.round() as u32);
-                if let Some(gpu) = self
-                    .outputs
-                    .get_mut((id.0 >> 24) as usize)
-                    .and_then(Option::as_mut)
-                    && let Err(e) = gpu.set_mode(*id, want)
-                {
-                    eprintln!("vigil: profile {}: {e}; using preferred mode", profile.name);
-                }
-            }
-        }
-        self.layout = resolved.outputs;
+        let (layout, disabled) = apply_profile(&mut self.outputs, &self.profiles);
+        self.layout = layout;
         disabled
     }
 
@@ -552,7 +807,7 @@ impl App {
     }
 
     fn rescan(&mut self) {
-        let mut events = Vec::new();
+        let mut events = std::mem::take(&mut self.pending_events);
         for slot in self.outputs.iter_mut() {
             let Some(gpu) = slot else { continue };
             match gpu.scan() {
@@ -695,7 +950,7 @@ impl App {
         let before = self.platform.adapters_created();
         self.platform.set_next_output(id);
         self.platform.use_next_adapter(gl_window.clone());
-        let component = self.theme.instantiate();
+        let component = self.theme.as_ref().ok_or("theme not loaded")?.instantiate();
         self.platform.clear_adapter_override();
         self.platform.clear_next_output();
         let component = component.map_err(|e| e.to_string())?;
@@ -729,12 +984,18 @@ impl App {
     }
 
     fn add_output(&mut self, id: OutputId) -> Result<(), String> {
+        // The splash may already own this output (and its surface).
+        let early = self.early.remove(&id);
         let gpu = self.gpu_for(id)?;
         let info = gpu.info(id).cloned().ok_or("no info for output")?;
-        let surface = gpu.create_surface(id).map_err(|e| e.to_string())?;
+        let surface = match early {
+            Some(_) => None,
+            None => Some(gpu.create_surface(id).map_err(|e| e.to_string())?),
+        };
         let device_fd = gpu.device_fd();
         let atomic = gpu.is_atomic();
-        let want_gl = self.looks.config.render.backend.eq_ignore_ascii_case("gl");
+        let want_gl =
+            early.is_none() && self.looks.config.render.backend.eq_ignore_ascii_case("gl");
         // Precedence: [output."NAME"] > monitor profile > EDID-derived default.
         let profile_scale = self
             .layout
@@ -768,7 +1029,7 @@ impl App {
         }
         // A rendering preference must never be why someone cannot log in, so
         // a GL failure degrades to software with a log line, per output.
-        let mut surface_slot = Some(surface);
+        let mut surface_slot = surface;
         let resolved_background = self.appearance_registry.resolve(
             &appearance_profiles::OutputIdentity::new(&info.connector, info.description()),
             None,
@@ -778,7 +1039,7 @@ impl App {
             resolved_background.path,
             Some(appearance_fit(resolved_background.fit)),
         );
-        let mut splash_slot: Option<(splash::Splash, Option<splash::Cover>)> = None;
+        let mut splash_slot: Option<(splash::Splash, Option<splash::Tag>, bool)> = None;
         let gl = if want_gl {
             match self.gl_output(id, scale, transform, atomic, &mut surface_slot, device_fd) {
                 Ok(built) => Some(built),
@@ -804,23 +1065,25 @@ impl App {
                 built
             }
             None => {
-                let surface = surface_slot
-                    .take()
-                    .ok_or("DRM surface consumed by a failed GL attempt")?;
-                let mut presenter: Box<dyn Presenter> =
-                    Box::new(DumbBufferPresenter::new(surface).map_err(|e| e.to_string())?);
-                // Own the screen visibly NOW: the splash goes up before the
-                // theme is instantiated, so the gap between taking the screen
-                // and the first greeter frame is the boot splash, not black.
-                // Hotplugs after startup skip it (the greeter is already up).
-                splash_slot = self.first_frame(
-                    &mut presenter,
-                    (info.width, info.height),
-                    transform,
-                    background.is_some(),
-                );
+                let presenter: Box<dyn Presenter> = match early {
+                    Some(Early {
+                        presenter,
+                        splash,
+                        tag,
+                        shown,
+                    }) => {
+                        splash_slot = Some((splash, tag, shown));
+                        Box::new(presenter)
+                    }
+                    None => {
+                        let surface = surface_slot
+                            .take()
+                            .ok_or("DRM surface consumed by a failed GL attempt")?;
+                        Box::new(DumbBufferPresenter::new(surface).map_err(|e| e.to_string())?)
+                    }
+                };
                 self.platform.set_next_output(id);
-                let component = self.theme.instantiate();
+                let component = self.theme.as_ref().ok_or("theme not loaded")?.instantiate();
                 self.platform.clear_next_output();
                 let component = component.map_err(|e| e.to_string())?;
                 let adapter = self
@@ -879,15 +1142,34 @@ impl App {
                 _ => String::new(),
             }
         );
-        let (splash, mut cover) = match splash_slot {
-            Some((splash, cover)) => (Some(splash), cover),
-            None => (None, None),
+        let (splash, mut cover, tag) = match splash_slot {
+            Some((splash, tag, shown)) => {
+                let mut cover = splash::Cover::new();
+                if shown {
+                    cover.presented(Instant::now(), 0.0);
+                }
+                (Some(splash), Some(cover), tag)
+            }
+            // No splash claimed it (a hotplug, or the splash is off): the
+            // greeter alone, tagged when asked.
+            None => (
+                None,
+                None,
+                (self.debug_tags && !hw_cursor).then(|| {
+                    splash::Tag::new(
+                        &self.scene,
+                        &info.connector,
+                        (scene_width, scene_height),
+                        transform,
+                    )
+                }),
+            ),
         };
         if background.is_none()
             && let Some(cover) = cover.as_mut()
         {
             // Nothing to wait for: the greeter is ready as it stands.
-            cover.mark_ready(Instant::now());
+            cover.mark_ready();
         }
         self.entries.push(Entry {
             id,
@@ -903,55 +1185,10 @@ impl App {
             window,
             splash,
             cover,
+            tag,
+            shown_once: false,
         });
         Ok(())
-    }
-
-    /// Draw the splash on a freshly claimed output, before anything slower
-    /// (theme instantiation, background decode) runs. The modeset commit
-    /// rides this first frame. Returns the splash, and the cover timing
-    /// unless the greeter has been up too long for a cover to make sense
-    /// (a monitor plugged in later).
-    fn first_frame(
-        &self,
-        presenter: &mut Box<dyn Presenter>,
-        size: (u32, u32),
-        transform: u8,
-        _has_background: bool,
-    ) -> Option<(splash::Splash, Option<splash::Cover>)> {
-        if !self.splash_cfg.enabled {
-            return None;
-        }
-        let transform = transform % 4;
-        let scene = if transform % 2 == 1 {
-            (size.1, size.0)
-        } else {
-            size
-        };
-        let splash = splash::Splash::new(&self.splash_cfg, scene, transform);
-        let covering = self.leaving.is_none()
-            && self.started.elapsed() < Duration::from_millis(self.splash_cfg.max_wait_ms);
-        let mut cover = covering.then(|| splash::Cover::new(Instant::now()));
-        if let Some(cover) = cover.as_mut() {
-            let shown = presenter.with_frame(&mut |canvas| match canvas {
-                Canvas::Cpu(mut target) => splash.draw_full(&mut target, 0),
-                _ => false,
-            });
-            match shown {
-                Ok(true) => {
-                    cover.presented(Instant::now());
-                    eprintln!(
-                        "vigil: [t+{}ms] splash first frame on {}x{}",
-                        vigil_core::uptime_ms(),
-                        size.0,
-                        size.1
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => eprintln!("vigil: splash first frame: {e}"),
-            }
-        }
-        Some((splash, cover))
     }
 
     fn remove_output(&mut self, id: OutputId) {
@@ -1135,54 +1372,104 @@ impl App {
     }
 
     /// start_session was accepted. greetd runs the session only once this
-    /// process exits, so the one job left is to put the sign-in splash on
-    /// every screen and get out of the way, not to tear down gracefully.
+    /// process exits, so the one job left is to hand every screen back to
+    /// the rest frame (the next stage starts on it) and get out of the way,
+    /// not to tear down gracefully.
     fn begin_leaving(&mut self) {
         let now = Instant::now();
         self.leaving = Some(now);
+        self.timeline = None;
         eprintln!(
-            "vigil: [t+{}ms] login accepted; sign-in splash up, exiting once shown",
+            "vigil: [t+{}ms] login accepted; easing to the rest frame, exiting once shown",
             vigil_core::uptime_ms()
         );
         for entry in self.entries.iter_mut() {
             if entry.splash.is_some() {
-                entry.cover = Some(splash::Cover::new(now));
+                entry.cover = Some(splash::Cover::new());
             }
         }
     }
 
-    /// Drive the sign-in splash; exit the process as soon as every screen
-    /// that has one has shown it and the flip had a vblank to land.
+    /// Drive the hand-off to the rest frame; exit the process as soon as
+    /// every screen that has a splash shows it and the flip had a vblank to
+    /// land. One timeline for all outputs: every frame in a pass uses the
+    /// same `now`.
     fn render_leaving(&mut self) {
         let now = Instant::now();
-        let t_ms = now.duration_since(self.started).as_millis() as u64;
+        let started = self.leaving.unwrap_or(now);
+        let waited = now.duration_since(started);
+        let fade = self.scene.stage_fade_s.max(0.0);
+        let progress = if fade <= 0.0 {
+            1.0
+        } else {
+            scene::ease(waited.as_secs_f64() / fade)
+        };
+        let last_frame = progress >= 1.0;
         let mut pending = false;
-        let mut last: Option<Instant> = None;
         for entry in self.entries.iter_mut() {
-            let (Some(splash), Some(cover)) = (entry.splash.as_ref(), entry.cover.as_mut()) else {
+            let Entry {
+                presenter,
+                window,
+                splash,
+                cover,
+                tag,
+                ..
+            } = entry;
+            let (Some(sp), Some(cover)) = (splash.as_ref(), cover.as_mut()) else {
                 continue;
             };
-            if cover.last_presented().is_none() {
-                let shown = entry.presenter.with_frame(&mut |canvas| match canvas {
-                    Canvas::Cpu(mut target) => splash.draw_full(&mut target, t_ms),
+            if !cover.final_shown() && cover.due(now) {
+                // The greeter as it stands, with the rest frame mixed in.
+                window.request_present();
+                let shown = presenter.with_frame(&mut |canvas| match canvas {
+                    Canvas::Cpu(target) => {
+                        let mut frame = FrameTarget {
+                            buffer: &mut target.buffer[..],
+                            width: target.width,
+                            height: target.height,
+                            stride: target.stride,
+                        };
+                        if last_frame {
+                            sp.draw_full(&mut frame, 0.0);
+                        } else if window.render_if_needed(FrameTarget {
+                            buffer: &mut frame.buffer[..],
+                            width: frame.width,
+                            height: frame.height,
+                            stride: frame.stride,
+                        }) {
+                            sp.blend_over(&mut frame, progress as f32);
+                        } else {
+                            return false;
+                        }
+                        if let Some(tag) = tag {
+                            tag.draw(&mut frame, splash::Stage::Greeter);
+                        }
+                        true
+                    }
                     _ => false,
                 });
                 match shown {
-                    Ok(true) => cover.presented(now),
+                    Ok(true) => {
+                        cover.presented(now, progress);
+                        if last_frame {
+                            cover.set_final_shown();
+                        }
+                    }
                     Ok(false) => {}
-                    Err(e) => eprintln!("vigil: sign-in splash: {e}"),
+                    Err(e) => eprintln!("vigil: hand-off to rest: {e}"),
                 }
             }
-            match cover.last_presented() {
-                Some(t) => last = Some(last.map_or(t, |l| l.max(t))),
-                None => pending = true,
+            if cover.final_shown() {
+                // Shown means on the display, not just handed to the kernel:
+                // the process must not exit while the last flip is in flight.
+                pending |= presenter.flip_pending();
+            } else {
+                pending = true;
             }
         }
-        let waited = now.duration_since(self.leaving.unwrap_or(now));
-        let settled = last.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(20));
-        if (!pending && settled) || waited >= Duration::from_millis(150) {
+        if !pending || waited >= Duration::from_millis(500) + Duration::from_secs_f64(fade) {
             eprintln!(
-                "vigil: [t+{}ms] exiting (sign-in splash shown, {} ms after login)",
+                "vigil: [t+{}ms] exiting (rest frame shown, {} ms after login)",
                 vigil_core::uptime_ms(),
                 waited.as_millis()
             );
@@ -1423,14 +1710,13 @@ impl App {
     }
 
     fn apply_backgrounds(&mut self, outputs: Vec<(OutputId, DecodedBackground)>) {
-        let now = Instant::now();
         for (id, decoded) in outputs {
             let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
                 continue;
             };
             // Whatever the outcome, the greeter has stopped waiting for it.
             if let Some(cover) = entry.cover.as_mut() {
-                cover.mark_ready(now);
+                cover.mark_ready();
             }
             match decoded {
                 Ok(Some(BackgroundBitmap::Rgba(rgba, width, height))) => {
@@ -1519,6 +1805,38 @@ impl App {
         }
     }
 
+    /// The shared timeline's phase at `now`, or None once no output is
+    /// covered any more. The timeline is ready when every covered output's
+    /// greeter is.
+    fn cover_phase(&mut self, now: Instant) -> Option<splash::Phase> {
+        let timeline = self.timeline.as_mut()?;
+        let mut covered = self
+            .entries
+            .iter()
+            .filter_map(|e| e.cover.as_ref())
+            .peekable();
+        if covered.peek().is_none() {
+            self.timeline = None;
+            return None;
+        }
+        if !timeline.is_ready() && covered.all(splash::Cover::is_ready) {
+            timeline.mark_ready(now);
+            eprintln!(
+                "vigil: [t+{}ms] greeter ready on every output; easing the glow out",
+                vigil_core::uptime_ms()
+            );
+        }
+        let phase = timeline.phase(now, scene::monotonic_s(), &self.scene);
+        if phase == splash::Phase::Done {
+            eprintln!(
+                "vigil: [t+{}ms] splash to greeter fade done",
+                vigil_core::uptime_ms()
+            );
+            self.timeline = None;
+        }
+        Some(phase)
+    }
+
     fn render(&mut self, dirty: &[OutputId]) {
         if !self.active {
             return;
@@ -1528,6 +1846,10 @@ impl App {
             return;
         }
         let mut dead = Vec::new();
+        // One timeline for every covered output, sampled once per pass: no
+        // screen runs ahead of another because its neighbour was slow to draw.
+        let now = Instant::now();
+        let phase = self.cover_phase(now);
         // `dirty` is advisory (see vigil-wayland: the software adapter cannot
         // intercept Slint's request_redraw, so gating on it froze animations
         // and input on metal). Every entry is offered a frame, but the scene
@@ -1541,36 +1863,50 @@ impl App {
                 present_failures,
                 splash,
                 cover,
+                tag,
+                shown_once,
                 ..
             } = entry;
-            // The splash covers a fresh output until the greeter has what
-            // it was waiting for, then cross-fades off.
+            // The splash covers a fresh output until the greeter is ready on
+            // every output, then the whole set cross-fades off together.
             let mut fade: Option<f32> = None;
-            if let Some(c) = cover.as_mut() {
-                let now = Instant::now();
-                match c.phase(now, &self.splash_cfg) {
-                    splash::Phase::Hold => {
+            if let (Some(c), Some(phase)) = (cover.as_mut(), phase) {
+                match phase {
+                    splash::Phase::Glow(level) => {
                         if let Some(sp) = splash.as_ref()
                             && c.due(now)
+                            && c.changes(level)
                         {
-                            let (full, t) = (c.needs_full(), c.t_ms(now));
+                            let full = c.needs_full();
                             let shown = presenter.with_frame(&mut |canvas| match canvas {
                                 Canvas::Cpu(mut target) => {
                                     if full {
-                                        sp.draw_full(&mut target, t)
+                                        let ok = sp.draw_full(&mut target, level);
+                                        if let (true, Some(tag)) = (ok, tag.as_ref()) {
+                                            tag.draw(&mut target, splash::Stage::GreeterSplash);
+                                        }
+                                        ok
                                     } else {
-                                        sp.draw_track(&mut target, t);
-                                        true
+                                        sp.draw_glow(&mut target, level)
                                     }
                                 }
                                 _ => false,
                             });
                             match shown {
-                                Ok(true) => c.presented(now),
+                                Ok(true) => c.presented(now, level),
                                 Ok(false) => {}
                                 Err(PresentError::DeviceLost) => dead.push(i),
                                 Err(e) => eprintln!("vigil: splash present: {e}"),
                             }
+                        }
+                        // While the glow eases out, the greeter's first
+                        // frame is drawn off screen so the fade starts on it.
+                        if self
+                            .timeline
+                            .as_ref()
+                            .is_some_and(|t| t.easing_out(now, &self.scene))
+                        {
+                            let _ = window.scene_needs_present();
                         }
                         continue;
                     }
@@ -1625,6 +1961,23 @@ impl App {
                         alpha,
                     );
                 }
+                if drew && let Some(tag) = tag.as_ref() {
+                    // Whichever stage holds more of the picture owns the tag.
+                    let stage = if fade.is_some_and(|a| a > 0.5) {
+                        splash::Stage::GreeterSplash
+                    } else {
+                        splash::Stage::Greeter
+                    };
+                    tag.draw(
+                        &mut FrameTarget {
+                            buffer: &mut target.buffer[..],
+                            width: target.width,
+                            height: target.height,
+                            stride: target.stride,
+                        },
+                        stage,
+                    );
+                }
                 if drew && debug_frames {
                     let row = &target.buffer[mid..mid + row_len];
                     let sum: u64 = row.iter().map(|&b| b as u64).sum();
@@ -1634,6 +1987,7 @@ impl App {
             }) {
                 Ok(drew) => {
                     if drew {
+                        *shown_once = true;
                         self.metrics.record_render();
                         self.metrics.record_commit();
                     }
@@ -1671,6 +2025,50 @@ impl App {
         if self.panel >= self.entries.len() {
             self.panel = 0;
         }
+        self.maybe_first_frame_hook();
+    }
+
+    /// Run `[splash] on_first_frame` once, when every output shows a frame
+    /// of ours and no flip is still in flight.
+    fn maybe_first_frame_hook(&mut self) {
+        if self.first_frame_hook_done || self.entries.is_empty() {
+            return;
+        }
+        let up = self.entries.iter().all(|e| {
+            let shown = match &e.cover {
+                Some(c) => c.shown(),
+                None => e.shown_once,
+            };
+            shown && !e.presenter.flip_pending()
+        });
+        if !up {
+            return;
+        }
+        self.first_frame_hook_done = true;
+        eprintln!(
+            "vigil: [t+{}ms] first frame presented on every output",
+            vigil_core::uptime_ms()
+        );
+        let cmd = self.splash_cfg.on_first_frame.trim().to_owned();
+        if cmd.is_empty() {
+            return;
+        }
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                // Reaped off the render path.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => eprintln!("vigil: on_first_frame: {e}"),
+        }
     }
 }
 
@@ -1701,6 +2099,7 @@ fn clock_text(format: &str) -> String {
 
 fn run() -> Result<i32, String> {
     vigil_core::uptime_ms();
+    let process_start = Instant::now();
     let cli = parse_cli()?;
 
     // Author/CI tool: validate a theme and exit without touching the seat.
@@ -1777,8 +2176,34 @@ fn run() -> Result<i32, String> {
     }
     let udev = vigil_outputs::udev_monitor(&seat).map_err(|e| e.to_string())?;
 
-    let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
-    let theme = Theme::load_or_default(resolved.theme.as_deref());
+    // The splash goes up first, on every output at once: registering the
+    // toolkit below blocks for about a second, and the greeter windows need
+    // it. The screens sit on the rest frame meanwhile.
+    let splash_cfg = match &cli.splash_config {
+        Some(path) => vigil_config::Splash::load_file(path),
+        None => config.splash.clone(),
+    };
+    let scene = splash::resolve_scene(&splash_cfg);
+    let debug_tags = splash_cfg.debug_tags || scene.debug_from_env();
+    let want_gl = config.render.backend.eq_ignore_ascii_case("gl");
+    let early = splash_bringup(
+        &mut outputs,
+        &profiles,
+        &splash_cfg,
+        &scene,
+        debug_tags,
+        config.render.keep_display_state,
+        !want_gl,
+    );
+    if !early.outputs.is_empty() {
+        eprintln!(
+            "vigil: [t+{}ms] splash up on {} output(s)",
+            vigil_core::uptime_ms(),
+            early.outputs.len()
+        );
+    }
+
+    let platform = VigilPlatform::new();
 
     let keymap = vigil_core::KeymapSettings {
         rules: config.keyboard.rules.clone(),
@@ -1856,7 +2281,6 @@ fn run() -> Result<i32, String> {
     let wake = WakeHandle::new(move || wake_signal.wakeup());
     let dirty = std::sync::Arc::new(DirtySet::new());
     let metrics = std::sync::Arc::new(Metrics::new());
-    platform.set_runtime(wake.clone(), dirty.clone(), metrics.clone());
 
     // Sleep signals on a worker thread (the vigil-pam pattern: the event loop
     // is calloop-driven and must never block on D-Bus). logind being absent
@@ -1891,10 +2315,6 @@ fn run() -> Result<i32, String> {
         .and_then(|name| appearance_profiles::PreparedBundle::load_published(name).ok())
         .flatten();
     let background_cache_key = appearance_user.unwrap_or("<theme>").to_owned();
-    let splash_cfg = match &cli.splash_config {
-        Some(path) => vigil_config::Splash::load_file(path),
-        None => config.splash.clone(),
-    };
     let bg_cache_dir = config
         .sessions
         .state_file
@@ -1918,7 +2338,7 @@ fn run() -> Result<i32, String> {
         remember,
         state_file: config.sessions.state_file.clone(),
         remembered_user,
-        theme,
+        theme: None,
         platform,
         entries: Vec::new(),
         row: layout::Row::default(),
@@ -1957,10 +2377,26 @@ fn run() -> Result<i32, String> {
         present_retry: Default::default(),
         exit_code: 1,
         splash_cfg,
-        started: Instant::now(),
+        scene,
+        debug_tags,
+        timeline: None,
+        early: early.outputs,
+        pending_events: early.events,
+        first_frame_hook_done: false,
+        started: process_start,
         leaving: None,
         bg_cache_dir,
     };
+
+    if !app.early.is_empty() {
+        app.timeline = Some(splash::Timeline::new(app.started, &app.splash_cfg));
+    }
+    // The slow part, with the splash already on every screen.
+    app.platform.register().map_err(|e| e.to_string())?;
+    // Validating the theme instantiates it once, before any runtime exists.
+    app.theme = Some(Theme::load_or_default(resolved.theme.as_deref()));
+    app.platform
+        .set_runtime(app.wake.clone(), app.dirty.clone(), app.metrics.clone());
 
     // Rescan also starts the background job for the outputs it brought up
     // (decode once, scale in parallel, or read the scaled-wallpaper cache),

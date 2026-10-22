@@ -1,62 +1,86 @@
-//! The splash: the frame vigil draws the instant it owns a screen, and again
-//! the instant a login succeeds, so the greeter reads as one piece with
-//! whatever drew the boot before it and whatever draws the desktop after.
+//! The splash: the frame vigil draws the instant it owns a screen, the glow
+//! that breathes while the greeter prepares, and the frame it hands over on
+//! after a login, so the greeter reads as one piece with whatever drew the
+//! boot before it and whatever draws the desktop after.
 //!
-//! Every dimension comes from [`vigil_config::Splash`]; nothing here knows a
-//! color, size or logo. Drawing is plain CPU writes into the presenter's
-//! XRGB8888 target, in the scene's upright orientation mapped to the panel.
+//! Geometry, palette and motion come from the shared scene spec
+//! ([`crate::scene`]); nothing here knows a size or a colour. Drawing is
+//! plain CPU writes into the presenter's XRGB8888 target, in the scene's
+//! upright orientation mapped to the panel.
+//!
+//! One timeline drives every output ([`Timeline`]): the glow breathes from
+//! CLOCK_MONOTONIC, eases out to the REST frame when the greeter is ready on
+//! all outputs, and a single cross-fade then hands the screens to the
+//! greeter. Per-output state is only what the swapchain needs.
 
 use std::time::{Duration, Instant};
 
+use font8x8::{BASIC_FONTS, UnicodeFonts};
 use vigil_config::Splash as SplashConfig;
 use vigil_core::{FrameTarget, scene_to_panel};
 
-/// Parse `#rrggbb`; anything else keeps `fallback`.
-pub fn parse_color(text: &str, fallback: [u8; 3]) -> [u8; 3] {
-    let hex = text.trim().trim_start_matches('#');
-    if hex.len() != 6 {
-        return fallback;
-    }
-    let Ok(v) = u32::from_str_radix(hex, 16) else {
-        return fallback;
-    };
-    [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+use crate::scene::{Scene, ease};
+
+/// Which stage owns a screen, for its debug tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    GreeterSplash,
+    Greeter,
 }
 
-/// Geometry of the loading line in scene pixels.
+impl Stage {
+    fn name(self) -> &'static str {
+        match self {
+            Stage::GreeterSplash => "GREETER-SPLASH",
+            Stage::Greeter => "GREETER",
+        }
+    }
+}
+
+/// Parse `#rrggbb`; anything else keeps `fallback`.
+pub fn parse_color(text: &str, fallback: [u8; 3]) -> [u8; 3] {
+    crate::scene::parse_color(text).unwrap_or(fallback)
+}
+
+/// The scene with the config's colour overrides applied.
+pub fn resolve_scene(cfg: &SplashConfig) -> Scene {
+    let mut scene = Scene::load(&cfg.scene);
+    for (over, slot) in [
+        (&cfg.ground, &mut scene.bg),
+        (&cfg.mark, &mut scene.mark),
+        (&cfg.accent, &mut scene.accent),
+    ] {
+        if let Some(text) = over {
+            *slot = parse_color(text, *slot);
+        }
+    }
+    scene
+}
+
+/// A rectangle of panel pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Track {
-    pub x: i64,
-    pub y: i64,
-    pub w: i64,
-    pub h: i64,
+struct Rect {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
 }
 
 /// Everything needed to draw one output's splash.
 pub struct Splash {
-    scene: (u32, u32),
     panel: (u32, u32),
-    transform: u8,
-    /// Ground, mark and idle line, already in panel orientation, tightly
-    /// packed XRGB8888 (little endian: B, G, R, X).
-    base: Vec<u8>,
-    track: Track,
-    line: [u8; 3],
-    sweep: [u8; 3],
-    sweep_w: f64,
-    sweep_ms: u64,
-}
-
-/// Pixel geometry of the scene on a `scene` screen, from the fractions in
-/// the config. Rounds half up, like the boot splash's own script.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Geometry {
-    pub logo: u32,
-    pub glow: u32,
-    pub cx: f64,
-    pub cy: f64,
-    pub track: Track,
-    pub shine_w: f64,
+    ground: [u8; 3],
+    accent: [u8; 3],
+    mark: [u8; 3],
+    /// The REST frame: ground and the mark, no glow. Panel orientation,
+    /// tightly packed XRGB8888 (little endian: B, G, R, X).
+    rest: Vec<u8>,
+    /// The panel pixels the glow box covers, and, over exactly those, the
+    /// glow's and the mark's alpha. The glow sits under the mark, so a frame
+    /// is redrawn from these without touching the rest of the screen.
+    glow_rect: Rect,
+    glow_alpha: Vec<u8>,
+    mark_alpha: Vec<u8>,
 }
 
 fn put(buf: &mut [u8], stride: usize, x: usize, y: usize, rgb: [u8; 3]) {
@@ -65,36 +89,6 @@ fn put(buf: &mut [u8], stride: usize, x: usize, y: usize, rgb: [u8; 3]) {
     buf[o + 1] = rgb[1];
     buf[o + 2] = rgb[0];
     buf[o + 3] = 0xff;
-}
-
-fn rnd(x: f64) -> i64 {
-    (x + 0.5).floor() as i64
-}
-
-pub fn layout(cfg: &SplashConfig, scene: (u32, u32)) -> Geometry {
-    let h = f64::from(scene.1);
-    let logo = rnd(h * cfg.logo_frac).max(1);
-    let glow = ((logo as f64) * cfg.glow_mult).round().max(1.0) as u32;
-    let cx = f64::from(scene.0) / 2.0;
-    let cy = h * cfg.center_frac;
-    let track_w = rnd(h * cfg.track_w_frac).max(1);
-    let track_h = rnd(h * cfg.track_h_frac)
-        .max(i64::from(cfg.track_h_min))
-        .max(1);
-    let gap = rnd(h * cfg.gap_frac);
-    Geometry {
-        logo: logo as u32,
-        glow,
-        cx,
-        cy,
-        track: Track {
-            x: rnd(cx - track_w as f64 / 2.0),
-            y: rnd(cy + logo as f64 / 2.0 + gap as f64),
-            w: track_w,
-            h: track_h,
-        },
-        shine_w: (track_w as f64 * cfg.shine_w_frac).round().max(1.0),
-    }
 }
 
 /// Alpha mask of the mark fitted into an `edge` x `edge` box, centred.
@@ -227,145 +221,159 @@ fn blur(src: &[u8], w: usize, h: usize, sigma: f64) -> Vec<u8> {
     out
 }
 
-/// Composite a colour through an alpha mask (scaled by `opacity`) onto an
-/// XRGB scene buffer with its top-left at (`ox`, `oy`).
-#[allow(clippy::too_many_arguments)]
-fn composite(
-    buf: &mut [u8],
-    sw: usize,
-    sh: usize,
-    mask: &[u8],
-    mw: usize,
-    ox: i64,
-    oy: i64,
-    rgb: [u8; 3],
-    opacity: f64,
-) {
-    for (i, &m) in mask.iter().enumerate() {
-        if m == 0 {
-            continue;
-        }
-        let (x, y) = (ox + (i % mw) as i64, oy + (i / mw) as i64);
-        if x < 0 || y < 0 || x >= sw as i64 || y >= sh as i64 {
-            continue;
-        }
-        let a = (f64::from(m) * opacity.clamp(0.0, 1.0)).round() as u32;
-        let o = y as usize * sw * 4 + x as usize * 4;
-        for (c, dst) in [(rgb[2], o), (rgb[1], o + 1), (rgb[0], o + 2)] {
-            let old = u32::from(buf[dst]);
-            buf[dst] = ((u32::from(c) * a + old * (255 - a) + 127) / 255) as u8;
+/// Shrink an `n` x `n` mask by an integer `f` with a box filter.
+fn shrink(src: &[u8], n: usize, f: usize) -> (Vec<u8>, usize) {
+    let q = n.div_ceil(f);
+    let mut out = vec![0u8; q * q];
+    for qy in 0..q {
+        for qx in 0..q {
+            let (mut sum, mut cnt) = (0u32, 0u32);
+            for y in qy * f..((qy + 1) * f).min(n) {
+                for x in qx * f..((qx + 1) * f).min(n) {
+                    sum += u32::from(src[y * n + x]);
+                    cnt += 1;
+                }
+            }
+            out[qy * q + qx] = (sum / cnt.max(1)) as u8;
         }
     }
+    (out, q)
+}
+
+/// Bilinear enlargement of a `q` x `q` mask to `n` x `n`.
+fn enlarge(src: &[u8], q: usize, n: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n * n];
+    let scale = q as f64 / n as f64;
+    for y in 0..n {
+        let fy = ((y as f64 + 0.5) * scale - 0.5).clamp(0.0, (q - 1) as f64);
+        let (y0, ty) = (fy.floor() as usize, fy.fract());
+        let y1 = (y0 + 1).min(q - 1);
+        for x in 0..n {
+            let fx = ((x as f64 + 0.5) * scale - 0.5).clamp(0.0, (q - 1) as f64);
+            let (x0, tx) = (fx.floor() as usize, fx.fract());
+            let x1 = (x0 + 1).min(q - 1);
+            let at = |xx: usize, yy: usize| f64::from(src[yy * q + xx]);
+            let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+            let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+            out[y * n + x] = (top + (bottom - top) * ty).round() as u8;
+        }
+    }
+    out
+}
+
+/// How much smaller the glow is blurred at. A blurred blob has no detail, so
+/// a quarter of the resolution is indistinguishable and a sixteenth of the
+/// work (the full-size blur cost seconds on a 4K screen).
+const GLOW_DOWN: usize = 4;
+
+/// The glow mask: the mark's silhouette centred in a `ge` box, blurred.
+fn glow_mask(logo: &[u8], edge: usize, ge: usize, sigma: f64) -> Vec<u8> {
+    let mut big = vec![0u8; ge * ge];
+    let off = ge.saturating_sub(edge) / 2;
+    for y in 0..edge.min(ge) {
+        for x in 0..edge.min(ge) {
+            big[(y + off) * ge + x + off] = logo[y * edge + x];
+        }
+    }
+    let (small, q) = shrink(&big, ge, GLOW_DOWN);
+    let blurred = blur(&small, q, q, sigma / GLOW_DOWN as f64);
+    enlarge(&blurred, q, ge)
 }
 
 impl Splash {
-    /// Build the static layer for a scene of `scene` pixels on a panel with
-    /// the given quarter-turn `transform`.
-    pub fn new(cfg: &SplashConfig, scene: (u32, u32), transform: u8) -> Self {
+    /// Build the layers for a scene of `scene` pixels on a panel with the
+    /// given quarter-turn `transform`.
+    pub fn new(cfg: &SplashConfig, spec: &Scene, scene: (u32, u32), transform: u8) -> Self {
         let transform = transform % 4;
-        let ground = parse_color(&cfg.ground, [0x0b, 0x0d, 0x10]);
-        let mark = parse_color(&cfg.mark, [0xc3, 0xc9, 0xd0]);
-        let accent = parse_color(&cfg.accent, [0x17, 0x93, 0xd1]);
-        let line = parse_color(&cfg.track, [0x1f, 0x28, 0x32]);
-        let sweep = parse_color(&cfg.shine, [0xbe, 0xe4, 0xf7]);
         let (sw, sh) = (scene.0 as usize, scene.1 as usize);
-        let g = layout(cfg, scene);
-        let track = g.track;
-
-        // Scene-space base, upright.
-        let mut scene_buf = vec![0u8; sw * sh * 4];
-        for y in 0..sh {
-            for x in 0..sw {
-                put(&mut scene_buf, sw * 4, x, y, ground);
-            }
-        }
-        if let Some(path) = cfg.logo.as_ref().filter(|p| !p.as_os_str().is_empty()) {
-            match mask(path, g.logo) {
-                Ok(logo) => {
-                    let edge = g.logo as usize;
-                    let ge = g.glow as usize;
-                    // Glow: the silhouette centred in a larger box, blurred.
-                    let mut big = vec![0u8; ge * ge];
-                    let off = (ge.saturating_sub(edge)) / 2;
-                    for y in 0..edge.min(ge) {
-                        for x in 0..edge.min(ge) {
-                            big[(y + off) * ge + x + off] = logo[y * edge + x];
-                        }
-                    }
-                    let glow = blur(&big, ge, ge, f64::from(g.logo / 6));
-                    let (gx, gy) = (rnd(g.cx - ge as f64 / 2.0), rnd(g.cy - ge as f64 / 2.0));
-                    composite(
-                        &mut scene_buf,
-                        sw,
-                        sh,
-                        &glow,
-                        ge,
-                        gx,
-                        gy,
-                        accent,
-                        cfg.glow_opacity,
-                    );
-                    let (lx, ly) = (rnd(g.cx - edge as f64 / 2.0), rnd(g.cy - edge as f64 / 2.0));
-                    composite(&mut scene_buf, sw, sh, &logo, edge, lx, ly, mark, 1.0);
-                }
-                Err(e) => eprintln!("vigil: splash logo {}: {e}", path.display()),
-            }
-        }
-        for ty in 0..track.h {
-            for tx in 0..track.w {
-                let (x, y) = (track.x + tx, track.y + ty);
-                if x >= 0 && y >= 0 && (x as usize) < sw && (y as usize) < sh {
-                    put(&mut scene_buf, sw * 4, x as usize, y as usize, line);
-                }
-            }
-        }
-
         let (pw, ph) = if transform % 2 == 1 {
-            (scene.1, scene.0)
+            (sh, sw)
         } else {
-            scene
+            (sw, sh)
         };
-        let base = if transform == 0 {
-            scene_buf
+        let g = spec.geometry(scene.0, scene.1);
+        let (edge, ge) = (g.logo as usize, g.glow as usize);
+
+        let logo = match cfg.logo.as_ref().filter(|p| !p.as_os_str().is_empty()) {
+            Some(path) => match mask(path, g.logo) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    eprintln!("vigil: splash logo {}: {e}", path.display());
+                    None
+                }
+            },
+            None => None,
+        };
+        let sigma = f64::from(g.logo / spec.glow_blur_div);
+        let glow = logo
+            .as_ref()
+            .map(|l| glow_mask(l, edge, ge, sigma))
+            .unwrap_or_default();
+
+        // The glow box in scene pixels, clipped to the screen, and the panel
+        // rectangle it lands on.
+        let (x0, y0) = (g.glow_x.max(0) as usize, g.glow_y.max(0) as usize);
+        let x1 = ((g.glow_x + ge as i64).max(0) as usize).min(sw);
+        let y1 = ((g.glow_y + ge as i64).max(0) as usize).min(sh);
+        let rect = if x1 > x0 && y1 > y0 {
+            let a = scene_to_panel(transform, sw, sh, x0, y0);
+            let b = scene_to_panel(transform, sw, sh, x1 - 1, y1 - 1);
+            Rect {
+                x: a.0.min(b.0),
+                y: a.1.min(b.1),
+                w: a.0.max(b.0) - a.0.min(b.0) + 1,
+                h: a.1.max(b.1) - a.1.min(b.1) + 1,
+            }
         } else {
-            let mut out = vec![0u8; pw as usize * ph as usize * 4];
-            for y in 0..sh {
-                for x in 0..sw {
-                    let (px, py) = scene_to_panel(transform, sw, sh, x, y);
-                    let (s, d) = (y * sw * 4 + x * 4, py * pw as usize * 4 + px * 4);
-                    out[d..d + 4].copy_from_slice(&scene_buf[s..s + 4]);
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            }
+        };
+        let mut glow_alpha = vec![0u8; rect.w * rect.h];
+        let mut mark_alpha = vec![0u8; rect.w * rect.h];
+        if let Some(logo) = &logo {
+            let off = (ge.saturating_sub(edge) / 2) as i64;
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let (bx, by) = (sx as i64 - g.glow_x, sy as i64 - g.glow_y);
+                    let (px, py) = scene_to_panel(transform, sw, sh, sx, sy);
+                    let i = (py - rect.y) * rect.w + (px - rect.x);
+                    glow_alpha[i] = glow[by as usize * ge + bx as usize];
+                    let (lx, ly) = (bx - off, by - off);
+                    if (0..edge as i64).contains(&lx) && (0..edge as i64).contains(&ly) {
+                        mark_alpha[i] = logo[ly as usize * edge + lx as usize];
+                    }
                 }
             }
-            out
+        }
+
+        let mut splash = Self {
+            panel: (pw as u32, ph as u32),
+            ground: spec.bg,
+            accent: spec.accent,
+            mark: spec.mark,
+            rest: Vec::new(),
+            glow_rect: rect,
+            glow_alpha,
+            mark_alpha,
         };
-        Self {
-            scene,
-            panel: (pw, ph),
-            transform,
-            base,
-            track,
-            line,
-            sweep,
-            sweep_w: g.shine_w,
-            sweep_ms: cfg.sweep_ms.max(1),
+        // REST: ground everywhere, the mark over its box.
+        let mut rest = vec![0u8; pw * ph * 4];
+        for px in rest.chunks_exact_mut(4) {
+            px.copy_from_slice(&[spec.bg[2], spec.bg[1], spec.bg[0], 0xff]);
         }
-    }
-
-    #[cfg(test)]
-    pub fn track(&self) -> Track {
-        self.track
-    }
-
-    /// Highlight strength 0..=0.8 at track column `x` after `t_ms`: a
-    /// gradient band that enters from the left edge, crosses, and repeats.
-    pub fn sweep_alpha(&self, x: f64, t_ms: u64) -> f64 {
-        let phase = (t_ms % self.sweep_ms) as f64 / self.sweep_ms as f64;
-        let start = -self.sweep_w + (self.track.w as f64 + self.sweep_w) * phase;
-        let u = (x + 0.5 - start) / self.sweep_w;
-        if !(0.0..=1.0).contains(&u) {
-            return 0.0;
-        }
-        0.8 * (1.0 - (2.0 * u - 1.0).abs())
+        let mut frame = FrameTarget {
+            buffer: &mut rest,
+            width: pw as u32,
+            height: ph as u32,
+            stride: pw * 4,
+        };
+        splash.draw_glow_rect(&mut frame, 0.0);
+        splash.rest = rest;
+        splash
     }
 
     fn fits(&self, target: &FrameTarget<'_>) -> bool {
@@ -375,47 +383,58 @@ impl Splash {
             && target.buffer.len() >= target.stride * target.height as usize
     }
 
-    /// The whole splash, with the sweep at `t_ms`. False when the target is
+    /// Redraw the glow box at glow opacity `level` (0 is the REST frame's
+    /// box): ground, the glow over it, the mark over that.
+    fn draw_glow_rect(&self, target: &mut FrameTarget<'_>, level: f64) {
+        let r = self.glow_rect;
+        let lvl = (level.clamp(0.0, 1.0) * 256.0).round() as u32;
+        let mix =
+            |from: u32, to: u32, a: u32| -> u8 { ((from * (255 - a) + to * a + 127) / 255) as u8 };
+        for ry in 0..r.h {
+            let row = (r.y + ry) * target.stride + r.x * 4;
+            let alpha = ry * r.w;
+            for rx in 0..r.w {
+                let ga = (u32::from(self.glow_alpha[alpha + rx]) * lvl) >> 8;
+                let la = u32::from(self.mark_alpha[alpha + rx]);
+                let o = row + rx * 4;
+                for (c, off) in [(2usize, 0usize), (1, 1), (0, 2)] {
+                    let under = mix(u32::from(self.ground[c]), u32::from(self.accent[c]), ga);
+                    target.buffer[o + off] = mix(u32::from(under), u32::from(self.mark[c]), la);
+                }
+                target.buffer[o + 3] = 0xff;
+            }
+        }
+    }
+
+    /// The whole splash with the glow at `level`. False when the target is
     /// not this panel's size (nothing is drawn).
-    pub fn draw_full(&self, target: &mut FrameTarget<'_>, t_ms: u64) -> bool {
+    pub fn draw_full(&self, target: &mut FrameTarget<'_>, level: f64) -> bool {
         if !self.fits(target) {
             return false;
         }
         let row = self.panel.0 as usize * 4;
         for y in 0..self.panel.1 as usize {
             target.buffer[y * target.stride..y * target.stride + row]
-                .copy_from_slice(&self.base[y * row..(y + 1) * row]);
+                .copy_from_slice(&self.rest[y * row..(y + 1) * row]);
         }
-        self.draw_track(target, t_ms);
+        if level > 0.0 {
+            self.draw_glow_rect(target, level);
+        }
         true
     }
 
-    /// Only the loading line. Valid on a buffer that already holds the
+    /// Only the glow's box. Valid on a buffer that already holds the
     /// splash's static layer.
-    pub fn draw_track(&self, target: &mut FrameTarget<'_>, t_ms: u64) {
-        let (sw, sh) = (self.scene.0 as usize, self.scene.1 as usize);
-        for ty in 0..self.track.h {
-            for tx in 0..self.track.w {
-                let (x, y) = (self.track.x + tx, self.track.y + ty);
-                if x < 0 || y < 0 || x as usize >= sw || y as usize >= sh {
-                    continue;
-                }
-                let a = self.sweep_alpha(tx as f64, t_ms);
-                let mix =
-                    |l: u8, s: u8| (f64::from(l) + (f64::from(s) - f64::from(l)) * a).round() as u8;
-                let rgb = [
-                    mix(self.line[0], self.sweep[0]),
-                    mix(self.line[1], self.sweep[1]),
-                    mix(self.line[2], self.sweep[2]),
-                ];
-                let (px, py) = scene_to_panel(self.transform, sw, sh, x as usize, y as usize);
-                put(target.buffer, target.stride, px, py, rgb);
-            }
+    pub fn draw_glow(&self, target: &mut FrameTarget<'_>, level: f64) -> bool {
+        if !self.fits(target) {
+            return false;
         }
+        self.draw_glow_rect(target, level);
+        true
     }
 
-    /// Mix the splash's static layer over what the target already holds:
-    /// `alpha` 1 is all splash, 0 leaves the target untouched.
+    /// Mix the REST frame over what the target already holds: `alpha` 1 is
+    /// all REST, 0 leaves the target untouched.
     pub fn blend_over(&self, target: &mut FrameTarget<'_>, alpha: f32) {
         if !self.fits(target) || alpha <= 0.0 {
             return;
@@ -424,7 +443,7 @@ impl Splash {
         let row = self.panel.0 as usize * 4;
         for y in 0..self.panel.1 as usize {
             let dst = &mut target.buffer[y * target.stride..y * target.stride + row];
-            let src = &self.base[y * row..(y + 1) * row];
+            let src = &self.rest[y * row..(y + 1) * row];
             for (d, s) in dst.iter_mut().zip(src) {
                 *d = ((u32::from(*s) * a + u32::from(*d) * (256 - a)) >> 8) as u8;
             }
@@ -432,66 +451,236 @@ impl Splash {
     }
 }
 
-/// Where one output is in the splash-to-greeter hand-off.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Phase {
-    /// The splash owns the screen; the greeter is not ready.
-    Hold,
-    /// Cross-fading; the value is the splash's remaining opacity.
-    Fade(f32),
-    /// The greeter owns the screen.
-    Done,
+/// A screen's debug tag: a border on its very edge and a label in the
+/// upright top-left corner, both in the owning stage's colour.
+pub struct Tag {
+    panel: (u32, u32),
+    border: usize,
+    splash_rgb: [u8; 3],
+    greeter_rgb: [u8; 3],
+    /// Label pixels in panel coordinates, per stage.
+    splash_label: Vec<(u32, u32)>,
+    greeter_label: Vec<(u32, u32)>,
 }
 
-/// Timing for one output's cover. The splash itself lives in the entry
-/// because the post-login splash needs it after the cover is gone.
-pub struct Cover {
-    started: Instant,
-    ready_at: Option<Instant>,
-    /// Frames fully drawn into distinct swapchain slots (2 means both
-    /// buffers hold the static layer, so animation can redraw the line only).
-    slots_filled: u8,
-    last_draw: Option<Instant>,
+/// Rows of the 8x8 label font for `c`. The middle dot (the spec's separator)
+/// is not ASCII, so it is drawn by hand.
+fn glyph(c: char) -> [u8; 8] {
+    if c == '\u{b7}' {
+        return [0, 0, 0, 0x18, 0x18, 0, 0, 0];
+    }
+    BASIC_FONTS.get(c).unwrap_or([0; 8])
 }
 
-/// Animation cadence while waiting.
-pub const FRAME_EVERY: Duration = Duration::from_millis(33);
-
-impl Cover {
-    pub fn new(now: Instant) -> Self {
+impl Tag {
+    /// A tag for the `scene`-sized screen on `connector`, panel rotated by
+    /// `transform`.
+    pub fn new(spec: &Scene, connector: &str, scene: (u32, u32), transform: u8) -> Self {
+        let transform = transform % 4;
+        let (sw, sh) = (scene.0 as usize, scene.1 as usize);
+        let panel = if transform % 2 == 1 {
+            (scene.1, scene.0)
+        } else {
+            scene
+        };
+        let t = spec.tag_geometry(scene.0, scene.1);
+        let scale = (t.pt as usize / 8).max(1);
+        let label = |stage: Stage| -> Vec<(u32, u32)> {
+            let text = format!(
+                "{} \u{b7} {connector} \u{b7} {}x{}",
+                stage.name(),
+                scene.0,
+                scene.1
+            );
+            let origin = (t.border + t.margin) as usize;
+            let mut px = Vec::new();
+            for (n, c) in text.chars().enumerate() {
+                for (gy, bits) in glyph(c).into_iter().enumerate() {
+                    for gx in 0..8usize {
+                        if bits >> gx & 1 == 0 {
+                            continue;
+                        }
+                        for dy in 0..scale {
+                            for dx in 0..scale {
+                                let x = origin + (n * 8 + gx) * scale + dx;
+                                let y = origin + gy * scale + dy;
+                                if x < sw && y < sh {
+                                    let (px_, py_) = scene_to_panel(transform, sw, sh, x, y);
+                                    px.push((px_ as u32, py_ as u32));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            px
+        };
         Self {
-            started: now,
-            ready_at: None,
-            slots_filled: 0,
-            last_draw: None,
+            panel,
+            border: t.border as usize,
+            splash_rgb: spec.splash_debug,
+            greeter_rgb: spec.greeter_debug,
+            splash_label: label(Stage::GreeterSplash),
+            greeter_label: label(Stage::Greeter),
         }
     }
 
-    /// The greeter has what it was waiting for (its background).
+    /// Draw the tag of `stage` over `target`.
+    pub fn draw(&self, target: &mut FrameTarget<'_>, stage: Stage) {
+        if target.width != self.panel.0 || target.height != self.panel.1 {
+            return;
+        }
+        let (rgb, label) = match stage {
+            Stage::GreeterSplash => (self.splash_rgb, &self.splash_label),
+            Stage::Greeter => (self.greeter_rgb, &self.greeter_label),
+        };
+        let (w, h, b) = (target.width as usize, target.height as usize, self.border);
+        let stride = target.stride;
+        for y in 0..h {
+            let full = y < b || y + b >= h;
+            let span = if full { 0..w } else { 0..b.min(w) };
+            for x in span {
+                put(target.buffer, stride, x, y, rgb);
+            }
+            if !full {
+                for x in w.saturating_sub(b)..w {
+                    put(target.buffer, stride, x, y, rgb);
+                }
+            }
+        }
+        for &(x, y) in label {
+            put(target.buffer, stride, x as usize, y as usize, rgb);
+        }
+    }
+}
+
+/// Where the shared timeline is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Phase {
+    /// The splash owns the screens; the glow is at this opacity.
+    Glow(f64),
+    /// Cross-fading to the greeter; the value is the REST frame's remaining
+    /// opacity.
+    Fade(f32),
+    /// The greeter owns the screens.
+    Done,
+}
+
+/// One timeline for every output, so no screen runs ahead of another.
+pub struct Timeline {
+    started: Instant,
+    /// When the glow began to ease in (the loop starts late: loading the
+    /// toolkit blocks for a while, and the screens sit on REST meanwhile).
+    anim_start: Option<Instant>,
+    ready_at: Option<Instant>,
+    max_wait: Duration,
+}
+
+impl Timeline {
+    pub fn new(started: Instant, cfg: &SplashConfig) -> Self {
+        Self {
+            started,
+            anim_start: None,
+            ready_at: None,
+            max_wait: Duration::from_millis(cfg.max_wait_ms),
+        }
+    }
+
+    /// The greeter is ready on every output (or has waited long enough).
     pub fn mark_ready(&mut self, now: Instant) {
         self.ready_at.get_or_insert(now);
     }
 
-    pub fn phase(&mut self, now: Instant, cfg: &SplashConfig) -> Phase {
-        let max_wait = Duration::from_millis(cfg.max_wait_ms);
-        if self.ready_at.is_none() && now.duration_since(self.started) >= max_wait {
+    pub fn is_ready(&self) -> bool {
+        self.ready_at.is_some()
+    }
+
+    /// The phase at `now`. `clock` is CLOCK_MONOTONIC seconds at `now`, which
+    /// sets the breathing phase.
+    pub fn phase(&mut self, now: Instant, clock: f64, spec: &Scene) -> Phase {
+        if self.ready_at.is_none() && now.duration_since(self.started) >= self.max_wait {
             self.ready_at = Some(now);
         }
+        let start = *self.anim_start.get_or_insert(now);
+        let t = now.saturating_duration_since(start).as_secs_f64();
         let Some(ready) = self.ready_at else {
-            return Phase::Hold;
+            return Phase::Glow(spec.glow_level(t, None, clock));
         };
-        let fade = Duration::from_millis(cfg.fade_ms);
-        let elapsed = now.duration_since(ready);
-        if fade.is_zero() || elapsed >= fade {
+        let t_out = ready.saturating_duration_since(start).as_secs_f64();
+        let t_fade = t_out + spec.out_s;
+        if t < t_fade {
+            return Phase::Glow(spec.glow_level(t, Some(t_out), clock));
+        }
+        let fade = spec.stage_fade_s;
+        if fade <= 0.0 || t >= t_fade + fade {
             Phase::Done
         } else {
-            Phase::Fade(1.0 - elapsed.as_secs_f32() / fade.as_secs_f32())
+            Phase::Fade(1.0 - ease((t - t_fade) / fade) as f32)
         }
     }
 
-    /// Splash milliseconds for the sweep.
-    pub fn t_ms(&self, now: Instant) -> u64 {
-        now.duration_since(self.started).as_millis() as u64
+    /// True while a ready timeline is still easing the glow out, before the
+    /// cross-fade: the time to draw the greeter's first frame off screen.
+    pub fn easing_out(&self, now: Instant, spec: &Scene) -> bool {
+        match (self.anim_start, self.ready_at) {
+            (Some(start), Some(ready)) => {
+                let t = now.saturating_duration_since(start).as_secs_f64();
+                let t_out = ready.saturating_duration_since(start).as_secs_f64();
+                t < t_out + spec.out_s
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The per-output half of the cover: what the swapchain holds.
+pub struct Cover {
+    /// Frames fully drawn into distinct swapchain slots (2 means both
+    /// buffers hold the static layer, so animation can redraw the glow only).
+    slots_filled: u8,
+    last_draw: Option<Instant>,
+    /// The greeter has what it was waiting for on this output.
+    ready: bool,
+    /// The glow level last drawn, to skip frames that would not change.
+    last_level: Option<f64>,
+    /// The hand-off's last frame (the rest frame) reached the CRTC.
+    final_shown: bool,
+}
+
+/// Animation cadence while waiting.
+pub const FRAME_EVERY: Duration = Duration::from_millis(16);
+
+impl Cover {
+    /// A cover whose first, full frame is already on its way to the screen.
+    pub fn new() -> Self {
+        Self {
+            slots_filled: 0,
+            last_draw: None,
+            ready: false,
+            last_level: None,
+            final_shown: false,
+        }
+    }
+
+    pub fn mark_ready(&mut self) {
+        self.ready = true;
+    }
+
+    pub fn final_shown(&self) -> bool {
+        self.final_shown
+    }
+
+    pub fn set_final_shown(&mut self) {
+        self.final_shown = true;
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    /// A splash frame has been handed to the display.
+    pub fn shown(&self) -> bool {
+        self.last_draw.is_some()
     }
 
     pub fn due(&self, now: Instant) -> bool {
@@ -504,24 +693,21 @@ impl Cover {
     }
 
     /// A drawn frame reached the CRTC.
-    pub fn presented(&mut self, now: Instant) {
+    pub fn presented(&mut self, now: Instant, level: f64) {
         self.slots_filled = (self.slots_filled + 1).min(2);
         self.last_draw = Some(now);
+        self.last_level = Some(level);
     }
 
     /// The swapchain was invalidated; both slots need the static layer again.
     pub fn reset_slots(&mut self) {
         self.slots_filled = 0;
+        self.last_level = None;
     }
 
-    /// The cover has been released by the greeter and is fading off.
-    pub fn released(&self) -> bool {
-        self.ready_at.is_some()
-    }
-
-    /// A frame has reached the CRTC, and when the last one did.
-    pub fn last_presented(&self) -> Option<Instant> {
-        self.last_draw
+    /// Whether drawing the glow at `level` would change the picture.
+    pub fn changes(&self, level: f64) -> bool {
+        self.needs_full() || self.last_level != Some(level)
     }
 
     /// Time until the next animation frame is due.
@@ -529,6 +715,12 @@ impl Cover {
         self.last_draw.map_or(Duration::ZERO, |t| {
             FRAME_EVERY.saturating_sub(now.duration_since(t))
         })
+    }
+}
+
+impl Default for Cover {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -551,241 +743,188 @@ mod tests {
         [t.buffer[o + 2], t.buffer[o + 1], t.buffer[o]]
     }
 
-    #[test]
-    fn parses_colors_and_keeps_fallback() {
-        assert_eq!(parse_color("#0b0d10", [1, 2, 3]), [0x0b, 0x0d, 0x10]);
-        assert_eq!(parse_color("nope", [1, 2, 3]), [1, 2, 3]);
-        assert_eq!(parse_color("#12", [1, 2, 3]), [1, 2, 3]);
-    }
-
-    #[test]
-    fn geometry_follows_the_shared_scene_spec() {
-        // Same numbers desktop-boot lib/scene.py geometry() gives for 3440x1440.
-        let g = layout(&SplashConfig::default(), (3440, 1440));
-        assert_eq!(g.logo, 230); // round(1440 * 0.16)
-        assert_eq!(g.glow, 460);
-        assert_eq!(g.cx, 1720.0);
-        assert!((g.cy - 676.8).abs() < 1e-9);
-        assert_eq!((g.track.w, g.track.h), (374, 4)); // 0.26, 0.0028 -> 4.03
-        assert_eq!(g.track.x, 1533);
-        assert_eq!(g.track.y, 677 + 115 + 72); // round(cy + 115 + 72)
-        assert_eq!(g.shine_w, 150.0);
-    }
-
-    #[test]
-    fn geometry_matches_scene_py_on_other_screens() {
-        // Values printed by desktop-boot lib/scene.py geometry(W, H):
-        // (W, H, logo, track_x, track_y, track_w, track_h, shine_w)
-        for (w, h, logo, tx, ty, tw, th, shine) in [
-            (
-                2160u32, 3840u32, 614u32, 581i64, 2304i64, 998i64, 11i64, 399.0,
-            ),
-            (1920, 1080, 173, 820, 648, 281, 3, 112.0),
-        ] {
-            let g = layout(&SplashConfig::default(), (w, h));
-            assert_eq!(
-                (
-                    g.logo, g.track.x, g.track.y, g.track.w, g.track.h, g.shine_w
-                ),
-                (logo, tx, ty, tw, th, shine),
-                "{w}x{h}"
-            );
-        }
-    }
-
-    #[test]
-    fn track_thickness_has_a_floor_and_everything_scales_with_height() {
-        let g = layout(&SplashConfig::default(), (600, 400));
-        assert_eq!(g.track.h, 2, "0.0028 * 400 = 1.1, floored to 2");
-        let tall = layout(&SplashConfig::default(), (2160, 3840));
-        assert_eq!(tall.logo, 614);
-    }
-
-    #[test]
-    fn first_frame_is_ground_with_idle_line() {
-        let cfg = SplashConfig::default();
-        let s = Splash::new(&cfg, (400, 200), 0);
-        let mut buf = Vec::new();
-        let mut t = target(&mut buf, 400, 200);
-        assert!(s.draw_full(&mut t, 0));
-        assert_eq!(px(&t, 0, 0), [0x0b, 0x0d, 0x10]);
-        let tr = s.track();
-        assert_eq!(
-            px(&t, (tr.x + 3) as usize, tr.y as usize),
-            [0x1f, 0x28, 0x32],
-            "sweep has not entered at t=0"
-        );
-    }
-
-    #[test]
-    fn sweep_crosses_the_line_and_repeats() {
-        let s = Splash::new(&SplashConfig::default(), (800, 500), 0);
-        let mid = s.sweep_alpha(s.track().w as f64 / 2.0, 1100);
-        assert!(mid > 0.5, "centre of the sweep is bright, got {mid}");
-        assert_eq!(s.sweep_alpha(0.0, 0), 0.0);
-        assert_eq!(s.sweep_alpha(50.0, 123), s.sweep_alpha(50.0, 123 + 2200));
-    }
-
-    #[test]
-    fn rotated_output_puts_the_line_in_panel_space() {
-        let s = Splash::new(&SplashConfig::default(), (200, 400), 1);
-        let mut buf = Vec::new();
-        let mut t = target(&mut buf, 400, 200);
-        assert!(s.draw_full(&mut t, 0));
-        let tr = s.track();
-        let (px_, py_) = scene_to_panel(1, 200, 400, (tr.x + 3) as usize, tr.y as usize);
-        assert_eq!(px(&t, px_, py_), [0x1f, 0x28, 0x32]);
-        assert_eq!(px(&t, 0, 0), [0x0b, 0x0d, 0x10]);
-    }
-
-    #[test]
-    fn wrong_sized_target_is_refused() {
-        let s = Splash::new(&SplashConfig::default(), (400, 200), 0);
-        let mut buf = Vec::new();
-        let mut t = target(&mut buf, 10, 10);
-        assert!(!s.draw_full(&mut t, 0));
-    }
-
-    fn write_logo(name: &str, body: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("vigil-splash-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
     const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
         <rect x="10" y="10" width="80" height="80" fill="#1793d1"/>
         <rect x="0" y="0" width="2" height="2" fill="#1793d1"/></svg>"##;
 
-    #[test]
-    fn svg_mark_is_centred_in_the_mark_colour_and_specks_are_dropped() {
-        let cfg = SplashConfig {
-            logo: Some(write_logo("logo.svg", SVG)),
-            ..SplashConfig::default()
-        };
-        let s = Splash::new(&cfg, (800, 500), 0);
-        let mut buf = Vec::new();
-        let mut t = target(&mut buf, 800, 500);
-        s.draw_full(&mut t, 0);
-        let g = layout(&cfg, (800, 500));
-        let (cx, cy) = (400usize, g.cy as usize);
-        assert_eq!(
-            px(&t, cx, cy),
-            [0xc3, 0xc9, 0xd0],
-            "mark colour, not the SVG's"
-        );
-        // The 2x2 corner shape (a TM sign) must not survive: the box's
-        // top-left pixel stays ground or glow, never mark colour.
-        let (bx, by) = (400 - g.logo as usize / 2, cy - g.logo as usize / 2);
-        assert_ne!(px(&t, bx, by), [0xc3, 0xc9, 0xd0]);
-        // Glow is accent-tinted ground just outside the mark.
-        let out = px(&t, 400, cy - g.logo as usize / 2 - 5);
-        assert!(
-            out[2] > 0x10,
-            "accent glow raises blue above ground, got {out:?}"
-        );
-    }
-
-    #[test]
-    fn png_mark_uses_its_alpha() {
-        let dir = std::env::temp_dir().join(format!("vigil-splash-png-{}", std::process::id()));
+    fn cfg_with_logo(name: &str) -> SplashConfig {
+        let dir = std::env::temp_dir().join(format!("vigil-splash-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("logo.png");
-        image::RgbaImage::from_pixel(32, 32, image::Rgba([1, 2, 3, 255]))
-            .save(&path)
-            .unwrap();
-        let cfg = SplashConfig {
+        let path = dir.join("logo.svg");
+        std::fs::write(&path, SVG).unwrap();
+        SplashConfig {
             logo: Some(path),
             ..SplashConfig::default()
-        };
-        let s = Splash::new(&cfg, (800, 500), 0);
+        }
+    }
+
+    #[test]
+    fn rest_frame_is_ground_and_mark_only() {
+        let spec = Scene::default();
+        let cfg = cfg_with_logo("rest");
+        let s = Splash::new(&cfg, &spec, (800, 500), 0);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 800, 500);
-        s.draw_full(&mut t, 0);
-        assert_eq!(px(&t, 400, 235), [0xc3, 0xc9, 0xd0]);
+        assert!(s.draw_full(&mut t, 0.0));
+        assert_eq!(px(&t, 0, 0), spec.bg);
+        let g = spec.geometry(800, 500);
+        let (cx, cy) = (400, (g.logo_y + i64::from(g.logo) / 2) as usize);
+        assert_eq!(px(&t, cx, cy), spec.mark);
+        // Beside the mark, inside the glow box: still ground at rest.
+        assert_eq!(px(&t, cx, g.logo_y as usize - 3), spec.bg);
+        // The speck in the box corner is dropped.
+        assert_ne!(px(&t, g.logo_x as usize, g.logo_y as usize), spec.mark);
     }
 
     #[test]
-    fn missing_logo_leaves_ground_and_line() {
-        let cfg = SplashConfig {
-            logo: Some("/nonexistent/logo.svg".into()),
-            ..SplashConfig::default()
+    fn glow_tints_the_ground_under_the_mark_and_scales_with_level() {
+        let spec = Scene::default();
+        let cfg = cfg_with_logo("glow");
+        let s = Splash::new(&cfg, &spec, (800, 500), 0);
+        let g = spec.geometry(800, 500);
+        let at = |level: f64| {
+            let mut buf = Vec::new();
+            let mut t = target(&mut buf, 800, 500);
+            s.draw_full(&mut t, level);
+            (
+                px(&t, 400, g.logo_y as usize - 3),
+                px(&t, 400, g.logo_y as usize + 40),
+            )
         };
-        let s = Splash::new(&cfg, (400, 200), 0);
-        let mut buf = Vec::new();
-        let mut t = target(&mut buf, 400, 200);
-        assert!(s.draw_full(&mut t, 0));
-        assert_eq!(px(&t, 200, 94), [0x0b, 0x0d, 0x10]);
+        let (lo, mark_lo) = at(0.1);
+        let (hi, mark_hi) = at(0.4);
+        assert!(lo[2] > spec.bg[2] && hi[2] > lo[2], "{lo:?} {hi:?}");
+        assert_eq!(mark_lo, spec.mark, "the mark stays over the glow");
+        assert_eq!(mark_hi, spec.mark);
+        // draw_glow alone matches a full draw at the same level.
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut ta = target(&mut a, 800, 500);
+        let mut tb = target(&mut b, 800, 500);
+        s.draw_full(&mut ta, 0.0);
+        s.draw_glow(&mut ta, 0.3);
+        s.draw_full(&mut tb, 0.3);
+        assert_eq!(ta.buffer, tb.buffer);
     }
 
     #[test]
-    fn blend_moves_from_target_to_splash() {
-        let s = Splash::new(&SplashConfig::default(), (4, 4), 0);
+    fn rotated_panel_gets_the_same_picture_turned() {
+        let spec = Scene::default();
+        let cfg = cfg_with_logo("rot");
+        let s = Splash::new(&cfg, &spec, (400, 800), 3);
+        let mut buf = Vec::new();
+        let mut t = target(&mut buf, 800, 400);
+        assert!(s.draw_full(&mut t, 0.2));
+        let g = spec.geometry(400, 800);
+        let (sx, sy) = (200usize, (g.logo_y + i64::from(g.logo) / 2) as usize);
+        let (px_, py_) = scene_to_panel(3, 400, 800, sx, sy);
+        assert_eq!(px(&t, px_, py_), spec.mark);
+    }
+
+    #[test]
+    fn no_logo_is_just_the_ground() {
+        let spec = Scene::default();
+        let s = Splash::new(&SplashConfig::default(), &spec, (200, 100), 0);
+        let mut buf = Vec::new();
+        let mut t = target(&mut buf, 200, 100);
+        assert!(s.draw_full(&mut t, 0.4));
+        assert_eq!(px(&t, 100, 47), spec.bg);
+        let mut small = Vec::new();
+        assert!(!s.draw_full(&mut target(&mut small, 10, 10), 0.0));
+    }
+
+    #[test]
+    fn blend_moves_from_target_to_rest() {
+        let spec = Scene::default();
+        let s = Splash::new(&SplashConfig::default(), &spec, (4, 4), 0);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 4, 4);
-        for b in t.buffer.iter_mut() {
-            *b = 200;
-        }
+        t.buffer.fill(200);
         s.blend_over(&mut t, 0.0);
         assert_eq!(px(&t, 0, 0), [200, 200, 200]);
         s.blend_over(&mut t, 1.0);
         let p = px(&t, 0, 0);
-        assert!(
-            p[0] <= 0x0c && p[2] <= 0x11,
-            "all splash at alpha 1, got {p:?}"
-        );
+        assert!(p[0] <= 0x0c && p[2] <= 0x11, "{p:?}");
     }
 
     #[test]
-    fn cover_holds_then_fades_then_is_done() {
+    fn tag_draws_border_and_label_in_the_stage_colour() {
+        let spec = Scene::default();
+        let tag = Tag::new(&spec, "Virtual-1", (640, 360), 0);
+        let mut buf = Vec::new();
+        let mut t = target(&mut buf, 640, 360);
+        tag.draw(&mut t, Stage::GreeterSplash);
+        assert_eq!(px(&t, 0, 180), spec.splash_debug);
+        assert_eq!(px(&t, 639, 180), spec.splash_debug);
+        assert_eq!(px(&t, 320, 0), spec.splash_debug);
+        let b = spec.tag_geometry(640, 360);
+        let lit = (0..120)
+            .flat_map(|y| (0..320).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                x > b.border as usize && y > b.border as usize && px(&t, x, y) == spec.splash_debug
+            })
+            .count();
+        assert!(lit > 50, "label pixels: {lit}");
+        tag.draw(&mut t, Stage::Greeter);
+        assert_eq!(px(&t, 0, 180), spec.greeter_debug);
+    }
+
+    #[test]
+    fn timeline_glows_then_eases_out_then_fades_once() {
+        let spec = Scene::default();
         let cfg = SplashConfig::default();
         let t0 = Instant::now();
-        let mut c = Cover::new(t0);
-        assert_eq!(c.phase(t0 + Duration::from_millis(500), &cfg), Phase::Hold);
-        let ready = t0 + Duration::from_millis(600);
-        c.mark_ready(ready);
-        match c.phase(ready + Duration::from_millis(125), &cfg) {
-            Phase::Fade(a) => assert!((a - 0.5).abs() < 0.01),
-            other => panic!("expected fade, got {other:?}"),
+        let mut tl = Timeline::new(t0, &cfg);
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // Not started: level zero. Then eases in.
+        assert_eq!(tl.phase(at(0), 0.0, &spec), Phase::Glow(0.0));
+        match tl.phase(at(2000), 0.0, &spec) {
+            Phase::Glow(l) => assert!((l - spec.glow_min).abs() < 1e-9),
+            p => panic!("{p:?}"),
         }
-        assert_eq!(
-            c.phase(ready + Duration::from_millis(300), &cfg),
-            Phase::Done
-        );
+        tl.mark_ready(at(2000));
+        // Eases out over out_s, then fades over stage_fade_s, then done.
+        match tl.phase(at(2000 + 150), 0.0, &spec) {
+            Phase::Glow(l) => assert!(l < spec.glow_min),
+            p => panic!("{p:?}"),
+        }
+        assert!(tl.easing_out(at(2100), &spec));
+        match tl.phase(at(2000 + 300 + 200), 0.0, &spec) {
+            Phase::Fade(a) => assert!((a - 0.5).abs() < 0.01, "{a}"),
+            p => panic!("{p:?}"),
+        }
+        assert_eq!(tl.phase(at(2000 + 300 + 400), 0.0, &spec), Phase::Done);
     }
 
     #[test]
-    fn cover_gives_up_waiting_after_max_wait() {
+    fn timeline_gives_up_waiting_after_max_wait() {
+        let spec = Scene::default();
         let cfg = SplashConfig::default();
         let t0 = Instant::now();
-        let mut c = Cover::new(t0);
+        let mut tl = Timeline::new(t0, &cfg);
         let late = t0 + Duration::from_millis(cfg.max_wait_ms + 1);
-        assert!(matches!(c.phase(late, &cfg), Phase::Fade(_)));
+        tl.phase(late, 0.0, &spec);
+        assert!(tl.is_ready());
     }
 
     #[test]
-    fn zero_fade_cuts() {
-        let cfg = SplashConfig {
-            fade_ms: 0,
-            ..SplashConfig::default()
-        };
+    fn cover_redraws_only_the_glow_once_both_slots_are_filled() {
         let t0 = Instant::now();
-        let mut c = Cover::new(t0);
-        c.mark_ready(t0);
-        assert_eq!(c.phase(t0, &cfg), Phase::Done);
-    }
-
-    #[test]
-    fn animation_redraws_only_the_line_once_both_slots_are_filled() {
-        let t0 = Instant::now();
-        let mut c = Cover::new(t0);
+        let mut c = Cover::new();
         assert!(c.needs_full());
-        c.presented(t0);
+        c.presented(t0, 0.0);
         assert!(c.needs_full());
-        c.presented(t0);
+        c.presented(t0, 0.1);
         assert!(!c.needs_full());
+        assert!(!c.changes(0.1));
+        assert!(c.changes(0.2));
         c.reset_slots();
         assert!(c.needs_full());
+    }
+
+    #[test]
+    fn parses_colors_and_keeps_fallback() {
+        assert_eq!(parse_color("#0b0d10", [1, 2, 3]), [0x0b, 0x0d, 0x10]);
+        assert_eq!(parse_color("nope", [1, 2, 3]), [1, 2, 3]);
     }
 }
