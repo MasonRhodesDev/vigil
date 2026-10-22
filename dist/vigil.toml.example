@@ -81,36 +81,55 @@
 # initialise falls back to software per output, with a line in the log. A
 # rendering preference must never be why someone cannot log in.
 #backend = "software"
+#
+# Keep the display state the boot splash left (default false). false
+# disables every screen when vigil starts, so each goes dark and its monitor
+# re-syncs on vigil's first frame. true leaves them lit: if the CRTC already
+# runs the mode vigil will use, the first frame is a plane update with no
+# re-sync (vigil logs per output whether its first commit is a modeset). If
+# the kernel refuses the kept state, vigil resets it and retries once.
+# Off until proven on real hardware.
+#keep_display_state = false
 
 [splash]
-# The frame vigil draws the moment it owns a screen (before the greeter is
-# ready), and again right after a successful login until it exits, so the
-# boot reads as one piece. The same keys, without this table header, can live
-# in their own small file passed with `vigil --splash-config FILE`.
+# What vigil draws on every screen from the moment it owns them until the
+# greeter is ready, and again after a login until it exits, so the boot reads
+# as one piece. The splash goes up on all outputs together, before the
+# toolkit loads. Geometry, palette and motion follow the shared scene spec
+# (a JSON file the boot-splash package installs); without that file vigil
+# uses built-in defaults equal to the spec's, so it works on its own. The
+# same keys, without this table header, can live in their own small file
+# passed with `vigil --splash-config FILE`.
 #
-# Every size is a fraction of the screen HEIGHT; the defaults below mirror
-# the desktop-boot splash scene, so set them in one place for both.
+# The glow breathes while the greeter prepares, eases out to the rest frame
+# when the greeter is ready on every output, then one cross-fade (the spec's
+# stage_fade_s) hands every screen to the greeter. After a login the screens
+# ease back to the rest frame and vigil exits. Only the software renderer
+# draws the splash; with [render] backend = "gl" the splash is skipped.
 #enabled = true
+#scene = "/usr/share/desktop-boot/scene.json"
+# Colour overrides; unset takes the scene's palette.
 #ground = "#0b0d10"
 #mark = "#c3c9d0"
 #accent = "#1793d1"       # glow behind the mark
-#track = "#1f2832"        # loading line
-#shine = "#bee4f7"        # sweep highlight on the line
 # The mark: an SVG (drawn as a one colour silhouette, tiny shapes such as a
 # trademark sign dropped) or a PNG (its alpha is the shape). Unset: no mark.
 #logo = "/usr/share/pixmaps/archlinux-logo.svg"
-#logo_frac = 0.16         # mark edge
-#glow_mult = 2.0
-#glow_opacity = 0.30
-#center_frac = 0.47       # mark centre from the top
-#gap_frac = 0.05          # mark bottom to the line
-#track_w_frac = 0.26
-#track_h_frac = 0.0028
-#track_h_min = 2          # pixels
-#shine_w_frac = 0.4       # of the line width
-#sweep_ms = 2200
-#fade_ms = 250            # splash to greeter cross-fade, 0 cuts
 #max_wait_ms = 4000       # never hide the greeter longer than this
+#
+# Stage tags for debugging a boot: each screen gets a label in the corner and
+# a border on its edge in the colour of the stage that owns it. Either set
+# the key below, or set the scene's DEBUG_STAGE_TAGS=1 in vigil's
+# environment. The key is the sure way under greetd, which gives the greeter
+# no environment of its own; the variable works by wrapping greetd's command,
+# e.g. command = "env DEBUG_STAGE_TAGS=1 /usr/bin/vigil" (not verified under
+# a real greetd).
+#debug_tags = false
+#
+# A shell command run once, after the first frame has reached the screen of
+# every output. Started without waiting, output discarded, so it cannot slow
+# rendering. For a boot-splash handoff (tell the previous stage it may quit).
+#on_first_frame = ""
 
 [profiles]
 # Monitor-layout profiles (monitor-profiles format), shared with the

@@ -28,6 +28,9 @@ pub struct DumbBufferPresenter {
     slots: [Slot; 2],
     back: usize,
     modeset_done: bool,
+    /// The back buffer holds a frame drawn by `stage_frame` and not yet
+    /// submitted.
+    staged: bool,
     /// A submitted flip has not yet been confirmed by its page-flip event.
     flip_pending: bool,
     width: u32,
@@ -96,6 +99,7 @@ impl DumbBufferPresenter {
             slots,
             back: 0,
             modeset_done: false,
+            staged: false,
             flip_pending: false,
             width,
             height,
@@ -134,6 +138,10 @@ impl Presenter for DumbBufferPresenter {
         self.flip_pending = false;
     }
 
+    fn flip_pending(&self) -> bool {
+        self.flip_pending
+    }
+
     fn crtc_id(&self) -> Option<u32> {
         Some(self.surface.crtc().into())
     }
@@ -147,26 +155,37 @@ impl Presenter for DumbBufferPresenter {
         if self.flip_pending {
             return Ok(false);
         }
-        let slot = &mut self.slots[self.back];
-
-        let drew = {
-            let stride = slot.buffer.pitch() as usize;
-            let mut mapping = self
-                .surface
-                .map_dumb_buffer(&mut slot.buffer)
-                .map_err(io_present_error)?;
-            draw(Canvas::Cpu(FrameTarget {
-                buffer: mapping.as_mut(),
-                width: self.width,
-                height: self.height,
-                stride,
-            }))
-        };
-        if !drew {
+        if !self.stage_frame(draw)? {
             return Ok(false);
         }
+        self.commit_staged()
+    }
 
-        let fb = slot.fb;
+    fn stage_frame(
+        &mut self,
+        draw: &mut dyn FnMut(Canvas<'_>) -> bool,
+    ) -> Result<bool, PresentError> {
+        let slot = &mut self.slots[self.back];
+        let stride = slot.buffer.pitch() as usize;
+        let mut mapping = self
+            .surface
+            .map_dumb_buffer(&mut slot.buffer)
+            .map_err(io_present_error)?;
+        let drew = draw(Canvas::Cpu(FrameTarget {
+            buffer: mapping.as_mut(),
+            width: self.width,
+            height: self.height,
+            stride,
+        }));
+        self.staged = drew;
+        Ok(drew)
+    }
+
+    fn commit_staged(&mut self) -> Result<bool, PresentError> {
+        if !self.staged || self.flip_pending {
+            return Ok(false);
+        }
+        let fb = self.slots[self.back].fb;
         let state = self.plane_state(fb);
         // Request the vblank event (`true`): completion re-opens the gate
         // above via `Presenter::vblank` — the day-1 TODO, finally forced by
@@ -179,6 +198,7 @@ impl Presenter for DumbBufferPresenter {
         };
         result.map_err(present_error)?;
 
+        self.staged = false;
         self.modeset_done = true;
         self.flip_pending = true;
         self.back ^= 1;

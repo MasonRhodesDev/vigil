@@ -87,8 +87,22 @@ impl VigilPlatform {
     /// component is instantiated.
     pub fn install() -> Result<Self, slint::platform::SetPlatformError> {
         let platform = Self::default();
-        slint::platform::set_platform(Box::new(platform.clone()))?;
+        platform.register()?;
         Ok(platform)
+    }
+
+    /// A platform that is not yet Slint's. Registering it ([`Self::register`])
+    /// loads the toolkit's fonts, which blocks for about a second on a
+    /// machine with a full font set, so a caller with something to show
+    /// first builds it, shows that, and registers afterwards.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make this the process-wide Slint platform. Once, before any
+    /// component is instantiated.
+    pub fn register(&self) -> Result<(), slint::platform::SetPlatformError> {
+        slint::platform::set_platform(Box::new(self.clone()))
     }
 
     pub fn set_runtime(

@@ -284,6 +284,24 @@ pub trait Presenter {
         draw: &mut dyn FnMut(Canvas<'_>) -> bool,
     ) -> Result<bool, PresentError>;
 
+    /// Draw a frame into the back buffer without submitting it, so several
+    /// outputs can have their first frame ready before any is shown.
+    /// `Ok(true)` means a frame is staged and [`Self::commit_staged`] will
+    /// show it; the default stages nothing (`Ok(false)`).
+    fn stage_frame(
+        &mut self,
+        draw: &mut dyn FnMut(Canvas<'_>) -> bool,
+    ) -> Result<bool, PresentError> {
+        let _ = draw;
+        Ok(false)
+    }
+
+    /// Submit the frame [`Self::stage_frame`] drew. Without one staged it
+    /// does nothing and returns `Ok(false)`.
+    fn commit_staged(&mut self) -> Result<bool, PresentError> {
+        Ok(false)
+    }
+
     /// Drop any assumption that the CRTC still holds our configuration, so
     /// the next frame does a full modeset instead of a page flip.
     ///
@@ -316,6 +334,12 @@ pub trait Presenter {
     /// recovery (modeset-while-flipping) is ENOMEM on amdgpu: the freeze
     /// that motivated this gate.
     fn vblank(&mut self) {}
+
+    /// A submitted frame has not reached the display yet (its page-flip event
+    /// is still to come). Presenters that do not track it say no.
+    fn flip_pending(&self) -> bool {
+        false
+    }
 
     /// Raw CRTC id this presenter scans out on, for routing vblank events.
     /// `None` opts out of routing (test presenters).

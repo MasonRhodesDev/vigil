@@ -28,6 +28,9 @@ slint-kit.workspace = true
 vigil-gl = { path = "../vigil-gl", optional = true }
 vigil-present-gl = { path = "../vigil-present-gl", optional = true }
 calloop.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+font8x8.workspace = true
 image.workspace = true
 # Renders the splash mark from an SVG (shapes only: no text, no raster).
 resvg = { version = "0.47", default-features = false }

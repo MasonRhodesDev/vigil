@@ -5036,9 +5036,12 @@ version = "0.4.1"
 dependencies = [
  "appearance-profiles 0.2.0",
  "calloop 0.14.4",
+ "font8x8",
  "image",
+ "libc",
  "monitor-profiles",
  "resvg",
+ "serde_json",
  "slint-idle-runtime",
  "slint-kit",
  "vigil-auth",
