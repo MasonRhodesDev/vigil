@@ -25,6 +25,38 @@ impl std::fmt::Display for AuthError {
 }
 impl std::error::Error for AuthError {}
 
+/// What to show for greetd's error text. greetd reports PAM failures as
+/// `pam_authenticate: AUTH_ERR`; the screen gets a short sentence and the raw
+/// text goes to the log. Text that is not in that shape passes through.
+pub fn friendly_error(description: &str) -> String {
+    let Some((call, code)) = description.split_once(": ") else {
+        return description.to_string();
+    };
+    if !call.starts_with("pam_") {
+        return description.to_string();
+    }
+    let text = match code.trim() {
+        // USER_UNKNOWN reads the same as a typo, so a name cannot be probed.
+        "AUTH_ERR" | "USER_UNKNOWN" => "Incorrect password",
+        "MAXTRIES" => "Too many failed attempts. Try again later.",
+        "PERM_DENIED" => "Access denied",
+        "ACCT_EXPIRED" => "This account has expired",
+        "NEW_AUTHTOK_REQD" | "AUTHTOK_EXPIRED" => "Your password has expired",
+        "AUTHINFO_UNAVAIL" | "CRED_INSUFFICIENT" | "SERVICE_ERR" | "SYSTEM_ERR" => {
+            "Sign-in is unavailable right now"
+        }
+        _ => "Sign-in failed",
+    };
+    text.to_string()
+}
+
+fn show_greetd_error(ui: &mut dyn AuthUi, description: &str) -> String {
+    let text = friendly_error(description);
+    eprintln!("vigil: auth: greetd error: {description}");
+    ui.show_error(&text);
+    text
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
@@ -286,7 +318,7 @@ impl AuthMachine {
                             return Ok(());
                         }
                         Response::Error { description, .. } => {
-                            ui.show_error(&description);
+                            show_greetd_error(ui, &description);
                             self.state = State::Idle;
                             return Ok(());
                         }
@@ -299,7 +331,7 @@ impl AuthMachine {
                     }
                 }
                 Response::Error { description, .. } => {
-                    ui.show_error(&description);
+                    let text = show_greetd_error(ui, &description);
                     self.state = State::Idle;
                     let Some(user) = self.user.clone() else {
                         return Ok(());
@@ -308,7 +340,7 @@ impl AuthMachine {
                     // so the next submission has a prompt to answer. A create
                     // failure here is surfaced, not looped on.
                     let _ = self.transact(&Request::CancelSession, ui);
-                    pending_error = Some(description);
+                    pending_error = Some(text);
                     response = self.transact(&Request::CreateSession { username: user }, ui)?;
                 }
             }
@@ -511,6 +543,36 @@ mod tests {
                 UiCall::Busy(true),
                 UiCall::Busy(false),
             ]
+        );
+    }
+
+    #[test]
+    fn pam_codes_become_short_messages() {
+        assert_eq!(
+            friendly_error("pam_authenticate: AUTH_ERR"),
+            "Incorrect password"
+        );
+        assert_eq!(
+            friendly_error("pam_authenticate: USER_UNKNOWN"),
+            "Incorrect password"
+        );
+        assert_eq!(
+            friendly_error("pam_authenticate: MAXTRIES"),
+            "Too many failed attempts. Try again later."
+        );
+        assert_eq!(
+            friendly_error("pam_acct_mgmt: ACCT_EXPIRED"),
+            "This account has expired"
+        );
+        assert_eq!(
+            friendly_error("pam_acct_mgmt: NEW_AUTHTOK_REQD"),
+            "Your password has expired"
+        );
+        assert_eq!(friendly_error("pam_authenticate: WEIRD"), "Sign-in failed");
+        assert_eq!(friendly_error("bad password"), "bad password");
+        assert_eq!(
+            friendly_error("session already started: yes"),
+            "session already started: yes"
         );
     }
 

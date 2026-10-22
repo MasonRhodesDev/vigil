@@ -91,14 +91,28 @@ fn errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
 
-/// Drop DRM master on a file. Ok when the file is not master (EINVAL): there
-/// is nothing to hand over then.
-fn drop_master(fd: RawFd) -> Result<bool, i32> {
+/// What dropping master on a file came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Dropped {
+    /// Master was dropped here.
+    Yes,
+    /// The file is not master: nothing to hand over.
+    NotMaster,
+    /// EACCES or EPERM: the seat manager (logind's TakeDevice) owns master
+    /// on this file and the kernel will not let this process drop it. The
+    /// seat manager pauses the device and drops master itself when it
+    /// releases the greeter's session, so the next owner still gets master.
+    SeatManaged(i32),
+}
+
+/// Drop DRM master on a file. Any other failure is an error.
+fn drop_master(fd: RawFd) -> Result<Dropped, i32> {
     // SAFETY: argument-less ioctl on a descriptor the caller owns.
     let r = unsafe { libc::ioctl(fd, DROP_MASTER) };
     match (r, errno()) {
-        (0, _) => Ok(true),
-        (_, libc::EINVAL) => Ok(false),
+        (0, _) => Ok(Dropped::Yes),
+        (_, libc::EINVAL) => Ok(Dropped::NotMaster),
+        (_, e @ (libc::EACCES | libc::EPERM)) => Ok(Dropped::SeatManaged(e)),
         (_, e) => Err(e),
     }
 }
@@ -274,9 +288,13 @@ pub fn start(devices: &[Device], timeout: Duration) -> Result<i32, String> {
     }
     for d in &held {
         match drop_master(d.fd) {
-            Ok(true) => eprintln!("vigil: hold: dropped DRM master on fd {}", d.fd),
-            Ok(false) => eprintln!(
+            Ok(Dropped::Yes) => eprintln!("vigil: hold: dropped DRM master on fd {}", d.fd),
+            Ok(Dropped::NotMaster) => eprintln!(
                 "vigil: hold: fd {} was not master (already released); nothing to drop",
+                d.fd
+            ),
+            Ok(Dropped::SeatManaged(e)) => eprintln!(
+                "vigil: hold: fd {} master is managed by the seat manager (errno {e}); holding the fd open, the seat manager drops master when it releases this session",
                 d.fd
             ),
             Err(e) => {
