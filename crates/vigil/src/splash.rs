@@ -362,8 +362,10 @@ impl Splash {
         };
         // REST: ground everywhere, the mark over its box.
         let mut rest = vec![0u8; pw * ph * 4];
-        for px in rest.chunks_exact_mut(4) {
-            px.copy_from_slice(&[spec.bg[2], spec.bg[1], spec.bg[0], 0xff]);
+        // XRGB pixels, so there is never a partial chunk.
+        let (pixels, _partial) = rest.as_chunks_mut::<4>();
+        for px in pixels {
+            *px = [spec.bg[2], spec.bg[1], spec.bg[0], 0xff];
         }
         let mut frame = FrameTarget {
             buffer: &mut rest,
