@@ -99,6 +99,12 @@
 # screen and goes away once the next owner has put a different framebuffer on
 # all of them, or after hold_timeout_ms (default 10000, 1000 to 60000). Any
 # error while setting it up falls back to a plain exit, with a log line.
+# Under logind the seat manager owns master on the fd (vigil cannot drop it,
+# EACCES) and drops it itself when the greeter's session ends; the child still
+# holds the file, so the next session gets master as usual. A framebuffer
+# console that binds at that moment repaints the screens black regardless; if
+# the log shows every screen moving to one framebuffer within about 100 ms of
+# the exit, that is the cause (see /sys/class/vtconsole/vtcon*/bind).
 # Off until proven on real hardware.
 #hold_last_frame_on_exit = false
 #hold_timeout_ms = 10000
