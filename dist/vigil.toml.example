@@ -90,6 +90,18 @@
 # the kernel refuses the kept state, vigil resets it and retries once.
 # Off until proven on real hardware.
 #keep_display_state = false
+#
+# Keep the rest frame on screen between vigil's exit and the session's first
+# frame (default false). Without it, closing vigil's DRM fd removes its
+# framebuffer and the kernel blanks every screen, so they sit black for as long
+# as the session takes to start. With it, vigil drops DRM master, leaves a
+# small detached child holding the fd, and exits; the child watches each held
+# screen and goes away once the next owner has put a different framebuffer on
+# all of them, or after hold_timeout_ms (default 10000, 1000 to 60000). Any
+# error while setting it up falls back to a plain exit, with a log line.
+# Off until proven on real hardware.
+#hold_last_frame_on_exit = false
+#hold_timeout_ms = 10000
 
 [splash]
 # What vigil draws on every screen from the moment it owns them until the

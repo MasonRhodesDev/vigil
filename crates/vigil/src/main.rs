@@ -4,6 +4,7 @@
 //! Config file support is M2; for M1 everything is CLI flags (greetd's
 //! `command =` line carries them).
 
+mod hold;
 mod layout;
 mod scene;
 mod sessions;
@@ -358,6 +359,9 @@ struct App {
     leaving: Option<Instant>,
     /// Scaled-wallpaper cache directory, if one can be used.
     bg_cache_dir: Option<PathBuf>,
+    /// `[render] hold_last_frame_on_exit`: how long the exit holder waits
+    /// for the next owner, or None when the holder is off.
+    hold_timeout: Option<Duration>,
 }
 
 /// Match a profile against the connected outputs and choose each output's
@@ -1473,10 +1477,46 @@ impl App {
                 vigil_core::uptime_ms(),
                 waited.as_millis()
             );
+            self.hold_last_frame();
             // No teardown: the kernel closes the DRM and input fds, and
             // every millisecond here is a millisecond of the session not
             // starting.
             std::process::exit(self.exit_code);
+        }
+    }
+
+    /// `[render] hold_last_frame_on_exit`: leave a detached child holding the
+    /// DRM fds so the rest frame stays up after this process exits. Every
+    /// failure is a log line and a normal exit.
+    fn hold_last_frame(&self) {
+        let Some(timeout) = self.hold_timeout else {
+            return;
+        };
+        let devices: Vec<hold::Device> = self
+            .outputs
+            .iter()
+            .flatten()
+            .filter(|gpu| gpu.alive())
+            .map(|gpu| {
+                let (fd, crtcs) = gpu.hold_snapshot();
+                hold::Device { fd, crtcs }
+            })
+            .collect();
+        let t0 = vigil_core::uptime_ms();
+        match hold::start(&devices, timeout) {
+            Ok(pid) => {
+                // One write, so the child's first line cannot land inside it.
+                use std::io::Write as _;
+                let line = format!(
+                    "vigil: [t+{}ms] hold: child {pid} keeps the last frame on {} screen(s) for up to {} ms ({} ms to set up)\n",
+                    vigil_core::uptime_ms(),
+                    devices.iter().map(|d| d.crtcs.len()).sum::<usize>(),
+                    timeout.as_millis(),
+                    vigil_core::uptime_ms().saturating_sub(t0)
+                );
+                let _ = std::io::stderr().write_all(line.as_bytes());
+            }
+            Err(e) => eprintln!("vigil: hold: not holding the last frame, exiting normally: {e}"),
         }
     }
 
@@ -2386,6 +2426,10 @@ fn run() -> Result<i32, String> {
         started: process_start,
         leaving: None,
         bg_cache_dir,
+        hold_timeout: config
+            .render
+            .hold_last_frame_on_exit
+            .then(|| config.render.hold_timeout()),
     };
 
     if !app.early.is_empty() {

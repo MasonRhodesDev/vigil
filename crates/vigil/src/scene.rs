@@ -38,6 +38,9 @@ pub struct TagGeometry {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scene {
+    /// When set, every screen sizes the scene from this fixed short side in
+    /// physical pixels, so the mark is one size on every head.
+    pub ref_short_side: Option<u32>,
     pub bg: [u8; 3],
     pub accent: [u8; 3],
     pub mark: [u8; 3],
@@ -63,6 +66,7 @@ pub struct Scene {
 impl Default for Scene {
     fn default() -> Self {
         Self {
+            ref_short_side: None,
             bg: [0x0b, 0x0d, 0x10],
             accent: [0x17, 0x93, 0xd1],
             mark: [0xc3, 0xc9, 0xd0],
@@ -152,6 +156,10 @@ impl Scene {
                 .unwrap_or(default)
         };
         let scene = Scene {
+            ref_short_side: at(&v, &["ref_short_side"])
+                .and_then(Value::as_u64)
+                .and_then(|x| u32::try_from(x).ok())
+                .filter(|x| *x > 0),
             bg: color(&["palette", "bg"], d.bg),
             accent: color(&["palette", "accent"], d.accent),
             mark: color(&["palette", "mark"], d.mark),
@@ -179,15 +187,26 @@ impl Scene {
         Ok(scene)
     }
 
-    /// Geometry of the mark on a `w` x `h` screen, upright. Sizes are
-    /// fractions of the short side so a portrait screen gets the same
-    /// apparent size as a landscape one.
+    /// The short side sizes are fractions of: the fixed reference when the
+    /// spec has one, else this screen's own.
+    fn short_side(&self, w: u32, h: u32) -> f64 {
+        f64::from(self.ref_short_side.unwrap_or_else(|| w.min(h)))
+    }
+
+    /// Geometry of the mark on a `w` x `h` screen (physical pixels, upright).
+    /// Sizes are fractions of the short side so a portrait screen gets the
+    /// same apparent size as a landscape one. With a fixed reference the
+    /// centre sits at H/2 + (centre_frac - 0.5) * ref, so the mark is the
+    /// same size and the same distance from the middle on every head.
     pub fn geometry(&self, w: u32, h: u32) -> Geometry {
-        let s = f64::from(w.min(h));
+        let s = self.short_side(w, h);
         let logo = rnd(s * self.logo_frac).max(1) as u32;
         let glow = logo * self.glow_mult;
         let cx = f64::from(w) / 2.0;
-        let cy = f64::from(h) * self.centre_frac;
+        let cy = match self.ref_short_side {
+            Some(_) => f64::from(h) / 2.0 + (self.centre_frac - 0.5) * s,
+            None => f64::from(h) * self.centre_frac,
+        };
         Geometry {
             logo,
             glow,
@@ -200,7 +219,7 @@ impl Scene {
 
     /// Sizes of a debug tag on a `w` x `h` screen.
     pub fn tag_geometry(&self, w: u32, h: u32) -> TagGeometry {
-        let s = f64::from(w.min(h));
+        let s = self.short_side(w, h);
         TagGeometry {
             border: (rnd(s * self.debug_border_frac).max(0) as u32).max(self.debug_border_min),
             margin: rnd(s * self.debug_margin_frac).max(0) as u32,
@@ -271,6 +290,28 @@ mod tests {
         assert_eq!((g.logo, g.glow, g.logo_x, g.logo_y), (346, 692, 907, 1632));
         let g = s.geometry(1920, 1080);
         assert_eq!((g.logo, g.glow, g.logo_x, g.logo_y), (173, 346, 874, 421));
+    }
+
+    #[test]
+    fn fixed_reference_gives_one_size_and_a_fixed_offset() {
+        let s = Scene::parse(r#"{"version":2,"ref_short_side":1440}"#).unwrap();
+        assert_eq!(s.ref_short_side, Some(1440));
+        let wide = s.geometry(3440, 1440);
+        let hd = s.geometry(1920, 1080);
+        let tall = s.geometry(2160, 3840);
+        assert_eq!((wide.logo, hd.logo, tall.logo), (230, 230, 230));
+        // Centre = H/2 - 0.03 * 1440 = H/2 - 43.2, then rounded half up.
+        assert_eq!(wide.logo_y, 562);
+        assert_eq!(hd.logo_y, 540 - 43 - 115);
+        assert_eq!(tall.logo_y, 1920 - 43 - 115);
+        assert_eq!(s.tag_geometry(1920, 1080), s.tag_geometry(3440, 1440));
+        // Null or zero means per-screen sizing, as before.
+        for text in [
+            r#"{"version":2,"ref_short_side":null}"#,
+            r#"{"version":2,"ref_short_side":0}"#,
+        ] {
+            assert_eq!(Scene::parse(text).unwrap().ref_short_side, None);
+        }
     }
 
     #[test]
