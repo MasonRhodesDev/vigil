@@ -5035,6 +5035,7 @@ name = "vigil"
 version = "0.4.1"
 dependencies = [
  "appearance-profiles 0.2.0",
+ "bytemuck",
  "calloop 0.14.4",
  "font8x8",
  "image",
