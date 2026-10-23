@@ -191,6 +191,36 @@ fn initial_session(
 }
 
 /// One live output: its swapchain and its scene.
+/// Run `compose` on a CPU-side frame and write the result into `target` with
+/// one forward copy. A presenter's buffer is a mapping of GPU memory,
+/// typically write-combined: writes are cheap, but every read is an
+/// uncached fetch, on the order of tens of MB/s. A mix that reads its
+/// destination (`Splash::blend_over`) must therefore never be pointed at
+/// the mapping itself; a 4K frame read back that way takes seconds.
+fn composed(
+    scratch: &mut Vec<u32>,
+    target: &mut FrameTarget<'_>,
+    compose: impl FnOnce(&mut FrameTarget<'_>) -> bool,
+) -> bool {
+    let len = target.stride * target.height as usize;
+    if target.buffer.len() < len {
+        return false;
+    }
+    scratch.resize(len.div_ceil(4), 0);
+    let bytes = &mut bytemuck::cast_slice_mut::<u32, u8>(&mut scratch[..])[..len];
+    let mut frame = FrameTarget {
+        buffer: &mut bytes[..],
+        width: target.width,
+        height: target.height,
+        stride: target.stride,
+    };
+    if !compose(&mut frame) {
+        return false;
+    }
+    splash::copy_out(&bytes[..], target);
+    true
+}
+
 struct Entry {
     id: OutputId,
     connector: String,
@@ -213,6 +243,10 @@ struct Entry {
     tag: Option<splash::Tag>,
     /// A greeter frame has been presented on this output.
     shown_once: bool,
+    /// CPU-side frame for the passes that mix two pictures (the fade and
+    /// the hand-off), see [`composed`]. u32-backed so the bytes are
+    /// 4-aligned, as the renderer's rotate path requires.
+    scratch: Vec<u32>,
 }
 
 /// An output the splash already owns: claimed, drawn and shown before the
@@ -1191,6 +1225,7 @@ impl App {
             cover,
             tag,
             shown_once: false,
+            scratch: Vec::new(),
         });
         Ok(())
     }
@@ -1410,13 +1445,23 @@ impl App {
         };
         let last_frame = progress >= 1.0;
         let mut pending = false;
+        let deadline = Duration::from_millis(500) + Duration::from_secs_f64(fade);
+        let mut expired = false;
         for entry in self.entries.iter_mut() {
+            // A slow output must not stretch the exit: the deadline is
+            // measured on the clock before every entry, not once per pass.
+            if started.elapsed() >= deadline {
+                expired = true;
+                break;
+            }
             let Entry {
                 presenter,
                 window,
                 splash,
                 cover,
                 tag,
+                scratch,
+                connector,
                 ..
             } = entry;
             let (Some(sp), Some(cover)) = (splash.as_ref(), cover.as_mut()) else {
@@ -1425,35 +1470,47 @@ impl App {
             if !cover.final_shown() && cover.due(now) {
                 // The greeter as it stands, with the rest frame mixed in.
                 window.request_present();
+                let t0 = Instant::now();
+                let mut drawn = None;
                 let shown = presenter.with_frame(&mut |canvas| match canvas {
-                    Canvas::Cpu(target) => {
-                        let mut frame = FrameTarget {
-                            buffer: &mut target.buffer[..],
-                            width: target.width,
-                            height: target.height,
-                            stride: target.stride,
-                        };
-                        if last_frame {
-                            sp.draw_full(&mut frame, 0.0);
-                        } else if window.render_if_needed(FrameTarget {
-                            buffer: &mut frame.buffer[..],
-                            width: frame.width,
-                            height: frame.height,
-                            stride: frame.stride,
-                        }) {
-                            sp.blend_over(&mut frame, progress as f32);
+                    Canvas::Cpu(mut target) => {
+                        let ok = if last_frame {
+                            // Write-only: the rest frame replaces the buffer.
+                            sp.draw_full(&mut target, 0.0)
                         } else {
+                            composed(scratch, &mut target, |frame| {
+                                window.render_if_needed(FrameTarget {
+                                    buffer: &mut frame.buffer[..],
+                                    width: frame.width,
+                                    height: frame.height,
+                                    stride: frame.stride,
+                                }) && {
+                                    sp.blend_over(frame, progress as f32);
+                                    true
+                                }
+                            })
+                        };
+                        if !ok {
                             return false;
                         }
                         if let Some(tag) = tag {
-                            tag.draw(&mut frame, splash::Stage::Greeter);
+                            tag.draw(&mut target, splash::Stage::Greeter);
                         }
+                        drawn = Some(t0.elapsed());
                         true
                     }
                     _ => false,
                 });
+                let total = t0.elapsed();
                 match shown {
                     Ok(true) => {
+                        let draw = drawn.unwrap_or_default();
+                        eprintln!(
+                            "vigil: [t+{}ms] leave frame on {connector}: draw {} ms, commit {} ms, progress {progress:.2}",
+                            vigil_core::uptime_ms(),
+                            draw.as_millis(),
+                            total.saturating_sub(draw).as_millis()
+                        );
                         cover.presented(now, progress);
                         if last_frame {
                             cover.set_final_shown();
@@ -1471,7 +1528,8 @@ impl App {
                 pending = true;
             }
         }
-        if !pending || waited >= Duration::from_millis(500) + Duration::from_secs_f64(fade) {
+        let waited = started.elapsed();
+        if expired || !pending || waited >= deadline {
             eprintln!(
                 "vigil: [t+{}ms] exiting (rest frame shown, {} ms after login)",
                 vigil_core::uptime_ms(),
@@ -1905,6 +1963,7 @@ impl App {
                 cover,
                 tag,
                 shown_once,
+                scratch,
                 ..
             } = entry;
             // The splash covers a fresh output until the greeter is ready on
@@ -1977,47 +2036,53 @@ impl App {
             match presenter.with_frame(&mut |canvas| {
                 // Either canvas: the window knows which backend it has, and
                 // the presenter hands out the matching kind.
-                let Canvas::Cpu(target) = canvas else {
+                let Canvas::Cpu(mut target) = canvas else {
                     return window.render(canvas);
                 };
                 let (mid, row_len) = (
                     target.stride * (target.height as usize / 2),
                     target.width as usize * 4,
                 );
-                let drew = window.render_if_needed(FrameTarget {
-                    buffer: &mut target.buffer[..],
-                    width: target.width,
-                    height: target.height,
-                    stride: target.stride,
-                });
-                if drew && let (Some(alpha), Some(sp)) = (fade, splash.as_ref()) {
-                    sp.blend_over(
-                        &mut FrameTarget {
+                // The fade reads the greeter back to mix the rest frame
+                // over it, so it composes on a CPU-side frame (see
+                // `composed`) and only the finished picture reaches the
+                // mapping.
+                let drew = match (fade, splash.as_ref()) {
+                    (Some(alpha), Some(sp)) => composed(scratch, &mut target, |frame| {
+                        let drew = window.render_if_needed(FrameTarget {
+                            buffer: &mut frame.buffer[..],
+                            width: frame.width,
+                            height: frame.height,
+                            stride: frame.stride,
+                        });
+                        if drew {
+                            sp.blend_over(frame, alpha);
+                            if let Some(tag) = tag.as_ref() {
+                                // Whichever stage holds more of the picture
+                                // owns the tag.
+                                let stage = if alpha > 0.5 {
+                                    splash::Stage::GreeterSplash
+                                } else {
+                                    splash::Stage::Greeter
+                                };
+                                tag.draw(frame, stage);
+                            }
+                        }
+                        drew
+                    }),
+                    _ => {
+                        let drew = window.render_if_needed(FrameTarget {
                             buffer: &mut target.buffer[..],
                             width: target.width,
                             height: target.height,
                             stride: target.stride,
-                        },
-                        alpha,
-                    );
-                }
-                if drew && let Some(tag) = tag.as_ref() {
-                    // Whichever stage holds more of the picture owns the tag.
-                    let stage = if fade.is_some_and(|a| a > 0.5) {
-                        splash::Stage::GreeterSplash
-                    } else {
-                        splash::Stage::Greeter
-                    };
-                    tag.draw(
-                        &mut FrameTarget {
-                            buffer: &mut target.buffer[..],
-                            width: target.width,
-                            height: target.height,
-                            stride: target.stride,
-                        },
-                        stage,
-                    );
-                }
+                        });
+                        if drew && let Some(tag) = tag.as_ref() {
+                            tag.draw(&mut target, splash::Stage::Greeter);
+                        }
+                        drew
+                    }
+                };
                 if drew && debug_frames {
                     let row = &target.buffer[mid..mid + row_len];
                     let sum: u64 = row.iter().map(|&b| b as u64).sum();
@@ -2549,6 +2614,41 @@ fn main() {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn composed_writes_the_finished_frame_and_a_refusal_writes_nothing() {
+        let (w, h, stride) = (3u32, 2u32, 16usize);
+        let mut buf = vec![7u8; stride * h as usize];
+        let mut target = FrameTarget {
+            buffer: &mut buf[..],
+            width: w,
+            height: h,
+            stride,
+        };
+        let mut scratch = Vec::new();
+        // Refused: the mapping is untouched.
+        assert!(!composed(&mut scratch, &mut target, |f| {
+            f.buffer.fill(1);
+            false
+        }));
+        assert!(target.buffer.iter().all(|&b| b == 7));
+        // Accepted: the scratch frame has the target's stride and lands whole.
+        assert!(composed(&mut scratch, &mut target, |f| {
+            assert_eq!((f.stride, f.buffer.len()), (stride, stride * 2));
+            f.buffer.fill(9);
+            true
+        }));
+        assert!(target.buffer.iter().all(|&b| b == 9));
+        // A target too small for its own geometry is refused, not indexed.
+        let mut short = [0u8; 8];
+        let mut small = FrameTarget {
+            buffer: &mut short[..],
+            width: w,
+            height: h,
+            stride,
+        };
+        assert!(!composed(&mut scratch, &mut small, |_| true));
+    }
 
     #[test]
     fn static_clock_uses_minute_deadline() {

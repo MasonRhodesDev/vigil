@@ -453,6 +453,14 @@ impl Splash {
     }
 }
 
+/// Copy a finished CPU-side frame (same stride and height as `dst`) into the
+/// target. The only operation a presenter mapping sees from a mixed frame:
+/// forward, whole-row writes, nothing read back.
+pub fn copy_out(src: &[u8], dst: &mut FrameTarget<'_>) {
+    let n = (dst.stride * dst.height as usize).min(src.len());
+    dst.buffer[..n].copy_from_slice(&src[..n]);
+}
+
 /// A screen's debug tag: a border on its very edge and a label in the
 /// upright top-left corner, both in the owning stage's colour.
 pub struct Tag {
