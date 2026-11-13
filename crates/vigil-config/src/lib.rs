@@ -1110,6 +1110,12 @@ fn load_layered_from(system: &Path, user: Option<&Path>) -> (Config, Vec<Ignored
 pub struct State {
     pub user: String,
     pub session: String,
+    /// Unix seconds when the greeter last started a session with no user
+    /// input (a preselected account that needed no credential).
+    pub auto_started_at: Option<u64>,
+    /// Consecutive such sessions that ended shortly after starting, as
+    /// counted at that start.
+    pub auto_streak: u32,
 }
 
 impl State {
@@ -1136,11 +1142,15 @@ impl State {
     /// must never break login, so failures log and return.
     pub fn store(&self, path: &Path) {
         let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        let body = format!(
-            "user = \"{}\"\nsession = \"{}\"\n",
+        let mut body = format!(
+            "user = \"{}\"\nsession = \"{}\"\nauto_streak = {}\n",
             escape(&self.user),
-            escape(&self.session)
+            escape(&self.session),
+            self.auto_streak
         );
+        if let Some(at) = self.auto_started_at {
+            body.push_str(&format!("auto_started_at = {at}\n"));
+        }
         let tmp = path.with_extension("tmp");
         let result = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
         if let Err(e) = result {
@@ -2149,9 +2159,37 @@ not_a_key = 1
         let state = State {
             user: "al\"ice".into(),
             session: "Test DE".into(),
+            ..State::default()
         };
         state.store(&tmp);
         assert_eq!(State::load(&tmp), Some(state));
+        std::fs::remove_file(tmp).unwrap();
+    }
+
+    #[test]
+    fn state_round_trip_keeps_autologin_fields() {
+        let tmp =
+            std::env::temp_dir().join(format!("vigil-state-autologin-{}.toml", std::process::id()));
+        let state = State {
+            user: "alice".into(),
+            session: "Test DE".into(),
+            auto_started_at: Some(1_700_000_000),
+            auto_streak: 2,
+        };
+        state.store(&tmp);
+        assert_eq!(State::load(&tmp), Some(state));
+        std::fs::remove_file(tmp).unwrap();
+    }
+
+    #[test]
+    fn state_without_autologin_fields_loads_with_defaults() {
+        let tmp =
+            std::env::temp_dir().join(format!("vigil-state-legacy-{}.toml", std::process::id()));
+        std::fs::write(&tmp, "user = \"alice\"\nsession = \"Test DE\"\n").unwrap();
+        let state = State::load(&tmp).unwrap();
+        assert_eq!(state.user, "alice");
+        assert_eq!(state.auto_started_at, None);
+        assert_eq!(state.auto_streak, 0);
         std::fs::remove_file(tmp).unwrap();
     }
 
