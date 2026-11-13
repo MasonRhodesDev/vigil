@@ -77,13 +77,16 @@ pub fn record_pause(prev: &State, streak: u32) -> State {
     }
 }
 
-pub fn notice(last_secs: Option<u64>) -> String {
-    match last_secs {
-        Some(secs) => format!(
-            "The last session ended after {secs} s, so automatic login is paused. Sign in to continue."
-        ),
-        None => "Recent sessions ended right after starting, so automatic login is paused. Sign in to continue.".to_owned(),
-    }
+pub fn notice(last_secs: Option<u64>, default_user: Option<&str>) -> String {
+    let why = match last_secs {
+        Some(secs) => format!("The last session ended after {secs} s"),
+        None => "Recent sessions ended right after starting".to_owned(),
+    };
+    let how = match default_user {
+        Some(user) => format!("Press Enter to sign in as {user}, or pick an account."),
+        None => "Sign in to continue.".to_owned(),
+    };
+    format!("{why}, so automatic login is paused. {how}")
 }
 
 pub fn now_secs() -> u64 {
@@ -188,8 +191,12 @@ mod tests {
     }
 
     #[test]
-    fn notice_names_the_duration_when_known() {
-        assert!(notice(Some(1)).contains("after 1 s"));
-        assert!(notice(None).contains("automatic login is paused"));
+    fn notice_names_the_duration_and_the_enter_action() {
+        let text = notice(Some(1), Some("games"));
+        assert!(text.contains("after 1 s"));
+        assert!(text.contains("Press Enter to sign in as games"));
+        let text = notice(None, None);
+        assert!(text.contains("automatic login is paused"));
+        assert!(text.ends_with("Sign in to continue."));
     }
 }

@@ -2548,7 +2548,14 @@ fn run() -> Result<i32, String> {
                 if let Some(user) = resolved.user.as_deref() {
                     app.auth.set_default_user(Some(user.to_owned()));
                 }
-                Some(autologin::notice(last_secs))
+                let default_user = resolved.user.clone().or_else(|| {
+                    app.users
+                        .get(app.selected_user)
+                        .filter(|name| name.as_str() != OTHER_USER)
+                        .cloned()
+                        .or_else(|| app.remembered_user.clone())
+                });
+                Some(autologin::notice(last_secs, default_user.as_deref()))
             }
             autologin::Verdict::Allow { .. } => None,
         };
