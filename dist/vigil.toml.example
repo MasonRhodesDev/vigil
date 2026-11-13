@@ -67,6 +67,9 @@
 # Preselect the last successful user/session (needs a writable state_file;
 # the package ships tmpfiles.d for /var/lib/vigil).
 #remember = true
+# The same file also records sessions the greeter started with no user
+# input (a preselected account that needs no credential). After three in a
+# row that ended within 30 s, automatic login pauses until someone signs in.
 #state_file = "/var/lib/vigil/state.toml"
 
 [render]

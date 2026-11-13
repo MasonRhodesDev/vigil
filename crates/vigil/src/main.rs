@@ -4,6 +4,7 @@
 //! Config file support is M2; for M1 everything is CLI flags (greetd's
 //! `command =` line carries them).
 
+mod autologin;
 mod hold;
 mod layout;
 mod scene;
@@ -333,6 +334,8 @@ struct App {
     selected_user: usize,
     remember: bool,
     state_file: PathBuf,
+    state: vigil_config::State,
+    auto_streak: u32,
     remembered_user: Option<String>,
     /// Loaded once the toolkit is up, which is after the splash is on screen.
     theme: Option<Theme>,
@@ -1380,6 +1383,10 @@ impl App {
             }
             if let UiMessage::SelectUser(index) = msg {
                 self.select_user(index);
+                if self.auth.is_complete() {
+                    self.finish_login(false);
+                    return;
+                }
                 continue;
             }
             if let UiMessage::Power(action) = msg {
@@ -1394,20 +1401,29 @@ impl App {
                 eprintln!("vigil: auth: {e}");
             }
             if self.auth.is_complete() {
-                self.exit_code = 0;
-                if self.remember
-                    && let Some(user) = self.auth.user()
-                {
-                    vigil_config::State {
-                        user: user.to_owned(),
-                        session: self.sessions[self.selected_session].name.clone(),
-                    }
-                    .store(&self.state_file);
-                }
-                self.begin_leaving();
+                self.finish_login(false);
                 return;
             }
         }
+    }
+
+    /// greetd accepted start_session. `automatic` means no user input led
+    /// here, which is what the autologin pause counts.
+    fn finish_login(&mut self, automatic: bool) {
+        self.exit_code = 0;
+        let mut state = if automatic {
+            autologin::record_auto_start(&self.state, autologin::now_secs(), self.auto_streak)
+        } else {
+            autologin::record_user_start(&self.state)
+        };
+        if self.remember
+            && let Some(user) = self.auth.user()
+        {
+            state.user = user.to_owned();
+            state.session = self.sessions[self.selected_session].name.clone();
+        }
+        state.store(&self.state_file);
+        self.begin_leaving();
     }
 
     /// start_session was accepted. greetd runs the session only once this
@@ -2343,9 +2359,12 @@ fn run() -> Result<i32, String> {
     // Kiosk --cmd mode never remembers; otherwise preselect last session and
     // let an empty username submit the last user.
     let remember = resolved.cmd.is_empty() && config.sessions.remember;
-    let remembered = remember
-        .then(|| vigil_config::State::load(&config.sessions.state_file))
-        .flatten();
+    let stored = vigil_config::State::load(&config.sessions.state_file);
+    let remembered = remember.then_some(stored.as_ref()).flatten();
+    let verdict = autologin::assess(stored.as_ref(), autologin::now_secs());
+    let auto_streak = match verdict {
+        autologin::Verdict::Allow { streak } | autologin::Verdict::Pause { streak, .. } => streak,
+    };
     // A pinned --user/[greeter] user is kiosk mode: no list, no choosing.
     let user_list = if resolved.user.is_none() && config.users.show_list {
         let mut list = users::enumerate();
@@ -2356,17 +2375,13 @@ fn run() -> Result<i32, String> {
     } else {
         Vec::new()
     };
-    let remembered_user = remembered
-        .as_ref()
-        .map(|s| s.user.clone())
-        .filter(|u| !u.is_empty());
+    let remembered_user = remembered.map(|s| s.user.clone()).filter(|u| !u.is_empty());
     // Preselect the remembered user when it is still a real account.
     let selected_user = remembered_user
         .as_ref()
         .and_then(|u| user_list.iter().position(|name| name == u))
         .unwrap_or(0);
-    let initial_session =
-        initial_session(&session_list, remembered.as_ref(), &config.sessions.default);
+    let initial_session = initial_session(&session_list, remembered, &config.sessions.default);
 
     let mut auth = AuthMachine::connect(cli.socket.as_deref()).map_err(|e| e.to_string())?;
     // With a list, the selected entry is the default an empty submit uses;
@@ -2445,6 +2460,8 @@ fn run() -> Result<i32, String> {
         selected_user,
         remember,
         state_file: config.sessions.state_file.clone(),
+        state: stored.unwrap_or_default(),
+        auto_streak,
         remembered_user,
         theme: None,
         platform,
@@ -2520,7 +2537,24 @@ fn run() -> Result<i32, String> {
             entries: &mut app.entries,
             snapshot: &mut app.snapshot,
         };
-        if let Some(user) = resolved.user.as_deref() {
+        let pause_notice = match verdict {
+            autologin::Verdict::Pause { streak, last_secs } => {
+                eprintln!(
+                    "vigil: [t+{}ms] automatic login paused: {streak} session(s) in a row ended within {} s of starting",
+                    vigil_core::uptime_ms(),
+                    autologin::SHORT_SESSION_SECS
+                );
+                autologin::record_pause(&app.state, streak).store(&app.state_file);
+                if let Some(user) = resolved.user.as_deref() {
+                    app.auth.set_default_user(Some(user.to_owned()));
+                }
+                Some(autologin::notice(last_secs))
+            }
+            autologin::Verdict::Allow { .. } => None,
+        };
+        if pause_notice.is_some() {
+            app.auth.begin(None, &mut fan)
+        } else if let Some(user) = resolved.user.as_deref() {
             app.auth.begin(Some(user), &mut fan)
         } else if !app.users.is_empty() {
             let selected = app
@@ -2533,6 +2567,12 @@ fn run() -> Result<i32, String> {
             app.auth.begin(None, &mut fan)
         }
         .map_err(|e| e.to_string())?;
+        if let Some(notice) = pause_notice {
+            fan.show_error(&notice);
+        }
+    }
+    if app.auth.is_complete() {
+        app.finish_login(true);
     }
 
     handle
@@ -2696,6 +2736,7 @@ mod config_tests {
         let state = vigil_config::State {
             user: String::new(),
             session: "B".into(),
+            ..Default::default()
         };
         assert_eq!(initial_session(&sessions, Some(&state), "A"), 1);
     }
@@ -2712,6 +2753,7 @@ mod config_tests {
         let state = vigil_config::State {
             user: String::new(),
             session: "Gone".into(),
+            ..Default::default()
         };
         assert_eq!(initial_session(&sessions, Some(&state), "B"), 1);
     }
