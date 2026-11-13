@@ -1407,8 +1407,7 @@ impl App {
         }
     }
 
-    /// greetd accepted start_session. `automatic` means no user input led
-    /// here, which is what the autologin pause counts.
+    /// `automatic`: no user input led to start_session.
     fn finish_login(&mut self, automatic: bool) {
         self.exit_code = 0;
         let mut state = if automatic {

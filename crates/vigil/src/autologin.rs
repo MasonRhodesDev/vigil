@@ -1,7 +1,5 @@
 //! Pause automatic login when sessions the greeter starts without any
-//! user input keep dying right after they start. Otherwise a broken
-//! desktop plus a preselected account that needs no credential restarts
-//! the greeter forever, with nobody at the keyboard able to break in.
+//! user input keep dying right after they start (issue #119).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,11 +13,7 @@ pub const PAUSE_AFTER: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// Automatic login may proceed; `streak` is what a new automatic start
-    /// records.
     Allow { streak: u32 },
-    /// Wait for the user. `last_secs` is how long the previous automatic
-    /// session lasted when that is known.
     Pause { streak: u32, last_secs: Option<u64> },
 }
 
@@ -49,7 +43,6 @@ pub fn assess(state: Option<&State>, now_secs: u64) -> Verdict {
     }
 }
 
-/// State to store when the greeter starts a session without user input.
 pub fn record_auto_start(prev: &State, now_secs: u64, streak: u32) -> State {
     State {
         auto_started_at: Some(now_secs),
@@ -58,8 +51,6 @@ pub fn record_auto_start(prev: &State, now_secs: u64, streak: u32) -> State {
     }
 }
 
-/// State to store when a typed credential or an explicit user action
-/// started the session.
 pub fn record_user_start(prev: &State) -> State {
     State {
         auto_started_at: None,
@@ -68,8 +59,6 @@ pub fn record_user_start(prev: &State) -> State {
     }
 }
 
-/// State to store once automatic login pauses, so a later greeter restart
-/// stays paused until a user signs in.
 pub fn record_pause(prev: &State, streak: u32) -> State {
     State {
         auto_streak: streak,
