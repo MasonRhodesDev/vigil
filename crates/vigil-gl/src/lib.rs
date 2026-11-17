@@ -161,6 +161,9 @@ unsafe impl EGLNativeSurface for GbmWindow {
 }
 
 impl GbmWindow {
+    /// # Safety
+    /// Only valid after a swap, and the returned buffer must be released back
+    /// to the surface.
     pub unsafe fn lock_front_buffer(&self) -> Result<gbm::BufferObject<()>, GlError> {
         unsafe { self.0.lock_front_buffer() }
             .map_err(|e| GlError(format!("lock front buffer: {e}")))
