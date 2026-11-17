@@ -1,8 +1,3 @@
-//! Dev harness: render a theme headlessly into a PNG — no DRM, no VM.
-//! Also the seed of the golden-image test matrix (DESIGN.md §8).
-//!
-//!   cargo run -p vigil --example theme_preview -- out.png [theme.slint]
-
 use vigil_core::OutputId;
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
@@ -15,8 +10,6 @@ fn main() {
     let out = args.next().unwrap_or_else(|| "theme-preview.png".into());
     let theme_path = args.next().map(std::path::PathBuf::from);
 
-    // PREVIEW_TRANSFORM=0|1|2|3 renders as a rotated output would scan out:
-    // the scene stays upright and the presented frame is the rotated one.
     let transform: u8 = std::env::var("PREVIEW_TRANSFORM")
         .ok()
         .and_then(|x| x.parse().ok())
@@ -29,7 +22,6 @@ fn main() {
     let mut window =
         OutputWindow::with_transform(OutputId(1), W, H, 1.0, transform, adapter, component)
             .expect("window");
-    // Panel geometry is what gets scanned out; the scene may be swapped.
     let (pw, ph) = (W, H);
 
     window.on_ui_message(std::rc::Rc::new(|m| println!("ui-message: {m:?}")));
@@ -43,14 +35,12 @@ fn main() {
     }
     window.set_users(&["mason".into(), "Other…".into()]);
     window.set_user_index(0);
-    // As the greeter does: the selected row's name, "" for Other….
     window.set_user_name("mason");
     window.set_sessions(&["Other DE".into(), "Test DE".into()]);
     window.set_session_index(0);
     use vigil_core::AuthUi;
     window.show_prompt("Password:", true);
 
-    // Type a character to verify the input field has keyboard focus.
     window.dispatch(vigil_core::InputEvent::Key {
         keysym: 97,
         utf8: Some("a".into()),
@@ -68,9 +58,6 @@ fn main() {
         pressed: true,
     });
 
-    // Click where the e2e driver aims for the session picker's "‹" button;
-    // with two sessions it wraps to the second, so a
-    // `ui-message: SelectSession(1)` line proves the coordinates are right.
     window.dispatch(vigil_core::InputEvent::PointerAbsolute { x: 98.0, y: 754.0 });
     window.dispatch(vigil_core::InputEvent::PointerButton {
         button: 0x110,
@@ -81,7 +68,6 @@ fn main() {
         pressed: false,
     });
 
-    // And the Restart power button bottom-right: expect Power(Reboot).
     window.dispatch(vigil_core::InputEvent::PointerAbsolute {
         x: 1118.0,
         y: 754.0,
@@ -105,7 +91,6 @@ fn main() {
     });
     println!("drew: {drew}");
 
-    // XRGB -> RGB for the PNG
     let mut rgb = Vec::with_capacity((W * H * 3) as usize);
     for px in buf.as_chunks::<4>().0 {
         rgb.extend_from_slice(&[px[2], px[1], px[0]]);

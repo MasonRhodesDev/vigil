@@ -22,9 +22,6 @@ vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }
 vigil-login = { path = "../vigil-login" }
 slint-kit.workspace = true
-# The GL path used to be opt-in (DESIGN.md §7). Production greeters on
-# HiDPI/rotated desks need it; packaging and the default feature gate now
-# enable GL. Software-only: `cargo build --no-default-features`.
 vigil-gl = { path = "../vigil-gl", optional = true }
 vigil-present-gl = { path = "../vigil-present-gl", optional = true }
 calloop.workspace = true
@@ -33,7 +30,6 @@ libc.workspace = true
 font8x8.workspace = true
 bytemuck = "1.25"
 image.workspace = true
-# Renders the splash mark from an SVG (shapes only: no text, no raster).
 resvg = { version = "0.47", default-features = false }
 
 [dev-dependencies]

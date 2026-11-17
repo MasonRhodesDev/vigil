@@ -1,13 +1,5 @@
-//! Login-user enumeration for the greeter's user list (issue #21). Pure
-//! parsing over /etc/passwd + /etc/login.defs so it works as the `greeter`
-//! user with no D-Bus and no session bus.
-
-/// Shell basenames that mean "this account cannot log in". A UID in the
-/// login range is not enough on its own: build accounts (nix, jenkins)
-/// live there too and would otherwise fill the list.
 const NON_LOGIN_SHELLS: &[&str] = &["nologin", "false", "true", "sync", "shutdown", "halt"];
 
-/// Users offered by the greeter, sorted, from the live system.
 pub fn enumerate() -> Vec<String> {
     let (uid_min, uid_max) = std::fs::read_to_string("/etc/login.defs")
         .map(|defs| parse_uid_range(&defs))
@@ -17,8 +9,6 @@ pub fn enumerate() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `UID_MIN`/`UID_MAX` from login.defs contents; the documented defaults
-/// when either is absent or unparseable.
 pub fn parse_uid_range(defs: &str) -> (u32, u32) {
     let field = |key: &str, fallback: u32| {
         defs.lines()
@@ -33,7 +23,6 @@ pub fn parse_uid_range(defs: &str) -> (u32, u32) {
     (field("UID_MIN", 1000), field("UID_MAX", 60000))
 }
 
-/// Login-capable users from /etc/passwd contents, sorted by name.
 pub fn filter_users(passwd: &str, uid_min: u32, uid_max: u32) -> Vec<String> {
     let mut users: Vec<String> = passwd
         .lines()
@@ -42,7 +31,7 @@ pub fn filter_users(passwd: &str, uid_min: u32, uid_max: u32) -> Vec<String> {
             let name = fields.next()?;
             let _passwd = fields.next()?;
             let uid: u32 = fields.next()?.parse().ok()?;
-            let shell = fields.nth(3)?; // gid, gecos, home, shell
+            let shell = fields.nth(3)?;
             if !(uid_min..=uid_max).contains(&uid) || name.is_empty() {
                 return None;
             }

@@ -1,9 +1,3 @@
-//! Theme subsystem (DESIGN.md §6): load `/etc/greetd/theme.slint` via
-//! slint-interpreter, validate it against the versioned contract (every
-//! required property/callback present and correctly typed), and fall back to
-//! the compiled-in default theme on any diagnostic. Themes are declarative —
-//! no code execution; worst case is a bad image path.
-
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -13,22 +7,13 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use slint_interpreter::{ComponentDefinition, ComponentInstance, Value, ValueType};
 
-/// Contract version this build of vigil implements (DESIGN.md §6).
 pub const CONTRACT_VERSION: u32 = 1;
 
-/// Source of the compiled-in default theme (themes/default/theme.slint),
-/// embedded so the fallback needs no filesystem.
 pub const DEFAULT_THEME_SOURCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../themes/default/theme.slint"
 ));
 
-/// slint-kit `ui/` sources, vendored at `themes/kit/ui/` (rev ccd7397).
-///
-/// The default theme `import`s `ui/theme.slint` etc. `slint_kit::ui_dir()` is
-/// `CARGO_MANIFEST_DIR` of the git checkout, which exists on the build host
-/// and nowhere else. Serving these from the binary is what makes a packaged
-/// greeter start on a fresh machine.
 const KIT_UI_FILES: &[(&str, &str)] = &[
     (
         "theme.slint",
@@ -76,9 +61,7 @@ const KIT_UI_FILES: &[(&str, &str)] = &[
 
 #[derive(Debug)]
 pub enum ThemeError {
-    /// Compile diagnostics, already formatted for the log.
     Compile(String),
-    /// The theme compiled but is missing/mistyping contract surface.
     Contract(String),
 }
 
@@ -92,14 +75,11 @@ impl std::fmt::Display for ThemeError {
 }
 impl std::error::Error for ThemeError {}
 
-/// A validated, instantiable theme.
 pub struct Theme {
     definition: ComponentDefinition,
 }
 
 impl Theme {
-    /// Load and validate the theme at `path`; on any error, log why and
-    /// return the compiled-in default (which must always validate).
     pub fn load_or_default(path: Option<&Path>) -> Theme {
         if let Some(path) = path {
             match compile_path(path) {
@@ -118,7 +98,6 @@ impl Theme {
         .unwrap_or_else(|error| panic!("embedded default theme is invalid (build defect): {error}"))
     }
 
-    /// Instantiate the theme for one output (one component per output).
     pub fn instantiate(&self) -> Result<ComponentInstance, ThemeError> {
         self.definition.create().map_err(|error| {
             ThemeError::Compile(format!("could not instantiate component: {error}"))
@@ -126,15 +105,10 @@ impl Theme {
     }
 }
 
-/// Validate a theme without instantiating a greeter. `Ok(())` means the
-/// theme compiles and satisfies contract v1.
 pub fn check(path: &Path) -> Result<(), ThemeError> {
     compile_path(path).map(|_| ())
 }
 
-/// A theme is either a `.slint` file or a directory containing
-/// `theme.slint` (with its assets beside it — `@image-url` resolves
-/// relative to the file, so a theme folder is self-contained).
 fn compile_path(path: &Path) -> Result<Theme, ThemeError> {
     let file = if path.is_dir() {
         let candidate = path.join("theme.slint");
@@ -158,9 +132,6 @@ fn compile_source(source: &str, path: PathBuf) -> Result<Theme, ThemeError> {
 }
 
 fn kit_source_for(path: &Path) -> Option<&'static str> {
-    // `import { Theme } from "ui/theme.slint"` and nested `from "theme.slint"`
-    // inside those files both resolve to a path whose last two components are
-    // `ui/<file>` once the include search has failed (packaged install).
     let name = path.file_name()?.to_str()?;
     let parent = path.parent()?.file_name()?.to_str()?;
     if parent != "ui" {
@@ -210,8 +181,6 @@ fn kit_include_paths() -> Vec<PathBuf> {
 
 fn finish_compilation(result: slint_interpreter::CompilationResult) -> Result<Theme, ThemeError> {
     if result.has_errors() {
-        // Lead with the first error: a theme author needs the cause, not a
-        // wall of cascading parse noise. Warnings are not failures.
         let errors: Vec<String> = result
             .diagnostics()
             .filter(|d| d.level() == slint_interpreter::DiagnosticLevel::Error)
@@ -245,11 +214,6 @@ fn finish_compilation(result: slint_interpreter::CompilationResult) -> Result<Th
     Ok(Theme { definition })
 }
 
-/// Validate the public contract from DESIGN.md §6.
-///
-/// Slint 1.17 exposes callback names but not their argument types through
-/// reflection. A single probe instance is therefore used to invoke each
-/// callback with its v1 arguments; invocation fails for a wrong arity or type.
 fn validate_contract(definition: &ComponentDefinition) -> Result<(), ThemeError> {
     const PROPERTIES: &[(&str, ValueType)] = &[
         ("output-name", ValueType::String),
@@ -372,8 +336,6 @@ mod tests {
     }
 
     fn init_headless() {
-        // set_platform is thread-local without an event-loop provider, so every
-        // unit-test thread can install an independent software-only backend.
         let _ = slint::platform::set_platform(Box::new(HeadlessPlatform));
     }
 
@@ -390,8 +352,6 @@ mod tests {
 
     #[test]
     fn default_theme_compiles_from_embedded_kit_without_include_paths() {
-        // Packaged binaries do not have the cargo git checkout that
-        // `slint_kit::ui_dir()` points at. The greeter must still compile.
         init_headless();
         let mut compiler = slint_interpreter::Compiler::default();
         attach_embedded_kit(&mut compiler);

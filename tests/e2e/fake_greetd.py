@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Minimal fake greetd: greetd-ipc wire protocol (native u32 length + JSON)."""
 import json, os, socket, struct, sys
 
 path, password = sys.argv[1], sys.argv[2]
@@ -38,8 +37,6 @@ while True:
         if req.get("response") == password:
             send(c, {"type": "success"})
         else:
-            # Diagnostic: length only, NEVER contents — a tester may type a
-            # real password by muscle memory.
             got = req.get("response") or ""
             print(
                 "fake-greetd: wrong password (got %d chars, expected %d)"

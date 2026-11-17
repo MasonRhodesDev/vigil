@@ -1,12 +1,3 @@
-//! Input subsystem (DESIGN.md §5): libinput events through xkbcommon state
-//! into normalized [`vigil_core::InputEvent`]s. Key repeat and compose are
-//! synthesized HERE — nobody else in the stack does repeat. The full public
-//! API exists from M1 even where implementation lands later (compose: M2).
-//!
-//! Hard requirement (DESIGN.md §1): never EVIOCGRAB — host daemons share the
-//! seat's input devices while the greeter is up. libinput does not grab by
-//! default; nothing in this crate may change that.
-
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -32,7 +23,6 @@ impl std::fmt::Display for InputError {
 }
 impl std::error::Error for InputError {}
 
-/// Owns the libinput context and xkb state for the seat.
 pub struct InputSystem {
     libinput: input::Libinput,
     keyboard: KeyboardState,
@@ -57,20 +47,16 @@ impl InputSystem {
         })
     }
 
-    /// Session paused (VT switch away): seat devices are being revoked.
     pub fn suspend(&mut self) {
         self.libinput.suspend();
     }
 
-    /// Session re-activated: reopen the seat's devices through the opener.
-    /// Without this, input stays dead after returning from another VT.
     pub fn resume(&mut self) -> Result<(), InputError> {
         self.libinput
             .resume()
             .map_err(|()| InputError("could not resume libinput after reactivation".into()))
     }
 
-    /// Drain pending libinput events and translate the supported ones.
     pub fn dispatch(&mut self) -> Vec<InputEvent> {
         if self.libinput.dispatch().is_err() {
             return Vec::new();
@@ -92,8 +78,6 @@ impl InputSystem {
                     });
                 }
                 event::Event::Pointer(PointerEvent::MotionAbsolute(motion)) => {
-                    // A unit transform yields normalized coordinates. The binary
-                    // scales these into the complete output-layout space.
                     translated.push(InputEvent::PointerAbsolute {
                         x: motion.absolute_x_transformed(1).clamp(0.0, 1.0),
                         y: motion.absolute_y_transformed(1).clamp(0.0, 1.0),
@@ -111,17 +95,14 @@ impl InputSystem {
         translated
     }
 
-    /// When the repeat timer should next fire, if a repeating key is held.
     pub fn next_repeat_deadline(&self) -> Option<std::time::Instant> {
         self.keyboard.next_repeat_deadline()
     }
 
-    /// Synthesize all repeats due at `now` and advance the repeat timer.
     pub fn tick_repeat(&mut self, now: Instant) -> Vec<InputEvent> {
         self.keyboard.tick_repeat(now)
     }
 
-    /// Rebuilds the compose table immediately; None restores the environment default.
     pub fn set_compose_locale(&mut self, locale: Option<&str>) {
         self.compose_locale = locale.map(str::to_owned);
         let locale = locale
@@ -130,7 +111,6 @@ impl InputSystem {
         self.keyboard.compose = compose_state(&locale);
     }
 
-    /// Current caps-lock state (theme contract `caps-lock`).
     pub fn caps_lock(&self) -> bool {
         self.keyboard.caps_lock()
     }
@@ -138,7 +118,6 @@ impl InputSystem {
 
 impl std::os::fd::AsFd for InputSystem {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        // SAFETY: the libinput context owns this fd for the life of self.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }
@@ -161,8 +140,6 @@ impl LibinputInterface for OpenerAdapter {
     }
 }
 
-/// Pure xkb translation and repeat state. It deliberately contains no
-/// libinput types, keeping keyboard behavior headless-testable.
 struct KeyboardState {
     keymap: xkb::Keymap,
     state: xkb::State,
@@ -189,8 +166,6 @@ fn compile_keymap(context: &xkb::Context, settings: &KeymapSettings) -> Option<x
     )
 }
 
-/// Build a compose state for `locale`, or None (logged) if the table
-/// does not load — typing must work without compose.
 fn compose_state(locale: &str) -> Option<compose::State> {
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     match compose::Table::new_from_locale(
@@ -206,7 +181,6 @@ fn compose_state(locale: &str) -> Option<compose::State> {
     }
 }
 
-/// LC_ALL > LC_CTYPE > LANG > "C", the glibc resolution order.
 fn default_compose_locale() -> String {
     ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
@@ -217,9 +191,6 @@ fn default_compose_locale() -> String {
 impl KeyboardState {
     fn new(settings: &KeymapSettings) -> Result<Self, InputError> {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        // A bad user-supplied layout must never brick the greeter: fall back
-        // to the system keymap with a log line (same philosophy as config
-        // and theme fallbacks).
         let keymap = compile_keymap(&context, settings)
             .or_else(|| {
                 if *settings != KeymapSettings::default() {
@@ -252,15 +223,12 @@ impl KeyboardState {
             },
         );
 
-        // Compose sees only presses; releases pass straight through (their
-        // keysym text is filtered downstream anyway).
         if pressed
             && let Some(state) = &mut self.compose
             && state.feed(self.state.key_get_one_sym(keycode)) == compose::FeedResult::Accepted
         {
             match state.status() {
                 compose::Status::Composing => {
-                    // Mid-sequence keys are swallowed and never arm repeat.
                     self.repeat = None;
                     return None;
                 }
@@ -268,7 +236,6 @@ impl KeyboardState {
                     let utf8 = state.utf8();
                     let keysym = state.keysym().map(|k| k.raw());
                     state.reset();
-                    // A composed character does not repeat.
                     self.repeat = None;
                     return Some(InputEvent::Key {
                         keysym: keysym.unwrap_or_else(|| self.state.key_get_one_sym(keycode).raw()),
@@ -377,7 +344,6 @@ mod tests {
         let _ = keyboard.key(KEY_A, false, now);
         let _ = keyboard.key(KEY_LEFTSHIFT, false, now);
 
-        // xkbcommon represents Return text as carriage return, not line feed.
         assert_eq!(
             key_parts(keyboard.key(KEY_ENTER, true, now).expect("event")),
             (0xff0d, Some("\r".into()), true)

@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""Host-side driver for run-scene.sh: watch every screen from the moment
-vigil starts, log in once the greeter is up everywhere, and keep watching until
-vigil exits. Every screendump is stamped with the host's monotonic clock; the
-stamps and file names go to capture.json for scene-check.py."""
 import json, os, socket, sys, time
 
 qmp_path, outdir = sys.argv[1], sys.argv[2]
@@ -69,8 +65,6 @@ while time.monotonic() - start < LIMIT:
             typestr("demo"); sendkey("ret"); time.sleep(1.0)
             typestr("hunter2"); sendkey("ret")
     if log_has("VIGIL-EXIT"):
-        # A few more sweeps: the last screens after the exit are the rest frame.
-        # With a next owner (VIGIL_E2E_NEXT) keep watching until it is done.
         exited = exited or time.monotonic()
         if log_has("NEXT-DONE") if os.environ.get("VIGIL_E2E_NEXT") else time.monotonic() - exited > 0.5:
             break

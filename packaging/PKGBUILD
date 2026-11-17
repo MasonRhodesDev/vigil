@@ -1,10 +1,4 @@
 # Maintainer: Mason Rhodes <mrhodesdev@gmail.com>
-#
-# Arch package for vigil. Same payload as the Fedora RPM
-# (packaging/vigil.spec); all paths are identical across both distros. The
-# package depends on greetd. post_install points stock agreety at vigil
-# and enables greetd as the display manager when none is set. Custom
-# greetd command lines (greetd-game-mode, operator) are left alone.
 
 pkgname=vigil
 pkgver=0.4.1
@@ -55,7 +49,6 @@ package() {
   install -d "$pkgdir/usr/share/vigil/slint-kit/ui"
   install -m644 themes/kit/ui/*.slint "$pkgdir/usr/share/vigil/slint-kit/ui/"
 
-  # Shared monitor-profile directory (see vigil.install for the group).
   install -dm2775 "$pkgdir/etc/monitor-profiles"
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

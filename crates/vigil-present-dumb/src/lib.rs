@@ -1,8 +1,3 @@
-//! The day-1 presenter (DESIGN.md §7): double-buffered DRM dumb buffers,
-//! XRGB8888, handed to the renderer as plain byte slices via
-//! [`vigil_core::FrameTarget`]. This path is permanent — it is the zero-GPU
-//! baseline, not scaffolding for the GL presenter.
-
 use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::buffer::{Buffer as _, DrmFourcc};
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
@@ -18,20 +13,12 @@ struct Slot {
     fb: framebuffer::Handle,
 }
 
-/// Software presenter over a pair of dumb buffers on one DRM surface.
-///
-/// The first `with_frame` performs the modeset commit; every later frame is
-/// a page flip to the freshly drawn back buffer.
-//
 pub struct DumbBufferPresenter {
     surface: DrmSurface,
     slots: [Slot; 2],
     back: usize,
     modeset_done: bool,
-    /// The back buffer holds a frame drawn by `stage_frame` and not yet
-    /// submitted.
     staged: bool,
-    /// A submitted flip has not yet been confirmed by its page-flip event.
     flip_pending: bool,
     width: u32,
     height: u32,
@@ -41,9 +28,6 @@ fn backend(e: impl std::fmt::Display) -> PresentError {
     PresentError::Backend(e.to_string())
 }
 
-/// A device that vanished (ENODEV) is as gone as one that got paused:
-/// surprise removal — a dock GPU unplugged at the greeter (#6) — must drop
-/// the output, not retry the present forever.
 fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
     use smithay::backend::drm::DrmError;
     use smithay::reexports::rustix;
@@ -63,9 +47,6 @@ fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
     }
 }
 
-/// [`present_error`] for the raw drm-rs calls (`map_dumb_buffer`), which
-/// fail with a plain io error — on a vanished device, before any commit is
-/// even attempted.
 fn io_present_error(e: std::io::Error) -> PresentError {
     use smithay::reexports::rustix;
     if rustix::io::Errno::from_io_error(&e) == Some(rustix::io::Errno::NODEV) {
@@ -76,8 +57,6 @@ fn io_present_error(e: std::io::Error) -> PresentError {
 }
 
 impl DumbBufferPresenter {
-    /// Allocate the swapchain for the surface's pending mode and take
-    /// ownership of the surface.
     pub fn new(surface: DrmSurface) -> Result<Self, PresentError> {
         let mode = surface.pending_mode();
         let (width, height) = mode.size();
@@ -129,8 +108,6 @@ impl Presenter for DumbBufferPresenter {
 
     fn invalidate(&mut self) {
         self.modeset_done = false;
-        // Pending flips (and their events) do not survive a VT switch or
-        // resume; a stale gate here would deadlock the output.
         self.flip_pending = false;
     }
 
@@ -150,8 +127,6 @@ impl Presenter for DumbBufferPresenter {
         &mut self,
         draw: &mut dyn FnMut(Canvas<'_>) -> bool,
     ) -> Result<bool, PresentError> {
-        // A flip is in flight: submitting another is EBUSY, and the error
-        // recovery (modeset mid-flip) is worse. Skip; nothing is consumed.
         if self.flip_pending {
             return Ok(false);
         }
@@ -187,10 +162,6 @@ impl Presenter for DumbBufferPresenter {
         }
         let fb = self.slots[self.back].fb;
         let state = self.plane_state(fb);
-        // Request the vblank event (`true`): completion re-opens the gate
-        // above via `Presenter::vblank` — the day-1 TODO, finally forced by
-        // metal (cursor-plane flips under continuous pointer motion raced
-        // the vblank into an EBUSY -> modeset -> ENOMEM spiral).
         let result = if self.modeset_done {
             self.surface.page_flip([state], true)
         } else {

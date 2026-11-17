@@ -1,5 +1,3 @@
-//! Pure, deterministic pre-lock warning timeline.
-
 use std::time::Duration;
 
 use vigil_config::{LockWarning, WarningAnimation, WarningEasing, WarningKeyframe};
@@ -21,9 +19,6 @@ pub struct Sample {
     pub frost: f32,
     pub wallpaper: f32,
     pub should_commit: bool,
-    /// This commit was forced by the wallpaper hold cap rather than reached
-    /// normally: the asset never arrived and locking beat waiting. Set on
-    /// the sample that forces it, so the caller can journal it once.
     pub forced_commit: bool,
     pub next_frame: Option<Duration>,
 }
@@ -37,38 +32,14 @@ pub struct ElementSample {
 
 pub const DEFAULT_SELECTORS: [&str; 5] = ["clock", "user_selector", "password", "status", "power"];
 
-/// Frame period of every ramp this crate animates. Animated values are
-/// quantized to this grid inside `sample()`/`element_samples()`, so a
-/// consumer may sample at any rate — event-loop wakes included — and a
-/// value-diff dedupes to at most one scene update per frame (issue #53:
-/// buffer-release wakes otherwise self-sustain a commit-per-render-time
-/// loop). Phase transitions, commit deadlines, and `next_frame` use real
-/// elapsed time and are never delayed by the grid.
 pub const FRAME_INTERVAL_MS: u64 = 33;
 
-/// What a freshly constructed [`Timeline`] believes about wallpaper
-/// readiness. Adapters that report readiness edge-triggered must seed their
-/// cache from this, or the first genuine change is never reported and the
-/// commit is not held for a slow asset.
 pub const WALLPAPER_READY_DEFAULT: bool = true;
 
-/// Floor a duration to the frame grid. Private and never called directly
-/// from a ramp: the grid belongs to the timeline, and a ramp that derives
-/// its own picks a different origin — see [`Timeline::grid`].
 fn quantize(elapsed: Duration) -> Duration {
     Duration::from_millis(elapsed.as_millis() as u64 / FRAME_INTERVAL_MS * FRAME_INTERVAL_MS)
 }
 
-/// Eased ramp progress for a ramp starting at `start`, sampled on the
-/// timeline's single frame grid: `now` is the real clock (completion is
-/// judged on it, so the terminal value is exact even when the deadline is
-/// off-grid) and `grid` is `quantize(now)` for the *whole* timeline.
-///
-/// Every ramp must share one grid. Flooring each ramp's own relative
-/// elapsed instead gives each a grid anchored at its own start, and two
-/// overlapping ramps then change value at two different phase offsets
-/// inside the same frame — two scene updates and two commits per frame,
-/// which is the storm issue #53 exists to stop.
 fn graded(
     now: Duration,
     grid: Duration,
@@ -93,10 +64,7 @@ pub struct Timeline {
     motion: f64,
     wallpaper_ready: bool,
     wallpaper_ready_at: Option<Duration>,
-    /// The wallpaper hold cap has already forced a commit; report it once.
     hold_expired: bool,
-    /// False for the manual-lock transition (issue #52): input is ignored,
-    /// hotplug commits, and the wallpaper never holds the commit.
     cancelable: bool,
 }
 
@@ -105,8 +73,6 @@ impl Timeline {
         Self::with_cancelable(config, true)
     }
 
-    /// A frost-in ramp for a manual or before-sleep lock: the warning's
-    /// keyframes, but nothing cancels it and nothing waits on it.
     pub fn new_transition(config: LockWarning) -> Self {
         Self::with_cancelable(config, false)
     }
@@ -152,8 +118,6 @@ impl Timeline {
         self.locked_at = Some(now);
     }
 
-    /// Output topology changed before commitment. A cancelable warning
-    /// cancels rather than risk partial coverage; a transition commits now.
     pub fn hotplug(&mut self) {
         if self.cancelable {
             self.cancel();
@@ -235,9 +199,6 @@ impl Timeline {
         } else {
             scheduled_wallpaper_start
         };
-        // Values on the frame grid, phases on real time: identical values
-        // inside one frame make any-rate sampling idempotent for consumers
-        // that diff progress, while commits and holds stay punctual.
         let grid = quantize(elapsed);
         debug_assert_eq!(
             self.grid(now)
@@ -265,9 +226,6 @@ impl Timeline {
         };
 
         let commit_at = wallpaper_start + wallpaper_duration;
-        // The hold cap lives here, beside the commit time it is relative to:
-        // computing it anywhere else duplicates this arithmetic, and every
-        // copy is a chance to disagree with it (issue #56).
         let hold_deadline = (self.cancelable && self.config.wallpaper_hold_max_ms > 0)
             .then(|| commit_at + Duration::from_millis(self.config.wallpaper_hold_max_ms));
         let mut forced_commit = false;
@@ -280,8 +238,6 @@ impl Timeline {
             && !self.wallpaper_ready
             && hold_deadline.is_some_and(|deadline| elapsed >= deadline)
         {
-            // A wedged asset pipeline must not leave the machine unlocked:
-            // lock with whatever the scene has.
             self.phase = Phase::CommitReady;
             forced_commit = !self.hold_expired;
             self.hold_expired = true;
@@ -303,15 +259,12 @@ impl Timeline {
             && let Some(deadline) = hold_deadline
             && !self.wallpaper_ready
         {
-            // Nothing else arms a wake while the commit is held.
             Some(
                 deadline
                     .saturating_sub(elapsed)
                     .max(Duration::from_millis(1)),
             )
         } else if self.phase == Phase::Running && !self.cancelable {
-            // A transition commits on schedule whether or not the wallpaper
-            // ever arrives: always wake for the commit.
             Some((commit_at.saturating_sub(elapsed)).max(Duration::from_millis(1)))
         } else {
             None
@@ -364,18 +317,12 @@ impl Timeline {
         }
     }
 
-    /// The one frame grid for this timeline at `now`, in the same absolute
-    /// terms the caller passes in. Every ramp — overlay and GUI element —
-    /// must derive its value from this, or two ramps land on grids offset
-    /// by the timeline's start and the scene changes twice per frame
-    /// (issue #53's mechanism, one layer up).
     fn grid(&self, now: Duration) -> Option<Duration> {
         let start = self.start?;
         Some(start + quantize(now.saturating_sub(start)))
     }
 
     pub fn element_samples(&self, now: Duration) -> Vec<ElementSample> {
-        // Before the timeline starts there is no grid; nothing animates.
         let grid = self.grid(now).unwrap_or(now);
         DEFAULT_SELECTORS
             .iter()
@@ -403,13 +350,6 @@ impl Timeline {
                         )
                     },
                 );
-                // A start that can *never* resolve is not an animation that
-                // has yet to begin -- it is an element with no start at all.
-                // Pinning it at 0.0 left it invisible for the life of the
-                // lock and kept `next_gui_wake` returning a frame period
-                // for ever, which is a 30 Hz wake in a settled locked
-                // session (#65). A keyframe that merely has not resolved
-                // *yet* (`Locked` before the lock lands) still holds at 0.0.
                 let unreachable_start = start == WarningKeyframe::None;
                 let progress = self.keyframe_time(start).map_or(
                     if unreachable_start { 1.0 } else { 0.0 },
@@ -420,9 +360,6 @@ impl Timeline {
                         } else if kind == WarningAnimation::None || duration_ms == 0 {
                             1.0
                         } else {
-                            // Same single grid: per-selector `offset_ms` would
-                            // otherwise give each element its own phase and
-                            // multiply the per-frame scene updates.
                             graded(
                                 now,
                                 grid,
@@ -481,13 +418,6 @@ pub struct RevealSample {
     pub next_frame: Option<Duration>,
 }
 
-/// Post-unlock fade: the lock wallpaper's opacity fades out, uncovering the
-/// desktop. Blur-free by default (`frost_fade` zero, `frost` pinned 0 - no
-/// tint, no compositor blur), so unlocking reveals a sharp desktop. When
-/// `frost_fade` is non-zero the reveal opts into a fading blur: `frost` starts
-/// at 1.0 and clears over `frost_fade`. The `(frost, wallpaper)` contract is
-/// shared with the warning's [`Sample`]; here `wallpaper` is the fading
-/// opacity and `frost` the fading blur.
 pub struct Reveal {
     fade: Duration,
     frost_fade: Duration,
@@ -505,7 +435,6 @@ impl Reveal {
         }
     }
 
-    /// Idempotent: the first call fixes the origin.
     pub fn start(&mut self, now: Duration) {
         if self.start.is_none() {
             self.start = Some(now);
@@ -516,17 +445,12 @@ impl Reveal {
         self.start.is_some()
     }
 
-    /// The blur that a reveal frame carries before the fade starts: full when
-    /// the reveal opts into blur, zero otherwise.
     fn resting_frost(&self) -> f32 {
         if self.frost_fade.is_zero() { 0.0 } else { 1.0 }
     }
 
     pub fn sample(&self, now: Duration) -> RevealSample {
         let Some(start) = self.start else {
-            // Not started: the lock wallpaper still fully covers. frost is 0
-            // for a blur-free reveal, or full for a blurring one (it clears
-            // once the fade starts).
             return RevealSample {
                 frost: self.resting_frost(),
                 wallpaper: 1.0,
@@ -536,8 +460,6 @@ impl Reveal {
         };
         let elapsed = now.saturating_sub(start);
         let grid = quantize(elapsed);
-        // The lock wallpaper fades out uniformly; the desktop appears through
-        // it. frost clears over frost_fade (0 for a blur-free unlock).
         let wallpaper = 1.0 - graded(elapsed, grid, Duration::ZERO, self.fade, self.easing);
         let frost = if self.frost_fade.is_zero() {
             0.0
@@ -637,13 +559,6 @@ mod tests {
 
     #[test]
     fn a_start_keyframe_that_never_resolves_settles_instead_of_waking_for_ever() {
-        // `start = none` names no keyframe, so the animation can never
-        // begin. Pinning it at progress 0.0 left the element invisible for
-        // the whole lock AND kept next_gui_wake returning a frame period --
-        // a permanent 30 Hz wake in a settled locked session (#65). This is
-        // reachable from config: WarningElement::default() pairs
-        // `start: None` with `kind: None`, so a theme that sets `kind` and
-        // omits `start` lands here.
         let mut cfg = config();
         cfg.gui.element = vec![vigil_config::WarningElement {
             selector: "power".into(),
@@ -757,17 +672,11 @@ mod tests {
         assert_eq!(held.wallpaper, 0.0);
         assert_eq!(held.next_frame, Some(Duration::from_millis(6_500)));
 
-        // Holding for an absent wallpaper is static too — but it is NOT
-        // wake-less: the hold cap is the only thing that will ever move
-        // this warning along, so it arms its own deadline. A `None` here
-        // is issue #56, not a quiet idle.
         timeline.set_wallpaper_ready(false, Duration::from_secs(2));
         let held = timeline.sample(Duration::from_secs(2));
         assert_eq!(held.next_frame, Some(Duration::from_millis(13_000)));
         assert!(!held.should_commit);
 
-        // With the cap disabled the old wake-less hold is what the operator
-        // explicitly asked for.
         let mut forever = Timeline::new(LockWarning {
             wallpaper_hold_max_ms: 0,
             ..config()
@@ -849,8 +758,6 @@ mod tests {
 
     #[test]
     fn reveal_fades_the_wallpaper_out_with_zero_frost() {
-        // Unlock has no blur or tint: frost is 0 at every sample and the
-        // lock wallpaper's opacity fades to reveal the sharp desktop.
         let mut reveal = Reveal::new(250, 0, WarningEasing::Linear);
         assert_eq!(
             reveal.sample(Duration::from_secs(5)),
@@ -862,7 +769,7 @@ mod tests {
             }
         );
         reveal.start(Duration::from_secs(1));
-        reveal.start(Duration::from_secs(9)); // idempotent
+        reveal.start(Duration::from_secs(9));
         let middle = reveal.sample(Duration::from_millis(1_000 + 4 * FRAME_INTERVAL_MS));
         assert!((middle.wallpaper - (1.0 - 132.0 / 250.0)).abs() < 1e-6);
         assert_eq!(middle.frost, 0.0, "no frost/blur mid-reveal");
@@ -870,7 +777,6 @@ mod tests {
             middle.next_frame,
             Some(Duration::from_millis(FRAME_INTERVAL_MS))
         );
-        // The whole fade is one phase now: done at the fade duration.
         let end = reveal.sample(Duration::from_millis(1_250));
         assert!(end.done);
         assert_eq!(end.wallpaper, 0.0);
@@ -880,9 +786,6 @@ mod tests {
 
     #[test]
     fn reveal_never_emits_frost() {
-        // The invariant the fix rests on, across the whole fade: not one
-        // sample carries frost, so nothing can blur or tint the desktop
-        // during unlock.
         let mut reveal = Reveal::new(400, 0, WarningEasing::EaseOut);
         reveal.start(Duration::ZERO);
         for ms in (0..=500).step_by(FRAME_INTERVAL_MS as usize) {
@@ -896,18 +799,11 @@ mod tests {
 
     #[test]
     fn reveal_blur_starts_full_and_clears() {
-        // Opt-in blur (frost_out_ms > 0): frost starts full before the fade
-        // and clears to 0 over frost_fade, independent of the wallpaper fade.
         let mut reveal = Reveal::new(100, 300, WarningEasing::Linear);
-        // Before start, the reveal rests at full blur (the locked desktop is
-        // still covered; the blur clears once the fade begins).
         assert_eq!(reveal.sample(Duration::from_secs(5)).frost, 1.0);
         reveal.start(Duration::ZERO);
-        // Mid frost-fade: 132 ms of 300 have cleared (linear, on the grid).
         let mid = reveal.sample(Duration::from_millis(4 * FRAME_INTERVAL_MS));
         assert!((mid.frost - (1.0 - 132.0 / 300.0)).abs() < 1e-6, "{mid:?}");
-        // The wallpaper (100 ms) has fully faded while the blur is still
-        // clearing, so the reveal is not done until the longer frost fade.
         assert_eq!(mid.wallpaper, 0.0);
         assert!(!mid.done);
         let end = reveal.sample(Duration::from_millis(300));
@@ -917,9 +813,6 @@ mod tests {
 
     #[test]
     fn the_hold_cap_is_measured_from_the_scheduled_commit() {
-        // The claim under test: the cap starts at commit_at, NOT at t0.
-        // Without the boundary assertions below, a deadline measured from
-        // t0 (which would lock a 30 s warning 25 s early) still passes.
         let mut timeline = Timeline::new(LockWarning {
             duration_ms: 3_000,
             wallpaper_in_ms: 1_500,
@@ -928,7 +821,6 @@ mod tests {
         });
         timeline.start(Duration::ZERO);
         timeline.set_wallpaper_ready(false, Duration::ZERO);
-        // commit_at = 3000, so the cap is due at exactly 8000.
         let held = timeline.sample(Duration::from_millis(7_999));
         assert!(!held.should_commit, "fired early");
         assert!(!held.forced_commit);
@@ -943,7 +835,6 @@ mod tests {
             forced.forced_commit,
             "the caller must be able to journal it"
         );
-        // Reported once only.
         let mut after = Timeline::new(LockWarning {
             duration_ms: 3_000,
             wallpaper_in_ms: 1_500,
@@ -958,19 +849,6 @@ mod tests {
 
     #[test]
     fn a_wallpaper_fade_at_least_as_long_as_the_warning_owns_the_commit() {
-        // Why `lock.warning.wallpaper_in_ms` sits on vigil-config's overlay
-        // SECURITY_FLOOR and not among the ramp shapes (issue #88).
-        //
-        // `scheduled_wallpaper_start = duration - wallpaper_in` saturates to
-        // zero once the fade is as long as the warning, so `wallpaper_start`
-        // is just `ready` and `commit_at = ready + wallpaper_in`. The hold
-        // cap is measured from that same commit, so the #56 failsafe moves
-        // out with it: a fade of u32::MAX ms is a 49-day unlocked screen,
-        // held by a config value and no timer at all.
-        //
-        // This is correct for an operator (a long fade should not be cut
-        // short — see the test below) and a lock-defeat lever for anyone
-        // who can write the file. Hence: system config only.
         let mut timeline = Timeline::new(LockWarning {
             duration_ms: 10_000,
             wallpaper_in_ms: u32::MAX as u64,
@@ -989,8 +867,6 @@ mod tests {
 
     #[test]
     fn a_fade_longer_than_its_warning_is_not_cut_short() {
-        // commit_at is max(duration, wallpaper_in), so a cap derived from
-        // duration alone fires during a perfectly healthy run.
         let mut timeline = Timeline::new(LockWarning {
             duration_ms: 2_000,
             wallpaper_in_ms: 10_000,
@@ -1006,8 +882,6 @@ mod tests {
 
     #[test]
     fn a_late_wallpaper_still_gets_its_full_fade() {
-        // ADR 0004: late assets extend the warning. Once one arrives the
-        // cap must stand down rather than truncate the fade.
         let mut timeline = Timeline::new(LockWarning {
             duration_ms: 3_000,
             wallpaper_in_ms: 1_500,
@@ -1042,8 +916,6 @@ mod tests {
 
     #[test]
     fn the_transition_ignores_the_hold_cap() {
-        // A non-cancelable transition never waits on the wallpaper, so the
-        // cap must never be what commits it.
         let mut timeline = Timeline::new_transition(LockWarning {
             duration_ms: 400,
             frost_in_ms: 150,
@@ -1060,24 +932,15 @@ mod tests {
 
     #[test]
     fn every_ramp_shares_one_grid_even_off_grid_and_with_gui_elements() {
-        // The overlay ramps quantize timeline-RELATIVE elapsed; the GUI
-        // element ramps quantized ABSOLUTE now. Whenever the timeline's
-        // start is not a multiple of the frame period — 32 times out of 33
-        // — those are two grids, and the scene changes at two phase offsets
-        // per frame. That is the storm issue #53 exists to stop, one layer
-        // up, and it survived the fix for the overlay ramps.
         let mut config = LockWarning {
             duration_ms: 2_000,
             frost_in_ms: 1_500,
             wallpaper_in_ms: 1_500,
             ..LockWarning::default()
         };
-        // A pre-lock keyframe, so element progress moves while the overlay
-        // ramps do. The shipped default starts at Locked, which is why this
-        // stayed invisible.
         config.gui.start = WarningKeyframe::FrostStart;
         config.gui.duration_ms = 2_000;
-        let start = Duration::from_millis(17); // deliberately off-grid
+        let start = Duration::from_millis(17);
         let mut timeline = Timeline::new(config);
         timeline.start(start);
 
@@ -1106,9 +969,6 @@ mod tests {
 
     #[test]
     fn sampling_is_idempotent_within_a_frame() {
-        // Any-rate sampling (event-loop wakes) must not manufacture new
-        // values between frames — the contract that fixes issue #53 at the
-        // source instead of in every consumer.
         let mut timeline = Timeline::new_transition(transition());
         timeline.start(Duration::ZERO);
         let a = timeline.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS));
@@ -1123,8 +983,6 @@ mod tests {
         let b = reveal.sample(Duration::from_millis(2 * FRAME_INTERVAL_MS + 10));
         assert_eq!((a.frost, a.wallpaper), (b.frost, b.wallpaper));
 
-        // Phase timing stays on real time: the transition still commits at
-        // its exact deadline even off-grid.
         let mut timeline = Timeline::new_transition(transition());
         timeline.start(Duration::ZERO);
         assert!(timeline.sample(Duration::from_millis(400)).should_commit);
@@ -1132,10 +990,6 @@ mod tests {
 
     #[test]
     fn overlapping_ramps_share_one_frame_grid() {
-        // frost_in + wallpaper_in > duration makes both ramps animate at
-        // once. Each ramp flooring its own relative elapsed would put their
-        // value changes at two phase offsets per frame — two scene updates
-        // and two commits, the storm issue #53 exists to stop.
         let mut timeline = Timeline::new(LockWarning {
             duration_ms: 2_000,
             frost_in_ms: 1_500,
@@ -1145,7 +999,6 @@ mod tests {
         timeline.start(Duration::ZERO);
         let mut changes = 0;
         let mut last = None;
-        // Walk the overlap window (wallpaper_start = 500) one ms at a time.
         for ms in 500..1_500 {
             let sample = timeline.sample(Duration::from_millis(ms));
             let value = (sample.frost, sample.wallpaper);
@@ -1154,7 +1007,6 @@ mod tests {
                 last = Some(value);
             }
         }
-        // 1000 ms at one change per 33 ms frame, inclusive of the first.
         let frames = 1_000 / FRAME_INTERVAL_MS + 1;
         assert!(
             changes <= frames,

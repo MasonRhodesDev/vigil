@@ -1,15 +1,3 @@
-//! Large text through the GL path draws glyphs, not boxes.
-//!
-//! femtovg rasterizes text over 92px from glyph outlines with a
-//! stencil-then-cover fill. On a surface without a stencil buffer the cover
-//! pass paints every glyph's bounding box, so a big clock comes out as solid
-//! rectangles while small text still looks right. This renders a 160px "0"
-//! and walks the row through its middle: a real glyph crosses ink twice (the
-//! two sides of the bowl), a box crosses it once.
-//!
-//!   cargo build -p vigil-gl --example gl_large_text
-//!   tests/gpu/run.sh -- target/debug/examples/gl_large_text
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -76,12 +64,9 @@ fn main() {
     instance.show().expect("show");
     window.render().expect("render");
 
-    // SAFETY: a swap just happened, and the buffer is released below.
     let bo = unsafe { gbm.lock_front_buffer() }.expect("lock front buffer");
     let row = bo
         .map(0, H / 2, W, 1, |mapped| {
-            // XRGB8888 little-endian: B, G, R, X. Green alone is enough to
-            // tell white ink from a black background.
             mapped.buffer()[..W as usize * 4]
                 .as_chunks::<4>()
                 .0
@@ -103,7 +88,6 @@ fn main() {
     println!("LARGE TEXT OK");
 }
 
-/// The interpreter's compile future resolves immediately without a runtime.
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -111,7 +95,6 @@ fn spin_on<F: std::future::Future>(future: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    // SAFETY: the vtable is a no-op waker over a null pointer it never reads.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);

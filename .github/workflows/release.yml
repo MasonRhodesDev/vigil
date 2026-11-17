@@ -8,8 +8,6 @@ permissions:
   contents: write
 
 jobs:
-  # The nested-compositor suite gates the release (issue #44): rebuilt and
-  # re-run on the tag itself, not just trusted from the branch run.
   nested-gate:
     runs-on: ubuntu-latest
     steps:

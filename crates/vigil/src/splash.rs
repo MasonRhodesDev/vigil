@@ -1,18 +1,3 @@
-//! The splash: the frame vigil draws the instant it owns a screen, the glow
-//! that breathes while the greeter prepares, and the frame it hands over on
-//! after a login, so the greeter reads as one piece with whatever drew the
-//! boot before it and whatever draws the desktop after.
-//!
-//! Geometry, palette and motion come from the shared scene spec
-//! ([`crate::scene`]); nothing here knows a size or a colour. Drawing is
-//! plain CPU writes into the presenter's XRGB8888 target, in the scene's
-//! upright orientation mapped to the panel.
-//!
-//! One timeline drives every output ([`Timeline`]): the glow breathes from
-//! CLOCK_MONOTONIC, eases out to the REST frame when the greeter is ready on
-//! all outputs, and a single cross-fade then hands the screens to the
-//! greeter. Per-output state is only what the swapchain needs.
-
 use std::time::{Duration, Instant};
 
 use font8x8::{BASIC_FONTS, UnicodeFonts};
@@ -21,7 +6,6 @@ use vigil_core::{FrameTarget, scene_to_panel};
 
 use crate::scene::{Scene, ease};
 
-/// Which stage owns a screen, for its debug tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     GreeterSplash,
@@ -37,12 +21,10 @@ impl Stage {
     }
 }
 
-/// Parse `#rrggbb`; anything else keeps `fallback`.
 pub fn parse_color(text: &str, fallback: [u8; 3]) -> [u8; 3] {
     crate::scene::parse_color(text).unwrap_or(fallback)
 }
 
-/// The scene with the config's colour overrides applied.
 pub fn resolve_scene(cfg: &SplashConfig) -> Scene {
     let mut scene = Scene::load(&cfg.scene);
     for (over, slot) in [
@@ -57,7 +39,6 @@ pub fn resolve_scene(cfg: &SplashConfig) -> Scene {
     scene
 }
 
-/// A rectangle of panel pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Rect {
     x: usize,
@@ -66,18 +47,12 @@ struct Rect {
     h: usize,
 }
 
-/// Everything needed to draw one output's splash.
 pub struct Splash {
     panel: (u32, u32),
     ground: [u8; 3],
     accent: [u8; 3],
     mark: [u8; 3],
-    /// The REST frame: ground and the mark, no glow. Panel orientation,
-    /// tightly packed XRGB8888 (little endian: B, G, R, X).
     rest: Vec<u8>,
-    /// The panel pixels the glow box covers, and, over exactly those, the
-    /// glow's and the mark's alpha. The glow sits under the mark, so a frame
-    /// is redrawn from these without touching the rest of the screen.
     glow_rect: Rect,
     glow_alpha: Vec<u8>,
     mark_alpha: Vec<u8>,
@@ -91,9 +66,6 @@ fn put(buf: &mut [u8], stride: usize, x: usize, y: usize, rgb: [u8; 3]) {
     buf[o + 3] = 0xff;
 }
 
-/// Alpha mask of the mark fitted into an `edge` x `edge` box, centred.
-/// SVG is rendered with resvg; a raster uses its own alpha. Shapes smaller
-/// than 2% of the largest (a trademark sign) are dropped.
 fn mask(path: &std::path::Path, edge: u32) -> Result<Vec<u8>, String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let is_svg = path
@@ -112,8 +84,6 @@ fn mask(path: &std::path::Path, edge: u32) -> Result<Vec<u8>, String> {
             resvg::tiny_skia::Transform::from_row(s, 0.0, 0.0, s, ox, oy),
             &mut pixmap.as_mut(),
         );
-        // `as_chunks` over a const size (clippy prefers it to `chunks_exact`);
-        // RGBA pixels, so there is never a partial chunk.
         let (pixels, _partial) = pixmap.data().as_chunks::<4>();
         pixels.iter().map(|p| p[3]).collect::<Vec<u8>>()
     } else {
@@ -185,7 +155,6 @@ fn drop_specks(alpha: &mut [u8], w: usize, h: usize, keep: f64) {
     }
 }
 
-/// Gaussian blur of a single-channel `w` x `h` image, separable, edge-clamped.
 fn blur(src: &[u8], w: usize, h: usize, sigma: f64) -> Vec<u8> {
     if sigma < 0.3 {
         return src.to_vec();
@@ -221,7 +190,6 @@ fn blur(src: &[u8], w: usize, h: usize, sigma: f64) -> Vec<u8> {
     out
 }
 
-/// Shrink an `n` x `n` mask by an integer `f` with a box filter.
 fn shrink(src: &[u8], n: usize, f: usize) -> (Vec<u8>, usize) {
     let q = n.div_ceil(f);
     let mut out = vec![0u8; q * q];
@@ -240,7 +208,6 @@ fn shrink(src: &[u8], n: usize, f: usize) -> (Vec<u8>, usize) {
     (out, q)
 }
 
-/// Bilinear enlargement of a `q` x `q` mask to `n` x `n`.
 fn enlarge(src: &[u8], q: usize, n: usize) -> Vec<u8> {
     let mut out = vec![0u8; n * n];
     let scale = q as f64 / n as f64;
@@ -261,12 +228,8 @@ fn enlarge(src: &[u8], q: usize, n: usize) -> Vec<u8> {
     out
 }
 
-/// How much smaller the glow is blurred at. A blurred blob has no detail, so
-/// a quarter of the resolution is indistinguishable and a sixteenth of the
-/// work (the full-size blur cost seconds on a 4K screen).
 const GLOW_DOWN: usize = 4;
 
-/// The glow mask: the mark's silhouette centred in a `ge` box, blurred.
 fn glow_mask(logo: &[u8], edge: usize, ge: usize, sigma: f64) -> Vec<u8> {
     let mut big = vec![0u8; ge * ge];
     let off = ge.saturating_sub(edge) / 2;
@@ -281,8 +244,6 @@ fn glow_mask(logo: &[u8], edge: usize, ge: usize, sigma: f64) -> Vec<u8> {
 }
 
 impl Splash {
-    /// Build the layers for a scene of `scene` pixels on a panel with the
-    /// given quarter-turn `transform`.
     pub fn new(cfg: &SplashConfig, spec: &Scene, scene: (u32, u32), transform: u8) -> Self {
         let transform = transform % 4;
         let (sw, sh) = (scene.0 as usize, scene.1 as usize);
@@ -310,8 +271,6 @@ impl Splash {
             .map(|l| glow_mask(l, edge, ge, sigma))
             .unwrap_or_default();
 
-        // The glow box in scene pixels, clipped to the screen, and the panel
-        // rectangle it lands on.
         let (x0, y0) = (g.glow_x.max(0) as usize, g.glow_y.max(0) as usize);
         let x1 = ((g.glow_x + ge as i64).max(0) as usize).min(sw);
         let y1 = ((g.glow_y + ge as i64).max(0) as usize).min(sh);
@@ -360,9 +319,7 @@ impl Splash {
             glow_alpha,
             mark_alpha,
         };
-        // REST: ground everywhere, the mark over its box.
         let mut rest = vec![0u8; pw * ph * 4];
-        // XRGB pixels, so there is never a partial chunk.
         let (pixels, _partial) = rest.as_chunks_mut::<4>();
         for px in pixels {
             *px = [spec.bg[2], spec.bg[1], spec.bg[0], 0xff];
@@ -385,8 +342,6 @@ impl Splash {
             && target.buffer.len() >= target.stride * target.height as usize
     }
 
-    /// Redraw the glow box at glow opacity `level` (0 is the REST frame's
-    /// box): ground, the glow over it, the mark over that.
     fn draw_glow_rect(&self, target: &mut FrameTarget<'_>, level: f64) {
         let r = self.glow_rect;
         let lvl = (level.clamp(0.0, 1.0) * 256.0).round() as u32;
@@ -408,8 +363,6 @@ impl Splash {
         }
     }
 
-    /// The whole splash with the glow at `level`. False when the target is
-    /// not this panel's size (nothing is drawn).
     pub fn draw_full(&self, target: &mut FrameTarget<'_>, level: f64) -> bool {
         if !self.fits(target) {
             return false;
@@ -425,8 +378,6 @@ impl Splash {
         true
     }
 
-    /// Only the glow's box. Valid on a buffer that already holds the
-    /// splash's static layer.
     pub fn draw_glow(&self, target: &mut FrameTarget<'_>, level: f64) -> bool {
         if !self.fits(target) {
             return false;
@@ -435,8 +386,6 @@ impl Splash {
         true
     }
 
-    /// Mix the REST frame over what the target already holds: `alpha` 1 is
-    /// all REST, 0 leaves the target untouched.
     pub fn blend_over(&self, target: &mut FrameTarget<'_>, alpha: f32) {
         if !self.fits(target) || alpha <= 0.0 {
             return;
@@ -453,28 +402,20 @@ impl Splash {
     }
 }
 
-/// Copy a finished CPU-side frame (same stride and height as `dst`) into the
-/// target. The only operation a presenter mapping sees from a mixed frame:
-/// forward, whole-row writes, nothing read back.
 pub fn copy_out(src: &[u8], dst: &mut FrameTarget<'_>) {
     let n = (dst.stride * dst.height as usize).min(src.len());
     dst.buffer[..n].copy_from_slice(&src[..n]);
 }
 
-/// A screen's debug tag: a border on its very edge and a label in the
-/// upright top-left corner, both in the owning stage's colour.
 pub struct Tag {
     panel: (u32, u32),
     border: usize,
     splash_rgb: [u8; 3],
     greeter_rgb: [u8; 3],
-    /// Label pixels in panel coordinates, per stage.
     splash_label: Vec<(u32, u32)>,
     greeter_label: Vec<(u32, u32)>,
 }
 
-/// Rows of the 8x8 label font for `c`. The middle dot (the spec's separator)
-/// is not ASCII, so it is drawn by hand.
 fn glyph(c: char) -> [u8; 8] {
     if c == '\u{b7}' {
         return [0, 0, 0, 0x18, 0x18, 0, 0, 0];
@@ -483,8 +424,6 @@ fn glyph(c: char) -> [u8; 8] {
 }
 
 impl Tag {
-    /// A tag for the `scene`-sized screen on `connector`, panel rotated by
-    /// `transform`.
     pub fn new(spec: &Scene, connector: &str, scene: (u32, u32), transform: u8) -> Self {
         let transform = transform % 4;
         let (sw, sh) = (scene.0 as usize, scene.1 as usize);
@@ -535,7 +474,6 @@ impl Tag {
         }
     }
 
-    /// Draw the tag of `stage` over `target`.
     pub fn draw(&self, target: &mut FrameTarget<'_>, stage: Stage) {
         if target.width != self.panel.0 || target.height != self.panel.1 {
             return;
@@ -564,23 +502,15 @@ impl Tag {
     }
 }
 
-/// Where the shared timeline is.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Phase {
-    /// The splash owns the screens; the glow is at this opacity.
     Glow(f64),
-    /// Cross-fading to the greeter; the value is the REST frame's remaining
-    /// opacity.
     Fade(f32),
-    /// The greeter owns the screens.
     Done,
 }
 
-/// One timeline for every output, so no screen runs ahead of another.
 pub struct Timeline {
     started: Instant,
-    /// When the glow began to ease in (the loop starts late: loading the
-    /// toolkit blocks for a while, and the screens sit on REST meanwhile).
     anim_start: Option<Instant>,
     ready_at: Option<Instant>,
     max_wait: Duration,
@@ -596,7 +526,6 @@ impl Timeline {
         }
     }
 
-    /// The greeter is ready on every output (or has waited long enough).
     pub fn mark_ready(&mut self, now: Instant) {
         self.ready_at.get_or_insert(now);
     }
@@ -605,8 +534,6 @@ impl Timeline {
         self.ready_at.is_some()
     }
 
-    /// The phase at `now`. `clock` is CLOCK_MONOTONIC seconds at `now`, which
-    /// sets the breathing phase.
     pub fn phase(&mut self, now: Instant, clock: f64, spec: &Scene) -> Phase {
         if self.ready_at.is_none() && now.duration_since(self.started) >= self.max_wait {
             self.ready_at = Some(now);
@@ -629,8 +556,6 @@ impl Timeline {
         }
     }
 
-    /// True while a ready timeline is still easing the glow out, before the
-    /// cross-fade: the time to draw the greeter's first frame off screen.
     pub fn easing_out(&self, now: Instant, spec: &Scene) -> bool {
         match (self.anim_start, self.ready_at) {
             (Some(start), Some(ready)) => {
@@ -643,25 +568,17 @@ impl Timeline {
     }
 }
 
-/// The per-output half of the cover: what the swapchain holds.
 pub struct Cover {
-    /// Frames fully drawn into distinct swapchain slots (2 means both
-    /// buffers hold the static layer, so animation can redraw the glow only).
     slots_filled: u8,
     last_draw: Option<Instant>,
-    /// The greeter has what it was waiting for on this output.
     ready: bool,
-    /// The glow level last drawn, to skip frames that would not change.
     last_level: Option<f64>,
-    /// The hand-off's last frame (the rest frame) reached the CRTC.
     final_shown: bool,
 }
 
-/// Animation cadence while waiting.
 pub const FRAME_EVERY: Duration = Duration::from_millis(16);
 
 impl Cover {
-    /// A cover whose first, full frame is already on its way to the screen.
     pub fn new() -> Self {
         Self {
             slots_filled: 0,
@@ -688,7 +605,6 @@ impl Cover {
         self.ready
     }
 
-    /// A splash frame has been handed to the display.
     pub fn shown(&self) -> bool {
         self.last_draw.is_some()
     }
@@ -702,25 +618,21 @@ impl Cover {
         self.slots_filled < 2
     }
 
-    /// A drawn frame reached the CRTC.
     pub fn presented(&mut self, now: Instant, level: f64) {
         self.slots_filled = (self.slots_filled + 1).min(2);
         self.last_draw = Some(now);
         self.last_level = Some(level);
     }
 
-    /// The swapchain was invalidated; both slots need the static layer again.
     pub fn reset_slots(&mut self) {
         self.slots_filled = 0;
         self.last_level = None;
     }
 
-    /// Whether drawing the glow at `level` would change the picture.
     pub fn changes(&self, level: f64) -> bool {
         self.needs_full() || self.last_level != Some(level)
     }
 
-    /// Time until the next animation frame is due.
     pub fn next_in(&self, now: Instant) -> Duration {
         self.last_draw.map_or(Duration::ZERO, |t| {
             FRAME_EVERY.saturating_sub(now.duration_since(t))
@@ -780,9 +692,7 @@ mod tests {
         let g = spec.geometry(800, 500);
         let (cx, cy) = (400, (g.logo_y + i64::from(g.logo) / 2) as usize);
         assert_eq!(px(&t, cx, cy), spec.mark);
-        // Beside the mark, inside the glow box: still ground at rest.
         assert_eq!(px(&t, cx, g.logo_y as usize - 3), spec.bg);
-        // The speck in the box corner is dropped.
         assert_ne!(px(&t, g.logo_x as usize, g.logo_y as usize), spec.mark);
     }
 
@@ -806,7 +716,6 @@ mod tests {
         assert!(lo[2] > spec.bg[2] && hi[2] > lo[2], "{lo:?} {hi:?}");
         assert_eq!(mark_lo, spec.mark, "the mark stays over the glow");
         assert_eq!(mark_hi, spec.mark);
-        // draw_glow alone matches a full draw at the same level.
         let mut a = Vec::new();
         let mut b = Vec::new();
         let mut ta = target(&mut a, 800, 500);
@@ -886,14 +795,12 @@ mod tests {
         let t0 = Instant::now();
         let mut tl = Timeline::new(t0, &cfg);
         let at = |ms: u64| t0 + Duration::from_millis(ms);
-        // Not started: level zero. Then eases in.
         assert_eq!(tl.phase(at(0), 0.0, &spec), Phase::Glow(0.0));
         match tl.phase(at(2000), 0.0, &spec) {
             Phase::Glow(l) => assert!((l - spec.glow_min).abs() < 1e-9),
             p => panic!("{p:?}"),
         }
         tl.mark_ready(at(2000));
-        // Eases out over out_s, then fades over stage_fade_s, then done.
         match tl.phase(at(2000 + 150), 0.0, &spec) {
             Phase::Glow(l) => assert!(l < spec.glow_min),
             p => panic!("{p:?}"),

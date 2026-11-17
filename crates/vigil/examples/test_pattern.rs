@@ -1,17 +1,3 @@
-//! Dev harness: modeset every connected output on a DRM node and show a
-//! test gradient, then flip to a second frame (validates commit + page_flip).
-//!
-//! Opens the node directly (no libseat), so it works against vkms or any
-//! card nothing else is master of:
-//!
-//!   sudo modprobe vkms
-//!   cargo run -p vigil --example test_pattern -- /dev/dri/cardN 3
-//!
-//! NOTE: running compositors (Hyprland/aquamarine at least) open EVERY DRM
-//! node including vkms and hold master, so this fails with EACCES from
-//! inside a desktop session. Run it from a spare VT or a headless boot;
-//! the CI vkms job has no compositor and is unaffected.
-
 use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -52,7 +38,6 @@ fn main() {
     }
     assert!(!presenters.is_empty(), "no connected outputs on {path}");
 
-    // Frame 1: gradient (modeset commit).
     for p in presenters.iter_mut() {
         p.with_frame(&mut |canvas| {
             let vigil_core::Canvas::Cpu(t) = canvas else {
@@ -69,7 +54,6 @@ fn main() {
     );
     std::thread::sleep(std::time::Duration::from_secs(hold_secs));
 
-    // Frame 2: shifted gradient (page flip).
     for p in presenters.iter_mut() {
         p.with_frame(&mut |canvas| {
             let vigil_core::Canvas::Cpu(t) = canvas else {
@@ -99,7 +83,7 @@ fn gradient(t: vigil_core::FrameTarget<'_>, phase: u32) {
 }
 
 fn libc_o_cloexec() -> i32 {
-    0o2000000 // O_CLOEXEC on linux
+    0o2000000
 }
 
 fn usage() -> ! {

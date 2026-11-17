@@ -1,7 +1,3 @@
-//! libseat session glue (DESIGN.md §5): acquire the seat, own VT-switch
-//! mechanics via smithay's `LibSeatSession`, and surface pause/activate as
-//! [`vigil_core::SessionEvent`]s. Logic here is reactive glue only.
-
 use std::os::fd::OwnedFd;
 use std::path::Path;
 
@@ -10,8 +6,6 @@ use smithay::backend::session::{Event as SessionSignal, Session};
 use smithay::reexports::rustix::fs::OFlags;
 use vigil_core::{DeviceOpener, SessionEvent};
 
-/// The libseat notifier, re-exported opaquely for the binary to register as
-/// a calloop event source. Its events translate via [`translate`].
 pub use smithay::backend::session::libseat::LibSeatSessionNotifier;
 
 #[derive(Debug)]
@@ -24,26 +18,20 @@ impl std::fmt::Display for SessionError {
 }
 impl std::error::Error for SessionError {}
 
-/// Owns the libseat session. Constructed once at startup by the binary;
-/// the returned notifier is registered as a calloop event source.
 pub struct SessionManager {
     session: LibSeatSession,
 }
 
 impl SessionManager {
-    /// Acquire the seat via libseat (logind or seatd).
     pub fn new() -> Result<(Self, LibSeatSessionNotifier), SessionError> {
         let (session, notifier) = LibSeatSession::new().map_err(|e| SessionError(e.to_string()))?;
         Ok((Self { session }, notifier))
     }
 
-    /// The seat name (e.g. `seat0`), needed by udev and libinput.
     pub fn seat_name(&self) -> String {
         self.session.seat()
     }
 
-    /// Open a device node through the session (libseat brokers the fd, so no
-    /// root and no video-group membership is needed).
     pub fn open_device(&mut self, path: &Path) -> Result<OwnedFd, SessionError> {
         self.session
             .open(
@@ -53,15 +41,10 @@ impl SessionManager {
             .map_err(|e| SessionError(e.to_string()))
     }
 
-    /// Whether the session currently holds the seat (false while VT-switched
-    /// away).
     pub fn is_active(&self) -> bool {
         self.session.is_active()
     }
 
-    /// Switch to another virtual terminal. A greeter that takes libinput
-    /// swallows the kernel's Ctrl+Alt+Fn handling, so it MUST offer this
-    /// itself or the machine has no way off the greeter VT.
     pub fn change_vt(&mut self, vt: i32) -> Result<(), SessionError> {
         self.session
             .change_vt(vt)
@@ -69,8 +52,6 @@ impl SessionManager {
     }
 }
 
-/// Cloneable seat-brokered device opener, so vigil-input can own an opener
-/// while the SessionManager stays in the event-loop state.
 #[derive(Clone)]
 pub struct SessionDeviceOpener {
     session: LibSeatSession,
@@ -109,8 +90,6 @@ impl DeviceOpener for SessionManager {
     }
 }
 
-/// Translate a smithay session signal into the core event. The binary calls
-/// this from its notifier callback so it never names smithay types.
 pub fn translate(signal: SessionSignal) -> SessionEvent {
     match signal {
         SessionSignal::PauseSession => SessionEvent::Pause,

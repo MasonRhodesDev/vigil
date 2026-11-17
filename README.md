@@ -13,8 +13,7 @@ error with automatic retry, Escape back to the username stage, a
 mouse-driven session picker over the installed
 wayland-sessions/xsessions, VT switching away and back (Ctrl+Alt+Fn),
 power buttons, and a successful `start_session` handoff with
-`XDG_SESSION_*` env. Architecture, interfaces, and milestones are in
-[DESIGN.md](DESIGN.md); next up is the on-metal VT test
+`XDG_SESSION_*` env. Next up is the on-metal VT test
 (`tests/vt/run.sh`), then M2 (hotplug polish, multi-GPU, runtime
 themes).
 
@@ -24,8 +23,7 @@ vigil is designed as two surfaces of one product: the **greeter** (this
 binary, on bare KMS at boot) and **vigil-lock**, a session lockscreen
 speaking `ext-session-lock-v1` under your compositor — same theme file,
 same contract, same auth seam, so login and lock are one visual identity.
-Each works without the other. The locker is specified in
-[DESIGN.md §12](DESIGN.md) (milestones L0–L2).
+Each works without the other.
 
 ## Why
 
@@ -151,5 +149,4 @@ must never be what keeps someone from logging in.
 
 ## License
 
-[GPL-3.0](LICENSE). Slint is used under its GPLv3 license option — see
-[DESIGN.md §12](DESIGN.md).
+[GPL-3.0](LICENSE). Slint is used under its GPLv3 license option.

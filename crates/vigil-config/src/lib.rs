@@ -1,5 +1,3 @@
-//! Shared config for the vigil pair (/etc/greetd/vigil.toml; DESIGN.md §9 G1). Parse-only, snake_case keys, every key optional; a broken config must never block login — load() always returns a usable Config.
-
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -74,49 +72,20 @@ impl Default for Sessions {
     }
 }
 
-/// The boot-splash look vigil shows between taking the screens and the first
-/// greeter frame, and again once a login is accepted.
-///
-/// Geometry, palette and motion come from the shared scene spec (a JSON file
-/// written by the boot-splash package, `scene` below), so every stage that
-/// draws between power-on and the desktop agrees. Without that file vigil
-/// uses built-in defaults equal to the spec's, so it stays usable on a
-/// machine that has no boot-splash package. Read from the `[splash]` table of
-/// the main config, or wholesale from a standalone file given with
-/// `--splash-config` (same keys, no table header). Colors are `#rrggbb`; a
-/// bad color keeps the spec's rather than breaking the greeter.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Splash {
-    /// Draw the splash at all. Off means vigil behaves as it did before.
     pub enabled: bool,
-    /// The scene spec to follow. A missing or unreadable file means the
-    /// built-in defaults.
     pub scene: PathBuf,
-    /// The mark: an SVG (rendered as a one-colour silhouette, tiny shapes
-    /// such as a trademark sign dropped) or a PNG (its alpha is the shape).
-    /// Unset or unreadable means no mark; the ground still draws.
     pub logo: Option<PathBuf>,
-    /// Colour overrides; unset takes the scene's palette.
     pub ground: Option<String>,
     pub mark: Option<String>,
     pub accent: Option<String>,
-    /// Draw each screen's stage tag (a label in the corner and a border in
-    /// the stage's colour). The scene's debug environment variable
-    /// (`DEBUG_STAGE_TAGS`) turns it on too.
     pub debug_tags: bool,
-    /// A shell command run once, after the first frame is on the screen of
-    /// every output (its page flip has completed). It is started without
-    /// waiting for it and its output is discarded, so it can never slow or
-    /// break rendering. Meant for a boot-splash handoff, for example telling
-    /// the previous stage it may quit. Empty (the default) runs nothing.
     pub on_first_frame: String,
-    /// Longest the splash may hold the screen waiting for the greeter's
-    /// background, milliseconds. A greeter must never stay hidden.
     pub max_wait_ms: u64,
 }
 
-/// Where the boot-splash package installs the scene spec.
 pub const DEFAULT_SCENE: &str = "/usr/share/desktop-boot/scene.json";
 
 impl Default for Splash {
@@ -136,8 +105,6 @@ impl Default for Splash {
 }
 
 impl Splash {
-    /// Read a standalone splash file (top-level keys, no `[splash]` table).
-    /// A missing or broken file yields the defaults and a stderr line.
     pub fn load_file(path: &Path) -> Splash {
         match std::fs::read_to_string(path) {
             Ok(text) => match toml::from_str(&text) {
@@ -155,42 +122,16 @@ impl Splash {
     }
 }
 
-/// Which renderer draws the greeter.
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct Render {
-    /// "software" (default) or "gl".
-    ///
-    /// Software is the zero-GPU baseline and what every machine can run;
-    /// "gl" is fidelity headroom and requires a build with the `gl` feature.
-    /// Anything unrecognised, unavailable, or that fails to initialise falls
-    /// back to software -- a rendering preference must never be why someone
-    /// cannot log in.
     pub backend: String,
-    /// Keep the display state the boot splash left (default false). False
-    /// disables every screen when vigil starts, so each one goes dark and
-    /// re-syncs on its first frame. True leaves them lit and lets the first
-    /// frame in the same mode land as a plane update with no re-sync; if
-    /// that frame is refused, vigil resets the state and retries once, so
-    /// the worst case is today's behaviour.
     pub keep_display_state: bool,
-    /// Keep the rest frame on screen after vigil exits (default false).
-    ///
-    /// When vigil leaves after a login, closing its DRM fd removes its
-    /// framebuffer and the kernel blanks the screens, so they stay black
-    /// until the session's first frame. True leaves a detached child holding
-    /// the fd (master dropped, so the session can take it) until the next
-    /// owner has put a different framebuffer on every held screen, or
-    /// `hold_timeout_ms` passes. Any error while setting it up means vigil
-    /// exits as it always did.
     pub hold_last_frame_on_exit: bool,
-    /// How long the holder waits for the next owner, in milliseconds
-    /// (default 10000, clamped to 1 s .. 60 s).
     pub hold_timeout_ms: Option<u32>,
 }
 
 impl Render {
-    /// The holder's timeout.
     pub fn hold_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(
             u64::from(self.hold_timeout_ms.unwrap_or(10_000)).clamp(1_000, 60_000),
@@ -201,11 +142,6 @@ impl Render {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Profiles {
-    /// Monitor-layout profile directory, shared with the session manager so
-    /// the login screen and the desktop agree on scale, position and mode.
-    /// Defaults to the packaged directory; an absent directory is not an
-    /// error and simply means outputs are laid out in DRM scan order, as
-    /// they were before profiles existed. Set to "" to force that off.
     pub dir: Option<PathBuf>,
 }
 
@@ -220,8 +156,6 @@ impl Default for Profiles {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Users {
-    /// Show the machine's users as a list. Set false on multi-tenant or
-    /// privacy-sensitive machines: the greeter then asks for a typed name.
     pub show_list: bool,
 }
 
@@ -254,8 +188,6 @@ pub struct Greeter {
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct Lock {
-    /// Seconds after locking during which a key/click unlocks without
-    /// auth (0 = disabled). Never survives suspend (dual-clock deadline).
     pub grace_secs: u64,
     pub warning: LockWarning,
     pub transition: LockTransition,
@@ -270,27 +202,13 @@ pub struct LockWarning {
     pub wallpaper_in_ms: u64,
     pub easing: WarningEasing,
     pub cancel_on_motion_px: f64,
-    /// How long past its scheduled commit a cancelable warning may be held
-    /// waiting for the wallpaper before it locks anyway (0 = wait forever,
-    /// the pre-0.4 behaviour). A wedged asset pipeline must not leave the
-    /// machine unlocked (issue #56); a lock with a plain background beats
-    /// an unlocked screen.
     pub wallpaper_hold_max_ms: u64,
     pub gui: WarningGui,
 }
 
 impl LockWarning {
-    /// Upper bound on [`Self::wallpaper_hold_max_ms`]. The knob exists to
-    /// bound how long the machine may sit unlocked waiting for an asset, so
-    /// leaving it unbounded reintroduces the very problem it fixes — a
-    /// fat-fingered value is indistinguishable in effect from "wait
-    /// forever" but gives no signal. `0` stays an explicit, documented
-    /// opt-out; anything else is clamped and logged, mirroring
-    /// [`LockTransition::clamp`].
     pub const MAX_WALLPAPER_HOLD_MS: u64 = 30_000;
 
-    /// Clamp the wallpaper hold. Returns whether anything changed. Never an
-    /// error: a bad config must still lock.
     pub fn clamp(&mut self) -> bool {
         if self.wallpaper_hold_max_ms == 0
             || self.wallpaper_hold_max_ms <= Self::MAX_WALLPAPER_HOLD_MS
@@ -317,37 +235,18 @@ impl Default for LockWarning {
     }
 }
 
-/// The short, non-cancelable frost ramp around a manual or before-sleep
-/// lock (issue #52). The idle warning is the cancelable, long form of the
-/// same overlay; this one ignores input, commits on hotplug, and never waits
-/// on the wallpaper. Zero durations restore the instant commit.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LockTransition {
-    /// Lock: tint ramps in over this, then the wallpaper.
     pub frost_in_ms: u64,
     pub wallpaper_in_ms: u64,
-    /// Unlock: the lock wallpaper's opacity fades out over this, uncovering
-    /// the desktop.
     pub wallpaper_out_ms: u64,
-    /// Unlock blur: the reveal blurs the uncovered desktop and clears the
-    /// blur over this duration. 0 (the default) is a blur-free, tint-free
-    /// unlock - the desktop is sharp the instant it shows. Set > 0 to opt the
-    /// reveal into a fading blur.
     pub frost_out_ms: u64,
     pub easing: WarningEasing,
 }
 
 impl Default for LockTransition {
     fn default() -> Self {
-        // On lock: the blur ramps up (frost_in) and the wallpaper fades in to
-        // opaque (wallpaper_in) over the lock clock - blur IS the warning that
-        // the device is about to lock, and the wallpaper covers the desktop
-        // before the lock commits. On unlock: instant. wallpaper_out = 0, so
-        // reveals() is false and auth success releases the lock at once - no
-        // blur, no tint, no fade. The reveal is a modular opt-in slot: set
-        // wallpaper_out_ms > 0 for an unlock fade, and frost_out_ms > 0 to add
-        // a fading blur to it (both default off).
         Self {
             frost_in_ms: 150,
             wallpaper_in_ms: 250,
@@ -359,8 +258,6 @@ impl Default for LockTransition {
 }
 
 impl LockTransition {
-    /// Each ramp is bounded so a misconfiguration can delay, never prevent,
-    /// the secure commit or the unlock.
     pub const MAX_RAMP_MS: u64 = 2_000;
 
     pub fn immediate() -> Self {
@@ -377,18 +274,14 @@ impl LockTransition {
         self.frost_in_ms + self.wallpaper_in_ms
     }
 
-    /// The reveal's wallpaper opacity-fade duration.
     pub fn reveal_ms(&self) -> u64 {
         self.wallpaper_out_ms
     }
 
-    /// The reveal's blur-fade duration. 0 = a blur-free unlock.
     pub fn reveal_frost_ms(&self) -> u64 {
         self.frost_out_ms
     }
 
-    /// The whole reveal span: a reveal exists (and the unlock is not instant)
-    /// if either the wallpaper fades or the blur fades.
     pub fn out_ms(&self) -> u64 {
         self.wallpaper_out_ms.max(self.frost_out_ms)
     }
@@ -401,14 +294,10 @@ impl LockTransition {
         self.out_ms() > 0
     }
 
-    /// Whether the opt-in reveal blurs the uncovered desktop.
     pub fn reveal_blurs(&self) -> bool {
         self.frost_out_ms > 0
     }
 
-    /// The non-cancelable timeline for the frost-in ramp, sharing the tint
-    /// alpha and the post-lock GUI animation with the idle warning so both
-    /// lock paths look identical once locked.
     pub fn as_warning(&self, frost_alpha: f32, gui: WarningGui) -> LockWarning {
         LockWarning {
             duration_ms: self.in_ms(),
@@ -417,16 +306,11 @@ impl LockTransition {
             wallpaper_in_ms: self.wallpaper_in_ms,
             easing: self.easing,
             cancel_on_motion_px: f64::INFINITY,
-            // The transition never waits on the wallpaper, so a hold cap is
-            // meaningless for it.
             wallpaper_hold_max_ms: 0,
             gui,
         }
     }
 
-    /// Clamp each ramp to [`Self::MAX_RAMP_MS`], scaling its halves
-    /// proportionally. Returns whether anything changed. Never an error: a
-    /// bad config must still lock.
     pub fn clamp(&mut self) -> bool {
         fn clamp_pair(first: &mut u64, second: &mut u64) -> bool {
             let total = *first + *second;
@@ -446,8 +330,6 @@ impl LockTransition {
             }
         }
         let changed_in = clamp_pair(&mut self.frost_in_ms, &mut self.wallpaper_in_ms);
-        // The reveal's wallpaper fade and blur fade run concurrently, not as
-        // two halves of one budget, so each clamps to the ceiling on its own.
         let changed_wallpaper_out = clamp_one(&mut self.wallpaper_out_ms);
         let changed_frost_out = clamp_one(&mut self.frost_out_ms);
         changed_in || changed_wallpaper_out || changed_frost_out
@@ -535,7 +417,6 @@ pub struct OutputOverride {
     pub scale: Option<f32>,
 }
 
-/// Parse TOML source (exposed for tests).
 pub fn parse(source: &str) -> Result<Config, toml::de::Error> {
     toml::from_str(source)
 }
@@ -563,33 +444,14 @@ impl Config {
         }
     }
 
-    /// Greeter load: explicit path, else SYSTEM_CONFIG. Missing file =
-    /// silent defaults; unreadable/invalid = eprintln!("vigil-config: {path}: {err}; using defaults") + defaults.
     pub fn load(path: Option<&Path>) -> Config {
         load_file(path.unwrap_or_else(|| Path::new(SYSTEM_CONFIG))).unwrap_or_default()
     }
 
-    /// Layer a parsed user overlay onto this config and report what was
-    /// refused. Pure: the file and stderr layers are [`Config::load_layered`].
-    ///
-    /// Only [`OVERLAY`] keys land, leaf by leaf, so a user file restyles the
-    /// lock rather than replacing its policy. Everything else — the security
-    /// floor, greeter-scope tables, typos — is left on the system config's
-    /// value and named in the returned notices.
     pub fn overlay(&mut self, user: &toml::Table) -> Vec<IgnoredOverlayKey> {
         let mut allowed = Vec::new();
         let mut ignored = Vec::new();
         walk_overlay("", user, &mut allowed, &mut ignored);
-        // An overlay key may never take a valid config and make it invalid.
-        // vigil-lock exits 2 on a config that fails validate_warning, before
-        // it takes the singleton guard, so adopting (say) a gui table with
-        // an unknown selector would hand the session a kill switch: one
-        // key in a session-writable file and no lock starts again. The
-        // hard exit stays for the system config and --config, where an
-        // operator wrote it and a loud failure is the right answer.
-        //
-        // Only enforced if the base validated: a system config that is
-        // already invalid must not turn every overlay key into a refusal.
         let enforce_valid = self.validate_warning().is_ok();
         for (key, value) in allowed {
             let apply = OVERLAY
@@ -619,14 +481,6 @@ impl Config {
         ignored
     }
 
-    /// Lock load, reporting every user-file key the overlay refused so the
-    /// caller can name it. [`Config::load_layered`] is this plus stderr.
-    ///
-    /// An explicit `path` is whole-file: `--config` is an operator and test
-    /// affordance, already a root-or-owner choice, and the lock's own
-    /// `lock-cmd.sh` never passes it. Without one the system config is the
-    /// base and `$XDG_CONFIG_HOME/vigil/config.toml` (fallback
-    /// `$HOME/.config/vigil/config.toml`) is a whitelisted overlay on top.
     pub fn load_layered_reporting(path: Option<&Path>) -> (Config, Vec<IgnoredOverlayKey>) {
         if let Some(path) = path {
             return (load_file(path).unwrap_or_default(), Vec::new());
@@ -637,18 +491,11 @@ impl Config {
         load_layered_from(Path::new(SYSTEM_CONFIG), user.as_deref())
     }
 
-    /// Lock load: the system config, with a whitelisted user overlay on top.
-    /// Ignored user keys are named on stderr. Same error philosophy as
-    /// [`Config::load`] — a broken user file costs its overlay, never the lock.
     pub fn load_layered(path: Option<&Path>) -> Config {
         let (config, ignored) = Config::load_layered_reporting(path);
         for notice in ignored.iter().take(MAX_REPORTED_REFUSALS) {
             eprintln!("vigil-config: {notice}");
         }
-        // vigil-lock is spawned per lock, so an unbounded list is a journal
-        // flood a user file can arrange for free. The count still tells the
-        // operator something is wrong; the full list is a
-        // load_layered_reporting call away.
         if let Some(rest) = ignored.len().checked_sub(MAX_REPORTED_REFUSALS)
             && rest > 0
         {
@@ -658,23 +505,10 @@ impl Config {
     }
 }
 
-/// How many refusals [`Config::load_layered`] names before summarising.
-/// Every refusal is still returned by [`Config::load_layered_reporting`];
-/// this bounds only what one lock spawn writes to the journal.
 const MAX_REPORTED_REFUSALS: usize = 8;
 
-/// How a user-overlay key lands on the config. One `fn` per whitelisted
-/// leaf so the whitelist and the merge cannot drift apart.
 type OverlaySetter = fn(&mut Config, toml::Value) -> Result<(), toml::de::Error>;
 
-/// The overlay whitelist: everything a session-writable
-/// `~/.config/vigil/config.toml` may set, and where it lands (issue #88).
-///
-/// Cosmetic only, by construction. The lock is the one part of the desktop a
-/// session must not be able to weaken from inside itself, so anything that
-/// decides *when* or *whether* the screen locks — [`SECURITY_FLOOR`] — is
-/// absent here and stays whatever the system config says. Adding a key to
-/// this table is a security decision, not a convenience one.
 const OVERLAY: &[(&str, OverlaySetter)] = &[
     ("look.theme", |config, value| {
         config.look.theme = value.try_into()?;
@@ -731,10 +565,6 @@ const OVERLAY: &[(&str, OverlaySetter)] = &[
     ("output", |config, value| {
         let overrides: HashMap<String, OverlayOutputOverride> = value.try_into()?;
         for (name, over) in overrides {
-            // Per connector, and per field within one. A user who names
-            // [output."DP-1"] must not erase the operator's
-            // [output."eDP-1"], and setting scale there must not drop the
-            // operator's background for the same connector.
             let entry = config.output.entry(name).or_default();
             let OverlayOutputOverride {
                 background,
@@ -759,23 +589,6 @@ const OVERLAY: &[(&str, OverlaySetter)] = &[
     }),
 ];
 
-/// Overlay mirrors of the tables the whitelist takes WHOLE.
-///
-/// `walk_overlay` names every key it drops, but a table handed to serde in
-/// one piece is a hole in that guarantee: serde silently ignores what it
-/// does not recognise, so `[lock.warning.gui] wallpaper_hold_max_ms = 0`
-/// read as accepted and a typo in `[output."DP-1"]` read as applied. These
-/// mirrors carry `deny_unknown_fields`, so the deserializer names it and
-/// the whole take is refused with a reason.
-///
-/// The real structs cannot carry it: the system config must keep tolerating
-/// unknown keys so an older vigil reads a newer config (`unknown_keys_ignored`).
-/// The overlay is the one place where being told is worth more than being
-/// forgiving.
-///
-/// Each conversion destructures the real struct and rebuilds it with no
-/// `..`, so a field added to either side fails to compile until the mirror
-/// gains it too.
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct OverlayWarningGui {
@@ -892,56 +705,26 @@ impl Default for OverlayWarningElement {
     }
 }
 
-/// Lock policy the overlay must never reach: how long the screen may stay
-/// unlocked, and how long a warning may be held open or cancelled.
-///
-/// A session that can write these can grant itself an unlock-without-auth
-/// window (`grace_secs`) or a wait-for-ever warning (`wallpaper_hold_max_ms
-/// = 0`, the issue #56 class) — a durable, one-file disarm of the failsafe,
-/// which is exactly the shape desktop-commons ADR 0006 rejects. Listed
-/// separately from "not whitelisted" so the refusal says *why*.
 const SECURITY_FLOOR: &[&str] = &[
     "lock.grace_secs",
     "lock.warning.cancel_on_motion_px",
     "lock.warning.duration_ms",
     "lock.warning.wallpaper_hold_max_ms",
-    // Not a ramp shape: the cancelable warning commits at
-    // `wallpaper_start + wallpaper_in_ms`, and `wallpaper_start` is at
-    // least `duration_ms - wallpaper_in_ms` — so a fade at least as long
-    // as the warning collapses the scheduled start to zero and the commit
-    // follows the fade instead of the warning. The hold cap is measured
-    // from that same commit, so it moves out too and the #56 failsafe goes
-    // with it. `wallpaper_in_ms = u32::MAX` is a 49-day unlocked screen.
-    // Pinned by vigil-warning's
-    // `a_wallpaper_fade_at_least_as_long_as_the_warning_owns_the_commit`.
-    // `lock.transition.wallpaper_in_ms` is unaffected and stays
-    // overlay-able: the transition never waits on the wallpaper, and
-    // LockTransition::clamp bounds every one of its ramps.
     "lock.warning.wallpaper_in_ms",
 ];
 
-/// Top-level tables only the greeter reads. The greeter loads the system
-/// config alone ([`Config::load`]), so setting these in a user file has no
-/// effect anywhere — worth naming, since silence reads as "it worked".
 const GREETER_SCOPE: &[&str] = &[
     "greeter", "keyboard", "power", "render", "sessions", "users",
 ];
 
-/// Why a user-overlay key did not reach the running config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayRefusal {
-    /// Lock policy. The system config is the only place that sets it.
     SecurityFloor,
-    /// A greeter-only key, which the user file never feeds.
     GreeterScope,
-    /// Not on the whitelist: a typo, or an operator-only key.
     NotOverlayable,
-    /// Whitelisted, but the value did not parse as that field's type.
     Invalid(String),
 }
 
-/// One refused user-overlay key and its reason, so a caller can name it
-/// without vigil-config choosing the log sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IgnoredOverlayKey {
     pub key: String,
@@ -964,11 +747,6 @@ impl std::fmt::Display for IgnoredOverlayKey {
     }
 }
 
-/// Split a user table into whitelisted (path, value) leaves and named
-/// refusals. Descends only where the whitelist has something deeper, so a
-/// wholly out-of-scope table (`[keyboard]`) is reported once rather than
-/// key by key, and a whitelisted table (`output`, `lock.warning.gui`) is
-/// taken whole.
 fn walk_overlay(
     prefix: &str,
     table: &toml::Table,
@@ -1012,22 +790,8 @@ fn refuse(path: &str) -> OverlayRefusal {
     }
 }
 
-/// The merge with both paths named, so it is testable without $HOME.
-/// The most a user overlay may be. The real file is a few hundred bytes;
-/// this only has to be too small to hurt and far larger than any honest
-/// config.
 const MAX_OVERLAY_BYTES: u64 = 256 * 1024;
 
-/// Read the overlay, or say why not. `Ok(None)` is "no overlay here",
-/// which is the ordinary case and silent.
-///
-/// The overlay path is session-writable, so it is not necessarily a file.
-/// A FIFO there blocks `open(2)` for ever and vigil-lock never reaches the
-/// singleton guard, let alone the lock — a hang is a lock defeat that
-/// needs no privileges at all. A symlink to /dev/zero reads until the
-/// machine dies. So: stat before opening (stat does not block on a FIFO
-/// and follows symlinks, so the check sees the real target), demand a
-/// regular file, and cap the read.
 fn read_overlay(path: &Path) -> Result<Option<String>, String> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
@@ -1044,19 +808,11 @@ fn read_overlay(path: &Path) -> Result<Option<String>, String> {
         ));
     }
     let file = std::fs::File::open(path).map_err(|err| err.to_string())?;
-    // Re-check on the descriptor actually opened: the path could have been
-    // swapped between the stat and the open. That race can still block in
-    // open(2) itself, which only O_NONBLOCK would close and which needs
-    // libc; the persistent FIFO — the exploitable case, since it does not
-    // need to win a race on every lock — is closed by the stat above.
     match file.metadata() {
         Ok(meta) if !meta.is_file() => return Err("not a regular file".into()),
         Ok(_) => {}
         Err(err) => return Err(err.to_string()),
     }
-    // Capped even though the size was checked: a file may grow between the
-    // stat and the read, and some pseudo-files report zero length and then
-    // read for ever.
     let mut source = String::new();
     std::io::Read::take(file, MAX_OVERLAY_BYTES + 1)
         .read_to_string(&mut source)
@@ -1085,8 +841,6 @@ fn load_layered_from(system: &Path, user: Option<&Path>) -> (Config, Vec<Ignored
             return (config, Vec::new());
         }
     };
-    // A broken user file costs its overlay, not the lock: the system
-    // config it was layering onto is already loaded and stands as-is.
     match toml::from_str::<toml::Table>(&source) {
         Ok(table) => {
             let ignored = config.overlay(&table);
@@ -1102,24 +856,16 @@ fn load_layered_from(system: &Path, user: Option<&Path>) -> (Config, Vec<Ignored
     }
 }
 
-/// Persisted greeter state (`[sessions] state_file`): who logged in last
-/// and which session they picked. Stored by NAME, not index — list order
-/// changes as sessions are installed/removed.
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct State {
     pub user: String,
     pub session: String,
-    /// Unix seconds when the greeter last started a session with no user
-    /// input (a preselected account that needed no credential).
     pub auto_started_at: Option<u64>,
-    /// Consecutive such sessions that ended shortly after starting, as
-    /// counted at that start.
     pub auto_streak: u32,
 }
 
 impl State {
-    /// None on any failure: missing file is silent, anything else logs.
     pub fn load(path: &Path) -> Option<State> {
         let source = match std::fs::read_to_string(path) {
             Ok(source) => source,
@@ -1138,8 +884,6 @@ impl State {
         }
     }
 
-    /// Best-effort write (tmp + rename): a read-only or absent state dir
-    /// must never break login, so failures log and return.
     pub fn store(&self, path: &Path) {
         let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         let mut body = format!(
@@ -1191,7 +935,6 @@ mod tests {
         assert!(config.power.enabled);
         assert!(config.sessions.remember);
         assert!(config.sessions.default.is_empty());
-        // Defaults to the packaged shared directory; absent = feature off.
         assert_eq!(
             config.profiles.dir,
             Some(PathBuf::from("/etc/monitor-profiles"))
@@ -1322,8 +1065,6 @@ kind = "none"
         .unwrap();
         let warning = config.lock.warning;
         assert_eq!(warning.duration_ms, 10_000);
-        // Parsed from the fixture above, not the Default impl: a key
-        // whose TOML spelling drifts from the field must fail here.
         assert_eq!(warning.wallpaper_hold_max_ms, 2_000);
         assert_eq!(
             parse("").unwrap().lock.warning.wallpaper_hold_max_ms,
@@ -1365,8 +1106,6 @@ easing = "linear"
     #[test]
     fn transition_defaults_are_short() {
         let transition = LockTransition::default();
-        // On lock: blur ramp + wallpaper fade-in (the warning). On unlock:
-        // instant - out 0, so reveals() is false and the reveal is opt-in.
         assert_eq!(transition.in_ms(), 400);
         assert_eq!(transition.out_ms(), 0);
         assert!(transition.ramps_in());
@@ -1377,8 +1116,6 @@ easing = "linear"
 
     #[test]
     fn the_wallpaper_hold_is_clamped() {
-        // The knob exists to bound how long the machine sits unlocked, so
-        // leaving it unbounded reintroduces the problem it fixes.
         let mut warning = LockWarning {
             wallpaper_hold_max_ms: u64::MAX,
             ..LockWarning::default()
@@ -1388,7 +1125,6 @@ easing = "linear"
             warning.wallpaper_hold_max_ms,
             LockWarning::MAX_WALLPAPER_HOLD_MS
         );
-        // The documented opt-out survives, and a sane value is untouched.
         let mut forever = LockWarning {
             wallpaper_hold_max_ms: 0,
             ..LockWarning::default()
@@ -1409,14 +1145,12 @@ easing = "linear"
         assert!(transition.clamp());
         assert_eq!(transition.in_ms(), LockTransition::MAX_RAMP_MS);
         assert_eq!(transition.frost_in_ms, 1_000);
-        // The opt-in out ramp clamps to the same ceiling as the in ramps.
         assert_eq!(transition.out_ms(), LockTransition::MAX_RAMP_MS);
         assert!(!LockTransition::default().clone().clamp());
     }
 
     #[test]
     fn reveal_blur_is_an_independent_opt_in() {
-        // frost_out_ms opts the reveal into a fading blur, default off.
         let blurring = LockTransition {
             wallpaper_out_ms: 300,
             frost_out_ms: 200,
@@ -1426,7 +1160,6 @@ easing = "linear"
         assert!(blurring.reveal_blurs());
         assert_eq!(blurring.reveal_ms(), 300);
         assert_eq!(blurring.reveal_frost_ms(), 200);
-        // A blur-only reveal (no wallpaper fade) still counts as a reveal.
         let blur_only = LockTransition {
             wallpaper_out_ms: 0,
             frost_out_ms: 200,
@@ -1438,9 +1171,6 @@ easing = "linear"
 
     #[test]
     fn clamp_bounds_the_reveal_fades_independently() {
-        // The wallpaper fade and the blur fade run concurrently, not as two
-        // halves of one budget: a within-limit pair must not clamp, and an
-        // over-limit fade clamps only itself.
         let mut ok = LockTransition {
             wallpaper_out_ms: LockTransition::MAX_RAMP_MS,
             frost_out_ms: LockTransition::MAX_RAMP_MS,
@@ -1484,8 +1214,6 @@ selector = "not-a-real-component"
         );
     }
 
-    /// The system config every overlay test layers onto: a hardened lock
-    /// (no grace, a bounded hold, a real warning) with a distinctive look.
     const SYSTEM: &str = "
 [look]
 clock_format = \"%H:%M\"
@@ -1507,7 +1235,6 @@ frost_in_ms = 150
 background = \"/etc/greetd/internal.png\"
 ";
 
-    /// Overlay a user source onto [`SYSTEM`], as load_layered does.
     fn overlay(user: &str) -> (Config, Vec<IgnoredOverlayKey>) {
         let mut config = parse(SYSTEM).unwrap();
         let table: toml::Table = toml::from_str(user).unwrap();
@@ -1515,7 +1242,6 @@ background = \"/etc/greetd/internal.png\"
         (config, ignored)
     }
 
-    /// A temp file that removes itself, so a failing assert cannot leak one.
     struct TempFile(PathBuf);
 
     impl TempFile {
@@ -1539,9 +1265,6 @@ background = \"/etc/greetd/internal.png\"
         }
     }
 
-    /// Every [`SECURITY_FLOOR`] key paired with the field it actually
-    /// protects, so the floor is checked by EFFECT rather than by name.
-    /// A floor key with no probe here fails `floor_probes_cover_the_floor`.
     #[allow(clippy::type_complexity)]
     fn floor_probes() -> Vec<(&'static str, fn(&Config) -> String)> {
         vec![
@@ -1561,14 +1284,10 @@ background = \"/etc/greetd/internal.png\"
         ]
     }
 
-    /// One overlay key, a value for it, and the same change made by hand.
-    /// Applying the source must produce exactly the config the closure
-    /// builds — no more, no less — which pins each setter to its own field.
     struct SetterProbe {
         key: &'static str,
         source: &'static str,
         expect: fn(&mut Config),
-        /// A hostile value of the right type, for the floor sweep.
         adversarial: &'static str,
     }
 
@@ -1722,11 +1441,6 @@ background = \"/etc/greetd/internal.png\"
 
     #[test]
     fn no_overlay_key_can_move_a_floored_field() {
-        // The floor stated as an effect: whatever any whitelisted key is
-        // handed, every floored FIELD still reads the system value. This is
-        // what catches a setter wired to the wrong field, and what would
-        // have caught lock.warning.wallpaper_in_ms being shelved among the
-        // ramp shapes.
         let system = parse(SYSTEM).unwrap();
         for probe in setter_probes() {
             for source in [probe.source, probe.adversarial] {
@@ -1772,7 +1486,6 @@ dir = \"/home/mason/.config/monitor-profiles\"
         assert_eq!(config.lock.warning.frost_alpha, 0.8);
         assert_eq!(config.lock.warning.easing, WarningEasing::Linear);
         assert_eq!(config.output["DP-1"].scale, Some(2.0));
-        // Merged per connector: the operator's other output survives.
         assert_eq!(
             config.output["eDP-1"].background,
             Some(PathBuf::from("/etc/greetd/internal.png"))
@@ -1781,7 +1494,6 @@ dir = \"/home/mason/.config/monitor-profiles\"
             config.profiles.dir,
             Some(PathBuf::from("/home/mason/.config/monitor-profiles"))
         );
-        // Leaf-wise: a key the user did not name keeps the system value.
         assert_eq!(
             config.look.background,
             Some(PathBuf::from("/etc/greetd/system.png"))
@@ -1791,9 +1503,6 @@ dir = \"/home/mason/.config/monitor-profiles\"
 
     #[test]
     fn overlay_names_unknown_keys_inside_a_whole_table_take() {
-        // gui and output are taken whole, so walk_overlay cannot name what
-        // they drop — serde has to. Without deny_unknown_fields both of
-        // these read as accepted.
         let (config, ignored) = overlay("[lock.warning.gui]\nwallpaper_hold_max_ms = 0\n");
         assert_eq!(config.lock.warning.wallpaper_hold_max_ms, 5_000);
         assert_eq!(
@@ -1809,7 +1518,6 @@ dir = \"/home/mason/.config/monitor-profiles\"
             ignored[0].refusal
         );
 
-        // Also inside the nested element array.
         let (_, ignored) =
             overlay("[[lock.warning.gui.element]]\nselector = \"clock\"\ngrace_secs = 99\n");
         assert_eq!(ignored.len(), 1);
@@ -1833,8 +1541,6 @@ dir = \"/home/mason/.config/monitor-profiles\"
 
     #[test]
     fn overlay_output_merges_per_connector_and_per_field() {
-        // One [output."DP-1"] in a user file used to erase every system
-        // [output.*]: the map was assigned, not merged.
         let (config, ignored) = overlay("[output.\"DP-1\"]\nscale = 2.0\n");
         assert_eq!(ignored, Vec::new());
         assert_eq!(
@@ -1844,8 +1550,6 @@ dir = \"/home/mason/.config/monitor-profiles\"
         );
         assert_eq!(config.output["DP-1"].scale, Some(2.0));
 
-        // And within one connector: setting scale must not drop the
-        // operator's background for the same output.
         let (config, ignored) = overlay("[output.\"eDP-1\"]\nscale = 1.5\n");
         assert_eq!(ignored, Vec::new());
         assert_eq!(config.output["eDP-1"].scale, Some(1.5));
@@ -1857,9 +1561,6 @@ dir = \"/home/mason/.config/monitor-profiles\"
 
     #[test]
     fn refusal_output_is_capped_but_the_list_is_not() {
-        // vigil-lock is spawned per lock, so an unbounded refusal list is a
-        // journal flood any user file can arrange. Only the printing is
-        // capped: the caller still gets everything.
         let junk: String = (0..40).map(|n| format!("junk_key_{n} = {n}\n")).collect();
         let (_, ignored) = overlay(&junk);
         assert_eq!(ignored.len(), 40);
@@ -1894,12 +1595,6 @@ dir = \"/home/mason/.config/monitor-profiles\"
 
     #[test]
     fn overlay_cannot_postpone_the_commit_with_a_long_wallpaper_fade() {
-        // `wallpaper_in_ms` looks like a ramp shape and is a commit
-        // deadline: the cancelable warning commits at
-        // `wallpaper_start + wallpaper_in_ms`, so a fade at least as long
-        // as the warning makes the commit — and the hold cap measured from
-        // it — track the fade. See vigil-warning's
-        // `a_wallpaper_fade_at_least_as_long_as_the_warning_owns_the_commit`.
         let (config, ignored) = overlay("[lock.warning]\nwallpaper_in_ms = 4294967295\n");
         assert_eq!(config.lock.warning.wallpaper_in_ms, 1_500);
         assert_eq!(
@@ -1909,9 +1604,6 @@ dir = \"/home/mason/.config/monitor-profiles\"
                 refusal: OverlayRefusal::SecurityFloor,
             }]
         );
-        // The transition's fade of the same name is not a deadline — it
-        // never waits on the wallpaper and clamp() bounds it — so it stays
-        // overlay-able.
         let (config, ignored) = overlay("[lock.transition]\nwallpaper_in_ms = 400\n");
         assert_eq!(ignored, Vec::new());
         assert_eq!(config.lock.transition.wallpaper_in_ms, 400);
@@ -1945,12 +1637,6 @@ cancel_on_motion_px = 100000.0
 
     #[test]
     fn overlay_with_invalid_gui_selector_is_refused_not_fatal() {
-        // vigil-lock exits 2 when validate_warning fails, before it even
-        // takes the singleton guard. Adopting an overlay gui that fails
-        // validation would hand the session a kill switch: one unknown
-        // selector in a session-writable file and no lock ever starts
-        // again. The overlay is refused instead; the hard exit stays for
-        // the system config and --config, where an operator wrote it.
         let mut config = parse(SYSTEM).unwrap();
         config.lock.warning.gui.element = vec![WarningElement {
             selector: "clock".into(),
@@ -2018,7 +1704,6 @@ not_a_key = 1
                 ("users", OverlayRefusal::GreeterScope),
             ]
         );
-        // The notice says which key and why, in one line.
         assert_eq!(
             ignored[1].to_string(),
             "user config: ignoring keyboard: greeter-scope — the greeter never reads the user file"
@@ -2038,8 +1723,6 @@ not_a_key = 1
     fn overlay_absent_leaves_system_config_untouched() {
         let system = TempFile::new("overlay-system", SYSTEM);
         let expected = parse(SYSTEM).unwrap();
-        // No user file at all, and a user path that does not exist: both
-        // are the system config, verbatim.
         assert_eq!(
             load_layered_from(system.path(), None),
             (expected.clone(), Vec::new())
@@ -2053,8 +1736,6 @@ not_a_key = 1
         );
     }
 
-    /// Was `layered_prefers_user_file`, which pinned the wholesale replace.
-    /// The user file now merges: cosmetics land, policy does not.
     #[test]
     fn layered_merges_user_file_over_system() {
         let system = TempFile::new("layered-system", SYSTEM);
@@ -2087,13 +1768,6 @@ not_a_key = 1
 
     #[test]
     fn a_non_regular_overlay_path_is_refused_not_opened() {
-        // The overlay path is session-writable and need not be a file. A
-        // FIFO there blocks open(2) for ever, so vigil-lock never reaches
-        // the singleton guard and the screen never locks — a lock defeat
-        // that costs nothing to mount and survives a reboot. read_overlay
-        // stats first (stat does not block on a FIFO) and demands a
-        // regular file, which covers the FIFO, the directory and the
-        // device node alike.
         let system = TempFile::new("nonregular-system", SYSTEM);
         let expected = parse(SYSTEM).unwrap();
         let dir =
@@ -2106,9 +1780,6 @@ not_a_key = 1
         );
         std::fs::remove_dir(&dir).unwrap();
 
-        // metadata() follows the link, so the check sees the device, not
-        // the symlink — the /dev/zero case (an unbounded read) with a
-        // target that cannot block the test.
         let link =
             std::env::temp_dir().join(format!("vigil-overlay-link-{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&link);
@@ -2140,8 +1811,6 @@ not_a_key = 1
 
     #[test]
     fn explicit_config_path_bypasses_the_overlay() {
-        // --config is an operator/test affordance and stays whole-file: it
-        // is already a root-or-owner choice, and lock-cmd.sh never passes it.
         let path = TempFile::new(
             "explicit",
             "[look]\nclock_format = \"%S\"\n\n[lock]\ngrace_secs = 300\n",

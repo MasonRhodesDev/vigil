@@ -1,13 +1,3 @@
-//! The point of the abstraction, demonstrated: the *same* `OutputWindow`
-//! the greeter uses, driving GL instead of software.
-//!
-//! Nothing here touches a scene API that the GL path implements separately.
-//! `set_clock`, `show_prompt`, `set_users` and the rest are the greeter's own
-//! code; only the backend differs.
-//!
-//!   cargo build -p vigil-present-gl --example gl_shared_scene
-//!   tests/gpu/run.sh --screenshot /tmp/shared.ppm -- target/debug/examples/gl_shared_scene
-
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -57,9 +47,6 @@ fn main() {
     let (mut presenter, gl) =
         GbmPresenter::new(surface, drm_fd, context, 1.0, 0).expect("presenter");
 
-    // The platform is installed first, then told to vend this GL window for
-    // the next instantiation: a component is bound to whatever adapter
-    // existed when it was created, and the GL window only exists now.
     let platform = VigilPlatform::install().expect("platform");
     let gl_window = GlWindow::with_surface(gl, slint::PhysicalSize::new(w, h)).expect("window");
     gl_window.set_size(slint::PhysicalSize::new(w, h));
@@ -68,9 +55,6 @@ fn main() {
     let theme = Theme::load_or_default(None);
     let component = theme.instantiate().expect("instantiate");
     platform.clear_adapter_override();
-    // If a software adapter was created for this component, the override did
-    // not cover it and femtovg is rendering a scene nothing is attached to --
-    // which succeeds, and shows black.
     assert!(
         platform.claim_last_adapter().is_none(),
         "theme bound to a software adapter, not the GL one"
@@ -85,7 +69,6 @@ fn main() {
     )
     .expect("output window");
 
-    // Ordinary greeter scene calls -- not a GL-specific API in sight.
     window.set_panel_visible(true);
     window.set_users(&["mason".into(), "Other…".into()]);
     window.set_user_index(0);
@@ -114,9 +97,6 @@ fn main() {
     assert!(presented > 0, "nothing was ever presented");
     println!("{presented}/{FRAMES} frames presented through the shared scene");
 
-    // An unchanged scene must stop presenting, or an idle login screen flips
-    // forever. This is the GL equivalent of the software partial-repaint
-    // bookkeeping, and the reason GlBackend keeps the last view.
     let idle = presenter
         .with_frame(&mut |canvas| window.render(canvas))
         .expect("idle frame");
@@ -132,7 +112,6 @@ fn main() {
     println!("SHARED SCENE OK");
 }
 
-/// A flip submitted while the previous is pending is refused with EBUSY.
 fn wait_for_flip(device: &DrmDevice, frame: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {

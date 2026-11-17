@@ -1,25 +1,3 @@
-//! Wayland session-lock stack for vigil-lock (DESIGN.md §12).
-//!
-//! Owns everything Wayland: the ext-session-lock-v1 lifecycle (surfaces per
-//! output including hotplug, the configure/commit dance, unlock + roundtrip),
-//! wl_shm buffer presentation into [`vigil_core::FrameTarget`]s, fractional
-//! scale (wp_fractional_scale_v1 + wp_viewporter — every output on the
-//! reference machine is fractionally scaled), and seat input translated to
-//! [`vigil_core::InputEvent`]s.
-//!
-//! The binary supplies a [`LockSession`] (its composition of vigil-ui
-//! windows + auth) and calls [`run`]; the event loop lives here because the
-//! Wayland connection *is* the loop for a lock client.
-//!
-//! `VIGIL_FRAME_HASH=1` adds an `event=frame.hash` record (output, role,
-//! size, FNV-1a of the pixels) for every frame this crate commits, on the
-//! journald stream beside `frame.present`. It answers "was that first lock
-//! frame actually the picture, or was it black" — the question issue #86
-//! came down to — from a capture-free trace. Off by default and free when
-//! off. The hash is taken *after* the attach and commit, so it cannot
-//! lengthen the interval an output is uncovered; it still costs a pass over
-//! the buffer per frame, so a hashed run's frame cadence is its own.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read as _;
@@ -89,11 +67,7 @@ mod hyprland_surface;
 use hyprland_surface::hyprland_surface_manager_v1::HyprlandSurfaceManagerV1;
 use hyprland_surface::hyprland_surface_v1::HyprlandSurfaceV1;
 
-/// What the binary implements: its composition of theme windows and auth.
 pub trait LockSession {
-    /// Install a thread-safe wakeup for asynchronous work. Calling it makes
-    /// the Wayland loop run a tick immediately instead of waiting for the
-    /// next frame deadline.
     fn set_runtime(
         &mut self,
         _wake: WakeHandle,
@@ -101,70 +75,27 @@ pub trait LockSession {
         _metrics: Arc<Metrics>,
     ) {
     }
-    /// An output has its first configured size; create its scene.
     fn output_ready(&mut self, id: OutputId, info: &OutputInfo);
-    /// The output's pixel size or scale changed.
     fn output_resized(&mut self, id: OutputId, info: &OutputInfo);
-    /// The same output scene is being rebound from warning layer-shell to
-    /// session-lock at unchanged geometry. Preserve decoded assets and only
-    /// force a present.
     fn output_rebound(&mut self, id: OutputId, info: &OutputInfo) {
         self.output_resized(id, info);
     }
-    /// Mark this output's scene as needing a full repaint even though no
-    /// Slint state changed. Called before a forced present would otherwise
-    /// commit an empty buffer (issue #35).
     fn force_repaint(&mut self, _id: OutputId) {}
-    /// Re-arm this output's next present *without* asking the scene to
-    /// redraw: the retained scene is already what the user is looking at,
-    /// and only the freshly acquired buffer is empty.
-    ///
-    /// Split from `force_repaint` because the handoff calls it from inside
-    /// a configure callback (issue #86): re-arming there must not also ask
-    /// the scene to redraw, which is what `force_repaint` does and what
-    /// issue #37 forbids in a protocol callback.
-    ///
-    /// Required, not defaulted. A default delegating to `force_repaint`
-    /// would be the #37 violation wearing the name of the fix for it — the
-    /// one call site is the callback — and "correct, just costlier" was the
-    /// wrong description of it. There is one implementor in tree and vigil
-    /// is alpha, so an implementor that has not thought about this gets a
-    /// compile error rather than a silent redraw.
     fn force_copy_out(&mut self, id: OutputId);
     fn output_gone(&mut self, id: OutputId);
-    /// A pre-lock warning surface is ready. The default creates the same scene
-    /// as a lock surface; implementations can keep authentication controls
-    /// hidden until `locked`.
     fn warning_output_ready(&mut self, id: OutputId, info: &OutputInfo) {
         self.output_ready(id, info);
     }
-    /// Overlay compositing values for this frame (frame-grid quantized by
-    /// the controller, so this is called at most once per frame).
     fn overlay_progress(&mut self, _frost: f32, _wallpaper: f32) {}
     fn overlay_elements(&mut self, _elements: &[vigil_flow::ElementSample]) {}
-    /// The pointer entered this output (panel-follows-pointer signal).
     fn focus_output(&mut self, id: OutputId);
     fn caps_lock(&mut self, on: bool);
-    /// Drain asynchronous session state (auth, logind, join socket, asset
-    /// readiness) into controller events. Called once per tick, before the
-    /// controller steps.
     fn poll_events(&mut self) -> Vec<FlowEvent> {
         Vec::new()
     }
-    /// Execute one session-side controller command (panel, auth, logind
-    /// hint, readiness signal, UI input). Wayland-side commands never reach
-    /// here — the event loop owns those.
     fn flow_command(&mut self, _cmd: &FlowCmd) {}
-    /// ~16ms cadence: clock, Slint timers.
     fn tick(&mut self);
-    /// Draw this output's scene if dirty; return whether pixels changed.
     fn render(&mut self, id: OutputId, target: FrameTarget<'_>) -> bool;
-    /// Whether this output owes a present, answered without a buffer.
-    ///
-    /// The presenter asks this *before* acquiring one: a buffer acquired
-    /// and dropped un-attached on a clean scene makes the compositor reply
-    /// `delete_id`, which wakes the loop, which acquires another (#65).
-    /// Conservative default: unknown means present.
     fn scene_needs_present(&mut self, _id: OutputId) -> bool {
         true
     }
@@ -185,7 +116,6 @@ fn err(e: impl std::fmt::Display) -> LockError {
     LockError(e.to_string())
 }
 
-/// Stable, inert names for [`FlowEvent`]s in diagnostic records.
 fn flow_event_kind(event: &FlowEvent) -> &'static str {
     match event {
         FlowEvent::Input(_) => "Input",
@@ -211,11 +141,7 @@ fn flow_event_kind(event: &FlowEvent) -> &'static str {
 
 enum SurfaceRole {
     Warning(LayerSurface),
-    Lock {
-        _surface: SessionLockSurface,
-    },
-    /// Post-authorization overlay that fades the wallpaper out over the
-    /// frosted desktop after `unlock_and_destroy` (issue #52).
+    Lock { _surface: SessionLockSurface },
     Reveal(LayerSurface),
 }
 
@@ -229,9 +155,6 @@ impl SurfaceRole {
     fn is_reveal(&self) -> bool {
         matches!(self, SurfaceRole::Reveal(_))
     }
-    /// Stable label for trace records. A frame fingerprint is only readable
-    /// next to which surface produced it: during the handoff two roles share
-    /// one output id and the hashes interleave.
     fn name(&self) -> &'static str {
         match self {
             SurfaceRole::Warning(_) => "warning",
@@ -247,20 +170,10 @@ impl SurfaceRole {
     }
 }
 
-/// During handoff both surfaces share one output ID and one retained
-/// OutputWindow: the lock surface renders first or the overlay consumes the
-/// one pending software frame and the lock surface commits black.
 fn present_priority(is_lock: bool) -> u8 {
     u8::from(!is_lock)
 }
 
-/// Whole-surface opacity, the lever that ramps compositor blur strength.
-/// `ext-background-effect-v1` only toggles a blur region; Hyprland's
-/// `hyprland_surface_v1.set_opacity` is documented to multiply "blur behind
-/// the surface in addition to the surface's content", and
-/// `wp_alpha_modifier_v1` does the same on compositors whose blur tracks
-/// surface alpha. Without either, frost is a per-pixel tint ramp over a
-/// constant blur.
 enum SurfaceOpacity {
     Hyprland(HyprlandSurfaceV1),
     AlphaModifier(WpAlphaModifierSurfaceV1),
@@ -271,7 +184,6 @@ impl SurfaceOpacity {
     fn is_some(&self) -> bool {
         !matches!(self, SurfaceOpacity::None)
     }
-    /// Double-buffered: takes effect on the next surface commit.
     fn set(&self, value: f32) {
         let value = f64::from(value.clamp(0.0, 1.0));
         match self {
@@ -291,30 +203,12 @@ impl SurfaceOpacity {
     }
 }
 
-/// Whether an OverlayProgress tick may skip rendering and only latch the
-/// surface opacity with a bare commit.
-///
-/// Pure, because this is the decision the ramp's smoothness rides on and it
-/// has four ANDed conditions - exactly the shape where an untested arm
-/// hides. True only when: the frost is running alone (wallpaper == 0, so
-/// the buffer is input-independent), a full session round has already
-/// synced the scene, and every overlay surface both has an opacity lever
-/// and has committed its first real buffer (#35/#37: a bare commit on an
-/// uncommitted surface would map it empty).
 fn ramp_commit_only(
     wallpaper: f32,
     prev_wallpaper: f32,
     scene_synced: bool,
     entries: impl Iterator<Item = (bool, bool, bool)>,
 ) -> bool {
-    // Both this tick's wallpaper AND the previous one must be zero. The
-    // invariant commit-only rides on is a property of the buffer already
-    // committed on the surface - and on the reveal's descending edge
-    // (wallpaper > 0 -> 0.0, which Reveal::sample produces on every
-    // unlock) that buffer still carries the half-dissolved wallpaper. One
-    // full round rebakes it; from then on prev is 0.0 and the latch
-    // resumes. The same edge covers a mid-warning hotplug driving
-    // wallpaper-ready back to false.
     if wallpaper != 0.0 || prev_wallpaper != 0.0 || !scene_synced {
         return false;
     }
@@ -331,19 +225,6 @@ fn ramp_commit_only(
     overlays > 0
 }
 
-/// Composite the frost tint (and, during reveal, the lock wallpaper) into a
-/// rendered overlay buffer. wl_shm ARGB8888 is premultiplied. With a
-/// whole-surface opacity lever the tint is baked at full strength and
-/// `frost` drives the surface — and, on Hyprland, the blur strength too.
-///
-/// Split out of `present` and kept pure so the fast path below can be held
-/// byte-identical to the arithmetic it replaces by a test, instead of by
-/// trust. The measurement that forced this, labelled by build: at
-/// 3840x2160 the per-pixel loop cost 46 ms per frame in release and
-/// 375-405 ms in debug, against 4-58 ms for the Slint render beside it -
-/// so a machine rendering three outputs serially shed most of a 1.5 s
-/// ease's 45 steps, and under the debug build the snap was first
-/// captured on, collapsed to two visible frames.
 fn overlay_blend(
     canvas: &mut [u8],
     frost: f32,
@@ -356,12 +237,6 @@ fn overlay_blend(
         (pixel_frost(frost, surface_opacity) * frost_alpha * (1.0 - wallpaper)).clamp(0.0, 1.0);
     let alpha = wallpaper + tint_alpha;
     if wallpaper == 0.0 {
-        // Frost-only: the output does not depend on the rendered input at
-        // all - every pixel becomes the same premultiplied tint, computed
-        // once and written per 4-byte chunk instead of recomputed through
-        // ~25M per-channel float round-trips at 4K. Measured, labelled by
-        // build: release 46 ms -> 4 ms per 4K frame; debug 375-405 ms ->
-        // ~15 ms (debug is the build the snap was first captured under).
         let tint_channel = (18.0 * tint_alpha).round() as u8;
         let pixel = [
             tint_channel,
@@ -385,8 +260,6 @@ fn overlay_blend(
     }
 }
 
-/// Per-pixel frost to bake into the overlay buffer. With a whole-surface
-/// opacity lever the buffer carries the full tint and the surface fades.
 fn pixel_frost(frost: f32, surface_opacity_available: bool) -> f32 {
     if surface_opacity_available {
         1.0
@@ -395,34 +268,15 @@ fn pixel_frost(frost: f32, surface_opacity_available: bool) -> f32 {
     }
 }
 
-/// Which role a new output surface gets. A warning overlay is only correct
-/// while the warning is showing AND the session lock has not been taken:
-/// once locked, a warning surface would be destroyed by warning cleanup and
-/// leave the output with no lock surface at all — permanently black, DESIGN
-/// §12 invariant 4 (issue #35 hotplug case).
 fn surface_role_is_warning(warning_active: bool, lock_taken: bool) -> bool {
     warning_active && !lock_taken
 }
 
-/// Whether `VIGIL_FRAME_HASH=1` asked for a fingerprint of every committed
-/// frame.
-///
-/// Read once. This sits on the present path, and `var_os` takes the env lock
-/// and scans the whole environment per call — the cost of the diagnostic
-/// must be zero when nobody asked for it.
 fn frame_hash_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("VIGIL_FRAME_HASH").is_some_and(|value| value == "1"))
 }
 
-/// FNV-1a over the pixels about to be committed.
-///
-/// Stable rather than `DefaultHasher`, whose algorithm is deliberately
-/// unspecified across builds — the same rationale (and the same constants)
-/// as `vigil-sim`'s `frame_hash`. The question this answers is "is the lock
-/// surface's first frame the same picture the warning surface last showed",
-/// and two runs of two binaries have to agree on the answer. Fingerprint,
-/// not a security digest.
 fn frame_hash(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -432,45 +286,6 @@ fn frame_hash(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-/// Record what the frame that was *just committed* looks like.
-///
-/// Called after the attach and the commit, never before. Hashing is a full
-/// pass over the buffer; done ahead of the commit it lands inside the window
-/// where the compositor is showing nothing — measured at 16.7-121 ms per
-/// output unoptimized (4.6-28.6 optimized), serialized across outputs, which
-/// is exactly the issue #37 shape smuggled back in by a diagnostic. After
-/// the commit it cannot extend that window at all.
-///
-/// Reading the slot once it is attached is why this takes the pool and the
-/// buffer rather than a canvas: `SlotPool::canvas` refuses an active slot,
-/// correctly, because it hands out a slice to *write* through. Nothing
-/// writes here, and the compositor does not write to a client buffer, so
-/// the bytes are stable while we read them.
-///
-/// Exactly `stride * height` bytes: `new_slot` rounds its allocation up to
-/// 64, and the padding beyond the last row is whatever the slot held
-/// before. Hashing it would make the fingerprint depend on allocator
-/// history, and would break the closed-form all-black hash that
-/// `check_trace.py` computes from `width * height * 4`.
-///
-/// INFO, not DEBUG like `frame.present` itself: the span-lines layer hints
-/// `LevelFilter::INFO` at the default detail, so a DEBUG record would need
-/// `SPAN_LINES=frames` as well and `VIGIL_FRAME_HASH=1` alone would print
-/// nothing. One opt-in knob, or the diagnostic is a trap. Volume is bounded
-/// by the operator having asked for it.
-///
-/// Capture-free: this hashes vigil's own buffer. ADR 0004 binds only
-/// vigil's registry globals, and nothing here reads the compositor's
-/// framebuffer.
-///
-/// It is therefore a fingerprint of *what vigil drew*, not of what the
-/// screen shows. On a lever surface (warning, reveal) the alpha-modifier is
-/// applied by the compositor after this, so the pixels on screen are a
-/// function of these bytes and a surface opacity this record does not
-/// carry. Two frames with the same hash can look different; two frames that
-/// look the same can hash differently. For the lock surface — the one issue
-/// #86 is about — there is no lever and the buffer is opaque XRGB, so the
-/// hash does describe the picture.
 fn emit_committed_frame_hash(
     id: OutputId,
     role: &'static str,
@@ -483,8 +298,6 @@ fn emit_committed_frame_hash(
         return;
     }
     let raw = pool.raw_data_mut(&buffer.slot());
-    // Empty when the slot does not belong to this pool (a resize raced the
-    // commit): no frame to fingerprint, and no reason to hash padding.
     let Some(bytes) = raw.get(..stride * px.1 as usize) else {
         return;
     };
@@ -509,15 +322,11 @@ struct Entry {
     opacity: SurfaceOpacity,
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
-    /// Scale in 120ths (wp_fractional_scale units); 120 = 1.0.
     scale120: u32,
     logical: (u32, u32),
     px: (u32, u32),
     pool: Option<SlotPool>,
     configured: bool,
-    /// A configured lock surface has committed a buffer of `px` at least
-    /// once. Reset on size change so the first present after a rebuild
-    /// cannot skip the commit (ext-session-lock blanks that output).
     committed: bool,
 }
 
@@ -558,82 +367,22 @@ struct App<S: LockSession + 'static> {
     metrics: Arc<Metrics>,
     qh: QueueHandle<App<S>>,
     present_retry: BTreeMap<OutputId, (std::time::Instant, u32)>,
-    /// First-configured surfaces whose scenes are built on the next tick,
-    /// outside the protocol callback: (output, is-lock-role). Inline scene
-    /// construction serialized the lock reveal across outputs (issue #37).
     pending_scenes: Vec<(OutputId, bool)>,
-    /// The lifecycle controller: every transition decision lives here, and
-    /// this loop only executes its commands (issue #43).
     flow: LockFlow,
     started: std::time::Instant,
-    /// Latest overlay compositing values from the controller. Only one
-    /// overlay generation animates at a time (warning surfaces are retired
-    /// before reveal surfaces exist), so one value serves both; an overlay
-    /// still mapped after its ramp ended holds the final value.
     overlay_progress: (f32, f32),
     frost_alpha: f32,
-    /// The opt-in reveal blurs the uncovered desktop (frost_out_ms > 0). Off
-    /// by default: the reveal carries no blur region and no tint.
     reveal_blur: bool,
-    /// Pre-lock overlays should exist (a ramp is running and cleanup has
-    /// not retired them).
     pre_lock_overlays: bool,
     scene_ids: BTreeSet<OutputId>,
     initial_outputs_added: bool,
     unlock_sent: bool,
-    /// A session.overlay_progress round has been REQUESTED since startup -
-    /// not proof one landed - and it is never reset. The resets that force
-    /// a full round after scene changes are carried elsewhere: by
-    /// entry.committed (cleared on every configure) and by the
-    /// previous-wallpaper guard in ramp_commit_only. Known reliance
-    /// (review F7): a mid-ramp PointerEnter can re-show the panel and
-    /// cursor, and only the frost-only fill overwriting every pixel keeps
-    /// them invisible - main re-hid them on every tick, the latch path
-    /// does not.
     ramp_scene_synced: bool,
-    /// The lock's root span, kept so phases can be parented to it
-    /// explicitly. A phase is created from inside `tick`, where the current
-    /// span is whichever `loop.iteration` is running, so without this the
-    /// tree would hang phases off arbitrary wakes.
     root_span: tracing::Span,
-    /// Span covering the phase the controller is currently in. Replaced -
-    /// and so emitted - on every `FlowCmd::PhaseChanged`.
-    ///
-    /// Held but deliberately *not* entered; children are given this span
-    /// as an explicit parent instead. Not because entering loses records -
-    /// it does not: an entered phase swapped from inside `tick` exits out
-    /// of stack order, but the subscriber removes an exited span by id
-    /// wherever it sits on the thread's stack and still closes it, so its
-    /// record is still written (measured: two `flow.phase` records at both
-    /// tiers either way, over repeated runs; an earlier "frames lost them"
-    /// observation had compared a clean exit against a killed run, and a
-    /// kill the loop never sees - SIGKILL today, any signal before #79 -
-    /// loses whatever is still open at every tier). What entering
-    /// does corrupt is frames-detail parentage: an entered phase becomes
-    /// the contextual parent of every `loop.iteration`, and the
-    /// replacement phase created inside `tick` nests under whichever
-    /// iteration happens to be running (measured: `flow.phase` with a
-    /// `loop.iteration` parent). Session detail hides the damage only
-    /// because filtered ancestors are skipped. Explicit parents keep
-    /// phases and iterations siblings under the root at every tier.
     phase_span: Option<tracing::Span>,
-    /// Controller events raised inside protocol callbacks. Drained at the
-    /// top of the next tick so no callback creates surfaces or tears the
-    /// lock down mid-dispatch — the same rule presentation follows, and the
-    /// ordering the pre-controller code had (callbacks set flags; begin_lock
-    /// and the unlock ran from tick).
     protocol_events: Vec<FlowEvent>,
 }
 
-/// Soonest present-retry deadline among outputs that still exist.
-///
-/// Retries are keyed by output, and an entry whose output has gone (or
-/// which can no longer be painted) must not steer the loop: its deadline
-/// is already in the past, `saturating_duration_since` yields zero, and
-/// `dispatch(Some(ZERO))` returns instantly on every iteration -- a spin
-/// with no work, the same family as the buffer churn in #65. Deriving the
-/// answer from live outputs makes a stale entry harmless rather than
-/// relying on every removal path remembering to prune (#70).
 fn soonest_retry(
     retries: &BTreeMap<OutputId, (std::time::Instant, u32)>,
     live: impl Fn(OutputId) -> bool,
@@ -648,15 +397,9 @@ fn soonest_retry(
 
 impl<S: LockSession> App<S> {
     fn deliver_input(&mut self, event: InputEvent) {
-        // The controller decides whether input cancels a warning, dismisses
-        // grace, or reaches the UI (FlowCmd::DispatchInput). Deferred: a
-        // grace dismissal releases the session lock, which must not run
-        // inside a wl_keyboard callback.
         self.raise(FlowEvent::Input(event));
     }
 
-    /// Raise a controller event from a protocol callback (deferred, see
-    /// [`App::protocol_events`]).
     fn raise(&mut self, event: FlowEvent) {
         self.protocol_events.push(event);
         self.wake.wake();
@@ -670,8 +413,6 @@ impl<S: LockSession> App<S> {
         }
     }
 
-    /// Execute controller commands: Wayland effects here, session effects
-    /// through the [`LockSession`] adapter.
     fn run(&mut self, cmds: Vec<FlowCmd>) {
         for cmd in cmds {
             match cmd {
@@ -691,21 +432,10 @@ impl<S: LockSession> App<S> {
                             )
                         }),
                     ) {
-                        // Frost-only tick on lever surfaces: the buffer is
-                        // already the full-strength tint, so a render would
-                        // reproduce it byte for byte (overlay_blend's
-                        // fast-path property). Latch the new opacity with a
-                        // bare commit - no buffer, no render - and the ramp
-                        // runs at grid rate even where a present round
-                        // costs hundreds of milliseconds.
                         for entry in &self.entries {
                             if !entry.role.is_lock() {
                                 entry.opacity.set(frost);
                                 entry.surface.commit();
-                                // The metric's contract is commits, not
-                                // commits that carried a buffer (review F5:
-                                // the wire showed 46 while the counter saw
-                                // 4, in exactly the phase it measures).
                                 self.metrics.record_commit();
                                 tracing::event!(
                                     name: "ramp.commit",
@@ -718,9 +448,6 @@ impl<S: LockSession> App<S> {
                         }
                     } else {
                         self.session.overlay_progress(frost, wallpaper);
-                        // The session pass hides the panel and cursor; once
-                        // a full round has run, later frost-only ticks need
-                        // only the opacity latch above.
                         self.ramp_scene_synced = true;
                         for entry in &self.entries {
                             self.dirty.mark(entry.id);
@@ -744,18 +471,8 @@ impl<S: LockSession> App<S> {
                 }
                 FlowCmd::ReleaseSessionLock => self.send_unlock(),
                 FlowCmd::DestroyRevealOverlays => self.drop_overlays(SurfaceRole::is_reveal),
-                // Diagnostics belong to the loop, not the adapter: routed
-                // through the session it is silently dropped by every
-                // implementation that does not override flow_command —
-                // exactly the silence the variant exists to prevent.
                 FlowCmd::Journal(note) => eprintln!("vigil-lock: {note}"),
-                // Explicit, not left to the catch-all below: routed to the
-                // session it would reach a `flow_command` that most
-                // implementations do not override, and be dropped.
                 FlowCmd::PhaseChanged { from, to } => {
-                    // Parented at the outgoing phase, so the transition's
-                    // timestamp falls inside the interval of the phase it
-                    // leaves rather than the one it enters.
                     let phase = self.phase_span.as_ref().and_then(tracing::Span::id);
                     tracing::event!(
                         name: "flow.transition",
@@ -765,9 +482,6 @@ impl<S: LockSession> App<S> {
                         from = %from,
                         to = %to
                     );
-                    // Dropping the outgoing span is what emits it, so a
-                    // phase's duration closes at the transition rather than
-                    // whenever the field is next touched.
                     self.phase_span = Some(tracing::info_span!(
                         target: "vigil",
                         parent: self.root_span.id(),
@@ -776,12 +490,6 @@ impl<S: LockSession> App<S> {
                     ));
                 }
                 FlowCmd::Exit(outcome) => self.outcome = Some(outcome),
-                // Listed, not caught by a wildcard. A `_ =>` arm here would
-                // route a future variant to `flow_command`, whose trait
-                // default is empty - so the next command added would be
-                // dropped silently, which is exactly what the comment above
-                // `Journal` warns about. Naming them makes the compiler
-                // raise it instead.
                 ref session_cmd @ (FlowCmd::ShowPanel(_)
                 | FlowCmd::DispatchInput(_)
                 | FlowCmd::StartAuth
@@ -815,17 +523,12 @@ impl<S: LockSession> App<S> {
             width: entry.px.0,
             height: entry.px.1,
             refresh_mhz: 0,
-            // Preserve the compositor's stable description so monitor and
-            // prepared-appearance profiles can match across connector moves.
             make: None,
             model: wayland_info.and_then(|info| info.description),
             scale: entry.scale120 as f32 / 120.0,
         }
     }
 
-    /// One ARGB layer-shell overlay over the live desktop: blur region
-    /// (compositor policy), whole-surface opacity lever when available.
-    /// `pass_through` makes it inert to input (the post-unlock reveal).
     fn create_overlay(
         &self,
         qh: &QueueHandle<Self>,
@@ -855,14 +558,10 @@ impl<S: LockSession> App<S> {
             KeyboardInteractivity::Exclusive
         });
         if pass_through {
-            // An empty input region: pointer events reach the restored
-            // desktop underneath for the whole fade.
             let region = self.compositor_proxy.create_region(qh, ());
             surface.set_input_region(Some(&region));
             region.destroy();
         }
-        // Blur is a pre-lock warning signal only: the reveal overlay carries
-        // no blur region, so unlocking uncovers a sharp desktop.
         let effect = blur
             .then(|| {
                 self.background_effects
@@ -889,11 +588,8 @@ impl<S: LockSession> App<S> {
 
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         if self.unlock_sent {
-            // The session is already released; nothing new may map.
             return;
         }
-        // The initial snapshot and later metadata callback can name the same
-        // object. Object identity is authoritative even before metadata exists.
         let adding_warning = surface_role_is_warning(self.pre_lock_overlays, self.lock.is_some());
         if self
             .entries
@@ -903,9 +599,6 @@ impl<S: LockSession> App<S> {
             return;
         }
         let id = OutputId(output.id().protocol_id());
-        // Warning and lock surfaces overlap during secure handoff. Fractional
-        // scale for the new lock surface may arrive after its first configure,
-        // so inherit the already-known scale for this wl_output.
         let inherited_scale120 = self
             .entries
             .iter()
@@ -962,9 +655,6 @@ impl<S: LockSession> App<S> {
         });
     }
 
-    /// The post-unlock overlay for one output, created while the session
-    /// is still locked so it is mapped (opaque wallpaper) by the time the
-    /// compositor reveals the desktop.
     fn add_reveal(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         if self
             .entries
@@ -1034,10 +724,6 @@ impl<S: LockSession> App<S> {
         );
         let first = !self.entries[idx].configured;
         let resized = self.entries[idx].configured && self.entries[idx].px != px;
-        // ext-session-lock blanks an output until a buffer matching this
-        // configure is attached — including same-size configures after
-        // DPMS/VT. Always force the next present; only rebuild the scene
-        // when the pixel size actually changed.
         self.entries[idx].committed = false;
         self.entries[idx].px = px;
         if let Some(viewport) = &self.entries[idx].viewport {
@@ -1056,8 +742,6 @@ impl<S: LockSession> App<S> {
         let id = self.entries[idx].id;
         let info = self.output_info(idx);
         if first && self.entries[idx].role.is_reveal() {
-            // The reveal reuses this output's lock scene; it only needs a
-            // rebuild if the compositor configured it at a different size.
             let lock_geometry = self
                 .entries
                 .iter()
@@ -1069,32 +753,14 @@ impl<S: LockSession> App<S> {
         } else if first {
             let is_lock = self.entries[idx].role.is_lock();
             if is_lock {
-                // All outputs lock together (issue #37): ext-session-lock
-                // blanks an output until a buffer matching this configure
-                // arrives, and building the Slint scene inline here
-                // serialized the reveal across outputs. Satisfy the
-                // configure now with a copy-out of the retained scene (the
-                // warning's last frame) — or black if there is none; the
-                // scene is built or rebound on the next tick and paints
-                // over it.
                 self.commit_first_frame(idx);
             }
             self.pending_scenes.push((id, is_lock));
         } else if resized {
             self.session.output_resized(id, &info);
         } else {
-            // Same-size reconfigure (DPMS wake, VT switch, hotplug
-            // re-layout): the scene is quiescent, but this configure
-            // invalidated the buffer. Without a repaint request, present()
-            // commits a zeroed buffer and the output stays black until the
-            // next clock tick (issue #35).
             self.session.output_rebound(id, &info);
         }
-        // Invariant: a configured lock surface gets a buffer in this event-loop
-        // iteration. Repainting stays outside protocol callbacks so redraws
-        // coalesce and no scene is ever *constructed* here (issue #37); the
-        // first-frame commit above is the bounded exception, which draws an
-        // existing scene if it is dirty and otherwise only copies it out.
         self.dirty.mark(id);
         self.wake.wake();
         let elapsed = configure_started.elapsed();
@@ -1103,55 +769,16 @@ impl<S: LockSession> App<S> {
         }
     }
 
-    /// Satisfy a lock-surface configure with its first buffer, before the
-    /// tick that builds or rebinds the scene has run.
-    ///
-    /// The warning overlay and the lock surface of one output share a single
-    /// retained `OutputWindow` (`output_rebound`), so when a warning ran
-    /// here the window's shadow already holds a fully rendered scene — the
-    /// exact picture on screen at this instant. Copy it out and the
-    /// warn→lock cut has no black frame in it (issue #86). Black is the
-    /// fallback, for the cases where no scene exists yet (`--immediate`, a
-    /// hotplug while locked, a warning that never painted) and for a
-    /// configure at a size the retained scene cannot fill — `render`
-    /// answers false for both.
-    ///
-    /// Kept next to present() so buffer acquisition stays auditable in one
-    /// place. The invariant is not "exactly two call sites": it is that a
-    /// protocol callback constructs no scene (issue #37 — building the Slint
-    /// scene inline here serialized the reveal across outputs). This
-    /// constructs none. Committing at the acked configure size is DESIGN §12
-    /// invariant 1; `px` is that size, set by the caller.
-    ///
-    /// What it costs, stated honestly: `render` goes through
-    /// `draw_into_shadow`, which asks Slint to draw if the scene is dirty.
-    /// The warning leaves the scene settled, so in the handoff this is
-    /// typically the copy-out alone (2.2 ms at 4K, vigil-ui's measurement) —
-    /// but "typically" is the word. Anything that dirtied the scene between
-    /// the warning's last frame and this configure (a panel toggle, a
-    /// property set from the flow) makes it a layout and raster first. That
-    /// is bounded by the lock scene's own complexity, never by desktop
-    /// content, and it is work this output owed anyway; it is not free, and
-    /// calling it a memcpy would be a claim the code does not support.
-    /// Stage 2's prebuilt buffers remove even this.
     fn commit_first_frame(&mut self, idx: usize) {
         let px @ (w, h) = self.entries[idx].px;
         let id = self.entries[idx].id;
         let role = self.entries[idx].role.name();
-        // Re-arm the copy-out before asking for it: a settled scene reports
-        // it owes nothing, and the shadow is settled precisely when the
-        // warning left a finished frame in it. `force_copy_out`, not
-        // `force_repaint` — the scene is already correct, only the freshly
-        // acquired buffer is empty, and a redraw request here would put
-        // scene work back inside the configure callback.
         self.session.force_copy_out(id);
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             self.schedule_present_retry(id);
             return;
         };
         let stride = w as usize * 4;
-        // XRGB: a lock surface is opaque, and the compositor composites
-        // nothing under it.
         let Ok((buffer, canvas)) =
             pool.create_buffer(w as i32, h as i32, stride as i32, wl_shm::Format::Xrgb8888)
         else {
@@ -1159,14 +786,6 @@ impl<S: LockSession> App<S> {
             return;
         };
         self.metrics.record_buffer_acquire();
-        // Zero first, unconditionally, exactly as present() does. A slot
-        // handed back by the pool holds whatever the last frame in it held,
-        // and `render` answering true is not a promise that it wrote: the
-        // software backend returns true after bailing on a misaligned buffer
-        // under a rotating transform (vigil-ui, `try_cast_slice_mut`). This
-        // is the surface the compositor shows while nothing else is on
-        // screen, so it never attaches memory nobody wrote. Next to a
-        // full-buffer copy-out the fill is noise.
         canvas.fill(0);
         let drew = self.session.render(
             id,
@@ -1186,10 +805,6 @@ impl<S: LockSession> App<S> {
         surface.commit();
         self.metrics.record_commit();
         self.entries[idx].committed = true;
-        // Fingerprint after the commit. This is the one frame whose latency
-        // the whole issue is about; a full hash pass ahead of the attach
-        // would put the diagnostic inside the black window it exists to
-        // measure.
         if frame_hash_enabled()
             && let Some(pool) = self.entries[idx].pool.as_mut()
         {
@@ -1197,18 +812,11 @@ impl<S: LockSession> App<S> {
         }
     }
 
-    /// Render if the scene is dirty and commit the new buffer.
-    ///
-    /// After a configure, the compositor blanks the output until a buffer is
-    /// attached. Skipping that commit (dirty-flag miss, shm alloc fail,
-    /// missing scene, same-size DPMS/VT configure) is the metal black screen.
     fn present(&mut self, idx: usize) {
         if !self.entries[idx].configured {
             return;
         }
         if self.unlock_sent && self.entries[idx].role.is_lock() {
-            // Released server-side by unlock_and_destroy; nothing to paint,
-            // and any retry we owed it is moot.
             let id = self.entries[idx].id;
             self.present_retry.remove(&id);
             return;
@@ -1216,8 +824,6 @@ impl<S: LockSession> App<S> {
         let (w, h) = self.entries[idx].px;
         let force = !self.entries[idx].committed;
         let id = self.entries[idx].id;
-        // Overlay compositing progress by role; None for the opaque lock
-        // surface and for a warning overlay whose timeline has retired.
         let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
         let overlay = !self.entries[idx].role.is_lock();
         let surface_opacity = self.entries[idx].opacity.is_some();
@@ -1228,32 +834,11 @@ impl<S: LockSession> App<S> {
             self.schedule_present_retry(id);
             return;
         };
-        // Probe before acquiring. A buffer taken and dropped un-attached on
-        // a clean scene is not free: the compositor answers every
-        // `wl_buffer.destroy` with `delete_id`, which makes the Wayland fd
-        // readable, which defeats the timeout the loop just armed, which
-        // brings us straight back here for another buffer. Measured at 24k
-        // iterations/s against Hyprland with nothing ever drawn, and at one
-        // per timeout against wlroots -- which does not reply eagerly, so
-        // the nested suite could never see it (#65).
-        //
-        // A forced present still acquires: an output that has not committed
-        // yet must get a frame even over a quiescent scene (#35/#37).
         if !force && !self.session.scene_needs_present(id) {
-            // Nothing owed, so no attempt is outstanding. Clearing here
-            // keeps the retry map's invariant positional-proof: a stale
-            // past-deadline entry clamps the loop timeout to zero and
-            // spins, which is the same family of bug as #65 itself.
             self.present_retry.remove(&id);
             return;
         }
         self.metrics.record_buffer_acquire();
-        // Opened after the dirtiness probe: a present that owes nothing is
-        // not a frame, and counting it as one would bury the real frames in
-        // the answer to "what happened during this transition". Dropped
-        // when `present` returns, on every path including the early ones,
-        // so a failed buffer acquisition still reads as a frame that cost
-        // time.
         let frame_span = tracing::debug_span!(
             target: "vigil",
             "frame.present",
@@ -1287,9 +872,6 @@ impl<S: LockSession> App<S> {
             },
         );
         if !drew && force {
-            // A forced present over a quiescent scene: request a repaint
-            // and re-render once before ever committing an empty buffer —
-            // the black-until-next-clock-tick failure of issue #35.
             self.session.force_repaint(id);
             drew = self.session.render(
                 id,
@@ -1306,15 +888,6 @@ impl<S: LockSession> App<S> {
             return;
         }
         if let Some((frost, wallpaper)) = overlay_progress {
-            // The reveal is blur- AND tint-free: its buffer is pure
-            // wallpaper. pixel_frost() forces full frost on lever surfaces
-            // (the surface opacity carries the ramp there), so a nonzero
-            // frost_alpha would still bake a gray tint even with frost
-            // pinned 0. Zero the tint explicitly for the reveal role.
-            // A blur-free reveal renders zero tint: pixel_frost() forces full
-            // frost on lever surfaces, so a nonzero frost_alpha would bake a
-            // gray tint even with frost pinned 0. A blurring reveal keeps the
-            // configured alpha so its frost fade carries a tint like the lock.
             let frost_alpha = if is_reveal && !self.reveal_blur {
                 0.0
             } else {
@@ -1322,8 +895,6 @@ impl<S: LockSession> App<S> {
             };
             overlay_blend(canvas, frost, wallpaper, frost_alpha, surface_opacity);
         }
-        // Captured after the overlay blend: the full-buffer premultiply is
-        // the cost this diagnostic exists to surface on slow compositors.
         let render_elapsed = render_started.elapsed();
         if drew {
             self.metrics.record_render();
@@ -1332,9 +903,6 @@ impl<S: LockSession> App<S> {
             eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
         }
         if let Some((frost, wallpaper)) = overlay_progress {
-            // The warning fades via frost (surface opacity ramps the blur
-            // strength in); the reveal fades via the lock wallpaper's
-            // opacity, with frost pinned 0 - so unlock has no blur or tint.
             let opacity = if self.entries[idx].role.is_reveal() {
                 wallpaper
             } else {
@@ -1358,14 +926,6 @@ impl<S: LockSession> App<S> {
                 render_elapsed, commit_elapsed
             );
         }
-        // Close the span before fingerprinting. `frame.present` must measure
-        // the frame, not the frame plus an opt-in diagnostic — a span whose
-        // duration changes when you turn on tracing is worse than no span.
-        // The hash record then lands beside it as a sibling rather than a
-        // child, which is also what it is: a fact about a frame already
-        // committed. On an overlay it fingerprints what vigil drew, not what
-        // the screen shows — the surface's opacity lever is applied after
-        // this and is not in the bytes.
         drop(frame_span);
         if frame_hash_enabled()
             && let Some(pool) = self.entries[idx].pool.as_mut()
@@ -1385,9 +945,6 @@ impl<S: LockSession> App<S> {
                 self.dirty.mark(id);
             }
         }
-        // Build deferred scenes in one batch: every output whose configure
-        // landed since the last tick already holds a solid placeholder, so
-        // the themed content appears on all of them together (issue #37).
         for (id, is_lock) in std::mem::take(&mut self.pending_scenes) {
             let Some(idx) = self.entries.iter().position(|entry| {
                 entry.id == id && entry.configured && entry.role.is_lock() == is_lock
@@ -1406,23 +963,15 @@ impl<S: LockSession> App<S> {
             } else {
                 self.session.output_rebound(id, &info);
             }
-            // The placeholder marked the surface committed, so the coming
-            // present is not forced: guarantee the fresh scene paints.
             self.session.force_repaint(id);
             self.dirty.mark(id);
         }
         self.session.tick();
-        // Drain async session state only after session.tick() has pumped
-        // it: readiness read before the pump left the timeline waiting on a
-        // wallpaper that had already arrived, and with no wakeup scheduled
-        // the warning never committed and the session never locked.
         let events: Vec<FlowEvent> = std::mem::take(&mut self.protocol_events)
             .into_iter()
             .chain(self.session.poll_events())
             .collect();
         for event in events {
-            // Diagnostic record: which inputs actually reach the flow, at
-            // what elapsed time. Session tier: a handful per lock.
             tracing::event!(
                 name: "flow.input",
                 target: "vigil",
@@ -1440,8 +989,6 @@ impl<S: LockSession> App<S> {
         if self.outcome.is_some() {
             return;
         }
-        // What the flow armed after this tick - the fact whose absence a
-        // 123 s live hang came down to, and which nothing recorded.
         tracing::event!(
             name: "flow.wait",
             target: "vigil",
@@ -1451,19 +998,7 @@ impl<S: LockSession> App<S> {
                 .next_wake()
                 .map_or(-1i64, |d| d.as_millis() as i64)
         );
-        // The DirtySet is advisory, not the render gate. The software adapter
-        // cannot intercept Slint's request_redraw (the slint::Window belongs to
-        // the inner MinimalSoftwareWindow, so core never calls the tracking
-        // wrapper), which left animations and input-driven changes unpresented
-        // on metal. Every configured surface is offered a present each tick;
-        // render_if_needed is a no-op for a clean scene and present() then
-        // commits nothing.
         let _ = self.dirty.take_all();
-        // During handoff both surfaces deliberately share one output ID and
-        // one retained OutputWindow. Render the fresh lock surfaces first;
-        // otherwise an overlay consumes the one pending software frame and
-        // the lock surface commits its black fallback. Two index passes: no
-        // per-tick allocation or sort (present() never adds/removes entries).
         for lock_pass in [0, 1] {
             for idx in 0..self.entries.len() {
                 if present_priority(self.entries[idx].role.is_lock()) == lock_pass {
@@ -1472,8 +1007,6 @@ impl<S: LockSession> App<S> {
             }
         }
         if !self.unlock_sent && self.reveal_entries_all_committed() {
-            // The overlays just mapped: tell the controller so the lock is
-            // released now rather than at the map deadline.
             let cmds = self.flow.step(self.now(), FlowEvent::RevealOverlaysMapped);
             self.run(cmds);
         }
@@ -1508,7 +1041,6 @@ impl<S: LockSession> App<S> {
         self.pre_lock_overlays = false;
     }
 
-    /// Destroy every overlay entry matching `role`, with its protocol objects.
     fn drop_overlays(&mut self, role: fn(&SurfaceRole) -> bool) {
         self.entries.retain_mut(|entry| {
             if role(&entry.role) {
@@ -1539,8 +1071,6 @@ impl<S: LockSession> App<S> {
         any && all
     }
 
-    /// `unlock_and_destroy` + roundtrip. The unlock must reach the
-    /// compositor before we exit, or the session may stay locked forever.
     fn send_unlock(&mut self) {
         if let Some(lock) = self.lock.take() {
             lock.unlock();
@@ -1552,59 +1082,29 @@ impl<S: LockSession> App<S> {
     }
 }
 
-/// Write end of the self-pipe the termination handler writes to; -1 until
-/// [`arm_termination`] runs. An atomic rather than a `OnceLock` because a
-/// signal handler reads it, and a plain load is all a handler may do.
 static TERMINATION_PIPE: AtomicI32 = AtomicI32::new(-1);
 
-/// The handler for SIGTERM, SIGINT and SIGHUP: one `write(2)` of the signal
-/// number and nothing else. `write` is async-signal-safe; formatting a trace
-/// record or taking the sink's lock is not (issue #79), so the record is
-/// written by the event loop once it has read this byte. The result is
-/// ignored on purpose: a full pipe means a wake is already pending, and a
-/// closed one means the loop is gone and the process is on its way out.
 extern "C" fn on_termination_signal(signal: libc::c_int) {
     let fd = TERMINATION_PIPE.load(Ordering::Relaxed);
     if fd < 0 {
         return;
     }
     let byte = signal as u8;
-    // SAFETY: a one-byte buffer that outlives the call, on a descriptor this
-    // process opened and never closes; write(2) is async-signal-safe.
     unsafe {
         libc::write(fd, (&byte as *const u8).cast(), 1);
     }
 }
 
-/// Turn SIGTERM, SIGINT and SIGHUP into [`FlowEvent::Terminate`] (#79).
-///
-/// A self-pipe rather than a flag, because of what the loop is: calloop over
-/// epoll, blocked with nothing to do for up to the clock interval, which is
-/// a minute when the clock shows no seconds. A flag is noticed at the next
-/// wake; a byte on a pipe the loop polls wakes it now, and from whichever
-/// thread the kernel delivered the signal to (the join-socket acceptor, a
-/// PAM worker, zbus). `SA_RESTART` keeps those threads' blocking calls from
-/// failing with EINTR; `epoll_wait` is never restarted, and calloop retries
-/// it. The byte carries the signal number so the outcome can name it.
-///
-/// Process-wide and once per process, like the singleton guard: the write
-/// end lives in a static the handler reads, and the read end belongs to the
-/// loop. The handler stays installed for the rest of the process, so a
-/// second signal after the loop has ended is a byte nobody reads, and the
-/// exit that is already under way finishes it.
 fn arm_termination<'l, S: LockSession + 'static>(
     handle: &LoopHandle<'l, App<S>>,
 ) -> Result<(), LockError> {
     let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: pipe2 fills the two-element array it is given.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
         return Err(err(format!(
             "termination pipe: {}",
             std::io::Error::last_os_error()
         )));
     }
-    // SAFETY: both descriptors were just returned by pipe2 and nothing else
-    // owns them.
     let (read_end, write_end) =
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     if TERMINATION_PIPE
@@ -1618,13 +1118,8 @@ fn arm_termination<'l, S: LockSession + 'static>(
     {
         return Err(err("termination handling armed twice in one process"));
     }
-    // The handler may run at any moment from now on, so the write end is
-    // never closed.
     std::mem::forget(write_end);
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-        // SAFETY: a zeroed sigaction is a valid starting point, the handler
-        // is `extern "C"` and does only async-signal-safe work, and the
-        // struct outlives the call.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             let handler: extern "C" fn(libc::c_int) = on_termination_signal;
@@ -1643,10 +1138,6 @@ fn arm_termination<'l, S: LockSession + 'static>(
         .insert_source(
             Generic::new(File::from(read_end), Interest::READ, Mode::Level),
             |_, pipe, app: &mut App<S>| {
-                // Drain everything queued; the flow is terminal after the
-                // first and ignores the rest. Raised, not stepped: the same
-                // deferral every protocol callback observes, so the exit
-                // runs from `tick` like every other command.
                 let mut reader: &File = pipe;
                 let mut bytes = [0_u8; 8];
                 loop {
@@ -1660,7 +1151,6 @@ fn arm_termination<'l, S: LockSession + 'static>(
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        // WouldBlock: drained.
                         Err(_) => break,
                     }
                 }
@@ -1671,7 +1161,6 @@ fn arm_termination<'l, S: LockSession + 'static>(
     Ok(())
 }
 
-/// Lock the session immediately and run until unlocked/denied/invalidated.
 pub fn run<S: LockSession + 'static>(session: S) -> Result<LockOutcome, LockError> {
     let lock = Lock {
         transition: vigil_config::LockTransition::immediate(),
@@ -1680,27 +1169,11 @@ pub fn run<S: LockSession + 'static>(session: S) -> Result<LockOutcome, LockErro
     run_with_lock(session, &lock, Some(0))
 }
 
-/// Run the locker under `lock` policy: an optional capture-free warning
-/// (cancelable, `duration_ms > 0`) or the short non-cancelable transition
-/// before acquiring session-lock, and the reveal fade after unlock.
-/// `warning_ms_override` carries `--warn`/`--no-warn`.
 pub fn run_with_lock<S: LockSession + 'static>(
     session: S,
     lock_config: &Lock,
     warning_ms_override: Option<u64>,
 ) -> Result<LockOutcome, LockError> {
-    // The root of the whole lock. Entered for the duration of the body, so
-    // every span and event below becomes its descendant without a parent
-    // being threaded through the executor.
-    //
-    // `outcome` and `error` are declared Empty and recorded here, after the
-    // body returns: a span's fields are fixed at creation, and how the lock
-    // ended is the one attribute that cannot be known then. The body is a
-    // separate function so its `?` early returns - every setup failure from
-    // connect_to_env through WaylandSource::insert - still land on this
-    // recording; recording at the body's own tail left a failed setup
-    // emitting a `lock.session` with neither field, indistinguishable from
-    // a session that ended without an outcome.
     let root = tracing::info_span!(
         target: "vigil",
         "lock.session",
@@ -1710,9 +1183,6 @@ pub fn run_with_lock<S: LockSession + 'static>(
     );
     let _root = root.clone().entered();
     let result = run_with_lock_body(session, lock_config, warning_ms_override);
-    // `display`, not `debug`: LockOutcome's Display is the inert, tested
-    // spelling (`Terminated:SIGTERM`), and Debug would put parentheses or
-    // braces into a value this record promises is a single token.
     match &result {
         Ok(outcome) => root.record("outcome", tracing::field::display(outcome)),
         Err(error) => root.record("error", tracing::field::display(error)),
@@ -1720,30 +1190,17 @@ pub fn run_with_lock<S: LockSession + 'static>(
     result
 }
 
-/// The fallible body of [`run_with_lock`]. The caller has entered the
-/// `lock.session` root span and records `outcome`/`error` from this
-/// function's return value, so a `?` here never skips the recording.
 fn run_with_lock_body<S: LockSession + 'static>(
     session: S,
     lock_config: &Lock,
     warning_ms_override: Option<u64>,
 ) -> Result<LockOutcome, LockError> {
-    // The entered `lock.session` root, reborrowed for explicit parenting.
     let root = tracing::Span::current();
 
     let conn = Connection::connect_to_env().map_err(err)?;
     let (globals, event_queue) = registry_queue_init(&conn).map_err(err)?;
     let qh: QueueHandle<App<S>> = event_queue.handle();
     let mut event_loop: EventLoop<App<S>> = EventLoop::try_new().map_err(err)?;
-    // From here on a termination signal is an event the loop handles, so the
-    // flow reaches a terminal phase and the trace closes (issue #79). Armed
-    // before anything that takes time (binding globals, building the
-    // controller, the immediate path's lock request), so the window in which
-    // a signal still kills the process outright is connect_to_env and the
-    // registry round trip above, which no loop can cover. A `--wait` parent
-    // never enters this function and stays killable the ordinary way.
-    // Failure degrades the way an absent layer-shell or join socket does:
-    // the lock is worth more than its trace.
     if let Err(error) = arm_termination(&event_loop.handle()) {
         eprintln!(
             "vigil-lock: {error}; a signal will still end the process, without closing its trace"
@@ -1767,7 +1224,6 @@ fn run_with_lock_body<S: LockSession + 'static>(
             if policy.transition.ramps_in() || policy.transition.reveals() {
                 eprintln!("vigil-lock: layer-shell unavailable ({error}); locking immediately");
             }
-            // No overlays are possible: neither ramp nor reveal can run.
             policy.transition = vigil_config::LockTransition::immediate();
             None
         }
@@ -1782,10 +1238,6 @@ fn run_with_lock_body<S: LockSession + 'static>(
         warning_ms_override,
     );
     let pre_lock_overlays = flow.phase() == vigil_flow::FlowPhase::PreLock;
-    // The phase the controller starts in is never announced - there is no
-    // transition into it - so open its span here or the first phase of every
-    // lock is missing from the trace, and the frames before the first
-    // transition sit inside no phase at all.
     let phase_span = Some(tracing::info_span!(
         target: "vigil",
         parent: root.id(),
@@ -1848,14 +1300,11 @@ fn run_with_lock_body<S: LockSession + 'static>(
         }
     );
 
-    // The controller's opening commands (hide the panel for a ramp, or take
-    // the session lock at once on the immediate path).
     app.run(boot_cmds);
     if let Some(error) = app.error.take() {
         return Err(error);
     }
 
-    // Outputs known now; later arrivals come via OutputHandler::new_output.
     let outputs: Vec<_> = app.outputs.outputs().collect();
     for output in outputs {
         app.add_output(&qh, output);
@@ -1888,35 +1337,18 @@ fn run_with_lock_body<S: LockSession + 'static>(
         ) {
             timeout = Some(timeout.map_or(retry, |current| current.min(retry)));
         }
-        // One span per wake, at `frames` detail. This is what places a
-        // transition relative to the loop that produced it: every
-        // frame.present sits inside the loop.iteration that drove it, and a
-        // flow.transition's t_us falls inside exactly one of them.
         let _iteration = tracing::debug_span!(target: "vigil", "loop.iteration").entered();
         event_loop.dispatch(timeout, &mut app).map_err(err)?;
         app.wake.acknowledge();
         app.metrics.record_wake();
-        // A frame deadline, Wayland input, or an asynchronous worker wakeup
-        // all converge here. No expensive client work belongs in callbacks.
         app.tick();
     }
-    // Close the phase before the session, so the tree nests the way it
-    // happened rather than by whatever order the fields drop in.
     app.phase_span = None;
     report_idle_cost(&metrics_at_start, &app.metrics, started);
-    if matches!(app.outcome, Some(LockOutcome::Terminated(_))) {
-        // A signal must leave the compositor's lock state exactly as the
-        // process dying would have, and the protocol settles what that is:
-        // "if the client dies while the session is locked, the compositor
-        // must not unlock the session in response". sctk's SessionLock
-        // sends a plain `destroy` from Drop, which after `locked` is a
-        // protocol error and, either way, a request this path has no
-        // business marshalling. Leak the object instead: nothing about the
-        // lock is sent, and the connection closing at exit is the whole
-        // story the compositor sees, as it was before #79.
-        if let Some(lock) = app.lock.take() {
-            std::mem::forget(lock);
-        }
+    if matches!(app.outcome, Some(LockOutcome::Terminated(_)))
+        && let Some(lock) = app.lock.take()
+    {
+        std::mem::forget(lock);
     }
     match (&app.error, app.outcome) {
         (Some(_), _) => Err(app.error.take().expect("checked above")),
@@ -1925,15 +1357,6 @@ fn run_with_lock_body<S: LockSession + 'static>(
     }
 }
 
-/// One line per lock, on the way out: how much work the session actually
-/// did, and at what rate.
-///
-/// ADR 0002 required these counters and they have been recorded since --
-/// but never reported anywhere, which is why a locked session burning most
-/// of a core with nothing on screen (#65) was invisible until someone
-/// thought to run pidstat. A settled lock should show a handful of wakes
-/// per minute and commits only when something changed; anything in the
-/// thousands is the shape of a loop feeding itself.
 fn report_idle_cost(
     start: &slint_idle_runtime::MetricsSnapshot,
     metrics: &Metrics,
@@ -2000,14 +1423,11 @@ impl<S: LockSession> LayerShellHandler for App<S> {
         };
         let id = self.entries[idx].id;
         if self.entries[idx].role.is_reveal() {
-            // Cosmetic: the fade simply loses this output.
             self.entries.remove(idx);
             return;
         }
         eprintln!("vigil-lock: warning surface {id:?} closed");
         self.entries.remove(idx);
-        // A cancelable warning ends here; a transition must still lock.
-        // The controller knows which it is running.
         self.raise(FlowEvent::OverlayClosed);
     }
 
@@ -2206,11 +1626,6 @@ impl<S: LockSession> SeatHandler for App<S> {
         capability: Capability,
     ) {
         match capability {
-            // MUST release, not just drop: the compositor keeps delivering
-            // events to an unreleased wl_keyboard, so after a seat
-            // capability bounce (observed across suspend/resume) the next
-            // `new_capability` binds a second one and every keystroke
-            // arrives twice — doubled password characters.
             Capability::Keyboard => {
                 if let Some(keyboard) = self.keyboard.take() {
                     keyboard.release();
@@ -2235,7 +1650,6 @@ impl<S: LockSession> CompositorHandler for App<S> {
         surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
-        // Integer fallback path: only honored when fractional scale is absent.
         if self.fractional_mgr.is_some() {
             return;
         }
@@ -2290,9 +1704,6 @@ impl<S: LockSession> OutputHandler for App<S> {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        // Deferred: a transition commits on topology change, and
-        // begin_lock must not create lock surfaces for an output sctk has
-        // not finished removing.
         self.raise(FlowEvent::OutputGone);
         if let Some(id) = self
             .entries
@@ -2316,10 +1727,6 @@ impl<S: LockSession> OutputHandler for App<S> {
         }
     }
 }
-
-// Raw protocol plumbing for fractional scale + viewporter (sctk has no
-// helpers for these; the manual impls don't overlap the Dispatch2 blanket
-// because our user-data types don't implement Dispatch2).
 
 impl<S: LockSession> Dispatch<WpFractionalScaleV1, FractionalTarget> for App<S> {
     fn event(
@@ -2360,10 +1767,6 @@ mod tests {
 
     #[test]
     fn a_retry_for_a_departed_output_cannot_steer_the_loop() {
-        // The hazard (#70): a retry outlives its output, its deadline is
-        // for ever in the past, the loop's timeout becomes ZERO and
-        // dispatch returns instantly on every iteration -- a spin with no
-        // work, the same shape as the buffer churn in #65.
         let now = Instant::now();
         let mut retries = super::BTreeMap::new();
         retries.insert(super::OutputId(1), (now - Duration::from_secs(60), 3_u32));
@@ -2389,7 +1792,6 @@ mod tests {
             super::soonest_retry(&retries, |_| true, now),
             Some(Duration::from_millis(200))
         );
-        // ...but only among the live ones.
         assert_eq!(
             super::soonest_retry(&retries, |id| id == super::OutputId(1), now),
             Some(Duration::from_millis(800))
@@ -2400,10 +1802,6 @@ mod tests {
 
     #[test]
     fn hotplug_after_lock_creates_a_lock_surface_not_a_warning() {
-        // The warning timeline object is retained until its GUI completes,
-        // so "warning object exists" must not decide the role once the lock
-        // is held (issue #35: the warning surface was destroyed by cleanup,
-        // leaving the hotplugged output permanently black).
         assert!(surface_role_is_warning(true, false));
         assert!(!surface_role_is_warning(true, true));
         assert!(!surface_role_is_warning(false, false));
@@ -2418,9 +1816,6 @@ mod tests {
 
     #[test]
     fn the_pure_signal_table_matches_libc() {
-        // vigil-flow names no platform constant (it is pure), so this is
-        // where its numbers meet the ones the handler is installed for and
-        // the byte the self-pipe carries (issue #79).
         use vigil_flow::Signal;
         assert_eq!(Signal::Hangup.number(), libc::SIGHUP);
         assert_eq!(Signal::Interrupt.number(), libc::SIGINT);
@@ -2435,8 +1830,6 @@ mod tests {
 
     #[test]
     fn lock_surface_renders_before_overlapping_overlays() {
-        // Warning and reveal overlays share the lock surface's OutputWindow;
-        // the lock surface must consume the pending frame first.
         assert!(present_priority(true) < present_priority(false));
     }
 
@@ -2448,15 +1841,9 @@ mod tests {
 
     #[test]
     fn the_frame_fingerprint_is_the_published_fnv_1a_constants() {
-        // Pinned to the algorithm, not to whatever this build's hasher does:
-        // the point of the record is comparing a warning frame's hash to a
-        // lock frame's hash, possibly from two different binaries. Vectors
-        // from the FNV-1a 64-bit reference.
         assert_eq!(super::frame_hash(b""), "cbf29ce484222325");
         assert_eq!(super::frame_hash(b"a"), "af63dc4c8601ec8c");
         assert_eq!(super::frame_hash(b"foobar"), "85944171f73967e8");
-        // A one-byte difference anywhere must move it: a black first frame
-        // and a copied-out warning frame must never fingerprint alike.
         let black = vec![0_u8; 4096];
         let mut nearly_black = black.clone();
         nearly_black[4095] = 1;
@@ -2484,7 +1871,6 @@ smithay_client_toolkit::delegate_dispatch2!(@<S: LockSession + 'static> App<S>);
 mod ramp_commit_only_tests {
     use super::ramp_commit_only;
 
-    // (is_lock, has_lever, committed)
     const OVERLAY_OK: (bool, bool, bool) = (false, true, true);
     const LOCK: (bool, bool, bool) = (true, false, false);
 
@@ -2500,19 +1886,14 @@ mod ramp_commit_only_tests {
 
     #[test]
     fn every_condition_alone_forces_the_full_round() {
-        // wallpaper > 0: the blend depends on the rendered input.
         assert!(!ramp_commit_only(0.5, 0.0, true, [OVERLAY_OK].into_iter()));
-        // Scene not yet synced: panel/cursor hiding has not been applied.
         assert!(!ramp_commit_only(0.0, 0.0, false, [OVERLAY_OK].into_iter()));
-        // An overlay without a lever needs its pixels re-blended per tick.
         assert!(!ramp_commit_only(
             0.0,
             0.0,
             true,
             [OVERLAY_OK, (false, false, true)].into_iter()
         ));
-        // An uncommitted overlay must not receive a bare commit: it would
-        // map with no buffer (#35/#37).
         assert!(!ramp_commit_only(
             0.0,
             0.0,
@@ -2523,33 +1904,21 @@ mod ramp_commit_only_tests {
 
     #[test]
     fn the_first_tick_after_a_wallpaper_fade_renders_a_full_round() {
-        // The invariant is about the buffer already committed on the
-        // surface, not the value arriving this tick. On the reveal's
-        // descending edge (wallpaper > 0 -> 0.0) the committed buffer still
-        // carries the half-dissolved wallpaper; skipping the render there
-        // freezes it for the whole frost-out. Reproduced in pixels: with a
-        // linear 165/1500 reveal the composite stuck at 141 where main
-        // reached 172.
         assert!(
             !ramp_commit_only(0.0, 0.2, true, [OVERLAY_OK].into_iter()),
             "the tick after a fade must re-render the pure tint"
         );
-        // ... and only that one tick: once a full round has rebaked the
-        // buffer, prev is 0.0 and commit-only resumes.
         assert!(ramp_commit_only(0.0, 0.0, true, [OVERLAY_OK].into_iter()));
     }
 
     #[test]
     fn lock_surfaces_neither_qualify_nor_disqualify() {
-        // The lock surface has no lever and is not part of the ramp; its
-        // state must be invisible to this decision.
         assert!(ramp_commit_only(
             0.0,
             0.0,
             true,
             [LOCK, OVERLAY_OK].into_iter()
         ));
-        // ... and a world with only lock surfaces has nothing to latch.
         assert!(!ramp_commit_only(0.0, 0.0, true, [LOCK].into_iter()));
         assert!(!ramp_commit_only(0.0, 0.0, true, std::iter::empty()));
     }
@@ -2559,9 +1928,6 @@ mod ramp_commit_only_tests {
 mod overlay_blend_tests {
     use super::*;
 
-    /// The arithmetic present() shipped before the fast path existed,
-    /// transcribed verbatim. The fast path must be byte-identical to this
-    /// on every input, or a "performance" change is silently a visual one.
     fn reference(
         canvas: &mut [u8],
         frost: f32,
@@ -2583,7 +1949,6 @@ mod overlay_blend_tests {
         }
     }
 
-    /// Deterministic junk that exercises every byte value.
     fn scribble(len: usize, seed: u8) -> Vec<u8> {
         (0..len)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
@@ -2592,10 +1957,6 @@ mod overlay_blend_tests {
 
     #[test]
     fn the_fast_path_is_byte_identical_to_the_reference() {
-        // The frost-only fill is valid precisely because the output ignores
-        // the rendered input; the wallpaper>0 loop must keep depending on
-        // it. Cover both, across the ramp and both lever states, on
-        // buffers whose every input byte differs.
         for &surface_opacity in &[true, false] {
             for &frost in &[0.0, 0.001, 0.35, 0.42, 0.9648, 1.0] {
                 for &wallpaper in &[0.0, 0.001, 0.5, 0.97, 1.0, 1.5, -0.2] {
@@ -2616,9 +1977,6 @@ mod overlay_blend_tests {
 
     #[test]
     fn frost_only_output_ignores_the_rendered_input() {
-        // The property the fill relies on, asserted directly rather than
-        // implied: two entirely different renders blend to the same bytes
-        // when wallpaper is zero.
         let mut a = scribble(64 * 4, 1);
         let mut b = scribble(64 * 4, 200);
         overlay_blend(&mut a, 0.42, 0.0, 0.35, true);
@@ -2628,9 +1986,6 @@ mod overlay_blend_tests {
 
     #[test]
     fn a_reveal_blend_still_depends_on_the_rendered_input() {
-        // The discrimination sibling: wallpaper>0 must NOT collapse to a
-        // constant, or the reveal would fade a grey card instead of the
-        // lock wallpaper.
         let mut a = scribble(64 * 4, 1);
         let mut b = scribble(64 * 4, 200);
         overlay_blend(&mut a, 1.0, 0.5, 0.35, true);
@@ -2640,7 +1995,6 @@ mod overlay_blend_tests {
 
     #[test]
     fn a_tail_shorter_than_a_pixel_is_left_alone_by_both_paths() {
-        // as_chunks_mut::<4> ignores a ragged tail; the fill must too.
         let original = scribble(4 * 3 + 2, 9);
         let mut fast = original.clone();
         let mut slow = original.clone();

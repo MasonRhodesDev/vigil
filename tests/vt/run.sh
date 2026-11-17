@@ -1,23 +1,7 @@
 #!/usr/bin/env bash
-# On-metal VT harness: run vigil against a fake greetd from a spare virtual
-# console. Real GPU modeset, real libinput — no VM, no changes to the real
-# greetd config. Log in on a free VT (Ctrl+Alt+F3) and run this script there;
-# it must NOT run under a compositor (libseat only grants the seat to the
-# active VT's session).
-#
-# The whole run is wrapped in `timeout` so a wedged greeter can never hold
-# the display/input hostage: worst case the screen comes back by itself.
-# Fake credentials: any username works, the accepted password is "vigil-test"
-# (override with VIGIL_TEST_PASSWORD). Try a wrong one first — you should get
-# the red error and a fresh prompt. A successful login just logs
-# START_SESSION and exits; it starts nothing.
 set -uo pipefail
 
 DIR=$(cd "$(dirname "$0")/../.." && pwd)
-# Release build: debug-profile software rendering at 4K is slow enough to
-# starve the event loop (libinput overflows and drops keystrokes).
-# $VIGIL_VT_BIN pre-flights an *installed* greeter -- the exact binary greetd
-# will run -- rather than the repo build.
 BIN=${VIGIL_VT_BIN:-$DIR/target/release/vigil}
 [ -x "$BIN" ] || BIN=$DIR/target/debug/vigil
 SOCK=${XDG_RUNTIME_DIR:-/tmp}/vigil-vt-test.sock
@@ -25,9 +9,6 @@ PASSWORD=${VIGIL_TEST_PASSWORD:-vigil-test}
 LOG=${VIGIL_VT_LOG:-$HOME/.cache/vigil-vt-test}
 LIMIT=${VIGIL_VT_TIMEOUT:-180}
 
-# Best-effort VT detection: any one signal is enough. libseat is the real
-# gatekeeper — if this session can't take the seat, vigil exits with a clear
-# error and the script reports FAIL — so a misread here only costs a warning.
 CTTY=$(ps -o tty= -p $$ | tr -d ' ')
 if [[ ${CTTY} != tty[0-9]* && ${XDG_SESSION_TYPE:-} != tty && -z ${XDG_VTNR:-} ]]; then
     echo "warning: this does not look like a virtual console login" >&2
@@ -43,13 +24,7 @@ GREETD=$!
 trap 'kill "$GREETD" 2>/dev/null' EXIT
 
 echo "vigil-vt: starting (auto-kill after ${LIMIT}s; password: $PASSWORD)"
-# No --user and no --cmd: the full greeter-spec flow. Type any username at
-# the first prompt (the fake greetd accepts all of them), pick a session
-# with the mouse, and use Ctrl+Alt+Fn to switch VTs at any time. Power
-# buttons are inhibited — this is a test, not a real login.
 export VIGIL_POWER_INHIBIT=1
-# $VIGIL_VT_CONFIG picks a non-default config -- how the GL renderer is
-# selected, so the same on-metal flow can be driven on either path.
 CONFIG_ARGS=()
 [ -n "${VIGIL_VT_CONFIG:-}" ] && CONFIG_ARGS=(--config "$VIGIL_VT_CONFIG")
 timeout --foreground "$LIMIT" \

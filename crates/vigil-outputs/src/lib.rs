@@ -1,11 +1,3 @@
-//! Output manager (DESIGN.md §5): DRM device/surface ownership, connector
-//! hotplug via `DrmScanner`, modesetting, and suspend/resume re-modeset.
-//! Emits [`vigil_core::OutputEvent`]s; surfaces are handed to the binary,
-//! which pairs each with a `Presenter`.
-//!
-//! Architectural commitment: multi-output is the core object model — a
-//! single monitor is the N=1 case of the same code (DESIGN.md §3).
-
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::OnceLock;
@@ -19,25 +11,16 @@ use smithay::utils::DeviceFd;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use vigil_core::{OutputEvent, OutputId, OutputInfo};
 
-/// Re-exported opaquely so the binary can hand surfaces to a presenter
-/// without naming smithay itself.
 pub use smithay::backend::drm::{DrmDeviceFd, DrmEvent, DrmSurface};
 
-/// Opaque udev monitor: a calloop event source firing on GPU/connector
-/// changes. The binary registers it and calls [`OutputManager::scan`] on any
-/// event without naming smithay types.
 pub use smithay::backend::udev::UdevBackend as UdevMonitor;
 
-/// Path of the seat's primary GPU DRM node.
 pub fn primary_gpu_path(seat: &str) -> Result<std::path::PathBuf, OutputsError> {
     smithay::backend::udev::primary_gpu(seat)
         .map_err(err)?
         .ok_or_else(|| OutputsError(format!("no GPU found on seat {seat}")))
 }
 
-/// Every GPU DRM node on the seat, primary (boot_vga) first, the rest in
-/// stable path order. Outputs may span cards (laptop dGPU driving a port),
-/// so the greeter runs one [`OutputManager`] per entry.
 pub fn all_gpu_paths(seat: &str) -> Result<Vec<std::path::PathBuf>, OutputsError> {
     let primary = smithay::backend::udev::primary_gpu(seat).map_err(err)?;
     let mut paths = smithay::backend::udev::all_gpus(seat).map_err(err)?;
@@ -54,7 +37,6 @@ pub fn all_gpu_paths(seat: &str) -> Result<Vec<std::path::PathBuf>, OutputsError
     Ok(paths)
 }
 
-/// A udev monitor for the seat's DRM subsystem.
 pub fn udev_monitor(seat: &str) -> Result<UdevMonitor, OutputsError> {
     smithay::backend::udev::UdevBackend::new(seat).map_err(err)
 }
@@ -80,55 +62,23 @@ struct Entry {
     info: OutputInfo,
 }
 
-/// Owns the DRM device for one GPU and every connected output on it.
 pub struct OutputManager {
     device: DrmDevice,
     scanner: DrmScanner,
     entries: HashMap<OutputId, Entry>,
-    /// Distinguishes this GPU's [`OutputId`]s from other cards' (connector
-    /// handles are only unique per device).
     namespace: u32,
 }
 
 impl OutputManager {
-    /// Take ownership of an opened DRM node (from vigil-session in
-    /// production; opened directly in dev harnesses) and prepare it for
-    /// modesetting. `namespace` is the GPU's index (0 for a single-GPU
-    /// setup) and is folded into every `OutputId`. Returns the notifier the
-    /// binary registers for vblank events.
     pub fn new(fd: OwnedFd, namespace: u32) -> Result<(Self, DrmDeviceNotifier), OutputsError> {
         Self::with_display_state(fd, namespace, false)
     }
 
-    /// [`Self::new`], choosing what happens to the display state the device
-    /// was handed over in.
-    ///
-    /// `keep_state` false disables every connector and plane when the device
-    /// opens, so vigil starts from a known state: every screen goes dark and
-    /// is modeset again by its first frame, and monitors re-sync. `true`
-    /// leaves what the previous owner (the boot splash) lit exactly as it
-    /// is, so a first frame in the same mode on the same CRTC is a plane
-    /// update, not a modeset. The caller must be ready for a commit to fail
-    /// on leftover state and answer with [`Self::reset_display_state`].
     pub fn with_display_state(
         fd: OwnedFd,
         namespace: u32,
         keep_state: bool,
     ) -> Result<(Self, DrmDeviceNotifier), OutputsError> {
-        // Virtualized drivers (virtio-gpu, vmwgfx) hide their cursor plane
-        // from atomic clients unless the client declares it will supply
-        // cursor hotspots (DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, kernel
-        // 6.8+). Declare before smithay enumerates planes. Our hotspot is
-        // the arrow tip at (0, 0) — the property's default — so declaring
-        // costs nothing. Both best-effort: legacy-only devices refuse the
-        // atomic cap, older kernels the hotspot cap, and either way the
-        // plane is simply absent, which the GL policy already handles.
-        //
-        // Order matters: the kernel refuses the hotspot declaration with
-        // EINVAL unless the client is ALREADY atomic (verified with
-        // examples/plane_probe.rs in the GPU harness — hotspot-then-atomic
-        // leaves virtio-gpu's cursor plane hidden). Setting atomic here is
-        // idempotent with smithay doing it again inside DrmDevice::new.
         {
             use std::os::fd::AsFd;
             let raw = RawDrm(fd.as_fd());
@@ -153,13 +103,10 @@ impl OutputManager {
         OutputId(self.namespace << 24 | (raw & 0x00ff_ffff))
     }
 
-    /// The GPU index this manager was created with (`OutputId` namespace).
     pub fn namespace(&self) -> u32 {
         self.namespace
     }
 
-    /// Rescan connectors (startup and on udev hotplug). Returns lifecycle
-    /// events for the binary to act on.
     pub fn scan(&mut self) -> Result<Vec<OutputEvent>, OutputsError> {
         let mut events = Vec::new();
         for scan_event in self.scanner.scan_connectors(&self.device).map_err(err)? {
@@ -202,16 +149,12 @@ impl OutputManager {
                         events.push(OutputEvent::Removed(id));
                     }
                 }
-                // Connected without a free CRTC: more monitors than the GPU
-                // can drive; skip (logged by the binary via the event gap).
                 DrmScanEvent::Connected { crtc: None, .. } => {}
             }
         }
         Ok(events)
     }
 
-    /// Create the DRM surface for an output; the binary wraps it in a
-    /// presenter. Call once per `OutputEvent::Added`.
     pub fn create_surface(&mut self, id: OutputId) -> Result<DrmSurface, OutputsError> {
         let entry = self
             .entries
@@ -222,31 +165,20 @@ impl OutputManager {
             .map_err(err)
     }
 
-    /// Disable every connector and plane, the state a device opened with
-    /// `keep_state` false starts from. Outputs already claimed need a fresh
-    /// modeset afterwards.
     pub fn reset_display_state(&mut self) -> Result<(), OutputsError> {
         self.device.reset_state().map_err(err)
     }
 
-    /// Whether the CRTC an output will use already runs exactly the mode the
-    /// output will be given: `Some(true)` means the first commit can be a
-    /// plane update, `Some(false)` that it is a real modeset (the screen
-    /// re-syncs), `None` that the state could not be read. Read before the
-    /// first commit, so it describes what the previous owner left.
     pub fn first_commit_is_modeset(&self, id: OutputId) -> Option<bool> {
         let entry = self.entries.get(&id)?;
         let crtc = self.device.get_crtc(entry.crtc).ok()?;
         Some(crtc.mode() != Some(entry.mode))
     }
 
-    /// Facts about a live output.
     pub fn info(&self, id: OutputId) -> Option<&OutputInfo> {
         self.entries.get(&id).map(|e| &e.info)
     }
 
-    /// Every mode the connector reports, as `(width, height, refresh_hz)`.
-    /// The binary picks one for a profile and calls [`Self::set_mode`].
     pub fn modes(&self, id: OutputId) -> Vec<(u32, u32, u32)> {
         self.entries
             .get(&id)
@@ -263,10 +195,6 @@ impl OutputManager {
             .unwrap_or_default()
     }
 
-    /// Choose the mode used by the next [`Self::create_surface`]. Must be one
-    /// of [`Self::modes`]; an unknown mode is refused so a profile typo cannot
-    /// hand DRM a mode the connector never advertised. Updates the cached
-    /// `OutputInfo` so the binary sees the geometry it will actually get.
     pub fn set_mode(&mut self, id: OutputId, mode: (u32, u32, u32)) -> Result<(), OutputsError> {
         let connector = self
             .entries
@@ -293,15 +221,11 @@ impl OutputManager {
         Ok(())
     }
 
-    /// Session paused (VT switch/suspend): stop touching DRM.
     pub fn pause(&mut self) {
         self.device.pause();
     }
 
-    /// Session activated: reclaim the device. Surfaces need a fresh modeset;
-    /// the binary requests redraws (presenters re-commit on next frame).
     pub fn activate(&mut self) -> Vec<OutputEvent> {
-        // `false` = do not reset state; surfaces re-commit themselves.
         if self.device.activate(false).is_err() {
             return Vec::new();
         }
@@ -311,25 +235,14 @@ impl OutputManager {
             .collect()
     }
 
-    /// The DRM device this manager owns.
-    ///
-    /// A GL presenter allocates its buffers on the same device and creates
-    /// framebuffers against it. Cloning shares the open file description,
-    /// which is what DRM master rides on -- opening the node again would not
-    /// be master.
     pub fn device_fd(&self) -> smithay::backend::drm::DrmDeviceFd {
         self.device.device_fd().clone()
     }
 
-    /// Whether the device does atomic modesetting (the cursor plane path
-    /// needs it; smithay's legacy fallback drives only the primary plane).
     pub fn is_atomic(&self) -> bool {
         self.device.is_atomic()
     }
 
-    /// Whether the kernel still backs this device. False after a surprise
-    /// removal (dock GPU unplugged): every ioctl on the fd is ENODEV from
-    /// then on, and the manager is only good for dropping.
     pub fn alive(&self) -> bool {
         use std::os::fd::AsFd;
         RawDrm(self.device.device_fd().as_fd())
@@ -337,10 +250,6 @@ impl OutputManager {
             .is_ok()
     }
 
-    /// What an exit holder needs from this device: its raw fd and, for every
-    /// CRTC that is scanning a framebuffer out, `(crtc id, framebuffer id)`.
-    /// The fd stays owned by the manager. Call it after the last flip landed,
-    /// so the framebuffer ids are the ones on screen.
     pub fn hold_snapshot(&self) -> (std::os::fd::RawFd, Vec<(u32, u32)>) {
         use std::os::fd::{AsFd, AsRawFd};
         let crtcs = self
@@ -355,13 +264,11 @@ impl OutputManager {
         (self.device.as_fd().as_raw_fd(), crtcs)
     }
 
-    /// Live output ids.
     pub fn ids(&self) -> Vec<OutputId> {
         self.entries.keys().copied().collect()
     }
 }
 
-/// Minimal DRM handle for setting client caps before smithay owns the fd.
 struct RawDrm<'a>(std::os::fd::BorrowedFd<'a>);
 
 impl std::os::fd::AsFd for RawDrm<'_> {
@@ -372,7 +279,6 @@ impl std::os::fd::AsFd for RawDrm<'_> {
 
 impl smithay::reexports::drm::Device for RawDrm<'_> {}
 
-/// The connector's preferred mode, falling back to its first (largest) mode.
 fn preferred_mode(conn: &connector::Info) -> Option<Mode> {
     conn.modes()
         .iter()
@@ -381,7 +287,6 @@ fn preferred_mode(conn: &connector::Info) -> Option<Mode> {
         .copied()
 }
 
-/// Human name matching kernel conventions, e.g. `DP-1`, `eDP-2`, `Virtual-1`.
 fn connector_name(conn: &connector::Info) -> String {
     use connector::Interface as I;
     let prefix = match conn.interface() {
@@ -402,8 +307,6 @@ fn connector_name(conn: &connector::Info) -> String {
     format!("{}-{}", prefix, conn.interface_id())
 }
 
-/// Raw EDID bytes from the connector's `EDID` property blob. `None` for any
-/// failure: a monitor that reports no EDID must still light up.
 fn read_edid(device: &DrmDevice, handle: connector::Handle) -> Option<Vec<u8>> {
     let props = device.get_properties(handle).ok()?;
     for (prop, raw) in props.iter() {
@@ -416,17 +319,10 @@ fn read_edid(device: &DrmDevice, handle: connector::Handle) -> Option<Vec<u8>> {
     None
 }
 
-/// hwdata's PNP registry: the table Hyprland's description comes from.
-/// aquamarine snapshots this file when it is built and substitutes the vendor
-/// name for the EDID's three-letter id; reading the installed copy gives the
-/// same answer on the same distro.
 const PNP_IDS_PATH: &str = "/usr/share/hwdata/pnp.ids";
 
-/// Used only when the registry is missing, so the ids that already matched
-/// before vigil read hwdata keep matching on a box without it.
 const PNP_FALLBACK: &[(&str, &str)] = &[("DEL", "Dell Inc."), ("GSM", "LG Electronics")];
 
-/// `pnp.ids` lines are `ID<TAB>Vendor name`.
 fn parse_pnp_ids(text: &str) -> HashMap<String, String> {
     text.lines()
         .filter_map(|line| line.split_once('\t'))
@@ -435,7 +331,6 @@ fn parse_pnp_ids(text: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// The vendor name for a PNP id, as Hyprland spells it.
 fn pnp_vendor(id: &str) -> Option<String> {
     static TABLE: OnceLock<Option<HashMap<String, String>>> = OnceLock::new();
     match TABLE.get_or_init(|| {
@@ -451,16 +346,6 @@ fn pnp_vendor(id: &str) -> Option<String> {
     }
 }
 
-/// `(make, model)` from an EDID block, built the way Hyprland builds an
-/// output's description so a `desc:` selector copied from `hyprctl monitors`
-/// matches here: aquamarine's make (the vendor name for the PNP id packed
-/// into bytes 8-9, or the id itself), then libdisplay-info's model and
-/// serial. The serial rides on the model, since vigil keeps two fields.
-/// Hyprland then erases every comma from the description (monitor rules are
-/// comma-separated), so "Red Hat, Inc." matches as "Red Hat Inc."; both
-/// fields only ever feed descriptions, so the commas go here.
-/// Every malformed input yields `None`s rather than panicking — this parses
-/// bytes a monitor supplied.
 fn parse_edid(edid: &[u8]) -> (Option<String>, Option<String>) {
     parse_edid_with(edid, pnp_vendor)
 }
@@ -484,11 +369,8 @@ fn parse_edid_with(
         }
         _ => None,
     };
-    // di_info_get_model: the product name descriptor, else the product code.
     let mut model = descriptor(edid, 0xfc)
         .unwrap_or_else(|| format!("0x{:04X}", u16::from_le_bytes([edid[10], edid[11]])));
-    // di_info_get_serial: the serial descriptor, else the numeric serial
-    // when it is not zero.
     let numeric = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
     let serial =
         descriptor(edid, 0xff).or_else(|| (numeric != 0).then(|| format!("0x{numeric:08X}")));
@@ -500,7 +382,6 @@ fn parse_edid_with(
     (make.map(uncomma), Some(uncomma(model)))
 }
 
-/// Text from one of the four 18-byte display descriptors.
 fn descriptor(edid: &[u8], tag: u8) -> Option<String> {
     if edid.len() < 128 {
         return None;
@@ -520,11 +401,6 @@ fn descriptor(edid: &[u8], tag: u8) -> Option<String> {
         })
 }
 
-/// Scale for a panel of `size_mm` showing `width_px`, snapped to the steps
-/// compositors actually offer. Bands chosen against real hardware: 1440p at
-/// 27" (109 dpi) stays 1.0, 4K at 27" (163 dpi) and a 16" 2560x1600 panel
-/// (188 dpi) both land on 1.5. No physical size (some monitors report 0)
-/// means no basis to guess: 1.0.
 fn scale_for(width_px: u32, size_mm: Option<(u32, u32)>) -> f32 {
     let Some((mm_w, _)) = size_mm else {
         return 1.0;
@@ -562,7 +438,6 @@ mod tests {
         block
     }
 
-    /// A slice of hwdata's pnp.ids, tab-separated like the real file.
     const PNP: &str =
         "BOE\tBOE\nDEL\tDell Inc.\nGSM\tLG Electronics\nHPN\tHP Inc.\nRHT\tRed Hat, Inc.\n";
 
@@ -580,10 +455,6 @@ mod tests {
             .join(" ")
     }
 
-    /// mason-work's desk, read from /sys/class/drm/*/edid, against the
-    /// descriptions `hyprctl monitors` printed for the same panels. The HP
-    /// is the one vigil used to spell "HPN HP E243 ...", which no profile
-    /// written against Hyprland could match.
     #[test]
     fn real_edids_match_hyprland_descriptions() {
         for (edid, hyprland) in [
@@ -628,9 +499,6 @@ mod tests {
         );
     }
 
-    /// No serial descriptor but a numeric serial: libdisplay-info prints it
-    /// as eight hex digits, which is how Hyprland names an LG TV
-    /// ("LG Electronics LG TV 0x01010101").
     #[test]
     fn numeric_serial_without_descriptor() {
         let mut block = edid([0x1e, 0x6d], [0, 0], Some("LG TV"), None);
@@ -638,15 +506,12 @@ mod tests {
         assert_eq!(description(&block), "LG Electronics LG TV 0x01010101");
     }
 
-    /// QEMU's virtual monitor, as `hyprctl monitors` prints it in the
-    /// hypr-qa guest: Hyprland erases the comma from "Red Hat, Inc.".
     #[test]
     fn commas_are_erased_like_hyprland() {
         let block = edid([0x49, 0x14], [0x34, 0x12], Some("QEMU Monitor"), None);
         assert_eq!(description(&block), "Red Hat Inc. QEMU Monitor");
     }
 
-    /// The serial descriptor wins over a numeric serial (the HP has both).
     #[test]
     fn serial_descriptor_beats_numeric_serial() {
         let mut block = edid([0x22, 0x0e], [0, 0], Some("HP E243"), Some("CNK7510Y4B"));

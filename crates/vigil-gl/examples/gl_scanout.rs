@@ -1,16 +1,3 @@
-//! Render the real theme through GL into a GBM surface, then lock the buffer
-//! that a DRM framebuffer would be made from.
-//!
-//! This is the whole scanout path except the CRTC commit, so it needs a card
-//! node we are DRM master on. Run it through the GPU harness:
-//!
-//!   cargo build -p vigil-gl --example gl_scanout
-//!   tests/gpu/run.sh -- target/debug/examples/gl_scanout
-//!   tests/gpu/run.sh --accel -- target/debug/examples/gl_scanout
-//!
-//! Pixels are read back *before* the swap: afterwards the back buffer is
-//! undefined and reads black however well the draw went.
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -71,11 +58,9 @@ fn main() {
         .expect("clock");
     instance.show().expect("show");
 
-    // Renders and swaps: femtovg's present forwards to eglSwapBuffers.
     window.render().expect("render");
     println!("rendered the default theme through femtovg: ok");
 
-    // SAFETY: a swap just happened, and the buffer is released below.
     let bo = unsafe { gbm.lock_front_buffer() }.expect("lock front buffer");
     println!(
         "front buffer: {}x{} stride={} format={:?}",
@@ -90,7 +75,6 @@ fn main() {
     println!("SCANOUT PATH OK (everything but the CRTC commit)");
 }
 
-/// The interpreter's compile future resolves immediately without a runtime.
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -98,7 +82,6 @@ fn spin_on<F: std::future::Future>(future: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    // SAFETY: the vtable is a no-op waker over a null pointer it never reads.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);

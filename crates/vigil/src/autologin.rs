@@ -1,14 +1,8 @@
-//! Pause automatic login when sessions the greeter starts without any
-//! user input keep dying right after they start (issue #119).
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vigil_config::State;
 
-/// A session that is gone again within this long of its start counts as
-/// short-lived.
 pub const SHORT_SESSION_SECS: u64 = 30;
-/// Consecutive short-lived automatic sessions before automatic login pauses.
 pub const PAUSE_AFTER: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

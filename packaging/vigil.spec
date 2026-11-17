@@ -1,15 +1,3 @@
-# RPM spec for vigil (repo: vigil). Built in COPR from a local SRPM produced
-# by packaging/build-srpm.sh (source tarball from the git tag + vendored
-# cargo deps as Source1 — no rust-*-devel packages needed).
-#
-# The package depends on greetd. %post points stock agreety at vigil and
-# enables greetd as the display manager when none is set. Custom greetd
-# command lines stay operator-owned. /etc/pam.d/vigil-lock ships as a
-# pass-through hook (auth include login) — a named place for operator
-# policy, not an opinion about it.
-#
-# The test suite runs by default; disable for a one-off build with
-# --without check.
 %bcond_without check
 
 Name:           vigil
@@ -23,8 +11,6 @@ Source1:        %{name}-%{version}-vendor.tar.xz
 
 BuildRequires:  cargo-rpm-macros >= 24
 BuildRequires:  systemd-rpm-macros
-# smithay backends: libseat + libinput + libdrm/gbm + libudev; xkbcommon for
-# keymaps; pam for the locker (pam-sys runs bindgen, hence clang).
 BuildRequires:  libseat-devel
 BuildRequires:  libinput-devel
 BuildRequires:  libxkbcommon-devel
@@ -34,14 +20,9 @@ BuildRequires:  mesa-libgbm-devel
 BuildRequires:  pam-devel
 BuildRequires:  clang-devel
 BuildRequires:  fontconfig-devel
-# The greeter runs as greetd's `greeter` user on greetd's socket.
 Requires:       greetd
-# pnp.ids: monitor vendor names, so desc: selectors match Hyprland's.
 Requires:       hwdata
-# groupadd in %pre for the shared monitor-profiles group.
 Requires(pre):  shadow-utils
-# The package creates this shared group in %%pre. Declare the capability so
-# RPM's file-owner dependency for /etc/monitor-profiles is self-satisfied.
 Provides:       group(monitor-profiles)
 
 %description
@@ -52,34 +33,24 @@ config, and auth seams. One Rust binary per surface, Slint scenes per
 output, runtime .slint themes with a compiled-in fallback.
 
 %prep
-# -a1 unpacks vendor/ and its generated git source replacements.
 %autosetup -p1 -a1
 %cargo_prep -v vendor
-# %%cargo_prep redirects crates.io only. Append the exact tagged/revision git
-# replacements captured by cargo vendor in build-srpm.sh.
 cfg=.cargo/config.toml
 [ -f "$cfg" ] || cfg=.cargo/config
 cat vendor-git-sources.toml >> "$cfg"
 
 %build
-# vigil's default features include `gl` (FemtoVG over GBM/EGL).
 %cargo_build
 %{cargo_license_summary}
 %{cargo_license} > LICENSE.dependencies
 
 %install
-# The build phase already produced both workspace binaries. Installing those
-# artifacts avoids a second `cargo install` resolution from each member crate,
-# which has no workspace lockfile and cannot resolve vendored Git sources.
 install -Dpm0755 target/rpm/vigil %{buildroot}%{_bindir}/vigil
 install -Dpm0755 target/rpm/vigil-lock %{buildroot}%{_bindir}/vigil-lock
 install -Dpm0755 target/rpm/vigil-sim %{buildroot}%{_bindir}/vigil-sim
 
 install -Dpm0755 dist/setup-greetd %{buildroot}%{_prefix}/lib/vigil/setup-greetd
 install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
-# Fedora's greetd package creates user "greetd", not Arch's "greeter".
-# setup-greetd subsequently reconciles the directory with the account in an
-# existing operator-owned greetd config, which may deliberately be different.
 sed -i 's/ greeter greeter / greetd greetd /' %{buildroot}%{_tmpfilesdir}/vigil.conf
 install -Dpm0644 dist/vigil-lock.pam %{buildroot}%{_sysconfdir}/pam.d/vigil-lock
 install -Dpm0644 dist/vigil.toml.example %{buildroot}%{_datadir}/vigil/vigil.toml.example
@@ -94,16 +65,7 @@ install -d -m2775 %{buildroot}%{_sysconfdir}/monitor-profiles
 %endif
 
 %pre
-# Shared monitor-profile group. The greeter reads layouts from
-# /etc/monitor-profiles so the login screen arranges monitors the way the
-# session will; the directory is group-writable so a desktop user can edit
-# them without root, with no username baked in. hyprstate creates the same
-# group and co-owns the directory with identical attributes -- either package
-# may be installed alone.
 getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
-
-# /var/lib/vigil itself comes from the tmpfiles.d snippet via systemd's file
-# triggers (no scriptlet needed on current Fedora).
 
 %post
 %{_prefix}/lib/vigil/setup-greetd >/dev/null 2>&1 || :

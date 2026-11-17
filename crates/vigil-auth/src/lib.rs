@@ -1,13 +1,3 @@
-//! Auth state machine (DESIGN.md §4): the greetd IPC conversation
-//! (create_session -> auth_message* -> post_auth_message_response ->
-//! start_session), rendering PAM messages verbatim through
-//! [`vigil_core::AuthUi`] and consuming [`vigil_core::UiMessage`]s.
-//! Session listing from /usr/share/{wayland-,x}sessions lands in M2.
-//!
-//! The synchronous greetd codec is used here. Each request/response round trip
-//! can therefore block briefly; a calloop-based owner should call this API from
-//! event-loop callbacks only when that small pause is acceptable.
-
 use std::env;
 use std::os::unix::net::UnixStream;
 
@@ -25,9 +15,6 @@ impl std::fmt::Display for AuthError {
 }
 impl std::error::Error for AuthError {}
 
-/// What to show for greetd's error text. greetd reports PAM failures as
-/// `pam_authenticate: AUTH_ERR`; the screen gets a short sentence and the raw
-/// text goes to the log. Text that is not in that shape passes through.
 pub fn friendly_error(description: &str) -> String {
     let Some((call, code)) = description.split_once(": ") else {
         return description.to_string();
@@ -36,7 +23,6 @@ pub fn friendly_error(description: &str) -> String {
         return description.to_string();
     }
     let text = match code.trim() {
-        // USER_UNKNOWN reads the same as a typo, so a name cannot be probed.
         "AUTH_ERR" | "USER_UNKNOWN" => "Incorrect password",
         "MAXTRIES" => "Too many failed attempts. Try again later.",
         "PERM_DENIED" => "Access denied",
@@ -60,18 +46,13 @@ fn show_greetd_error(ui: &mut dyn AuthUi, description: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
-    /// The greeter itself is asking who is logging in; greetd has not been
-    /// contacted yet. Entered only when no fixed user was configured.
     AwaitingUser,
     AwaitingPrompt,
     Complete,
 }
 
-/// Prompt text for the greeter-owned username stage.
 pub const USERNAME_PROMPT: &str = "Username";
 
-/// One greetd conversation. Connects to the explicitly supplied socket, or
-/// falls back to `$GREETD_SOCK` when no path is supplied.
 pub struct AuthMachine {
     stream: UnixStream,
     command: Vec<String>,
@@ -79,8 +60,6 @@ pub struct AuthMachine {
     state: State,
     user: Option<String>,
     default_user: Option<String>,
-    /// Whether the user was fixed at startup (kiosk/autologin style). When
-    /// false, the machine owns a username stage and Cancel returns to it.
     fixed_user: bool,
 }
 
@@ -104,32 +83,23 @@ impl AuthMachine {
         })
     }
 
-    /// Set the command and environment passed verbatim to greetd when
-    /// authentication succeeds.
     pub fn set_session(&mut self, command: Vec<String>, env: Vec<String>) {
         self.command = command;
         self.env = env;
     }
 
-    /// Username submitted with an empty field falls back to this (the
-    /// remembered last user); with none set, empty re-prompts.
     pub fn set_default_user(&mut self, user: Option<String>) {
         self.default_user = user;
     }
 
-    /// The user of the current conversation, once known.
     pub fn user(&self) -> Option<&str> {
         self.user.as_deref()
     }
 
-    /// Whether greetd accepted `start_session` and the greeter may finish.
     pub fn is_complete(&self) -> bool {
         self.state == State::Complete
     }
 
-    /// Begin the greeter conversation. With a fixed `user` (kiosk/autologin
-    /// style) this goes straight to greetd; without one the greeter asks for
-    /// the username first — greetd is not contacted until it is submitted.
     pub fn begin(&mut self, user: Option<&str>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         match user {
             Some(user) => {
@@ -144,12 +114,6 @@ impl AuthMachine {
         }
     }
 
-    /// Begin or switch an account selected by the greeter's user list.
-    ///
-    /// Unlike [`Self::begin`] with `Some`, a listed account is not fixed:
-    /// the user may switch accounts or choose manual entry later. A selected
-    /// account goes directly to greetd's first authentication prompt; `None`
-    /// is the explicit manual-entry choice and shows the username prompt.
     pub fn select_user(
         &mut self,
         user: Option<&str>,
@@ -177,8 +141,6 @@ impl AuthMachine {
         self.state = State::AwaitingUser;
     }
 
-    /// Begin a conversation for `user`. After a failure or cancellation the
-    /// same machine can be started again without reconnecting.
     pub fn start(&mut self, user: &str, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         if self.state == State::Complete {
             return Err(AuthError("session has already started".into()));
@@ -197,8 +159,6 @@ impl AuthMachine {
         self.process_response(response, ui)
     }
 
-    /// Feed a UI message into the conversation. A response is valid only while
-    /// a visible or secret prompt is outstanding.
     pub fn handle(&mut self, msg: UiMessage, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         match msg {
             UiMessage::Respond(username) if self.state == State::AwaitingUser => {
@@ -235,8 +195,6 @@ impl AuthMachine {
                 }
                 Ok(())
             }
-            // Session choice is the binary's product logic (it owns the
-            // enumerated list); it never reaches greetd through here.
             UiMessage::SelectSession(_) | UiMessage::SelectUser(_) => Ok(()),
             UiMessage::Power(_) => Err(AuthError("power actions are not authentication".into())),
         }
@@ -259,9 +217,6 @@ impl AuthMachine {
         mut response: Response,
         ui: &mut dyn AuthUi,
     ) -> Result<(), AuthError> {
-        // An auth failure restarts the conversation, and the fresh prompt
-        // clears UI messages per the contract — so the failure is re-raised
-        // AFTER that prompt or the user never sees why they are retyping.
         let mut pending_error: Option<String> = None;
         loop {
             match response {
@@ -336,9 +291,6 @@ impl AuthMachine {
                     let Some(user) = self.user.clone() else {
                         return Ok(());
                     };
-                    // Best-effort session teardown, then a fresh conversation
-                    // so the next submission has a prompt to answer. A create
-                    // failure here is surfaced, not looped on.
                     let _ = self.transact(&Request::CancelSession, ui);
                     pending_error = Some(text);
                     response = self.transact(&Request::CreateSession { username: user }, ui)?;
@@ -430,7 +382,6 @@ mod tests {
             let listener = match UnixListener::bind(&path) {
                 Ok(listener) => listener,
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    // Some sandboxes prohibit AF_UNIX even under writable roots.
                     fs::remove_dir_all(&dir).unwrap();
                     return None;
                 }
@@ -589,8 +540,6 @@ mod tests {
                     description: "bad password".into(),
                 },
             );
-            // The machine tears down and restarts the conversation on its
-            // own after an auth error, so the next submission has a prompt.
             assert_cancel(request(stream));
             respond(stream, Response::Success);
             assert_create(request(stream), "alice");
@@ -609,8 +558,6 @@ mod tests {
             .handle(UiMessage::Respond("wrong".into()), &mut ui)
             .unwrap();
         assert!(!machine.is_complete());
-        // The failure must still be on screen after the restarted
-        // conversation re-prompts, not flash-and-cleared by it.
         assert_eq!(
             ui.0.last(),
             Some(&UiCall::Error("bad password".into())),
@@ -737,7 +684,6 @@ mod tests {
     #[test]
     fn username_stage_asks_before_contacting_greetd() {
         let Some(server) = FakeServer::spawn(|stream| {
-            // greetd sees nothing until the username is submitted.
             assert_create(request(stream), "alice");
             respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
             assert_answer(request(stream), Some("hunter2"));
@@ -754,7 +700,6 @@ mod tests {
             ui.0.first(),
             Some(&UiCall::Prompt(USERNAME_PROMPT.into(), false))
         );
-        // Empty and whitespace submissions re-prompt without a connection.
         machine
             .handle(UiMessage::Respond("  ".into()), &mut ui)
             .unwrap();

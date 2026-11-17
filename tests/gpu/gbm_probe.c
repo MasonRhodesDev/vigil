@@ -1,19 +1,3 @@
-// Environment check for the GL path (issue #17): can we get an EGL *window*
-// surface over a GBM surface, render into it, and lock the result as a
-// buffer object? That last object is what becomes a DRM framebuffer, so this
-// is the whole scanout path minus the commit.
-//
-// Run it through the GPU harness, which supplies a card node we are master
-// on -- on a desktop the compositor holds master and this fails:
-//
-//   cc -O1 -o /tmp/gbm_probe tests/gpu/gbm_probe.c $(pkg-config --cflags --libs gbm egl glesv2)
-//   tests/gpu/run.sh -- /tmp/gbm_probe /dev/dri/card0
-//
-// Two mistakes it exists to document, because both fail quietly rather than
-// loudly: the EGLConfig must match the GBM surface's format by
-// EGL_NATIVE_VISUAL_ID (otherwise EGL_BAD_MATCH), and pixels must be read
-// before eglSwapBuffers (afterwards the back buffer is undefined and reads
-// black however well the draw went).
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -52,10 +36,6 @@ int main(int argc, char **argv) {
     EGLint attrs[] = {EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE,
                       EGL_OPENGL_ES2_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
                       EGL_BLUE_SIZE, 8, EGL_NONE};
-    // The config's EGL_NATIVE_VISUAL_ID must equal the GBM surface's format,
-    // or eglCreateWindowSurface returns EGL_BAD_MATCH. Taking the first
-    // config is the classic way to get this wrong: it is usually ARGB8888
-    // against an XRGB8888 surface.
     EGLConfig cfgs[64]; EGLint n = 0;
     if (!eglChooseConfig(dpy, attrs, cfgs, 64, &n) || n < 1) { printf("FAIL eglChooseConfig\n"); return 1; }
     EGLConfig cfg = NULL;
@@ -80,8 +60,6 @@ int main(int argc, char **argv) {
 
     glClearColor(0.1f, 0.4f, 0.7f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    // Read BEFORE the swap: afterwards the back buffer's contents are
-    // undefined, and reading there reports black no matter what was drawn.
     unsigned char px[4] = {0};
     glReadPixels(320, 240, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
     printf("center pixel (expect ~25,102,178): %u,%u,%u\n", px[0], px[1], px[2]);

@@ -1,8 +1,3 @@
-//! UI subsystem (DESIGN.md §5): the custom Slint `Platform` (one full-output
-//! `Window` per output — validated by spike M0b), per-output background
-//! bitmaps, the software cursor as a scene element, and the AuthUi
-//! implementation that binds theme contract properties.
-
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -31,17 +26,9 @@ use vigil_core::{
 };
 use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 
-/// The custom Slint platform. Window adapters are created one at a time and
-/// captured per output (M0b's adapter-capture pattern).
 #[derive(Clone, Default)]
 pub struct VigilPlatform {
     adapters: Rc<RefCell<Vec<Rc<MinimalSoftwareWindow>>>>,
-    /// Adapter to vend for the next instantiation instead of a software one.
-    ///
-    /// A component is bound to whatever adapter existed when it was created,
-    /// so a GL scene has to be built against its own GL window -- which only
-    /// exists after that output's surface does. The binary sets this, then
-    /// instantiates.
     next: Rc<RefCell<Option<Rc<dyn WindowAdapter>>>>,
     runtime: Rc<RefCell<Option<RuntimeBinding>>>,
     next_output: Rc<RefCell<Option<OutputId>>>,
@@ -83,24 +70,16 @@ impl WindowAdapter for TrackedSoftwareWindow {
 }
 
 impl VigilPlatform {
-    /// Install as the process-wide Slint platform. Call once, before any
-    /// component is instantiated.
     pub fn install() -> Result<Self, slint::platform::SetPlatformError> {
         let platform = Self::default();
         platform.register()?;
         Ok(platform)
     }
 
-    /// A platform that is not yet Slint's. Registering it ([`Self::register`])
-    /// loads the toolkit's fonts, which blocks for about a second on a
-    /// machine with a full font set, so a caller with something to show
-    /// first builds it, shows that, and registers afterwards.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Make this the process-wide Slint platform. Once, before any
-    /// component is instantiated.
     pub fn register(&self) -> Result<(), slint::platform::SetPlatformError> {
         slint::platform::set_platform(Box::new(self.clone()))
     }
@@ -118,7 +97,6 @@ impl VigilPlatform {
         });
     }
 
-    /// Associate the next theme instantiation with one physical output.
     pub fn set_next_output(&self, output: OutputId) {
         *self.next_output.borrow_mut() = Some(output);
     }
@@ -127,27 +105,18 @@ impl VigilPlatform {
         *self.next_output.borrow_mut() = None;
     }
 
-    /// Claim the adapter created by the most recently instantiated component.
     pub fn claim_last_adapter(&self) -> Option<Rc<MinimalSoftwareWindow>> {
         self.adapters.borrow_mut().pop()
     }
 
-    /// Vend `adapter` for components instantiated from now until
-    /// [`Self::clear_adapter_override`]. Wrap exactly one instantiation.
     pub fn use_next_adapter(&self, adapter: Rc<dyn WindowAdapter>) {
         *self.next.borrow_mut() = Some(adapter);
     }
 
-    /// Go back to vending software adapters.
     pub fn clear_adapter_override(&self) {
         *self.next.borrow_mut() = None;
     }
 
-    /// How many software adapters have been created and not yet claimed.
-    ///
-    /// Compare across an instantiation to tell whether it got the override:
-    /// the absolute count is not a signal, because earlier outputs leave
-    /// adapters behind.
     pub fn adapters_created(&self) -> usize {
         self.adapters.borrow().len()
     }
@@ -155,26 +124,13 @@ impl VigilPlatform {
 
 impl Platform for VigilPlatform {
     fn cursor_flash_cycle(&self) -> Duration {
-        // Login/lock prompts may remain focused for hours. A blinking caret
-        // must not keep every fullscreen output's animation clock alive.
         Duration::ZERO
     }
 
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
-        // A one-shot override: taken, so the next instantiation goes back to
-        // the software default rather than silently reusing this adapter.
-        // Sticky, not one-shot: instantiating one component asks for an
-        // adapter more than once, and handing out the override only the first
-        // time leaves the component bound to a software window that the GL
-        // renderer then draws nothing into -- a black screen with every log
-        // line reporting success.
         if let Some(adapter) = self.next.borrow().clone() {
             return Ok(adapter);
         }
-        // Partial repaints into the window's persistent shadow buffer; each
-        // present then copies the shadow to the (possibly alternating)
-        // output buffer. Software-rendering a full 4K scene per frame is
-        // what made the first on-metal run drop keystrokes.
         let adapter = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
         self.adapters.borrow_mut().push(adapter.clone());
         let Some(runtime) = self.runtime.borrow().clone() else {
@@ -189,7 +145,6 @@ impl Platform for VigilPlatform {
         let redraw = runtime
             .wake
             .redraw_handle(runtime.dirty, runtime.metrics, output);
-        // Showing a new scene always owes its output one initial frame.
         redraw.request_redraw();
         Ok(Rc::new(TrackedSoftwareWindow {
             inner: adapter,
@@ -198,64 +153,33 @@ impl Platform for VigilPlatform {
     }
 }
 
-/// One output's scene: Slint window + theme instance + per-output state.
 pub struct OutputWindow {
     _id: OutputId,
-    /// How this scene becomes pixels. Everything above is what the scene
-    /// *is*, and is identical whichever renderer draws it.
     backend: Box<dyn RenderBackend>,
-    /// Scene dimensions: what Slint renders and what every coordinate in
-    /// this type is expressed in. For a rotated output these are the
-    /// *rotated* dimensions, so the whole UI, pointer and cursor stay in one
-    /// upright coordinate space and only the final copy-out knows better.
     width: u32,
     height: u32,
     scale: f32,
     pointer_x: f64,
     pointer_y: f64,
     cursor_visible: bool,
-    /// Bumped whenever the scene changes. Slint's own redraw request fires
-    /// once for a custom adapter and never re-arms, so a backend that has no
-    /// partial-repaint bookkeeping of its own (GL) needs a signal it can
-    /// trust. Every mutation funnels through `set_property`, so one counter
-    /// there covers the lot.
     revision: std::cell::Cell<u64>,
     component: ComponentInstance,
-    /// Scanout (panel) dimensions. Equal to the scene except on a
-    /// quarter-turn transform, which swaps them - so this is the quantity a
-    /// compositor's configure is in, and the scene is not.
     panel: (u32, u32),
 }
 
-/// The software baseline: Slint's `SoftwareRenderer` into a persistent
-/// shadow buffer, copied out (rotating if the output is transformed) with
-/// the cursor composited on top.
 pub struct SoftwareBackend {
-    /// Persistent scene buffer (tightly packed XRGB8888). Slint partial-
-    /// repaints into it; presents copy it out. Keeps cursor motion at
-    /// memcpy cost instead of a full software re-render.
     shadow: Vec<u8>,
-    /// The next present must copy out even if the scene didn't change
-    /// (cursor moved/toggled, or a fresh swapchain buffer needs filling).
     needs_present: bool,
     adapter: Rc<MinimalSoftwareWindow>,
-    /// Panel (scanout) dimensions; differ from the scene on a quarter turn.
     panel_width: u32,
     panel_height: u32,
-    /// wl_output/Hyprland transform: 0, 1, 2, 3 = 0, 90, 180, 270 degrees.
     transform: u8,
-    /// Scanout-ready scene pixels copied below a transparent Slint overlay.
     native_background: Option<std::sync::Arc<[u8]>>,
     native_overlay: Vec<u8>,
-    /// The next render must repaint and composite the whole scene: the
-    /// buffer Slint draws into was just swapped (overlay <-> shadow) or the
-    /// background under the overlay changed, so its partial-repaint history
-    /// describes pixels that are no longer there.
     full_repaint: bool,
 }
 
 impl OutputWindow {
-    /// Bind an interpreter component to the adapter captured while it was instantiated.
     pub fn new(
         id: OutputId,
         width: u32,
@@ -267,13 +191,6 @@ impl OutputWindow {
         Self::with_transform(id, width, height, scale, 0, adapter, component)
     }
 
-    /// Bind a component to a backend built elsewhere -- the GL path, which
-    /// this crate cannot name without depending on it.
-    ///
-    /// `width`/`height` are *scene* dimensions here: a caller with its own
-    /// adapter has already sized it, so there is nothing left to swap. Such
-    /// a caller also owns its own transform, so [`Self::panel_size`] reports
-    /// the scene size for these windows - this type is not told otherwise.
     pub fn with_backend(
         id: OutputId,
         width: u32,
@@ -304,8 +221,6 @@ impl OutputWindow {
         })
     }
 
-    /// `width`/`height` are the panel's scanout dimensions; a quarter-turn
-    /// transform swaps them to get the scene the theme is laid out in.
     pub fn with_transform(
         id: OutputId,
         width: u32,
@@ -328,8 +243,6 @@ impl OutputWindow {
             .dispatch_event(WindowEvent::ScaleFactorChanged {
                 scale_factor: scale,
             });
-        // Size before show: the first layout happens on show, and a wrong
-        // size there means a first frame laid out for the wrong output.
         adapter.set_size(PhysicalSize::new(width, height));
         component.show()?;
         Ok(Self {
@@ -357,30 +270,11 @@ impl OutputWindow {
         })
     }
 
-    /// Whether this output draws the software cursor (the one under the
-    /// pointer). The cursor is composited at present time, never rendered
-    /// by Slint, so toggling or moving it costs a copy, not a re-render.
-    /// Force the next present to copy out even if the scene is unchanged.
-    /// After a resume the scanout buffers hold whatever survived suspend, so
-    /// there is nothing to be gained by trusting them.
     pub fn request_present(&mut self) {
         self.backend.request_present();
         self.component.window().request_redraw();
     }
 
-    /// Re-arm the copy-out without requesting a redraw.
-    ///
-    /// The difference from [`Self::request_present`] is the missing
-    /// `request_redraw`: this says "the buffer is stale", not "the scene is
-    /// stale". A settled scene therefore stays settled and the next render
-    /// copies the shadow out as it stands.
-    ///
-    /// Two callers, both of which want exactly that. A presenter retrying
-    /// after a device error, on a bounded deadline, must not wake the loop
-    /// to do it. And the warn→lock handoff (vigil#86) arms this from inside
-    /// the lock surface's configure callback, where the retained scene is
-    /// already the picture on screen and asking Slint to draw would be the
-    /// scene work vigil#37 forbids there.
     pub fn request_present_deferred(&mut self) {
         self.backend.request_present();
     }
@@ -392,14 +286,10 @@ impl OutputWindow {
         }
     }
 
-    /// Set the pre-fit background bitmap (from `background` below).
     pub fn set_background(&mut self, rgba: Vec<u8>, width: u32, height: u32) {
         self.set_background_pixels(&rgba, width, height);
     }
 
-    /// Set a pre-fit background without requiring ownership of its backing
-    /// cache entry. Slint takes its own pixel-buffer copy here, so workers can
-    /// share one rendered bitmap between equal-sized outputs.
     pub fn set_background_pixels(&mut self, rgba: &[u8], width: u32, height: u32) {
         if rgba.len() != width as usize * height as usize * 4 {
             return;
@@ -408,9 +298,6 @@ impl OutputWindow {
         self.set_property("background-source", Value::Image(Image::from_rgba8(buffer)));
     }
 
-    /// Use a prepared XRGB frame as the renderer's immutable base layer.
-    /// Themes predating the optional `native-background` property stay on
-    /// the image path so custom themes remain compatible.
     pub fn set_native_background_xrgb(
         &mut self,
         xrgb: std::sync::Arc<[u8]>,
@@ -447,7 +334,6 @@ impl OutputWindow {
             && self.component.get_property("native-background").is_ok()
     }
 
-    /// Remove a previously rendered bitmap and reveal the theme background.
     pub fn clear_background(&mut self) {
         self.backend.clear_native_background();
         let _ = self
@@ -456,12 +342,10 @@ impl OutputWindow {
         self.set_property("background-source", Value::Image(Image::default()));
     }
 
-    /// Whether this output hosts the login panel (theme `panel-visible`).
     pub fn set_panel_visible(&mut self, visible: bool) {
         self.set_property("panel-visible", Value::Bool(visible));
     }
 
-    /// Whether the theme's host power actions are visible.
     pub fn set_power_visible(&mut self, visible: bool) {
         self.set_optional_property("power-visible", Value::Bool(visible));
     }
@@ -484,15 +368,7 @@ impl OutputWindow {
         self.set_optional_property(property, Value::Number(progress.clamp(0.0, 1.0) as f64));
     }
 
-    /// Route a normalized input event into this window.
     pub fn dispatch(&mut self, event: InputEvent) {
-        // Keys and buttons change what the scene shows through paths
-        // Slint's one-shot redraw request cannot be trusted to re-arm for,
-        // so they bump the revision. Pointer motion does not: its only
-        // scene-visible effect (hover) does re-arm via the adapter's
-        // request_redraw, and a per-motion revision bump would make a
-        // hardware-cursor GL output re-render the scene for every pixel
-        // the pointer travels (#25).
         if !matches!(
             event,
             InputEvent::PointerMotion { .. } | InputEvent::PointerAbsolute { .. }
@@ -550,31 +426,18 @@ impl OutputWindow {
         }
     }
 
-    /// Scene dimensions — what the theme is laid out in, and what pointer
-    /// coordinates and backgrounds for this output must be sized to. Differs
-    /// from the panel's scanout size on a quarter-turn transform.
     pub fn scene_size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
-    /// Scanout dimensions — what a compositor's configure and every
-    /// [`FrameTarget`] for this output are expressed in. Same as
-    /// [`Self::scene_size`] except on a quarter turn, which swaps them.
-    ///
-    /// Compare a configure against this one, never against the scene: they
-    /// agree only while the transform is 0, so a comparison written against
-    /// the scene is correct by coincidence and silently wrong the day an
-    /// output is rotated.
     pub fn panel_size(&self) -> (u32, u32) {
         self.panel
     }
 
-    /// Current pointer position in scene pixels.
     pub fn pointer(&self) -> (f64, f64) {
         (self.pointer_x, self.pointer_y)
     }
 
-    /// A description of the scene for the backend to draw.
     fn view(&self) -> SceneView {
         SceneView {
             scene_size: (self.width, self.height),
@@ -585,22 +448,15 @@ impl OutputWindow {
         }
     }
 
-    /// Draw into whatever canvas the presenter handed out; returns whether
-    /// anything was drawn. The one render entry point both paths share.
     pub fn render(&mut self, canvas: CoreCanvas<'_>) -> bool {
         let view = self.view();
         self.backend.render(&view, canvas)
     }
 
-    /// Render into a CPU target if dirty; returns whether pixels changed.
     pub fn render_if_needed(&mut self, target: FrameTarget<'_>) -> bool {
         self.render(CoreCanvas::Cpu(target))
     }
 
-    /// Whether this window owes a present, without needing a buffer to
-    /// answer. Draws the scene into the backend's shadow, so a following
-    /// `render_if_needed` only copies out. See `RenderBackend::
-    /// scene_needs_present` for why a presenter must be able to ask.
     pub fn scene_needs_present(&mut self) -> bool {
         let view = self.view();
         self.backend.scene_needs_present(&view)
@@ -613,8 +469,6 @@ impl OutputWindow {
         )
     }
 
-    /// Wire the theme's contract callbacks (submit/cancel/session-changed/
-    /// power-action) into a single sink of [`UiMessage`]s.
     pub fn on_ui_message(&self, sink: std::rc::Rc<dyn Fn(UiMessage)>) {
         let s = sink.clone();
         let r = self.component.set_callback("submit", move |args| {
@@ -662,32 +516,24 @@ impl OutputWindow {
         debug_assert!(r.is_ok());
     }
 
-    /// Theme contract `clock-text`.
     pub fn set_clock(&mut self, text: &str) {
         self.set_property("clock-text", Value::String(text.into()));
     }
 
-    /// Theme contract `caps-lock`.
     pub fn set_caps_lock(&mut self, on: bool) {
         self.set_property("caps-lock", Value::Bool(on));
     }
 
-    /// Theme contract `status-banner` (reserved host-integration line;
-    /// empty hides it).
     pub fn set_status_banner(&mut self, text: &str) {
         self.set_property("status-banner", Value::String(text.into()));
     }
 
-    /// Optional theme properties `user-name` and `user-initial` (not in
-    /// contract v1): set best-effort, silently skipped on themes that lack
-    /// them. Slint has no substring, so the initial is computed here.
     pub fn set_user_name(&mut self, name: &str) {
         self.set_optional_property("user-name", Value::String(name.into()));
         let initial: String = name.chars().take(1).flat_map(char::to_uppercase).collect();
         self.set_optional_property("user-initial", Value::String(initial.into()));
     }
 
-    /// Theme contract `sessions`: display names of the launchable sessions.
     pub fn set_sessions(&mut self, names: &[String]) {
         let model: Vec<Value> = names
             .iter()
@@ -699,13 +545,10 @@ impl OutputWindow {
         );
     }
 
-    /// Theme contract `selected-session`.
     pub fn set_session_index(&mut self, index: usize) {
         self.set_property("selected-session", Value::Number(index as f64));
     }
 
-    /// Optional theme property `users` (contract v2): the selectable user
-    /// names, `Other…` last. Empty on themes that predate the list.
     pub fn set_users(&mut self, names: &[String]) {
         let model: Vec<Value> = names
             .iter()
@@ -717,18 +560,14 @@ impl OutputWindow {
         );
     }
 
-    /// Optional theme property `selected-user` (contract v2).
     pub fn set_user_index(&mut self, index: usize) {
         self.set_optional_property("selected-user", Value::Number(index as f64));
     }
 
-    /// Optional theme property `color-scheme` ("dark" | "light" | "").
     pub fn set_color_scheme(&mut self, scheme: &str) {
         self.set_optional_property("color-scheme", Value::String(scheme.into()));
     }
 
-    /// Optional theme property `accent-color`. Portal sRGB is already
-    /// [0,1] floats, which is exactly what `from_rgb_f32` wants.
     pub fn set_accent_color(&mut self, rgb: (f32, f32, f32)) {
         self.set_optional_property(
             "accent-color",
@@ -736,8 +575,6 @@ impl OutputWindow {
         );
     }
 
-    /// Paint slint-kit `Theme` (if the theme exports it) plus contract
-    /// `color-scheme` / `accent-color` from an LMTT [`TokenSet`].
     pub fn apply_kit_tokens(&mut self, tokens: &TokenSet) {
         self.set_color_scheme(&tokens.mode);
         let _ = self.component.set_global_property(
@@ -760,14 +597,11 @@ impl OutputWindow {
         self.touch();
     }
 
-    /// As [`Self::set_property`] but for optional contract properties a theme
-    /// may legitimately not declare.
     fn set_optional_property(&self, name: &str, value: Value) {
         let _ = self.component.set_property(name, value);
         self.touch();
     }
 
-    /// Mark the scene changed.
     fn touch(&self) {
         self.revision.set(self.revision.get().wrapping_add(1));
         self.component.window().request_redraw();
@@ -778,13 +612,10 @@ impl OutputWindow {
     }
 }
 
-/// Load LMTT tokens through slint-kit / lmtt-core. For vigil-lock.
-/// The greeter must not call this.
 pub fn apply_kit_tokens_from_disk(window: &mut OutputWindow, mode: &str) {
     window.apply_kit_tokens(&slint_kit::load_tokens_preferring(mode));
 }
 
-/// Load LMTT tokens from system/packaged/embedded layers. No user tree.
 pub fn apply_kit_tokens_from_system(window: &mut OutputWindow, mode: &str) {
     window.apply_kit_tokens(&slint_kit::load_tokens_system(mode));
 }
@@ -803,8 +634,6 @@ impl AuthUi for OutputWindow {
     fn show_error(&mut self, text: &str) {
         self.set_property("error-message", Value::String(text.into()));
         self.set_property("auth-state", Value::String("error".into()));
-        // Optional `error-serial`: counts errors shown, so a theme can react
-        // to a repeat failure that leaves every other property unchanged.
         if let Ok(Value::Number(serial)) = self.component.get_property("error-serial") {
             self.set_optional_property("error-serial", Value::Number(serial + 1.0));
         }
@@ -836,7 +665,6 @@ impl TargetPixel for Xrgb8888 {
     }
 }
 
-/// Premultiplied ARGB8888 overlay pixel (little-endian B, G, R, A).
 #[derive(Clone, Copy, Default)]
 #[repr(transparent)]
 struct Argb8888(u32);
@@ -878,9 +706,6 @@ fn pointer_button(button: u32) -> PointerEventButton {
 }
 
 fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
-    // Special keys FIRST: xkb yields control utf8 for these ("\r", "\x08", …)
-    // which would shadow the slint key codes slint actually listens for
-    // (e.g. TextInput `accepted` wants Key::Return = '\n', not '\r').
     let key = match keysym {
         0xff0d => Key::Return,
         0xff08 => Key::Backspace,
@@ -902,10 +727,6 @@ fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
     Some(key.into())
 }
 
-/// Per-output background resolution, one precedence rule per dimension:
-/// CLI > `[output."NAME"]` override > `[look]` > caller fallback > default. An override keys
-/// on the exact connector name; with two GPUs exposing the same name
-/// (e.g. two DP-1s) the override applies to every one of them.
 pub struct Looks {
     pub cli_background: Option<std::path::PathBuf>,
     pub fallback_background: Option<std::path::PathBuf>,
@@ -918,7 +739,6 @@ impl Looks {
         self.for_connector_with_fallback(connector, None, None)
     }
 
-    /// Resolve application overrides above a dynamic registry fallback.
     pub fn for_connector_with_fallback(
         &self,
         connector: &str,
@@ -943,8 +763,6 @@ impl Looks {
     }
 }
 
-/// Parse a config fit string, logging bad values (they fall through to the
-/// next precedence level rather than erroring).
 fn parse_fit(value: Option<&str>, context: &str) -> Option<BackgroundFit> {
     let value = value?;
     let parsed = BackgroundFit::parse(value);
@@ -954,9 +772,6 @@ fn parse_fit(value: Option<&str>, context: &str) -> Option<BackgroundFit> {
     parsed
 }
 
-/// Decode `_path` and produce an RGBA bitmap of exactly `_out_w x _out_h`
-/// per `_fit` (stretch/fill/fit/center/tile). Pure image math (M2 completes
-/// all five modes; M1 ships fill).
 pub fn background(
     path: &Path,
     fit: BackgroundFit,
@@ -970,10 +785,6 @@ pub fn background(
     render_background(&source, fit, out_w, out_h)
 }
 
-/// A source image decoded once and reusable for several output sizes.
-///
-/// Held as RGBA8 so every output scales from the same buffer: converting
-/// per output copied a 6000x4000 wallpaper (96 MB) once per monitor.
 pub struct BackgroundImage(RgbaImage);
 
 pub fn load_background(path: &Path) -> Result<BackgroundImage, String> {
@@ -1038,19 +849,10 @@ fn fit_rgba(source: &RgbaImage, fit: BackgroundFit, out_w: u32, out_h: u32) -> R
     }
 }
 
-/// Scaled-wallpaper cache: the decoded, fitted RGBA for one (file, fit, size)
-/// stored raw under `dir`, so a later boot skips decoding and Lanczos-scaling
-/// a multi-megapixel source on the CPU and just reads the result.
-///
-/// The key covers the source's path, length and mtime, the fit and the output
-/// size, so a changed wallpaper or monitor misses instead of showing stale
-/// pixels. Every failure (no directory, unwritable, short file) degrades to
-/// a miss: a cache must never be why a greeter has no background.
 pub mod bgcache {
     use super::BackgroundFit;
     use std::path::{Path, PathBuf};
 
-    /// Files kept per cache directory; the oldest beyond this are removed.
     const KEEP: usize = 12;
 
     fn fnv(bytes: &[u8], mut hash: u64) -> u64 {
@@ -1061,8 +863,6 @@ pub mod bgcache {
         hash
     }
 
-    /// File name for a cache entry, or `None` when the source cannot be
-    /// stat-ed (then there is nothing trustworthy to key on).
     pub fn entry_path(
         dir: &Path,
         source: &Path,
@@ -1086,14 +886,11 @@ pub mod bgcache {
         Some(dir.join(format!("{h:016x}-{width}x{height}.rgba")))
     }
 
-    /// The cached pixels, only if the file is exactly `width * height * 4`.
     pub fn read(path: &Path, width: u32, height: u32) -> Option<Vec<u8>> {
         let bytes = std::fs::read(path).ok()?;
         (bytes.len() == width as usize * height as usize * 4).then_some(bytes)
     }
 
-    /// Best-effort store (temp file then rename, so a reader never sees a
-    /// partial entry), then trim the directory to [`KEEP`] newest files.
     pub fn write(path: &Path, bytes: &[u8]) {
         let Some(dir) = path.parent() else { return };
         if std::fs::create_dir_all(dir).is_err() {
@@ -1173,10 +970,6 @@ pub mod bgcache {
     }
 }
 
-/// Last state pushed through [`AuthUi`], kept so scenes rebuilt after a VT
-/// switch, resume, or hotplug can be brought back to what the user was
-/// looking at — a fresh theme instance starts blank (found twice: greeter
-/// VT round trip, then the lockscreen's post-resume "bare password box").
 #[derive(Default)]
 pub struct UiSnapshot {
     pub prompt: (String, bool),
@@ -1186,8 +979,6 @@ pub struct UiSnapshot {
 }
 
 impl UiSnapshot {
-    /// Record an [`AuthUi`] call so `apply` can replay it later. Callers'
-    /// AuthUi impls forward each method here alongside their fan-out.
     pub fn on_prompt(&mut self, text: &str, secret: bool) {
         self.prompt = (text.to_owned(), secret);
         self.info.clear();
@@ -1208,35 +999,16 @@ impl UiSnapshot {
     }
 }
 
-/// Advance Slint timers and animations at the start of an event-loop iteration.
 pub fn advance_timers() {
     slint::platform::update_timers_and_animations();
 }
 
-/// Return the maximum duration the event loop may sleep before the next Slint timer.
 pub fn duration_until_next_timer_update() -> Option<Duration> {
     slint::platform::duration_until_next_timer_update()
 }
 
 impl SoftwareBackend {
-    /// Partial-repaint the scene into the persistent shadow and report
-    /// whether a present is owed.
-    ///
-    /// This needs no target, which is the whole point: a presenter can ask
-    /// "is there anything to show?" without first acquiring a `wl_buffer`.
-    /// Acquiring one and dropping it un-attached on a clean scene is what
-    /// span the locked-idle loop -- the compositor answers every
-    /// `wl_buffer.destroy` with `delete_id`, which wakes the event loop,
-    /// which churns another buffer (#65).
-    ///
-    /// Dirtiness cannot be predicted without doing this: Slint sets it
-    /// *during* the render (`draw_if_needed` reports whether it drew), and
-    /// core calls `request_redraw` on the inner window rather than any
-    /// wrapper we could observe -- which is why the DirtySet is only
-    /// advisory.
     fn draw_into_shadow(&mut self, view: &SceneView) -> bool {
-        // Slint partial-repaints into the persistent shadow (ReusedBuffer
-        // contract: same buffer, contents preserved between renders).
         let shadow_stride = view.scene_size.0 as usize;
         let native_background = self.native_background.clone();
         let full = self.full_repaint;
@@ -1247,10 +1019,6 @@ impl SoftwareBackend {
                 RepaintBufferType::ReusedBuffer
             });
             if let Some(background) = &native_background {
-                // The overlay persists too: Slint clears and redraws only
-                // the regions that changed (to transparent, the window
-                // background), and only those are blended back over the
-                // background. A keystroke costs the field, not the screen.
                 let overlay = bytemuck::cast_slice_mut::<u8, Argb8888>(&mut self.native_overlay);
                 let region = renderer.render(overlay, shadow_stride);
                 if full {
@@ -1350,9 +1118,6 @@ impl RenderBackend for SoftwareBackend {
         if !self.needs_present {
             return false;
         }
-        // Copy out (the target may be an alternating swapchain buffer with a
-        // wider stride), then composite the cursor on top — the shadow itself
-        // never contains it.
         if self.transform == 0 {
             let row_bytes = scene_w as usize * 4;
             for y in 0..scene_h as usize {
@@ -1390,8 +1155,6 @@ fn composite_native_background(background: &[u8], overlay: &[Argb8888], output: 
     );
 }
 
-/// Composite one rectangle of the scene (`stride` pixels per row), clamped
-/// to the buffers.
 fn composite_native_rect(
     background: &[u8],
     overlay: &[Argb8888],
@@ -1438,29 +1201,11 @@ fn composite_native_span(background: &[Xrgb8888], overlay: &[Argb8888], output: 
 }
 
 impl SoftwareBackend {
-    /// Scene pixel -> panel pixel for this output's transform.
-    ///
-    /// Convention (wl_output / Hyprland): the transform names how the panel
-    /// is mounted, so the content is rotated the opposite way to come out
-    /// upright. `1` (90) rotates the scene a quarter turn *counter-clockwise*
-    /// into the panel, `3` (270) clockwise — pinned on metal against Hyprland.
     #[inline]
     fn to_panel(&self, scene: (u32, u32), sx: usize, sy: usize) -> (usize, usize) {
         scene_to_panel(self.transform, scene.0 as usize, scene.1 as usize, sx, sy)
     }
 
-    /// Rotate the shadow into the scanout buffer.
-    ///
-    /// Tiled rather than scanline: a quarter turn writes down a column for
-    /// every row it reads, so the naive loop misses cache on nearly every
-    /// pixel. On a 4K panel that is 8.3M scattered writes per present, and
-    /// per-frame work on that scale is precisely what starved the event loop
-    /// and dropped keystrokes once already (see the shadow buffer above).
-    ///
-    /// Measured on the reference machine, rotating a 2160x3840 scene into a
-    /// 3840x2160 panel: naive 15.8 ms/frame, tiled 7.5 ms. For scale, the
-    /// unrotated row memcpy is 2.2 ms. A tile of 16 pixels is one 64-byte
-    /// cache line of XRGB8888 and measured fastest; 8 and 32 both lose ~1 ms.
     fn rotate_out(&self, scene: (u32, u32), target: &mut [Xrgb8888], target_stride: usize) {
         const TILE: usize = 16;
         let (sw, sh) = (scene.0 as usize, scene.1 as usize);
@@ -1480,8 +1225,6 @@ impl SoftwareBackend {
         }
     }
 
-    /// Overlay the software cursor into the just-rendered frame, scaled to
-    /// the output's HiDPI factor (nearest neighbor — it is a pointer).
     fn blit_cursor(&self, view: &SceneView, pixels: &mut [Xrgb8888], pixel_stride: usize) {
         let scale = f64::from(view.scale.max(1.0));
         let out_w = (CURSOR[0].len() as f64 * scale) as usize;
@@ -1498,10 +1241,6 @@ impl SoftwareBackend {
                 if px >= view.scene_size.0 as usize {
                     break;
                 }
-                // The cursor is composited after the rotation, so its scene
-                // coordinates have to make the same trip the frame just did
-                // — otherwise the pointer sits at right angles to the UI it
-                // is pointing at.
                 let (tx, ty) = self.to_panel(view.scene_size, px, py);
                 match row[((ox as f64 / scale) as usize).min(row.len() - 1)] {
                     b'X' => pixels[ty * pixel_stride + tx] = Xrgb8888(0),
@@ -1517,9 +1256,6 @@ impl SoftwareBackend {
 mod tests {
     use super::scene_to_panel;
 
-    // The corner-pinning rotation tests live in vigil-core next to
-    // scene_to_panel itself; the bijection property stays here with the
-    // renderer that relies on it.
     #[test]
     fn every_transform_is_a_bijection_onto_the_panel() {
         let (sw, sh) = (7, 5);
@@ -1720,8 +1456,6 @@ mod tests {
         });
         platform.set_runtime(wake.clone(), dirty.clone(), metrics.clone());
         platform.set_next_output(OutputId(1));
-        // Compile a tiny interpreter component here instead of depending on vigil-theme;
-        // the crate boundary requires vigil-ui to remain theme-implementation agnostic.
         let source = r#"
             export component Smoke inherits Window {
                 background: #204060;
@@ -1751,14 +1485,8 @@ mod tests {
                 0x60, 0x40, 0x20, 0, 0x60, 0x40, 0x20, 0, 0x60, 0x40, 0x20, 0, 0x60, 0x40, 0x20, 0
             ]
         );
-        // A static visible frame does not re-arm itself.
         assert!(dirty.take_all().is_empty());
 
-        // ...and reports that it owes nothing, WITHOUT a target. A presenter
-        // must be able to ask before acquiring a buffer: acquiring one and
-        // dropping it un-attached on a clean scene makes the compositor
-        // reply delete_id, which wakes the loop, which acquires another
-        // (#65). A probe that just says "true" restores that loop.
         assert!(
             !window.scene_needs_present(),
             "a settled scene must not ask to be presented"
@@ -1769,20 +1497,6 @@ mod tests {
             "a scene asked to repaint must still report it owes a present"
         );
 
-        // A target that disagrees with the panel renders NOTHING, and asking
-        // again never helps — the window has to be rebuilt at the new size.
-        // This is why a warning→lock rebind at a changed pixel size is not a
-        // rebind: vigil-lock's `rebound_needs_resize` exists because keeping
-        // the retained window here would leave that output black for the
-        // whole locked session (issue #40 geometry, issue #86 handoff). The
-        // integration itself only shows up on a compositor that configures
-        // the lock surface differently from the layer surface, so the seam
-        // is asserted from both sides instead.
-        //
-        // The quantity being compared is the PANEL size, which is what a
-        // configure carries and what a FrameTarget is measured in. It
-        // coincides with the scene here because this window is untransformed;
-        // the rotated case below pins that they are different quantities.
         assert_eq!(window.panel_size(), (2, 2));
         assert_eq!(window.scene_size(), (2, 2));
         let mut wrong = vec![0_u8; 36];
@@ -1852,14 +1566,6 @@ mod tests {
         }));
         assert_eq!(buffer, [0xff, 0, 0, 0].repeat(4));
 
-        // A quarter turn separates the panel from the scene, and a
-        // FrameTarget follows the panel. vigil-lock compares a compositor's
-        // configure against `panel_size` for exactly this reason: written
-        // against `scene_size` it is correct only until an output is
-        // rotated, and would then call every unchanged configure a resize
-        // and rebuild the scene on every rebind. Last in this test because
-        // instantiating a scene arms its output's dirty flag, and the
-        // assertions above read the dirty set.
         let source = r#"
             export component Rotated inherits Window {
                 background: #204060;

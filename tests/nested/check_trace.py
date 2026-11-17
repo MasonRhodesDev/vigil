@@ -1,122 +1,4 @@
 #!/usr/bin/env python3
-"""Protocol-ordering checker for the nested lock harness (issue #44).
-
-Parses a vigil-lock stderr capture produced with WAYLAND_DEBUG=1
-(both wayland-backend debug formats: sys `[ts] iface#id.msg(args)` and
-rs `[ts][rs] -> iface@id.req(args)` / `[ts][rs] <- iface@id.event, (args)`)
-and asserts:
-
-  --expect locked      the compositor granted the lock (locked event seen)
-  --expect cancelled   the lock was NEVER requested (cancel-before-commit)
-  --handoff            every warning surface teardown happens only after
-                       every lock surface's first commit-with-buffer
-                       (the handoff never exposes the desktop)
-  --locked-to-commit-ms N
-                       every output that went through the handoff committed
-                       its first lock buffer within N ms of the `locked`
-                       event (see "The black window" below); the per-output
-                       numbers print on every run either way
-  --first-frame-not-black
-                       with VIGIL_FRAME_HASH=1 in the environment of the
-                       traced locker: the first lock-surface frame of any
-                       output whose warning painted is not the all-black
-                       buffer (see "Frame hashes" below)
-  --outputs N          at least N lock surfaces were created
-  --reveal             the post-unlock reveal overlay (issue #52) was
-                       created after `locked`, unlock_and_destroy came after
-                       every reveal surface request (and after its first
-                       buffer commit whenever the compositor configured it
-                       before the unlock), and reveal teardown only after
-                       unlock_and_destroy
-  --no-reveal          no vigil-reveal overlay was ever created (the
-                       instant-unlock default: reveal is opt-in only)
-  --no-layer           no layer surface at all (`--immediate` path)
-  --session-outcome V  the span-lines trace on the same stderr is complete:
-                       exactly one `span=lock.session` record, carrying
-                       `outcome=V`, and no record names a parent that was
-                       never written (see "Closing the trace" below)
-  --no-unlock          the lock object was never released or destroyed by
-                       the client: no ext_session_lock_v1.unlock_and_destroy
-                       and no ext_session_lock_v1.destroy request
-  --no-capture-only    only run the capture-bind check
-
-Closing the trace (issue #79)
------------------------------
-vigil-lock writes span-lines records (`span=... id=... parent=...`) onto the
-stderr this harness captures, beside the protocol lines. The root is the
-`lock.session` span, written when the run ends with its outcome; every
-phase, loop iteration and frame names it (or a child of it) as parent. A
-locker that dies from a signal writes none of it: no destructor runs, so the
-root is simply absent and every record that pointed at it dangles. The
-measurement that opened #79 was 33 `loop.iteration` records with a missing
-parent after SIGTERM, against zero after a clean exit. `--session-outcome`
-is that measurement as a gate: the root exists, once, says how the run
-ended, and nothing dangles. `SPAN_LINES=frames` in the locker's environment
-is what makes the per-wake records exist to be checked.
-
-`--no-unlock` is the other half of the same scenario. A signal must leave the
-compositor's lock exactly as the process dying would have, and the protocol
-says what that is: "if the client dies while the session is locked, the
-compositor must not unlock the session in response". WAYLAND_DEBUG prints a
-request when it is marshalled, flushed or not, so a trace with neither
-unlock_and_destroy nor destroy is proof the client never asked for either.
-
-Layer surfaces are classified by the namespace passed to
-get_layer_surface: "vigil-warning" (pre-lock overlay, --handoff) versus
-"vigil-reveal" (post-unlock overlay, --reveal).
-
-The capture check always runs: binding any screencopy/image-capture/
-export-dmabuf global is forbidden (capture-free warning, ADR).
-
-The black window (issue #86)
-----------------------------
-The compositor stops rendering normal surfaces at the `locked` event, and
-shows nothing on an output until that output's lock surface commits a
-buffer. So the interval that is actually uncovered is, per output:
-
-    locked_to_commit = first lock-surface commit-with-buffer - `locked`
-
-That is what --locked-to-commit-ms gates. WAYLAND_DEBUG stamps every line
-with a monotonic `[ ms.us ]`, so it is measured, not inferred. Only outputs
-that went through the handoff are eligible: an output hotplugged into an
-already-locked session has no relationship to a `locked` event that fired
-before it existed, and including it would gate a number that means nothing.
-
-A second, looser number is printed but NOT gated: from the warning
-surface's last commit (or the lock request) to the same first lock commit.
-It is an upper bound on the same window rather than the window itself,
-because the warning surface keeps being *displayed* after it stops
-committing - the ramp's commit-only ticks (`ramp_commit_only`) mean it can
-stop committing buffers hundreds of milliseconds before `locked`. Gating it
-made a flake, not a check: S9 measured 258 ms against a 250 ms bound on one
-machine and 249 ms on another, and the black-committing code it was meant
-to catch passed it at 3 ms.
-
-Read either number for what it is: sway-tier timing is NOT Hyprland-tier
-timing. This harness runs a headless pixman wlroots against an unoptimized
-debug build, and its numbers say nothing about the seat's. What a bound can
-catch is a regression that adds a whole scheduling round before the first
-commit. What it cannot catch is #86 itself - the broken handoff committed
-*fast*, and committed black. That is --first-frame-not-black's job.
-
-Frame hashes (issue #86)
-------------------------
-The gap being short does not mean the frame is right: the old handoff
-committed instantly and committed *black*. `VIGIL_FRAME_HASH=1` makes
-vigil-lock emit a span-lines `event=frame.hash` record (FNV-1a over the
-committed pixels) for every frame it commits, onto the same stderr this
-trace captures. `--first-frame-not-black` uses those to assert the
-positive: an output whose warning painted must not receive an all-black
-first lock frame. Hashing costs a pass over the whole buffer, so it
-inflates every timing in a trace that carries it — do not gate a gap on a
-hashed run.
-
-Full pixel continuity (warning's last frame == lock's first frame) is NOT
-asserted here and cannot be: the warning buffer is ARGB after the overlay
-blend and the lock buffer is XRGB straight out of the scene shadow, so the
-two agree on colour and disagree on the fourth byte. Equality belongs to a
-metal check that compares channels, alongside seat verification.
-"""
 
 import argparse
 import re
@@ -124,8 +6,6 @@ import sys
 
 SEND = re.compile(r"^\[\s*([0-9.]+)\](?:\[rs\])?\s*(?:\[discarded\])?\s*-> ([a-z0-9_]+)[#@](\d+)\.([a-z0-9_]+)\((.*)\)")
 EVENT = re.compile(r"^\[\s*([0-9.]+)\](?:\[rs\])?\s*(?:<- )?([a-z0-9_]+)[#@](\d+)\.([a-z0-9_]+)[,(]")
-# span-lines records share this stderr; they carry no `[ts]` prefix, so the
-# protocol regexes above never match one.
 HASH = re.compile(r"^event=frame\.hash\s")
 
 FNV_OFFSET = 0xCBF29CE484222325
@@ -134,17 +14,10 @@ MASK64 = (1 << 64) - 1
 
 
 def black_hash(byte_count):
-    """The fingerprint vigil-lock emits for a buffer of `byte_count` zeros.
-
-    FNV-1a over zeros never XORs anything in, so the whole loop collapses to
-    repeated multiplication: h = offset * prime**n. Closed form rather than
-    a Python loop over eight megabytes per output.
-    """
     return f"{(FNV_OFFSET * pow(FNV_PRIME, byte_count, MASK64 + 1)) & MASK64:016x}"
 
 
 def parse_record(line):
-    """span-lines record -> dict. Keys and values never contain space or `=`."""
     fields = {}
     for token in line.split():
         key, sep, value = token.partition("=")
@@ -154,14 +27,6 @@ def parse_record(line):
 
 
 def dangling_parents(records):
-    """Records naming a parent id no span record carries, and a summary.
-
-    The root has `parent=-`. Everything else points at a span that must have
-    been written by the time the process ended; a span still open when the
-    process dies is never written, and every child it had dangles. The
-    summary groups them as the issue did (`33x loop.iteration -> missing
-    parent <id>`), so a failure reads as a shape rather than a count.
-    """
     ids = {r["id"] for r in records if "id" in r}
     dangling = [
         r for r in records
@@ -178,13 +43,6 @@ def dangling_parents(records):
     return dangling, summary
 
 def locked_to_commit(locked_ms, first_lock_commit_ms, handoff_outputs):
-    """{wl_output: ms} from the `locked` event to that output's first buffer.
-
-    Restricted to outputs that carried a warning surface, i.e. the ones that
-    were on screen when the lock was granted. An output hotplugged into an
-    already-locked session commits whenever it is configured, which is not a
-    handoff and not a measurement of one.
-    """
     if locked_ms is None:
         return {}
     return {
@@ -195,13 +53,6 @@ def locked_to_commit(locked_ms, first_lock_commit_ms, handoff_outputs):
 
 
 def handoff_gaps(lock_request_ms, first_lock_commit_ms, warning_commits_ms):
-    """{wl_output: (gap_ms, start_ms, commit_ms)} for every output that locked.
-
-    The gap starts at the last thing the user could still have been shown on
-    that output — its warning surface's last commit — or at the lock request
-    if the warning had already stopped committing, whichever is later. It
-    ends at the lock surface's first commit-with-buffer.
-    """
     gaps = {}
     for output, commit_ms in first_lock_commit_ms.items():
         candidates = [ms for ms in warning_commits_ms.get(output, []) if ms <= commit_ms]
@@ -242,53 +93,35 @@ def main():
     locked_seen = False
     locked_line = None
     unlock_line = None
-    lock_destroy_line = None  # ext_session_lock_v1.destroy (never after locked)
-    span_records = []       # every span-lines record, parsed (issue #79)
-    lock_surfaces = {}      # ext_session_lock_surface id -> wl_surface id
-    warning_surfaces = {}   # zwlr_layer_surface id -> wl_surface id
-    pending_attach = {}     # wl_surface id -> has non-null buffer attached
-    first_lock_commit = {}  # wl_surface id -> line index of first buffer commit
-    warning_teardowns = []  # line indices of warning surface/layer destroys
-    reveal_surfaces = {}    # zwlr_layer_surface id -> wl_surface id
-    reveal_requests = []    # line indices of reveal get_layer_surface
-    reveal_configured = {}  # zwlr_layer_surface id -> line of first configure
-    reveal_first_commit = {}  # wl_surface id -> line of first buffer commit
-    reveal_teardowns = []   # line indices of reveal surface/layer destroys
+    lock_destroy_line = None
+    span_records = []
+    lock_surfaces = {}
+    warning_surfaces = {}
+    pending_attach = {}
+    first_lock_commit = {}
+    warning_teardowns = []
+    reveal_surfaces = {}
+    reveal_requests = []
+    reveal_configured = {}
+    reveal_first_commit = {}
+    reveal_teardowns = []
     layer_requests = 0
     capture_binds = []
-    # Handoff-gap bookkeeping, all keyed by the wl_output the surface was
-    # created on — the one identity the warning surface and the lock surface
-    # of a single display share.
-    lock_surface_output = {}     # wl_surface id -> wl_output id (live only)
-    warning_surface_output = {}  # wl_surface id -> wl_output id (live only)
-    # Outputs that ever carried a warning surface. Separate from the live map
-    # above, which is pruned on destroy: warning surfaces are torn down at the
-    # end of the handoff, so asking the live map afterwards says "no output
-    # went through the handoff" about a trace that is entirely a handoff.
+    lock_surface_output = {}
+    warning_surface_output = {}
     handoff_outputs = set()
     lock_request_ms = None
     locked_ms = None
-    first_lock_commit_ms = {}    # wl_output id -> ms of first buffer commit
-    warning_commits_ms = {}      # wl_output id -> [ms of every buffer commit]
-    # frame.hash records (VIGIL_FRAME_HASH=1), keyed by vigil's OutputId,
-    # which is the wl_output's protocol id — the same number as above.
-    first_lock_hash = {}         # output -> (hash, width, height)
-    warning_hashed = set()       # outputs whose warning committed a frame
-    # A frame.hash record is written immediately AFTER its own commit, so it
-    # fingerprints the most recent lock commit-with-buffer on that output —
-    # not the next one. Hashing moved behind the commit so the diagnostic
-    # could not lengthen the black window it measures, and the correlation
-    # has to follow it. That is what turns "when did a buffer arrive" into
-    # "when did a buffer that is not black arrive" — the number issue #86 is
-    # actually about.
-    last_lock_commit_ms = {}     # output -> ms of most recent lock commit
-    first_nonblack_ms = {}       # output -> ms of first non-black lock commit
+    first_lock_commit_ms = {}
+    warning_commits_ms = {}
+    first_lock_hash = {}
+    warning_hashed = set()
+    last_lock_commit_ms = {}
+    first_nonblack_ms = {}
 
     with open(args.trace, errors="replace") as fh:
         for lineno, line in enumerate(fh):
             if line.startswith(("span=", "event=")):
-                # A span-lines record: kept whole for the completeness check,
-                # then frame.hash falls through to its own handling below.
                 span_records.append(parse_record(line))
             if HASH.match(line):
                 record = parse_record(line)
@@ -371,20 +204,10 @@ def main():
                         reveal_teardowns.append(lineno)
                     elif iface == "wl_surface" and oid in reveal_surfaces.values():
                         reveal_teardowns.append(lineno)
-                    # Forget the surface->output mapping when the surface
-                    # goes. Wayland object ids are recycled, so a later
-                    # surface can be handed the number this one just
-                    # released; keeping the old entry would attribute its
-                    # commits to the wrong output and silently corrupt the
-                    # timing measurements. No current trace reuses an id -
-                    # this is here so none has to.
                     if iface == "wl_surface":
                         gone = lock_surface_output.pop(oid, None)
                         warning_surface_output.pop(oid, None)
                         if gone is not None:
-                            # Its output has no live lock surface now, so a
-                            # later hash must not be attributed to this
-                            # surface's last commit.
                             last_lock_commit_ms.pop(gone, None)
                 continue
             m = EVENT.match(line)
@@ -534,13 +357,6 @@ def main():
                     f"{lock_destroy_line}; the lock object must be left to the compositor"
                 )
 
-    # The span-lines side of the trace: how many records, how many per-wake
-    # spans, whether the root arrived and what it said, and what dangles.
-    # Printed pass or fail for the same reason the gap numbers are: it is the
-    # number #79 was measured in. Only when the completeness gate is asked
-    # for, though: a capture read while the detached locker is still running
-    # (S2, S7b) dangles by construction, and printing that beside "ok" would
-    # read as a defect nobody is gating.
     if args.session_outcome is not None:
         outcomes = ",".join(s.get("outcome", "<absent>") for s in sessions) or "<none>"
         print(
@@ -551,19 +367,10 @@ def main():
             + (f" ({dangling_summary})" if dangling else "")
         )
 
-    # Printed on every run that measured one, pass or fail: a gate nobody
-    # can read the number behind is a gate nobody retunes. `locked` is here
-    # because the compositor stops rendering normal surfaces at that event,
-    # not at the request, so it bounds the part of the gap that is actually
-    # black on a strict compositor.
     for output, ms in sorted(uncovered.items()):
         print(f"check_trace: black window output {output}: {ms:.1f}ms (locked -> first lock commit)")
     for output, (gap, start, commit) in sorted(gaps.items()):
         since_locked = "" if locked_ms is None else f" since_locked={commit - locked_ms:.1f}ms"
-        # The gap above ends at the first buffer; this one ends at the first
-        # buffer that is not black, which is what the eye sees. They are the
-        # same number exactly when the fix is working, and only a hashed run
-        # can tell them apart.
         nonblack = first_nonblack_ms.get(output)
         to_content = "" if nonblack is None else f" to_content={nonblack - start:.1f}ms"
         print(

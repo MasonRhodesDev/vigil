@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Checks a run-scene.sh run with VIGIL_E2E_NEXT set: what the screens show
-between vigil's exit and a next owner's first frame.
-
-  hold-check.py WORKDIR hold     [render] hold_last_frame_on_exit was on
-  hold-check.py WORKDIR          the control: it was off, and the run must show
-                                 the black gap the holder exists to remove
-
-With the holder on, per screen: after the rest frame is up there is no dark
-frame before the next owner's pattern, the rest frame stayed up until then,
-the pattern is still up at the end of the run (the holder's exit did not blank
-it), the holder existed at vigil's exit and is gone after the handover, and the
-next owner was not refused master.
-"""
 import json
 import os
 import re
@@ -21,9 +8,6 @@ import numpy as np
 
 work = sys.argv[1]
 hold = len(sys.argv) > 2 and sys.argv[2] == "hold"
-# A compositor's first commit may itself be black (and its first real frame
-# comes later, on the owner's schedule), so against Hyprland the claim is the
-# weaker, honest one: the rest frame stays up until the owner's first commit.
 compositor = os.environ.get("VIGIL_E2E_NEXT") == "hyprland"
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = json.load(open(os.path.join(work, "scene.json")))
@@ -53,12 +37,9 @@ def classify(im):
     h, w = im.shape[:2]
     if int(im[::max(1, h // 40), ::max(1, w // 40)].max()) <= 3:
         return "dark"
-    # Rest: ground at the corners (inside the debug border) and the mark's
-    # colour present in numbers.
     b = max(4, round(min(w, h) * spec["debug"]["border_frac"])) + 3
     corners = [im[b, b], im[b, w - b - 1], im[h - b - 1, b], im[h - b - 1, w - b - 1]]
     ground = all(np.abs(c.astype(int) - BG).max() <= 2 for c in corners)
-    # Every 3rd pixel each way is plenty to find a mark hundreds of pixels wide.
     sub = im[::3, ::3].astype(np.int16)
     marks = int(np.all(np.abs(sub - MARK) <= 6, axis=2).sum())
     if ground and marks > 50:
@@ -81,16 +62,10 @@ rest_end = {}
 for dev, rows in series.items():
     kinds = [k for _, k in rows]
     print(f"      {dev}: " + " ".join(f"{k[0]}" for k in kinds[-60:]) + "   (r rest, d dark, o other, m mixed; last 60 frames)")
-    # The rest frame that matters is the last one: the greeter fades to it
-    # after login, and then the next owner takes over.
     rest_idx = [i for i, k in enumerate(kinds) if k == "rest"]
     check(bool(rest_idx), f"{dev}: reaches the rest frame")
     if not rest_idx:
         continue
-    # The next owner's frame is the final run of "other" frames (up to three
-    # trailing frames may be the owner being killed at the end of the run). A
-    # single odd frame right after the rest frame, as a screen goes black, is
-    # not a next owner.
     end = len(kinds)
     for _ in range(3):
         if end > 0 and kinds[end - 1] != "other":
@@ -137,10 +112,6 @@ for dev, rows in series.items():
         check(dark >= 3, f"{dev}: control: the screen goes black before the next owner ({dark} dark frames, gap {t_next - t_last:.2f}s)")
 
 if hold and compositor and len(rest_end) == len(heads):
-    # Host and guest clocks differ, but the spacing between the screens'
-    # last rest frames must match the spacing between the holder's own
-    # "crtc moved" timestamps: a screen leaves the rest frame exactly when the
-    # owner commits to it, not before.
     moved = sorted(int(m) for m in re.findall(r"vigil-hold: \[\+(\d+)ms\] crtc", log))
     ends = sorted(rest_end.values())
     if len(moved) == len(ends):
