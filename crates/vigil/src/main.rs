@@ -1516,10 +1516,7 @@ impl App {
             use std::sync::{Arc, OnceLock};
             type Source = OnceLock<Result<Arc<vigil_ui::BackgroundImage>, String>>;
             let mut sources: HashMap<PathBuf, Source> = HashMap::new();
-            for (_, path, _, _, _, prepared) in &requests {
-                if prepared.is_some() {
-                    continue;
-                }
+            for (_, path, _, _, _, _) in &requests {
                 if let Some(path) = path {
                     sources.entry(path.clone()).or_default();
                 }
