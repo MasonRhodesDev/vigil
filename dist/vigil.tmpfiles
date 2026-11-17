@@ -1,1 +1,1 @@
-d /var/lib/vigil 0750 greeter greeter -
+d /var/lib/vigil 0750 :greeter :greeter -
