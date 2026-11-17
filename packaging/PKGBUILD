@@ -1,7 +1,7 @@
 # Maintainer: Mason Rhodes <mrhodesdev@gmail.com>
 
 pkgname=vigil
-pkgver=0.4.1
+pkgver=0.4.3
 pkgrel=1
 pkgdesc="Compositor-less greetd greeter and matching session lockscreen"
 arch=('x86_64' 'aarch64')

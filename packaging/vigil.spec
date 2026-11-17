@@ -1,7 +1,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.4.1
+Version:        0.4.3
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -51,7 +51,7 @@ install -Dpm0755 target/rpm/vigil-sim %{buildroot}%{_bindir}/vigil-sim
 
 install -Dpm0755 dist/setup-greetd %{buildroot}%{_prefix}/lib/vigil/setup-greetd
 install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
-sed -i 's/ greeter greeter / greetd greetd /' %{buildroot}%{_tmpfilesdir}/vigil.conf
+sed -i 's/ :greeter :greeter / :greetd :greetd /' %{buildroot}%{_tmpfilesdir}/vigil.conf
 install -Dpm0644 dist/vigil-lock.pam %{buildroot}%{_sysconfdir}/pam.d/vigil-lock
 install -Dpm0644 dist/vigil.toml.example %{buildroot}%{_datadir}/vigil/vigil.toml.example
 install -Dpm0644 themes/default/theme.slint %{buildroot}%{_datadir}/vigil/themes/default.slint
@@ -83,6 +83,24 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Tue Nov 17 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.4.3-1
+- GL renderer: ask EGL for a stencil buffer, so the clock's large glyphs
+  draw as text instead of solid boxes (#105). Supersedes the unreleased 0.4.2.
+- Software renderer: no longer panics when one output's wallpaper comes from
+  the prepared cache and another's needs a decode from the same file.
+- /var/lib/vigil ownership from the tmpfiles entry applies only at creation,
+  so the account setup-greetd picks survives reboots and the greeter can
+  save the remembered user and session again.
+- Monitors are named the way Hyprland names them, so one profile matches
+  both sides of login (#109).
+- Boot: splash on every output, one cross-fade into the greeter, a rest
+  frame after login, cached wallpaper scaling, and an opt-in exit holder
+  (#111, #113, #114, #115, #116).
+- Faster hand-off at login on the dumb-buffer path (#117).
+- Automatic login pauses after three quick session crashes in a row (#120).
+- vigil-login moves to zbus 6 (#112); dependency updates clear the
+  pulldown-cmark advisories and the yanked async-executor.
+
 * Tue Oct 13 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.4.1-1
 - The default theme is laid out by output size (#100). The clock scales
   with the output and sits centered above a card sized to its content: an

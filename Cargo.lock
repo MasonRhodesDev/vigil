@@ -197,9 +197,9 @@ dependencies = [
 
 [[package]]
 name = "async-executor"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
+checksum = "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
 dependencies = [
  "async-task",
  "concurrent-queue",
@@ -3508,9 +3508,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.4"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
 dependencies = [
  "bitflags 2.13.2",
  "getopts",
@@ -5032,7 +5032,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vigil"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "appearance-profiles 0.2.0",
  "bytemuck",
@@ -5061,7 +5061,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-auth"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "greetd_ipc",
  "vigil-core",
@@ -5069,7 +5069,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-config"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "serde",
  "toml 0.9.12+spec-1.1.0",
@@ -5078,14 +5078,14 @@ dependencies = [
 
 [[package]]
 name = "vigil-core"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "monitor-profiles",
 ]
 
 [[package]]
 name = "vigil-flow"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "vigil-config",
  "vigil-core",
@@ -5094,7 +5094,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-gl"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "drm",
  "gbm",
@@ -5108,7 +5108,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-input"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "input 0.9.1",
  "smithay",
@@ -5118,7 +5118,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-lock"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "appearance-profiles 0.2.0",
  "image",
@@ -5141,7 +5141,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-login"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "vigil-core",
  "zbus 6.0.0",
@@ -5149,7 +5149,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-outputs"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "smithay",
  "smithay-drm-extras",
@@ -5158,7 +5158,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-pam"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "pam-client",
  "vigil-core",
@@ -5166,7 +5166,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-present-dumb"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "smithay",
  "vigil-core",
@@ -5174,7 +5174,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-present-gl"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "gbm",
  "slint",
@@ -5188,7 +5188,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-session"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "smithay",
  "vigil-core",
@@ -5196,7 +5196,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-sim"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "font8x8",
  "image",
@@ -5215,7 +5215,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-theme"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "slint",
  "slint-interpreter",
@@ -5225,7 +5225,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-ui"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "bytemuck",
  "image",
@@ -5239,7 +5239,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-warning"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "vigil-config",
  "vigil-core",
@@ -5247,7 +5247,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-wayland"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "calloop-wayland-source 0.4.1",
  "libc",
