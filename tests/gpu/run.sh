@@ -1,34 +1,4 @@
 #!/bin/sh
-# Run a command inside a GPU-capable virtme-ng guest and propagate its exit
-# code. This is what makes the GL path (issue #17) testable at all.
-#
-#   tests/gpu/run.sh [--accel] [--screenshot FILE.ppm] -- <command...>
-#   tests/gpu/run.sh -- target/debug/examples/gbm_probe /dev/dri/card0
-#   tests/gpu/run.sh --screenshot /tmp/gl.ppm -- target/debug/examples/gl_modeset
-#
-# Why a VM: EGL rendering on a *card* node needs DRM master, and on a desktop
-# the compositor holds it -- eglCreateWindowSurface fails with EGL_BAD_MATCH
-# and amdgpu reports EACCES. In the guest nothing else owns the device.
-#
-# Two modes, both headless:
-#
-#   default   -device virtio-gpu-pci
-#             Mesa falls back to kms_swrast/llvmpipe: real GL, real GBM, no
-#             host GPU required. This is the mode for CI -- it works on a
-#             stock runner with no graphics hardware at all.
-#
-#   --accel   -device virtio-gpu-gl-pci -display egl-headless
-#             (no --screenshot: see below)
-#             virglrenderer forwards to the host GPU (GL_RENDERER reports
-#             virgl over the real card). For fidelity and performance checks
-#             where llvmpipe's speed would mislead.
-#
-# Requires: qemu-system-x86-core, virtme-ng; --accel also needs
-# virglrenderer on the host.
-#
-# VIGIL_VM_KERNEL=/boot/vmlinuz-linux boots that kernel instead of the
-# running one, for hosts whose running kernel has no image to hand virtme
-# (a container on someone else's kernel). tests/e2e honours it too.
 set -eu
 
 ACCEL=0
@@ -44,19 +14,10 @@ done
 [ $# -gt 0 ] || { echo "usage: $0 [--accel] [--screenshot FILE] -- <command...>" >&2; exit 2; }
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-# Not under /tmp: virtme overlays a fresh tmpfs there, so the guest could
-# never write its log back to a path the host can read.
 WORK=$(mktemp -d -p "${XDG_CACHE_HOME:-$HOME/.cache}" vigil-gpu.XXXXXX)
 LOG=$WORK/gpu.log
 : > "$LOG"
 
-# --screenshot needs QMP to ask QEMU for the guest's display. Capturing what
-# the virtual monitor actually shows is the only way to tell a frame that
-# reached the screen from a commit that merely returned success.
-#
-# Software mode only. egl-headless keeps nothing in QEMU's Pixman buffer by
-# design, so screendump there answers "no surface" -- the frame is on the
-# guest's CRTC, there is just no host-side copy to hand back.
 QMP=$WORK/qmp.sock
 QMPOPT=
 [ -n "$SHOT" ] && QMPOPT="-qmp unix:$QMP,server=on,wait=off"
@@ -68,8 +29,6 @@ else
     GPU="-device virtio-gpu-pci $QMPOPT"
 fi
 
-# The command runs as root in the guest, with the repo visible from the host
-# rootfs and $WORK writable.
 cat > "$WORK/guest.sh" <<EOF
 #!/bin/sh
 cd "$REPO" || exit 1
@@ -85,8 +44,6 @@ timeout "${VIGIL_GPU_TIMEOUT:-300}" vng --run ${VIGIL_VM_KERNEL:-} --disable-mic
 VM=$!
 
 if [ -n "$SHOT" ]; then
-    # Fire once the command has done its work but before the guest exits;
-    # the modeset examples hold the mode briefly for exactly this.
     for _ in $(seq 120); do
         grep -q "MODESET OK" "$LOG" 2>/dev/null && break
         sleep 1

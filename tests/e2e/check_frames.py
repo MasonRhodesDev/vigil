@@ -1,31 +1,14 @@
 #!/usr/bin/env python3
-"""Pixel assertions over the screendumps drive.py captured.
-
-Region samples and distinct-colour counts, not golden images: text
-rasterization differs across host font stacks and the guest inherits the
-HOST's installed theme, so exact pixels would be flaky (same reasoning as
-crates/vigil/tests/theme_states.rs). What is stable: a rendered frame has
-many distinct colours, a dead renderer's frame has almost none, and the
-login card occupies a fixed centered region at every stage.
-
-The stages are display 0 (QMP screendump without a device argument
-captures the first virtio-gpu console). The second output is captured once,
-by device id, for its large clock.
-
-Usage: check_frames.py WORKDIR
-"""
 import sys
 
 GREETER_STAGES = [
     "1-username.ppm", "2-password.ppm", "2c-back.ppm", "3-error.ppm",
     "4-username-again.ppm", "5-picker.ppm", "6-typed.ppm",
 ]
-# 2b-vt2.ppm is the VT2 text console — nothing of vigil's to assert.
 DISTINCT_MIN = 8
 
 
 def load_ppm(path):
-    """Binary P6 only. Returns (width, height, rgb_bytes)."""
     with open(path, "rb") as fh:
         data = fh.read()
     magic, dims, _maxval, px = data.split(b"\n", 3)
@@ -47,9 +30,6 @@ def distinct_colors(img, step=8):
 
 
 def card_rect(img):
-    """The card's field and status rows, recentered on the actual frame
-    (1280x800 geometry in theme_states.rs). It starts below where either
-    clock size ends, so the clock alone cannot pass for a rendered card."""
     w, h, _ = img
     return (w // 2 - 175, h // 2 + 25, w // 2 + 175, h // 2 + 88)
 
@@ -66,15 +46,10 @@ def sample(img, rect, step=4):
     return out
 
 
-# Clock glyphs fill about a quarter of their bounding box; a GL surface
-# without stencil fills each glyph's whole box (issue: greeter clock as
-# white rectangles), which measured 0.69 here against 0.28 for real text.
 CLOCK_FILL_MAX = 0.5
 
 
 def clock_fill(img):
-    """Fraction of the clock's bounding box that is ink, on an output with
-    no card: the only bright pixels above the footer are the clock's."""
     w, h, px = img
     ink = []
     for y in range(0, h - 120):

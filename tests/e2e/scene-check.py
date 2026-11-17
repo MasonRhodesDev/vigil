@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""Checks the frames run-scene.sh captured against the scene spec's rules.
-
-Each screen is sampled from the host (screendump), so every instant below is
-good to one capture sweep (tens of milliseconds); the thresholds allow for
-that. Nothing here asserts exact pixels except the ground colour and the debug
-border, which are exact by construction.
-
-  1. every screen is lit in the splash stage, and they light together
-  2. the ground covers each screen edge to edge (a pixel inside every corner)
-  3. the mark has the same apparent size and position on every screen, on the
-     short-side basis, including the one that is rotated
-  4. the glow shows (a pixel beside the mark gains the accent)
-  5. splash to greeter is one cross-fade: it starts on every screen together,
-     moves one way and never overshoots
-  6. after login every screen eases back to the rest frame together
-"""
 import json
 import os
 import re
@@ -24,7 +8,6 @@ import numpy as np
 
 work = sys.argv[1]
 HERE = os.path.dirname(os.path.abspath(__file__))
-# The scene the guest read (run-scene.sh copies it, with VIGIL_E2E_REF applied).
 spec = json.load(open(os.path.join(work, "scene.json")))
 REF = spec.get("ref_short_side")
 BG = tuple(int(spec["palette"]["bg"][i:i + 2], 16) for i in (1, 3, 5))
@@ -33,9 +16,7 @@ SPLASH = tuple(int(spec["stages"]["greeter-splash"]["debug"][i:i + 2], 16) for i
 GREETER = tuple(int(spec["stages"]["greeter"]["debug"][i:i + 2], 16) for i in (1, 3, 5))
 LOGO_FRAC = spec["geometry"]["logo_frac"]
 CENTRE = spec["geometry"]["centre_frac_of_h"]
-# The fixture mark (tests/fixtures/mark.svg) spans 88 x 84 of its 100 box.
 MARK_W, MARK_H = 0.88, 0.84
-# transform per virtio-gpu card, as written by run-scene.sh's profile.
 TRANSFORM = {"gpu0": 0, "gpu1": 0, "gpu2": 3}
 
 cap = json.load(open(os.path.join(work, "capture.json")))
@@ -74,8 +55,6 @@ def stage_of(im):
 
 
 def to_scene(t, w, h):
-    """Panel pixel to scene pixel, the inverse of vigil's scene_to_panel for
-    the quarter turns the run uses (0 and 3)."""
     def f(x, y):
         return (y, w - 1 - x) if t == 3 else (x, y)
     return f
@@ -91,7 +70,6 @@ for dev in heads:
         rows.append({"t": (c["t"] + c["t_done"]) / 2, "im": im, "stage": stage_of(im)})
     series[dev] = rows
 
-# 1. lit together
 first = {}
 for dev, rows in series.items():
     lit = [r for r in rows if r["stage"] == "splash"]
@@ -103,7 +81,6 @@ if len(first) == len(heads):
     print(f"      first light per screen (s): " + ", ".join(f"{d} {t:.3f}" for d, t in first.items()))
     check(spread <= 150, f"screens light together (spread {spread:.0f} ms, capture precision about 60 ms)")
 
-# vigil's own first-frame stamps
 log = open(os.path.join(work, "vigil.log"), errors="replace").read()
 stamps = [int(m) for m in re.findall(r"\[t\+(\d+)ms\] splash first frame", log)]
 if stamps:
@@ -117,7 +94,6 @@ check(bool(m), "vigil logged the first frame on every output")
 for line in re.findall(r"splash first frame on [^\n]*", log):
     print("      " + line)
 
-# 2. cover and 3. the mark
 norm = {}
 sizes = {}
 offs = {}
@@ -142,8 +118,6 @@ for dev, rows in series.items():
     if t % 2:
         bw, bh = bh, bw
     S = REF or min(sw, sh)
-    # Expected centre of the mark's box (the fixture mark is not centred in
-    # its box, so compare against the box centre of its own extent).
     want_cy = sh / 2 + (CENTRE - 0.5) * S if REF else sh * CENTRE
     norm[dev] = (bw / S, bh / S, sx / sw, sy / sh)
     sizes[dev] = (bw, bh)
@@ -160,7 +134,6 @@ if REF and len(sizes) > 1:
     check(all(abs(a - b) <= 2 for sz in sizes.values() for a, b in zip(sz, ref_sz)),
           f"ref_short_side {REF}: the mark is the same pixel size on every head {sorted(set(sizes.values()))}")
 
-# 4. glow: a pixel just above the mark gains blue over the ground
 for dev, rows in series.items():
     t = TRANSFORM.get(dev, 0)
     best = 0
@@ -177,10 +150,7 @@ for dev, rows in series.items():
         best = max(best, int(im[py, px, 2]) - BG[2])
     check(best >= 3, f"{dev}: the glow shows beside the mark (peak +{best} blue over the ground)")
 
-# 5. the cross-fade
 def probe(im, t):
-    """The mean of a patch low on the screen (away from the mark and the tag),
-    so the wallpaper's grain does not read as motion."""
     h, w = im.shape[:2]
     sw, sh = (h, w) if t % 2 else (w, h)
     sx, sy = int(sw * 0.5), int(sh * 0.82)
@@ -211,14 +181,10 @@ if len(starts) == len(heads) and None not in starts.values():
     spread = (max(starts.values()) - min(starts.values())) * 1000
     check(spread <= 150, f"the cross-fade starts on every screen together (spread {spread:.0f} ms)")
 
-# 6. after login: the rest frame, together
 ends = {}
 for dev, rows in series.items():
     t = TRANSFORM.get(dev, 0)
-    # The run ends with vigil's exit, after which a VM screen goes dark; the
-    # last picture that is not dark is the hand-off's result.
     dist = [(r["t"], np.abs(probe(r["im"], t) - np.array(BG)).sum()) for r in rows if r["stage"] != "dark"]
-    # first time after the greeter is up that the ground is back for good
     back = None
     for i in range(len(dist) - 1, -1, -1):
         if dist[i][1] > 8:

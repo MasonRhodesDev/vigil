@@ -1,48 +1,13 @@
-//! Reading the user's own `pam_faillock` tally (issue #92).
-//!
-//! When faillock has the account locked, `pam_authenticate` returns the same
-//! `PAM_AUTH_ERR` it returns for a typo, and the locker showed the same
-//! "authentication failed" for both. The user least able to work out why
-//! their correct password stopped working is precisely the one it happened
-//! to — so vigil reads the tally and says so, with the time left.
-//!
-//! No privilege is required and none is taken: `/run/faillock/<user>` is
-//! `rw-rw---- <user> root`, so the session user reads its own record. This
-//! module only ever reads. Resetting a tally is `faillock --reset`, a
-//! deliberate act, not something a lockscreen does on the user's behalf.
-//!
-//! Everything here is advisory. A tally that is missing, short, oversized,
-//! unreadable or written by a future version means "not locked, unknown" —
-//! never an error that could get between the user and their session.
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// linux-pam `modules/pam_faillock/faillock.h`:
-///
-/// ```c
-/// struct tally {
-///     char source[52];
-///     uint16_t reserved;
-///     uint16_t status;
-///     uint64_t time;
-/// };
-/// ```
-///
-/// Written straight out of memory: 64 bytes per record, host byte order,
-/// no header and no version field. Confirmed byte-for-byte against a live
-/// `/run/faillock/mason` (see the golden test below).
 pub const RECORD_LEN: usize = 64;
 const STATUS_OFFSET: usize = 54;
 const TIME_OFFSET: usize = 56;
 const STATUS_VALID: u16 = 0x1;
 
-/// A tally is a handful of 64-byte records. Anything past this is not one,
-/// and vigil will not allocate for it.
 const MAX_TALLY_BYTES: u64 = 64 * 1024;
 
-/// `faillock.conf` defaults, as documented in the shipped file: every key is
-/// commented out by default, so these are what a stock system runs.
 pub const DEFAULT_DENY: u32 = 3;
 pub const DEFAULT_UNLOCK_TIME: u64 = 600;
 pub const DEFAULT_FAIL_INTERVAL: u64 = 900;
@@ -51,20 +16,16 @@ const CONF_PATH: &str = "/etc/security/faillock.conf";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record {
-    /// Unix seconds of the attempt.
     pub time: u64,
     pub status: u16,
 }
 
 impl Record {
-    /// `TALLY_STATUS_VALID`. An invalid record is a slot faillock has
-    /// retired; it stays in the file and must not be counted.
     pub fn is_valid(&self) -> bool {
         self.status & STATUS_VALID != 0
     }
 }
 
-/// The subset of `/etc/security/faillock.conf` that decides a lockout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     pub deny: u32,
@@ -84,21 +45,13 @@ impl Default for Policy {
     }
 }
 
-/// A lockout in force right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lockout {
-    /// Clears on its own after this long.
     Until(Duration),
-    /// `unlock_time = 0`: nothing but `faillock --reset` clears it.
     Indefinite,
 }
 
-/// Bytes -> records. Trailing bytes that do not complete a record are
-/// ignored rather than rejected: the file is appended to in place, and a
-/// reader has no lock against a writer mid-write.
 pub fn parse_tally(bytes: &[u8]) -> Vec<Record> {
-    // `as_chunks` over a const size (clippy prefers it to `chunks_exact`);
-    // the remainder is a trailing partial record, ignored as documented.
     let (records, _partial) = bytes.as_chunks::<RECORD_LEN>();
     records
         .iter()
@@ -113,8 +66,6 @@ pub fn parse_tally(bytes: &[u8]) -> Vec<Record> {
         .collect()
 }
 
-/// Parse the `key = value` lines of `faillock.conf`. Absent, unreadable or
-/// commented-out keys keep their documented defaults.
 pub fn parse_conf(text: &str) -> Policy {
     let mut policy = Policy::default();
     for line in text.lines() {
@@ -123,9 +74,6 @@ pub fn parse_conf(text: &str) -> Policy {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            // Bare flags (`audit`, `silent`, `even_deny_root`) carry no value
-            // and none of them change the arithmetic below. The user is not
-            // root, so root_unlock_time cannot apply either.
             continue;
         };
         let value = value.trim();
@@ -154,16 +102,6 @@ pub fn parse_conf(text: &str) -> Policy {
     policy
 }
 
-/// Is the account locked, and for how much longer?
-///
-/// Mirrors linux-pam's `check_tally`, deliberately and exactly:
-/// `latest_time` is the newest record of any kind; a failure counts when it
-/// is valid and within `fail_interval` of that newest record; `deny`
-/// failures lock the account; and the lockout clears once
-/// `latest_time + unlock_time < now`. The countdown therefore runs from the
-/// *most recent* failure, not the first — every further wrong password while
-/// locked pushes the deadline out again, which is the behaviour a user needs
-/// to be told about rather than left to discover.
 pub fn lockout(records: &[Record], policy: &Policy, now: u64) -> Option<Lockout> {
     if policy.deny == 0 {
         return None;
@@ -182,8 +120,6 @@ pub fn lockout(records: &[Record], policy: &Policy, now: u64) -> Option<Lockout>
         return Some(Lockout::Indefinite);
     }
     let clears_at = latest.saturating_add(policy.unlock_time);
-    // Upstream unlocks on `latest + unlock_time < now`, so the final second
-    // is still locked.
     (clears_at >= now).then(|| Lockout::Until(Duration::from_secs(clears_at - now)))
 }
 
@@ -193,10 +129,7 @@ fn policy_from_disk() -> Policy {
         .unwrap_or_default()
 }
 
-/// The live answer for `user`, or `None` for "not locked, or unknowable".
 pub fn read(user: &str) -> Option<Lockout> {
-    // The tally is addressed by file name; a user string that could climb
-    // out of the directory is not one this ever asks about.
     if user.is_empty() || user.contains('/') || Path::new(user).components().count() != 1 {
         return None;
     }
@@ -225,16 +158,12 @@ mod tests {
         Policy::default()
     }
 
-    /// The record layout, verified against a real `/run/faillock/mason`
-    /// written by pam_faillock on this machine. `faillock(8)` decoded the
-    /// same record as `2026-09-04 13:37:55 SVC vigil-lock V`.
     #[test]
     fn parses_a_record_written_by_pam_faillock() {
         let mut bytes = vec![0u8; RECORD_LEN];
         bytes[..10].copy_from_slice(b"vigil-lock");
         bytes[STATUS_OFFSET..STATUS_OFFSET + 2].copy_from_slice(&1u16.to_le_bytes());
         bytes[TIME_OFFSET..TIME_OFFSET + 8].copy_from_slice(&1_788_554_275u64.to_le_bytes());
-        // Byte-for-byte what the live file held.
         assert_eq!(
             &bytes[48..],
             &[
@@ -250,7 +179,6 @@ mod tests {
     #[test]
     fn a_short_or_empty_tally_is_not_a_lockout() {
         assert_eq!(parse_tally(&[]), Vec::new());
-        // A torn write mid-record contributes nothing rather than erroring.
         assert_eq!(parse_tally(&[0u8; RECORD_LEN + 9]).len(), 1);
         assert_eq!(lockout(&[], &strict(), 1_000_000), None);
     }
@@ -272,8 +200,6 @@ mod tests {
             record(now - 10, true),
             record(now - 5, true),
         ];
-        // Upstream counts from the newest failure, so the countdown is
-        // unlock_time measured from `now - 5`.
         assert_eq!(
             lockout(&records, &strict(), now),
             Some(Lockout::Until(Duration::from_secs(DEFAULT_UNLOCK_TIME - 5)))
@@ -288,7 +214,6 @@ mod tests {
             record(now - DEFAULT_FAIL_INTERVAL - 500, true),
             record(now, true),
         ];
-        // Only the newest is within fail_interval of the newest.
         assert_eq!(lockout(&records, &strict(), now), None);
     }
 
@@ -313,7 +238,6 @@ mod tests {
             record(old, true),
         ];
         assert_eq!(lockout(&records, &strict(), now), None);
-        // ...and the last second of the window is still locked.
         let edge = now - DEFAULT_UNLOCK_TIME;
         let records = [
             record(edge - 2, true),
@@ -373,9 +297,7 @@ mod tests {
                 dir: PathBuf::from("/run/faillock"),
             }
         );
-        // `never` is documented as equivalent to 0.
         assert_eq!(parse_conf("unlock_time = never").unlock_time, 0);
-        // Garbage keeps the default rather than erroring the unlock.
         assert_eq!(parse_conf("deny = lots").deny, DEFAULT_DENY);
     }
 

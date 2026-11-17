@@ -1,26 +1,4 @@
 #!/bin/sh
-# Journald round-trip suite: do the locker's trace records survive the
-# transport they are designed for?
-#
-# Everything else that captures a trace redirects stderr to a file. That
-# proves the records are well-formed and proves nothing about journald,
-# which is the whole reason the format carries no timestamps of its own:
-# journald is supposed to supply __MONOTONIC_TIMESTAMP, _BOOT_ID and _PID,
-# and its clock is supposed to order records across processes.
-#
-# The compositor and journald are independent, so this borrows a headless
-# sway for ext-session-lock and the host's own journald for the transport.
-# The locker runs in a transient scope started from a transient service -
-# the topology lock-cmd.sh uses (ADR 0006) - so its stderr is a real
-# journald stream rather than a pipe.
-#
-# The child gets a PRIVATE XDG_RUNTIME_DIR so its logind calls cannot reach
-# the developer's own session: running this must never set LockedHint on the
-# seat you are sitting at. journald is reached through the inherited stderr
-# fd, which does not consult XDG_RUNTIME_DIR, so isolating one does not cost
-# the other.
-#
-# Opt-in locally, skips cleanly without its dependencies.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 
@@ -63,9 +41,6 @@ done
 NESTED_WD=$(basename "$sock")
 NESTED_RUNTIME=$XDG_RUNTIME_DIR
 
-# A trace id minted by the launcher, as a shell wrapper would. Proving the
-# locker adopts it is the only way to know propagation works across an exec
-# rather than merely inside one process's tests.
 hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 TP="00-$(hex 16)-$(hex 8)-01"
 TRACE_ID=$(printf '%s' "$TP" | cut -d- -f2)
@@ -79,10 +54,6 @@ XDG_RUNTIME_DIR=$HOST_RUNTIME systemd-run --user --collect --quiet --unit="$UNIT
         --setenv=TRACEPARENT='$TP' \
         -- '$VLOCK' --warn 4000" >/dev/null 2>&1
 
-# Cancel the warning, so the locker leaves through span_lines::exit. A
-# SIGTERM would close the trace too since #79, but through a different path
-# (the nested suite's S10 measures that one); this suite measures the
-# transport, so it takes the ordinary exit.
 sleep 1.5
 WAYLAND_DISPLAY=$NESTED_WD wtype -s 800 x 2>/dev/null || true
 sleep 3

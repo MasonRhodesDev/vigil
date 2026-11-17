@@ -13,7 +13,6 @@ jobs:
   arch-ci:
     uses: MasonRhodesDev/packaging-workflows/.github/workflows/rust-ci.yml@v1
     with:
-      # smithay backends + xkbcommon + pam (bindgen needs clang)
       pacman-deps: seatd libinput libxkbcommon systemd libdrm mesa pam clang fontconfig ttf-dejavu
 
   arch:

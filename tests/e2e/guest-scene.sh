@@ -1,8 +1,4 @@
 #!/bin/sh
-# Runs INSIDE the virtme-ng guest (root, host rootfs read-only). The scene
-# run's counterpart of guest.sh: a fixed fake greetd, the splash and scene
-# settings from $VIGIL_E2E_DIR, and DEBUG_STAGE_TAGS on so the frames say
-# which stage owns each screen.
 REPO=${VIGIL_REPO:?}
 DIR=${VIGIL_E2E_DIR:?}
 BIN=${VIGIL_E2E_BIN:-$REPO/target/release/vigil}
@@ -20,30 +16,21 @@ seatd 2>>"$LOG" &
 for i in $(seq 50); do [ -e /run/seatd.sock ] && break; sleep 0.1; done
 export LIBSEAT_BACKEND=seatd
 [ "${VIGIL_E2E_TAGS:-key}" = env ] && export DEBUG_STAGE_TAGS=1
-# VIGIL_E2E_NOFBCON=1 unbinds the framebuffer console, so that a console
-# repaint when the seat is disabled cannot be mistaken for the next owner.
 if [ -n "${VIGIL_E2E_NOFBCON:-}" ]; then
     for v in /sys/class/vtconsole/vtcon*; do
         grep -q "frame buffer" "$v/name" 2>/dev/null && echo 0 > "$v/bind"
     done
 fi
-# The cue the host driver waits for; it then watches the screens from t=0.
 echo "VIGIL-START" >> "$LOG"
 "$BIN" --socket /tmp/greetd.sock --config "$VIGIL_E2E_CONFIG" 2>>"$LOG"
 RC=$?
 echo "VIGIL-EXIT:$RC" | tee -a "$LOG"
-# VIGIL_E2E_NEXT=modetest plays the session: after a delay (greetd starting
-# the session) a DRM client takes master and puts its own framebuffer on
-# every screen. The holder (if on) must keep vigil's last frame up until then
-# and be gone afterwards.
 if [ -n "${VIGIL_E2E_NEXT:-}" ]; then
     holders() { for c in /proc/[0-9]*/comm; do [ "$(cat "$c" 2>/dev/null)" = vigil-hold ] && echo "${c%/comm}"; done; }
     echo "HOLDERS-AT-EXIT: $(holders | tr '\n' ' ')" >> "$LOG"
     sleep "${VIGIL_E2E_NEXT_DELAY:-3}"
     echo "NEXT-START" >> "$LOG"
     if [ "$VIGIL_E2E_NEXT" = hyprland ]; then
-        # A real compositor: Hyprland on every card, solid-colour background,
-        # no animations, started as the session would be (new libseat client).
         export XDG_RUNTIME_DIR=/tmp/xdg-next
         mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
         printf 'misc {\n disable_hyprland_logo = true\n disable_splash_rendering = true\n background_color = 0xff2060c0\n force_default_wallpaper = 0\n}\nanimations { enabled = false }\n' > "$DIR/hypr-next.conf"

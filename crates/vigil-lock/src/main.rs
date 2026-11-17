@@ -1,7 +1,3 @@
-//! vigil-lock: session lockscreen sharing vigil's theme and auth seams
-//! (DESIGN.md §12). Policy layer only: vigil-wayland owns the protocol,
-//! vigil-pam owns authentication, vigil-ui/-theme own the scene.
-
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,24 +20,15 @@ use vigil_ui::{Looks, OutputWindow, UiSnapshot, VigilPlatform, apply_kit_tokens_
 use vigil_wayland::{LockOutcome, LockSession};
 
 struct Cli {
-    /// None until resolved by `parse_cli` — parsing itself never reads the
-    /// environment, so tests can exercise flags with USER/LOGNAME unset.
     user: Option<String>,
     config: Option<PathBuf>,
     theme: Option<PathBuf>,
     background: Option<PathBuf>,
     bg_mode: Option<BackgroundFit>,
     grace: Option<u64>,
-    /// Write one byte here once the compositor confirms the lock (systemd/
-    /// hypridle readiness protocol).
     ready_fd: Option<i32>,
-    /// Re-exec as a background child and exit 0 only once it is locked —
-    /// the blocking form a `before_sleep_cmd` needs: the caller's sleep
-    /// inhibitor is not released until the screen is already secured.
     wait: bool,
     warning_ms: Option<u64>,
-    /// Skip the frost transition on lock and the reveal on unlock
-    /// (`[lock.transition]`): today's instant commit, for scripts and tests.
     immediate: bool,
 }
 
@@ -99,9 +86,6 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
                 let v = value("--ready-fd")?;
                 cli.ready_fd = Some(v.parse().map_err(|_| format!("bad --ready-fd {v}"))?);
             }
-            // `--wait` is the user-facing readiness contract: detach the
-            // locker and return only after the compositor confirms K5. Keep
-            // the old spelling for callers upgraded independently.
             "--wait" | "--daemonize" => cli.wait = true,
             "--warn" => {
                 let v = value("--warn")?;
@@ -116,10 +100,6 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
     Ok(cli)
 }
 
-/// Fold the flags that override `vigil.toml` into the loaded config.
-/// `--warn`/`--no-warn` set the cancelable warning; `--immediate` removes
-/// the non-cancelable transition, and every ramp is clamped so a bad config
-/// delays a lock but never prevents it.
 fn apply_cli_to_config(cli: &Cli, config: &mut Config) {
     if let Some(duration_ms) = cli.warning_ms {
         config.lock.warning.duration_ms = duration_ms;
@@ -144,9 +124,6 @@ fn apply_cli_to_config(cli: &Cli, config: &mut Config) {
     }
 }
 
-/// The user to authenticate: an explicit `--user` wins; otherwise the
-/// session environment. Pure, so the error path is unit-testable without
-/// mutating the process environment (unsafe in edition 2024).
 fn resolve_user(
     explicit: Option<String>,
     env_user: Option<String>,
@@ -168,20 +145,6 @@ fn appearance_fit(fit: appearance_profiles::Fit) -> BackgroundFit {
     }
 }
 
-/// Whether a warning→lock rebind at `configured` pixels can keep the
-/// retained window, or has to rebuild it.
-///
-/// "Rebind" means the same output's scene moving from the warning layer
-/// surface to the session-lock surface. It is only a rebind while the
-/// geometry holds: the software backend refuses a target whose dimensions
-/// disagree with the window, so a mismatched rebind renders nothing,
-/// forever — the output would stay black for the whole locked session
-/// (issue #40's mixed-fractional-scale case, found while fixing issue #86).
-///
-/// Both arguments are *panel* pixels. `OutputInfo` is what the compositor
-/// configured, which is a scanout size; the window's scene size is the same
-/// number only while the transform is 0, and comparing against it would be
-/// correct by coincidence until the day an output is rotated.
 fn rebound_needs_resize(panel: (u32, u32), configured: (u32, u32)) -> bool {
     panel != configured
 }
@@ -218,9 +181,6 @@ struct BackgroundResult {
     cache_hit: bool,
 }
 
-/// Process-lifetime wallpaper cache and renderer. Expensive image work never
-/// runs on the Wayland thread; OnceLock coalesces equal source decodes and
-/// equal output-sized renders when outputs arrive together.
 struct BackgroundWorker {
     tx: mpsc::Sender<BackgroundResult>,
     sources: Arc<Mutex<HashMap<PathBuf, Arc<OnceLock<SourceImage>>>>>,
@@ -322,9 +282,6 @@ impl BackgroundWorker {
     }
 }
 
-/// The half of a PAM attempt the locker drives. A trait purely so the event
-/// pump can be exercised without libpam: issue #91 was a pump bug in the one
-/// place that had no harness.
 trait AuthAttempt {
     fn respond(&self, text: String);
     fn cancel(&mut self);
@@ -343,27 +300,11 @@ impl AuthAttempt for PamAttempt {
     }
 }
 
-/// The live attempt bound to the channel its worker emits into.
 struct LiveAttempt<A> {
     attempt: A,
     events: mpsc::Receiver<AuthEvent>,
 }
 
-/// Which PAM attempt the locker is listening to — issue #91's fix.
-///
-/// Every worker used to emit into one shared channel with no attempt
-/// identity, so a superseded or detached worker's late `Done(Err)` retired
-/// whatever attempt was live at the time. That dropped the live attempt's
-/// response sender, which failed *its* blocked conversation, which produced
-/// another late `Done(Err)`: the "conversation failed" cascade that ran the
-/// user into a faillock lockout with the right password in their hands.
-///
-/// The identity here is the channel itself. A worker emits into the receiver
-/// that was created with it, and starting or retiring an attempt drops that
-/// receiver — so a stale worker's events have nowhere to go. There is no
-/// generation counter to keep in step and no comparison the pump can forget:
-/// events cannot outlive the attempt that owns them. Workers are still never
-/// joined (issue #49); they just talk into a dead channel now.
 struct AuthTrack<A = PamAttempt> {
     live: Option<LiveAttempt<A>>,
 }
@@ -373,9 +314,6 @@ impl<A: AuthAttempt> AuthTrack<A> {
         Self { live: None }
     }
 
-    /// Start an attempt, handing `spawn` the sender its worker must emit
-    /// into. Any previous attempt is retired by the assignment: its receiver
-    /// drops here, which is exactly what makes it unable to speak again.
     fn start(&mut self, spawn: impl FnOnce(mpsc::Sender<AuthEvent>) -> A) {
         let (tx, events) = mpsc::channel();
         self.live = Some(LiveAttempt {
@@ -388,8 +326,6 @@ impl<A: AuthAttempt> AuthTrack<A> {
         self.live.is_some()
     }
 
-    /// Retire the attempt: the worker unwinds on its own and nothing it says
-    /// from here on is heard.
     fn retire(&mut self) {
         self.live = None;
     }
@@ -406,19 +342,12 @@ impl<A: AuthAttempt> AuthTrack<A> {
         }
     }
 
-    /// Abandon the worker without retiring the slot: unlock must never wait
-    /// on PAM (issue #49), and the detached conversation's inevitable
-    /// `Done(Err)` is still delivered so the pump can recognise and ignore
-    /// it rather than treat it as a failed unlock.
     fn detach(&mut self) {
         if let Some(live) = &mut self.live {
             live.attempt.detach();
         }
     }
 
-    /// Everything the *current* attempt has said since the last drain.
-    /// Collected rather than iterated in place because handling an event
-    /// mutates the track.
     fn drain(&mut self) -> Vec<AuthEvent> {
         self.live
             .as_ref()
@@ -427,49 +356,24 @@ impl<A: AuthAttempt> AuthTrack<A> {
     }
 }
 
-/// How many consecutive conversation failures the locker will paper over
-/// before it stops hiding them.
-///
-/// Not zero: after the identity fix a conversation failure is a genuine
-/// anomaly the user should not be blamed for, and reopening silently is the
-/// right answer to a one-off. Not unbounded either: each reopened
-/// transaction is another `pam_authenticate` that can end in a faillock
-/// strike, so a stack that fails every time must surface rather than burn
-/// the user's remaining attempts invisibly (issue #91).
 const MAX_SILENT_CONVERSATION_RETRIES: u32 = 3;
 
-/// What a finished attempt means. Split out of the pump so the policy is
-/// testable without a compositor (issue #91).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DoneOutcome {
-    /// Authenticated.
     Authorized,
-    /// A conversation abandoned at unlock, finishing late. Not a failure.
     Ignore,
-    /// PAM judged the credential: show it, re-prompt.
     Denied(String),
-    /// PAM refused because faillock has the account locked. Say so, with the
-    /// time left, instead of blaming the password (issue #92).
     LockedOut {
         message: String,
         remaining: Option<Duration>,
     },
-    /// Our own conversation broke: reopen it without blaming the user.
     ReopenQuietly(String),
-    /// Conversations keep breaking. Stop hiding it.
     Surface(String),
 }
 
-/// `unlocked`: the lock is already released, so any straggling conversation
-/// is one we abandoned. `losses`: consecutive conversation failures so far,
-/// this one included.
 fn done_outcome(result: Result<(), AuthError>, unlocked: bool, losses: u32) -> DoneOutcome {
     match result {
         Ok(()) => DoneOutcome::Authorized,
-        // A detached conversation (grace / loginctl unlock) finishing late is
-        // not an auth failure: opening another PAM transaction here means a
-        // conversation nobody answers — a logged failure per unlock, and a
-        // pam_faillock strike against the user.
         Err(_) if unlocked => DoneOutcome::Ignore,
         Err(AuthError::Denied(message)) => DoneOutcome::Denied(message),
         Err(AuthError::Locked { message, remaining }) => {
@@ -485,14 +389,8 @@ fn done_outcome(result: Result<(), AuthError>, unlocked: bool, losses: u32) -> D
     }
 }
 
-/// The lockout line the user reads (issue #92).
-///
-/// Deliberately not "authentication failed": the whole point is that this
-/// user's password is probably fine and the account is the problem. The
-/// countdown is what turns a mystery into a wait.
 fn account_locked_message(remaining: Option<Duration>) -> String {
     let Some(remaining) = remaining else {
-        // unlock_time = 0: nothing but `faillock --reset` clears it.
         return "Account locked \u{2014} it will not unlock on its own".into();
     };
     let seconds = remaining.as_secs();
@@ -517,8 +415,6 @@ struct Locker {
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
     auth: AuthTrack,
-    /// Consecutive conversation failures with no PAM verdict and no user
-    /// input in between; reset by either.
     conversation_losses: u32,
     login: Option<LoginSession>,
     login_rx: mpsc::Receiver<LoginEvent>,
@@ -530,16 +426,8 @@ struct Locker {
     unlocked: bool,
     last_clock: (Instant, String),
     ready_fd: Option<i32>,
-    /// Controller events produced by the async pumps this tick.
     pending: Vec<FlowEvent>,
-    /// Last wallpaper readiness reported to the controller (edge-triggered).
-    /// Seeded to `Timeline`'s own default (`true`) so a first poll that finds
-    /// assets outstanding actually reports the change — seeded `false`, the
-    /// two agreed by accident and the commit was never held for a slow
-    /// wallpaper.
     wallpaper_ready: bool,
-    /// Auth state to replay onto scenes rebuilt mid-lock (resume/resize
-    /// recreates outputs; a fresh theme instance starts blank).
     snapshot: UiSnapshot,
     background_worker: BackgroundWorker,
     background_rx: mpsc::Receiver<BackgroundResult>,
@@ -568,17 +456,9 @@ fn forwarded_channel<T: Send + 'static>(
     (source_tx, app_rx)
 }
 
-/// logind event → locker action. `Unlock` is honored without auth on
-/// purpose: logind only accepts `UnlockSession` from root or the session's
-/// own user, it is the escape hatch every locker implements, and a working
-/// `loginctl unlock-session` is worth having when a locker misbehaves.
-/// Translate a logind signal into a controller event. The grace window is
-/// the controller's (a grace must never survive a suspend, #9 residual —
-/// `PrepareForSleep(true)` bans one for the rest of the run).
 fn login_flow_event(event: LoginEvent) -> Option<FlowEvent> {
     match event {
         LoginEvent::Unlock => Some(FlowEvent::LogindUnlock),
-        // We ARE the locker; a Lock request while running means "commit now".
         LoginEvent::Lock => Some(FlowEvent::CommitRequested),
         LoginEvent::PrepareForSleep(sleeping) => Some(FlowEvent::PrepareForSleep(sleeping)),
     }
@@ -594,8 +474,6 @@ impl Locker {
             .user
             .take()
             .ok_or("user not resolved before Locker::new")?;
-        // Either pre-lock overlay phase: out-of-band lock requests (logind,
-        // sleep, a joining locker) must commit it instead of queueing.
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
         let clock_format = config.look.clock_format.clone();
@@ -660,10 +538,6 @@ impl Locker {
             pending: Vec::new(),
             wallpaper_ready: vigil_flow::WALLPAPER_READY_DEFAULT,
             snapshot: {
-                // Show a usable password prompt from the first frame: with
-                // pam_fprintd in the stack the real prompt only arrives
-                // after fingerprint resolves, and typed responses buffer
-                // until PAM asks — the card must not sit there blank.
                 let mut snapshot = UiSnapshot::default();
                 snapshot.on_prompt("Password", true);
                 snapshot
@@ -688,10 +562,6 @@ impl Locker {
     }
 
     fn start_attempt(&mut self) {
-        // Auth belongs on a HELD lock (issue #36): a denied locker that
-        // opens a PAM conversation logs a failed auth on every hypridle
-        // re-fire. locked() flips ipc.locked before its start_attempt call,
-        // so this holds on both call sites (grant and post-failure retry).
         debug_assert!(
             self.lock_ipc.lock().expect("lock IPC poisoned").locked,
             "PAM conversation must not start before the compositor grants the lock"
@@ -708,10 +578,6 @@ impl Locker {
         });
     }
 
-    /// Executor for [`FlowCmd::SignalReady`]: the compositor holds the lock
-    /// from this moment — it will never reveal the session again without
-    /// unlock_and_destroy, even if we have not painted yet. Safe to let a
-    /// suspend proceed.
     fn signal_locked(&mut self) {
         eprintln!("vigil-lock: session locked");
         let joiners = {
@@ -727,16 +593,12 @@ impl Locker {
             use std::os::fd::FromRawFd;
             let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
             let _ = ready.write_all(b"1");
-            // Dropping closes the fd; a --wait parent unblocks on
-            // either the byte or the EOF.
         }
     }
 
     fn apply_panel(&mut self) {
         for (i, e) in self.entries.iter_mut().enumerate() {
             e.window.set_panel_visible(i == self.panel);
-            // Hyprland does not draw a cursor over lock surfaces a client
-            // that sets no cursor image — the software cursor covers it.
             e.window.set_cursor_visible(i == self.panel);
         }
     }
@@ -748,10 +610,6 @@ impl Locker {
     }
 
     fn pump_auth(&mut self) {
-        // Only the live attempt's channel is drained. A worker that was
-        // superseded or detached talks into a receiver that no longer
-        // exists, so it cannot retire the attempt the user is typing into
-        // (issue #91).
         for event in self.auth.drain() {
             match event {
                 AuthEvent::Prompt { text, secret } => {
@@ -766,9 +624,6 @@ impl Locker {
                     self.snapshot.error = text.clone();
                     self.each_window(|w| w.show_error(&text));
                 }
-                // Exactly one Done ends an attempt, and nothing it emitted
-                // can follow it; the pump stops rather than reasoning about
-                // events that belong to an attempt it just retired.
                 AuthEvent::Done(result) => {
                     self.finish_attempt(result);
                     return;
@@ -777,10 +632,6 @@ impl Locker {
         }
     }
 
-    /// Apply a finished attempt's verdict. Retires the conversation here
-    /// rather than when the controller's reply arrives: pump_ui runs later
-    /// in this same tick and would otherwise respond() into a dead
-    /// conversation and silently lose the submission.
     fn finish_attempt(&mut self, result: Result<(), AuthError>) {
         let conversation = result
             .as_ref()
@@ -796,8 +647,6 @@ impl Locker {
             DoneOutcome::Ignore => {}
             DoneOutcome::Denied(message) => {
                 self.auth.retire();
-                // The controller decides the retry (a fresh PAM transaction
-                // per attempt, hyprlock's model).
                 self.pending.push(FlowEvent::AuthErr(message));
             }
             DoneOutcome::LockedOut { message, remaining } => {
@@ -830,17 +679,11 @@ impl Locker {
                     if self.auth.is_live() {
                         self.snapshot.busy = true;
                         self.each_window(|w| w.set_busy(true));
-                        // The user is driving again: whatever ran the quiet
-                        // reopen budget down was transient.
                         self.conversation_losses = 0;
                     }
                     self.auth.respond(text);
                 }
                 UiMessage::Cancel => self.auth.cancel(),
-                // A locker has no session picker; power actions are policy
-                // for L2.
-                // A locker has no session or user picker; power actions are
-                // policy for L2.
                 UiMessage::SelectSession(_) | UiMessage::SelectUser(_) | UiMessage::Power(_) => {}
             }
         }
@@ -854,8 +697,6 @@ impl Locker {
         }
     }
 
-    /// Portal appearance → theme properties, cached so scenes rebuilt later
-    /// (resume, hotplug, resize) come up with the same look.
     fn pump_appearance(&mut self) {
         while let Ok(event) = self.appearance_rx.try_recv() {
             match event {
@@ -864,7 +705,6 @@ impl Locker {
                     self.retint();
                 }
                 AppearanceEvent::Accent(_) => {
-                    // `lmtt switch` writes tokens then the portal; re-read LMTT.
                     self.retint();
                 }
             }
@@ -910,20 +750,9 @@ impl Locker {
         self.each_window(|w| apply_kit_tokens_from_disk(w, mode));
     }
 
-    /// Executor for [`FlowCmd::DetachAuth`]: stop caring about PAM and arm
-    /// the teardown watchdog. The controller drives the release itself.
     fn detach_auth(&mut self) {
-        // Unlock must never wait on PAM. Grace and loginctl unlocks can fire
-        // while a conversation is mid-flight (or a module is wedged outside
-        // it — pam_fprintd waiting on a finger), and the teardown drop of a
-        // joining attempt was exactly issue #49's immortal-locker hang.
         self.auth.detach();
         self.unlocked = true;
-        // Belt and braces: teardown after this point should be milliseconds
-        // (roundtrip + drops). If anything else wedges — a stuck D-Bus
-        // connection, a slow thread drop — the locker must still die rather
-        // than survive the session (issue #49). The screen is already
-        // released when this fires, so _exit is safe.
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(5));
             unsafe { libc::_exit(0) };
@@ -1096,7 +925,6 @@ impl LockSession for Locker {
     }
 
     fn output_resized(&mut self, id: OutputId, info: &OutputInfo) {
-        // Simplest correct handling: rebuild the scene at the new geometry.
         self.entries.retain(|e| e.id != id);
         self.output_ready(id, info);
     }
@@ -1106,23 +934,6 @@ impl LockSession for Locker {
             return;
         };
         if rebound_needs_resize(entry.window.panel_size(), (info.width, info.height)) {
-            // The rebind is only free at unchanged geometry. Under mixed
-            // fractional scale (issue #40) the lock surface's configure can
-            // land at a different pixel size than the warning's, and the
-            // retained window cannot fill that buffer: SoftwareBackend::render
-            // rejects a target whose dimensions disagree with the panel, so
-            // every present for this output answers false and the output
-            // stays black for the whole session. Rebuild at the size the
-            // compositor actually acked.
-            //
-            // Known and NOT fixed here: output_resized drops the entry and
-            // calls output_ready, which early-returns on a theme
-            // instantiation or adapter-capture failure and leaves the output
-            // with no scene at all — black by a different route. That hole
-            // predates this branch (every resize and every hotplug already
-            // goes through it); the rebind just makes it reachable from one
-            // more place. Fixing it means output_ready reporting failure
-            // instead of returning, which is a separate change.
             self.output_resized(id, info);
             return;
         }
@@ -1136,9 +947,6 @@ impl LockSession for Locker {
     }
 
     fn force_copy_out(&mut self, id: OutputId) {
-        // Deferred: arms the backend's copy-out without a Slint redraw
-        // request. Called from the configure callback during the handoff,
-        // where the scene is already correct and scene work is forbidden.
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
             entry.window.request_present_deferred();
         }
@@ -1165,8 +973,6 @@ impl LockSession for Locker {
     }
 
     fn overlay_progress(&mut self, _frost: f32, _wallpaper: f32) {
-        // Surface opacity and compositor frost are owned by vigil-wayland.
-        // The lock scene contributes only its wallpaper during a ramp.
         self.each_window(|window| {
             window.set_panel_visible(false);
             window.set_cursor_visible(false);
@@ -1191,8 +997,6 @@ impl LockSession for Locker {
         if ipc_commit {
             events.push(FlowEvent::CommitRequested);
         }
-        // Edge-triggered: the controller holds the commit while assets are
-        // outstanding, so it only needs the transitions.
         let ready = !self.entries.is_empty() && self.warning_backgrounds.is_empty();
         if ready != self.wallpaper_ready {
             self.wallpaper_ready = ready;
@@ -1227,12 +1031,6 @@ impl LockSession for Locker {
                     window.show_error(&message);
                     window.set_busy(false);
                 });
-                // Deliberately does NOT retire the attempt. `finish_attempt`
-                // already did, before it raised the AuthErr this command
-                // answers, and the controller pairs the command with
-                // StartAuth — so retiring here could only ever hit an
-                // attempt started *since*, which is issue #91's whole
-                // failure mode. Retiring belongs where the verdict arrives.
             }
             FlowCmd::ShowAccountLocked { remaining } => {
                 let message = account_locked_message(*remaining);
@@ -1286,12 +1084,6 @@ impl LockSession for Locker {
     }
 
     fn scene_needs_present(&mut self, id: OutputId) -> bool {
-        // `false` for an unknown output deliberately contradicts the
-        // trait's conservative default: it is correct only because
-        // `render` above answers `false` for the same unknown output, so
-        // the probe stays a strict over-approximation of "render would
-        // draw". Change one and you must change the other, or an output
-        // can be skipped while a render would have painted it.
         self.entries
             .iter_mut()
             .find(|e| e.id == id)
@@ -1312,21 +1104,10 @@ impl LockSession for Locker {
     }
 }
 
-/// Format the current local time, in process.
-///
-/// This used to fork `/usr/bin/date`. Once a minute for the life of a lock
-/// (and once a second for a format carrying `%S`) that is a fork, an exec,
-/// a dynamic link and a page-fault storm to format a short string -- inside
-/// the one process that must keep working when the session is under
-/// pressure. glibc's strftime is what `date` was calling anyway, so the
-/// output is identical for every format a user can write.
 fn clock_text(format: &str) -> String {
     let Ok(fmt) = std::ffi::CString::new(format) else {
-        // A NUL in the format: no valid strftime call exists.
         return String::new();
     };
-    // SAFETY: localtime_r writes into our own `tm`; strftime writes at most
-    // `buf.len()` bytes into `buf`. Both pointers are valid for the call.
     unsafe {
         let now = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();
@@ -1334,17 +1115,12 @@ fn clock_text(format: &str) -> String {
             return String::new();
         }
         let mut buf = vec![0_u8; 256];
-        // 0 means "did not fit" as well as "empty result"; either way there
-        // is nothing to show, which is what the old `date` failure did too.
         let written = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), fmt.as_ptr(), &tm);
         buf.truncate(written);
         String::from_utf8(buf).unwrap_or_default()
     }
 }
 
-/// The blocking half of `--wait`: spawn the real locker as a child
-/// whose stdout is our socketpair, and return only when it reports locked
-/// (one byte) or dies first (EOF). Exit 0 here == the session IS locked.
 fn detach_and_wait_for_lock() -> ! {
     use std::io::Read;
     use std::os::fd::OwnedFd;
@@ -1361,9 +1137,6 @@ fn detach_and_wait_for_lock() -> ! {
             .args(["--ready-fd", "1"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(OwnedFd::from(child_end)));
-        // SAFETY: this hook runs in the forked child before exec and calls only
-        // the async-signal-safe setsid(2). A new child is not a process-group
-        // leader, so it can create a session and detach from the caller's TTY.
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -1374,18 +1147,11 @@ fn detach_and_wait_for_lock() -> ! {
             });
         }
         let mut child = command.spawn().map_err(|e| format!("spawn locker: {e}"))?;
-        // Command still holds its copy of the child's stdout socketpair end;
-        // if it lives past read_exact, a child that dies before the ready
-        // byte never produces EOF and --wait hangs forever (hypridle's
-        // before_sleep_cmd would wait on a crashed locker).
         drop(command);
         let mut byte = [0u8; 1];
         match parent_end.read_exact(&mut byte) {
             Ok(()) => Ok(0),
             Err(_) => {
-                // EOF without the ready byte: the locker died before the
-                // compositor confirmed the lock. Propagate its exit code so
-                // the caller knows the screen is NOT secured.
                 let status = child.wait().map_err(|e| format!("wait locker: {e}"))?;
                 Ok(status.code().unwrap_or(1).max(1))
             }
@@ -1424,9 +1190,6 @@ impl Drop for LockIpcSocket {
     }
 }
 
-/// The singleton name: one locker per user runtime dir per compositor.
-/// Keyed by WAYLAND_DISPLAY so nested/test compositors never collide with
-/// the real session's locker.
 fn lock_instance_name() -> String {
     let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
     let display = std::path::Path::new(&display)
@@ -1443,8 +1206,6 @@ fn lock_socket_path() -> Option<PathBuf> {
         .map(|path| path.join(format!("{}.sock", lock_instance_name())))
 }
 
-/// Join an already-running warning. Success means the compositor has
-/// confirmed session-lock, not merely that the commit request was accepted.
 fn join_lock() -> Result<bool, String> {
     let Some(path) = lock_socket_path() else {
         return Ok(false);
@@ -1452,10 +1213,6 @@ fn join_lock() -> Result<bool, String> {
     join_lock_at(&path)
 }
 
-/// How long a joiner waits for the owner to confirm the lock. A commit
-/// request forces an in-flight warning to commit immediately, so a healthy
-/// owner answers within scene-build time; a hung owner must not hang every
-/// subsequent lock attempt with it (issue #50 interaction with #49).
 const JOIN_LOCKED_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn join_lock_at(path: &std::path::Path) -> Result<bool, String> {
@@ -1490,11 +1247,6 @@ fn start_lock_ipc() -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String>
 
 fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcState>>), String> {
     use std::os::unix::fs::PermissionsExt;
-    // Callers hold the singleton-guard flock, so any existing socket file is
-    // a leftover from a dead owner (span_lines::exit skips Drop): bind
-    // first, and only unlink + retry when the address is genuinely in use.
-    // The old probe-then-unlink order let two racing starts both unlink and
-    // both bind, stacking lockers (issue #50 TOCTOU).
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
@@ -1541,23 +1293,6 @@ fn signal_ready_fd(ready_fd: Option<i32>) {
 }
 
 fn main() {
-    // Before anything else, so no span is opened without somewhere to go.
-    // `install` rather than `layer`: it registers the layer with
-    // `span_lines::exit`, so anything still open at a terminal path is
-    // closed and marked `status=exit` instead of silently lost. Today that
-    // is insurance, not the active mechanism: every span lives inside
-    // `run_with_lock`, which returns before any of the exit calls below
-    // run, so their open set is empty - no captured trace has ever carried
-    // a `status=exit` record. SIGTERM, SIGINT and SIGHUP are not the
-    // exception they used to be: vigil-wayland turns them into a flow
-    // event (vigil#79), so a signalled locker leaves through the same match
-    // at the bottom of this function with its spans already closed. Only
-    // SIGKILL and a crash still lose what is open.
-    //
-    // The allowlist is "vigil" and nothing else. Installing a subscriber
-    // makes this process collect every instrumented crate in its tree, and
-    // zbus and calloop are in that tree carrying D-Bus paths and error
-    // strings into a journal readable by adm.
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     tracing_subscriber::registry()
@@ -1580,36 +1315,19 @@ fn main() {
         eprintln!("vigil-lock: {error}");
         span_lines::exit(2);
     }
-    // `apply_cli_to_config` already folded --warn/--no-warn/--immediate in,
-    // so the policy the controller runs is exactly the resolved config.
     let mut lock_policy = config.lock.clone();
     cli.theme = cli.theme.or(config.look.theme.clone());
-    // Singleton guard (issue #50): exactly one locker per seat. flock
-    // ownership is kernel-released on any death — SIGKILL and Drop-skipping
-    // exits included — so only a LIVE owner blocks us; the socket is the
-    // join RPC (commit / locked). Concurrent invocations either defer to
-    // the owner (waiting for compositor-confirmed lock) or refuse to stack.
     let (_singleton, lock_ipc_socket, lock_ipc) = loop {
         match singleton_guard::try_acquire(&lock_instance_name()) {
             Ok(Some(guard)) => match start_lock_ipc() {
                 Ok((socket, state)) => break (guard, Some(socket), state),
                 Err(error) => {
-                    // Owned but not joinable: still safe to lock (the flock
-                    // alone prevents stacking), but a cancelable warning
-                    // whose join contract can't be honored must not run.
                     eprintln!("vigil-lock: lock IPC unavailable: {error}; locking immediately");
                     lock_policy.warning.duration_ms = 0;
                     break (guard, None, Arc::new(Mutex::new(LockIpcState::default())));
                 }
             },
             Ok(None) => {
-                // Another live locker owns the seat. Ask it to commit and
-                // succeed only once the compositor confirms the lock. Retry
-                // briefly (the owner binds its socket just after taking the
-                // flock) and re-try ownership each round: if the owner dies
-                // mid-join its stale socket refuses connections while the
-                // flock is free, and refusing to stack would leave the
-                // session unlocked.
                 let mut attempts = 0;
                 loop {
                     match join_lock() {
@@ -1632,7 +1350,6 @@ fn main() {
                         singleton_guard::try_acquire(&lock_instance_name()),
                         Ok(Some(_))
                     ) {
-                        // Owner gone; take over from the top of the loop.
                         break;
                     }
                 }
@@ -1663,17 +1380,11 @@ fn main() {
         LockOutcome::Unlocked | LockOutcome::Cancelled => {}
         LockOutcome::Denied => eprintln!("vigil-lock: lock denied (another locker running?)"),
         LockOutcome::Invalidated => eprintln!("vigil-lock: lock invalidated by the compositor"),
-        // Said in words because the exit code alone (128 + signal) reads
-        // like a crash. The compositor keeps a lock whose client goes away,
-        // so a locked session stays locked; nothing here released it.
         LockOutcome::Terminated(signal) => eprintln!(
             "vigil-lock: {} received; exiting, a held session lock stays held by the compositor",
             signal.name()
         ),
     }
-    // The exit code is the outcome's (vigil-flow owns the table): 0, 1, 2,
-    // 3 as before, and 128 + the signal number for a termination, which is
-    // what the parent saw when the signal killed the process outright.
     span_lines::exit(outcome.exit_code());
 }
 
@@ -1681,9 +1392,6 @@ fn main() {
 mod tests {
     #[test]
     fn clock_text_matches_what_date_would_have_printed() {
-        // The fork this replaced called glibc strftime; so do we. Compare
-        // against `date` itself for the formats a user can configure,
-        // retrying once across a tick boundary before believing a mismatch.
         for format in ["%H:%M", "%Y-%m-%d", "%A", "%I:%M %p"] {
             let mine = super::clock_text(format);
             let theirs = std::process::Command::new("date")
@@ -1694,7 +1402,6 @@ mod tests {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
             if mine != theirs {
-                // A minute may have rolled between the two reads.
                 assert_eq!(super::clock_text(format), theirs, "format {format}");
             }
             assert!(!mine.is_empty(), "format {format} produced nothing");
@@ -1704,17 +1411,13 @@ mod tests {
     #[test]
     fn clock_text_survives_a_hostile_format() {
         assert_eq!(super::clock_text("with\0nul"), "");
-        // A format that produces nothing is not a crash.
         let _ = super::clock_text("");
-        // Longer than the buffer: truncation is reported as empty, never UB.
         let _ = super::clock_text(&"%Y".repeat(300));
     }
 
     use super::*;
     use std::cell::RefCell;
 
-    /// Stands in for `PamAttempt` so the event pump's identity rules can be
-    /// tested without libpam, a compositor, or a real password.
     #[derive(Default)]
     struct FakeAttempt {
         answered: Rc<RefCell<Vec<String>>>,
@@ -1734,7 +1437,6 @@ mod tests {
         }
     }
 
-    /// Start an attempt and hand back the sender its "worker" would emit on.
     fn start(track: &mut AuthTrack<FakeAttempt>) -> mpsc::Sender<AuthEvent> {
         let mut sender = None;
         track.start(|tx| {
@@ -1744,25 +1446,12 @@ mod tests {
         sender.expect("start must hand the worker a sender")
     }
 
-    /// **Issue #91's regression test** — the race that locked the user out of
-    /// their own machine.
-    ///
-    /// A superseded worker keeps running (vigil-pam never joins it, issue
-    /// #49) and errors out late. While every worker emitted into one shared
-    /// channel with no attempt identity, that late `Done(Err)` retired
-    /// whatever attempt was live *at the time it arrived* — dropping the
-    /// response sender of the conversation the user was typing into, which
-    /// failed that conversation, which produced another late `Done(Err)`.
-    /// Six lockers and three faillock strikes later the correct password
-    /// stopped working.
     #[test]
     fn a_superseded_worker_cannot_touch_the_live_attempt() {
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
         let stale = start(&mut track);
-        // A retry supersedes it. The first worker is still running.
         let live = start(&mut track);
 
-        // Exactly what a dying vigil-pam worker emits, in order.
         let _ = stale.send(AuthEvent::Error("conversation failed".into()));
         let _ = stale.send(AuthEvent::Done(Err(AuthError::Conversation(
             "Authentication failure".into(),
@@ -1778,7 +1467,6 @@ mod tests {
             "a superseded worker retired the attempt the user is typing into"
         );
 
-        // ...and the live attempt is still able to speak for itself.
         let _ = live.send(AuthEvent::Prompt {
             text: "Password:".into(),
             secret: true,
@@ -1792,10 +1480,6 @@ mod tests {
         );
     }
 
-    /// The other half of the identity rule: once an attempt is retired,
-    /// nothing it says afterwards is heard either. Retiring is what the
-    /// wrong-password path does before the controller starts the next
-    /// attempt, and the retired worker's `Done(Err)` always arrives after.
     #[test]
     fn a_retired_attempt_is_deaf() {
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
@@ -1806,10 +1490,6 @@ mod tests {
         assert!(!track.is_live());
     }
 
-    /// Detaching (issue #49: unlock must never wait on PAM) leaves the slot
-    /// in place on purpose, so the abandoned conversation's inevitable
-    /// `Done(Err)` is still delivered — and recognised as the non-event it
-    /// is rather than logged as a failed unlock.
     #[test]
     fn a_detached_attempt_still_reports_so_the_pump_can_ignore_it() {
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
@@ -1837,15 +1517,11 @@ mod tests {
         assert_eq!(*answered.borrow(), vec!["hunter2".to_owned()]);
         assert!(cancelled.get());
 
-        // Nothing to talk to once retired, and no panic for trying.
         track.retire();
         track.respond("hunter2".into());
         assert_eq!(answered.borrow().len(), 1);
     }
 
-    /// A genuine wrong password is still a genuine wrong password: the user
-    /// sees it and the controller re-prompts. Nothing about the conversation
-    /// classification may soften that.
     #[test]
     fn a_rejected_credential_is_still_shown_and_reprompted() {
         assert_eq!(
@@ -1859,10 +1535,6 @@ mod tests {
         assert_eq!(done_outcome(Ok(()), false, 0), DoneOutcome::Authorized);
     }
 
-    /// Stage 2. A conversation vigil broke is not a credential failure, so it
-    /// must not travel the path the user reads as one — but it cannot be
-    /// hidden forever either, because every quiet reopen is another
-    /// `pam_authenticate` that faillock can strike.
     #[test]
     fn a_broken_conversation_reopens_quietly_but_not_forever() {
         let broken = || AuthError::Conversation("Authentication failure".into());
@@ -1879,8 +1551,6 @@ mod tests {
         );
     }
 
-    /// Issue #92. The lockout line has to be legible at a glance and never
-    /// read as "you typed it wrong".
     #[test]
     fn the_lockout_line_says_locked_and_counts_down() {
         let line = |secs| account_locked_message(Some(Duration::from_secs(secs)));
@@ -1897,9 +1567,6 @@ mod tests {
         }
     }
 
-    /// A lockout, a denial and a broken conversation are three different
-    /// things and must stay three different things: the #91 bug was two of
-    /// them sharing a path, and #92 is the third hiding inside the second.
     #[test]
     fn a_lockout_is_neither_a_denial_nor_a_conversation_failure() {
         let remaining = Some(Duration::from_secs(581));
@@ -1917,8 +1584,6 @@ mod tests {
                 remaining,
             }
         );
-        // A conversation failure can never be dressed up as a lockout, no
-        // matter how many of them there have been.
         for losses in [1, MAX_SILENT_CONVERSATION_RETRIES + 1] {
             assert!(!matches!(
                 done_outcome(
@@ -1929,7 +1594,6 @@ mod tests {
                 DoneOutcome::LockedOut { .. }
             ));
         }
-        // ...and a lockout past the release is still nothing to act on.
         assert_eq!(
             done_outcome(
                 Err(AuthError::Locked {
@@ -1957,8 +1621,6 @@ mod tests {
 
     #[test]
     fn parsing_never_resolves_the_user_from_the_environment() {
-        // parse_cli_from must stay pure: package CI runs with USER/LOGNAME
-        // unset, and these tests must not depend on builder identity.
         let cli = parse_cli_from(["--wait".to_owned()]).unwrap();
         assert!(cli.user.is_none());
     }
@@ -1989,25 +1651,10 @@ mod tests {
 
     #[test]
     fn a_rebind_at_a_new_size_rebuilds_the_scene() {
-        // Unchanged geometry is the whole point of the rebind: the decoded
-        // wallpaper and the laid-out scene survive the move from the warning
-        // layer surface to the lock surface.
         assert!(!rebound_needs_resize((3840, 2160), (3840, 2160)));
-        // A configure at any other size is not a rebind. vigil-ui's software
-        // backend refuses a target that disagrees with the panel (asserted
-        // over there), so keeping the old window means every present for this
-        // output answers false — black for the whole locked session, not one
-        // frame. Mixed fractional scale is how the sizes come to disagree
-        // (issue #40).
         assert!(rebound_needs_resize((3840, 2160), (3200, 1800)));
         assert!(rebound_needs_resize((3840, 2160), (2160, 3840)));
         assert!(rebound_needs_resize((3840, 2160), (3841, 2160)));
-        // Both sides are panel pixels. A rotated output's scene is the
-        // transposed pair, so feeding the scene in here would call an
-        // unchanged configure a resize and rebuild every rotated output's
-        // scene on every rebind — the comparison has to be panel-to-panel.
-        // vigil-ui pins that `panel_size` and `scene_size` are in fact
-        // different quantities under a quarter turn.
         assert!(rebound_needs_resize((2160, 3840), (3840, 2160)));
     }
 
@@ -2122,15 +1769,12 @@ mod tests {
 
     #[test]
     fn stale_socket_from_a_dead_owner_is_reclaimed() {
-        // span_lines::exit skips Drop, so a killed owner always leaves its
-        // socket file behind. Under the singleton flock that leftover is
-        // provably dead: bind must reclaim it instead of refusing to start.
         let path = std::env::temp_dir().join(format!(
             "vigil-lock-ipc-stale-test-{}.sock",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
-        drop(UnixListener::bind(&path).unwrap()); // dead owner's leftover file
+        drop(UnixListener::bind(&path).unwrap());
         let (guard, _state) = start_lock_ipc_at(path.clone()).unwrap();
         assert!(UnixStream::connect(&path).is_ok());
         drop(guard);

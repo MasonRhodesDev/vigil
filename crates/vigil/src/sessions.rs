@@ -1,28 +1,12 @@
-//! Session (desktop environment) enumeration: the `.desktop` entries under
-//! /usr/share/wayland-sessions and /usr/share/xsessions, the same lists every
-//! spec-following greeter offers. Pure parsing, unit-tested; the event loop
-//! owns which entry is selected.
-
 use std::path::Path;
 
-/// One launchable session as greetd will receive it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionEntry {
-    /// Display name (`Name=`), suffixed with ` (X11)` for xsessions.
     pub name: String,
-    /// Command line for greetd `start_session`.
     pub cmd: Vec<String>,
-    /// `KEY=value` environment for greetd `start_session`.
     pub env: Vec<String>,
 }
 
-/// Enumerate installed sessions: Wayland first, then X11, each sorted by
-/// name. X11 entries are listed for spec completeness but untested
-/// (DESIGN.md non-goals). Never empty: a login-shell entry is the fallback.
-///
-/// `VIGIL_SESSION_DIRS` (colon-separated) overrides the standard directories
-/// (tests, unusual distros); a directory whose basename is `xsessions`
-/// counts as X11.
 pub fn enumerate(config_dirs: &[String]) -> Vec<SessionEntry> {
     let mapping = |dir: std::path::PathBuf| {
         let kind = if dir.file_name().is_some_and(|n| n == "xsessions") {
@@ -93,8 +77,6 @@ fn read_dir_entries(dir: &Path, kind: SessionKind) -> Vec<SessionEntry> {
     sessions
 }
 
-/// Parse the `[Desktop Entry]` group of a session file. Only the keys a
-/// greeter needs; unknown keys are ignored per the desktop-entry spec.
 fn parse_desktop(content: &str, stem: &str, kind: SessionKind) -> Option<SessionEntry> {
     let mut in_entry = false;
     let mut name = None;
@@ -144,7 +126,6 @@ fn parse_desktop(content: &str, stem: &str, kind: SessionKind) -> Option<Session
         format!("XDG_SESSION_DESKTOP={stem}"),
     ];
     if let Some(names) = desktop_names {
-        // DesktopNames is `;`-separated; XDG_CURRENT_DESKTOP is `:`-separated.
         let joined = names
             .split(';')
             .filter(|s| !s.is_empty())
@@ -166,10 +147,6 @@ fn executable_exists(program: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).exists()))
 }
 
-/// Split an `Exec=` line into argv per the desktop-entry quoting rules that
-/// matter for session files: whitespace splits, double quotes group, `\`
-/// escapes inside quotes. Field codes (`%f` etc.) never appear in session
-/// entries and are dropped defensively.
 fn split_exec(exec: &str) -> Option<Vec<String>> {
     let mut args = Vec::new();
     let mut current = String::new();

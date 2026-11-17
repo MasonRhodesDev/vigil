@@ -1,23 +1,11 @@
-//! The shared scene spec: one description of geometry, palette and motion
-//! for every stage that draws between power-on and the desktop (the boot
-//! splash package owns it and writes it as JSON). vigil follows it for its
-//! two stages, `greeter-splash` and `greeter`.
-//!
-//! Every value has a built-in default equal to the spec's, so a machine
-//! without the boot-splash package still gets a coherent splash, and a file
-//! that is missing, unreadable or of another version is a log line, never a
-//! failure.
-
 use std::path::Path;
 
 use serde_json::Value;
 
-/// Round half up, the rule the other drawers use.
 fn rnd(x: f64) -> i64 {
     (x + 0.5).floor() as i64
 }
 
-/// Pixel geometry of the mark on one screen (origin top-left, upright).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
     pub logo: u32,
@@ -28,7 +16,6 @@ pub struct Geometry {
     pub glow_y: i64,
 }
 
-/// A debug tag's sizes, in pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TagGeometry {
     pub border: u32,
@@ -38,8 +25,6 @@ pub struct TagGeometry {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scene {
-    /// When set, every screen sizes the scene from this fixed short side in
-    /// physical pixels, so the mark is one size on every head.
     pub ref_short_side: Option<u32>,
     pub bg: [u8; 3],
     pub accent: [u8; 3],
@@ -91,7 +76,6 @@ impl Default for Scene {
     }
 }
 
-/// `#rrggbb` to bytes.
 pub fn parse_color(text: &str) -> Option<[u8; 3]> {
     let hex = text.trim().strip_prefix('#')?;
     if hex.len() != 6 {
@@ -106,7 +90,6 @@ fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
 }
 
 impl Scene {
-    /// Read the spec at `path`. Anything wrong keeps the defaults.
     pub fn load(path: &Path) -> Scene {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -187,17 +170,10 @@ impl Scene {
         Ok(scene)
     }
 
-    /// The short side sizes are fractions of: the fixed reference when the
-    /// spec has one, else this screen's own.
     fn short_side(&self, w: u32, h: u32) -> f64 {
         f64::from(self.ref_short_side.unwrap_or_else(|| w.min(h)))
     }
 
-    /// Geometry of the mark on a `w` x `h` screen (physical pixels, upright).
-    /// Sizes are fractions of the short side so a portrait screen gets the
-    /// same apparent size as a landscape one. With a fixed reference the
-    /// centre sits at H/2 + (centre_frac - 0.5) * ref, so the mark is the
-    /// same size and the same distance from the middle on every head.
     pub fn geometry(&self, w: u32, h: u32) -> Geometry {
         let s = self.short_side(w, h);
         let logo = rnd(s * self.logo_frac).max(1) as u32;
@@ -217,7 +193,6 @@ impl Scene {
         }
     }
 
-    /// Sizes of a debug tag on a `w` x `h` screen.
     pub fn tag_geometry(&self, w: u32, h: u32) -> TagGeometry {
         let s = self.short_side(w, h);
         TagGeometry {
@@ -227,22 +202,18 @@ impl Scene {
         }
     }
 
-    /// Whether the scene's debug environment variable asks for stage tags.
     pub fn debug_from_env(&self) -> bool {
         std::env::var(&self.debug_env)
             .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "yes" | "true" | "on"))
     }
 }
 
-/// Smoothstep on 0..1, clamped: the one easing curve every drawer uses.
 pub fn ease(x: f64) -> f64 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
 }
 
 impl Scene {
-    /// How far the glow is eased in, 0..1. `t` is seconds since the stage
-    /// began animating, `t_out` the second it began easing out for a hand-off.
     pub fn motion_level(&self, t: f64, t_out: Option<f64>) -> f64 {
         let mut level = ease(t / self.in_s.max(f64::EPSILON));
         if let Some(t_out) = t_out {
@@ -251,26 +222,21 @@ impl Scene {
         level
     }
 
-    /// Breathing curve, 0..1, starting at its bottom.
     pub fn breath(&self, phase_s: f64) -> f64 {
         (1.0 - (std::f64::consts::TAU * phase_s / self.breath_period_s).cos()) / 2.0
     }
 
-    /// Glow opacity at stage time `t`. `clock` (CLOCK_MONOTONIC seconds)
-    /// sets the breathing phase, so two drawers agree on it.
     pub fn glow_level(&self, t: f64, t_out: Option<f64>, clock: f64) -> f64 {
         self.motion_level(t, t_out)
             * (self.glow_min + (self.glow_max - self.glow_min) * self.breath(clock))
     }
 }
 
-/// CLOCK_MONOTONIC in seconds, the breathing phase's shared source.
 pub fn monotonic_s() -> f64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: clock_gettime only writes the timespec we hand it.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
 }
@@ -279,13 +245,11 @@ pub fn monotonic_s() -> f64 {
 mod tests {
     use super::*;
 
-    // Values printed by the boot-splash spec's geometry(W, H).
     #[test]
     fn geometry_follows_the_short_side() {
         let s = Scene::default();
         let g = s.geometry(3440, 1440);
         assert_eq!((g.logo, g.glow, g.logo_x, g.logo_y), (230, 460, 1605, 562));
-        // A portrait screen gets the same apparent size from its short side.
         let g = s.geometry(2160, 3840);
         assert_eq!((g.logo, g.glow, g.logo_x, g.logo_y), (346, 692, 907, 1632));
         let g = s.geometry(1920, 1080);
@@ -300,12 +264,10 @@ mod tests {
         let hd = s.geometry(1920, 1080);
         let tall = s.geometry(2160, 3840);
         assert_eq!((wide.logo, hd.logo, tall.logo), (230, 230, 230));
-        // Centre = H/2 - 0.03 * 1440 = H/2 - 43.2, then rounded half up.
         assert_eq!(wide.logo_y, 562);
         assert_eq!(hd.logo_y, 540 - 43 - 115);
         assert_eq!(tall.logo_y, 1920 - 43 - 115);
         assert_eq!(s.tag_geometry(1920, 1080), s.tag_geometry(3440, 1440));
-        // Null or zero means per-screen sizing, as before.
         for text in [
             r#"{"version":2,"ref_short_side":null}"#,
             r#"{"version":2,"ref_short_side":0}"#,
@@ -344,7 +306,6 @@ mod tests {
         assert_eq!(s.motion_level(0.0, None), 0.0);
         assert_eq!(s.motion_level(s.in_s, None), 1.0);
         assert!((s.motion_level(s.in_s / 2.0, None) - 0.5).abs() < 1e-9);
-        // Easing out from fully in lands back on zero after out_s.
         assert_eq!(s.motion_level(5.0 + s.out_s, Some(5.0)), 0.0);
         assert!(s.motion_level(5.0 + s.out_s / 2.0, Some(5.0)) < 1.0);
         assert!((s.breath(0.0)).abs() < 1e-9);

@@ -24,13 +24,6 @@ jobs:
       - run: cargo test --workspace
       - run: ./tests/check-sim-scenario.sh
 
-  # The render-state matrix (crates/vigil/tests/theme_states.rs) runs in the
-  # `check` job's cargo test — headless, no GPU, gates merges.
-
-  # Nested-compositor lock-readiness suite (issue #44): protocol ordering,
-  # singleton/join, cancel, handoff, hotplug — against headless sway.
-  # Gates release: release.yml requires this workflow to be green on the
-  # tagged commit.
   nested:
     runs-on: ubuntu-latest
     steps:
@@ -49,9 +42,6 @@ jobs:
       - run: cargo build -p vigil-wayland --example lock_probe
       - run: ./tests/nested/run.sh
 
-  # Best-effort KMS smoke test: runner kernels may lack vkms (risk #4), so
-  # this must never block a merge; the QEMU e2e (tests/e2e/) needs KVM and
-  # stays a local/manual gate for now.
   vkms:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -71,9 +61,6 @@ jobs:
         if: steps.vkms.outputs.have == '1'
         run: |
           cargo build -p vigil --example test_pattern
-          # Since Linux 6.15 vkms is a faux-bus device: its card's device path
-          # is .../faux/vkms and device/driver names faux_driver, not vkms.
-          # Match either layout, and list the DRM devices if neither matches.
           card=$(for c in /sys/class/drm/card[0-9]; do \
             { readlink -f "$c/device"; readlink "$c/device/driver"; } 2>/dev/null \
               | grep -q vkms && basename "$c" && break; done || true)

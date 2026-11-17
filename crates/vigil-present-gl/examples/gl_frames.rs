@@ -1,14 +1,3 @@
-//! Present many GL frames through `GbmPresenter` on a real CRTC.
-//!
-//! The point is the count. A GBM surface owns a small fixed pool of buffers,
-//! and a presenter that never releases them runs it dry after two or three
-//! frames -- a bug a one-frame demo cannot see. This drives enough frames
-//! that a leak has to surface.
-//!
-//!   cargo build -p vigil-present-gl --example gl_frames
-//!   tests/gpu/run.sh --screenshot /tmp/frames.ppm -- target/debug/examples/gl_frames
-//!   tests/gpu/run.sh --accel -- target/debug/examples/gl_frames
-
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
@@ -50,8 +39,6 @@ fn main() {
         .open(&node)
         .expect("open card");
     let fd = Arc::new(OwnedFd::from(file));
-    // Duplicate rather than re-open: DRM master rides on the open file
-    // description, so a second open would not be master.
     let drm_fd = DrmDeviceFd::new(DeviceFd::from(fd.try_clone().expect("dup card fd")));
     let (mut device, _notifier) = DrmDevice::new(drm_fd.clone(), false).expect("drm device");
 
@@ -114,8 +101,6 @@ fn main() {
     instance.show().expect("show");
 
     for frame in 0..FRAMES {
-        // A changing clock keeps the scene genuinely dirty, so every
-        // iteration really renders and swaps rather than short-circuiting.
         instance
             .set_property(
                 "clock-text",
@@ -136,9 +121,6 @@ fn main() {
             .unwrap_or_else(|e| panic!("frame {frame}: {e}"));
         assert!(presented, "frame {frame} did not present");
 
-        // Wait for the flip to complete before submitting the next one.
-        // Without this the presenter is refused with EBUSY within a handful
-        // of frames -- which is exactly what this example caught.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         'wait: loop {
             match device.receive_events() {
@@ -161,7 +143,6 @@ fn main() {
 
     println!("{FRAMES} FRAMES OK (buffer pool held up)");
 
-    // Hold the last frame long enough for a screenshot.
     let hold = std::env::var("VIGIL_GL_HOLD_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -171,7 +152,6 @@ fn main() {
     println!("DONE");
 }
 
-/// The interpreter's compile future resolves immediately without a runtime.
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -179,7 +159,6 @@ fn spin_on<F: std::future::Future>(future: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    // SAFETY: the vtable is a no-op waker over a null pointer it never reads.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);

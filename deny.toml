@@ -1,25 +1,10 @@
-# cargo-deny configuration — supply-chain gate for the binary that IS the
-# login screen. Run locally with `cargo deny check`; CI runs it on pushes,
-# PRs, and weekly.
-
 [advisories]
 version = 2
 yanked = "deny"
-# Add RUSTSEC IDs here (with a justifying comment) only if an advisory is
-# confirmed not to affect us and a fix isn't yet available.
 ignore = [
-    # Slint's pinned font/text stack; unmaintained-status advisories, not
-    # vulnerabilities. Drop each when a slint upgrade sheds the crate.
     { id = "RUSTSEC-2026-0192", reason = "unmaintained dep pinned by slint 1.17's renderer tree" },
     { id = "RUSTSEC-2026-0196", reason = "unmaintained dep pinned by slint 1.17's renderer tree" },
     { id = "RUSTSEC-2026-0206", reason = "unmaintained dep pinned by slint 1.17's renderer tree" },
-    # zbus 5 only reaches the lock through slint-interpreter's
-    # cfg(target_arch = "wasm32") dependency on i-slint-backend-winit, which
-    # needs zbus ^5.14 (checked: slint 1.17.1 pinned, 1.18.1 latest still
-    # does). vigil-login uses zbus 6 and no native target builds zbus 5
-    # (`cargo tree -i zbus@5.18.0 -e all` is empty without `--target all`).
-    # Drop all three when slint's winit backend moves to zbus 6 or the
-    # interpreter sheds that dependency.
     { id = "RUSTSEC-2026-0370", reason = "zvariant, merged into zbus 6; held at zbus 5 by slint 1.17.1/1.18.1 wasm32-only winit backend" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names, merged into zbus 6; held at zbus 5 by slint 1.17.1/1.18.1 wasm32-only winit backend" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, merged into zbus 6; held at zbus 5 by slint 1.17.1/1.18.1 wasm32-only winit backend" },
@@ -27,9 +12,6 @@ ignore = [
 
 [licenses]
 version = 2
-# vigil itself is GPL-3.0-only; Slint is consumed under its GPLv3 option
-# (its SPDX expression is an OR — GPL-3.0-only satisfying it is the choice
-# DESIGN.md §13 records). The rest of the tree is the usual permissive set.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -52,9 +34,6 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# The workspace's own crates are path deps with no version — that's a
-# "wildcard" to cargo-deny. Exempt local path deps; still catch a real
-# `foo = "*"` registry wildcard.
 allow-wildcard-paths = true
 
 [sources]
@@ -65,10 +44,7 @@ allow-git = [
     "https://github.com/MasonRhodesDev/appearance-profiles",
     "https://github.com/MasonRhodesDev/slint-kit",
     "https://github.com/MasonRhodesDev/linux-multi-theme-toggle",
-    # Cargo.toml pins tag v0.1.0 and Cargo.lock pins 2c18ead7; cargo-deny
-    # allow-git matches repository URLs while those files enforce revision.
     "https://github.com/MasonRhodesDev/slint-idle-runtime",
-    # singleton-guard, pinned by rev in Cargo.toml.
     "https://github.com/MasonRhodesDev/desktop-commons",
 ]
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

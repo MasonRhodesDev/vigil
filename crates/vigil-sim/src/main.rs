@@ -1,9 +1,3 @@
-//! Safe, windowed development harness for Vigil.
-//!
-//! This binary deliberately has no dependency on PAM, greetd, logind, DRM,
-//! libinput, or the Wayland session-lock implementation. UI actions append to
-//! an in-memory trace and can never affect the host session.
-
 use std::cell::RefCell;
 use std::fs;
 use std::io::{Read, Write};
@@ -122,14 +116,6 @@ impl SimArgs {
     }
 }
 
-/// Resolve `--config PATH` for the preview, loudly.
-///
-/// Whole-file, like `vigil-lock --config`: an explicit path is an
-/// operator choice, and the simulator reads no ambient config either way.
-/// A missing or unparsable file is fatal here rather than a silent
-/// fallback to defaults — you asked to preview a config, and showing you
-/// the built-in ramp while implying it was yours is the one answer that
-/// is worse than not running.
 fn load_preview_config(path: &std::path::Path) -> vigil_config::Lock {
     let source = fs::read_to_string(path).unwrap_or_else(|error| {
         eprintln!("vigil-sim: {}: {error}", path.display());
@@ -162,7 +148,6 @@ struct Simulator {
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
-    /// Pointer position in the simulator's fixed 1280x800 canvas.
     pointer: PhysicalPosition<f64>,
     drawer_open: bool,
     scene: Option<OutputWindow>,
@@ -171,8 +156,6 @@ struct Simulator {
     started: Instant,
     last_tick: Instant,
     sim_now: Duration,
-    /// The production lock controller, driven against fake capabilities.
-    /// The simulator owns no transition logic of its own (issue #43).
     warning: Option<LockFlow>,
     paused: bool,
     blur_enabled: bool,
@@ -180,21 +163,14 @@ struct Simulator {
     desktop_blurred: Arc<Vec<u8>>,
     lock_wallpaper: Arc<Vec<u8>>,
     warning_wait: Option<Duration>,
-    /// Fixed origins so the controller's monotonic and wall clocks are
-    /// derived from the simulated clock rather than read live.
     epoch_mono: Instant,
     epoch_wall: std::time::SystemTime,
     warning_phase: Option<FlowPhase>,
-    /// Overlay compositing values as last reported by the controller.
     warning_progress: (f32, f32),
     warning_elements: Vec<vigil_flow::ElementSample>,
     warning_panel: bool,
     warning_power: bool,
     state_file: Option<std::path::PathBuf>,
-    /// Lock policy the warning ramp previews, resolved from `--config`.
-    /// `None` is the built-in preview policy: the simulator never reads an
-    /// ambient /etc/greetd/vigil.toml or ~/.config/vigil/config.toml, so a
-    /// scenario run stays byte-identical on a machine that has one.
     config: Option<vigil_config::Lock>,
     accept_warning_input: bool,
     warning_pointer_origin: Option<PhysicalPosition<f64>>,
@@ -314,9 +290,6 @@ impl Simulator {
         self.write_state();
     }
 
-    /// Stable, machine-readable phase labels. `{phase:?}` on a tuple
-    /// variant yields `Done(Cancelled)`, and fixtures compare this string
-    /// exactly — parenthesised Debug output is a poor contract.
     fn phase_label(phase: FlowPhase) -> String {
         match phase {
             FlowPhase::PreLock => "prelock".into(),
@@ -361,9 +334,6 @@ impl Simulator {
         let adapter = self.platform.claim_last_adapter().expect("theme adapter");
         let mut scene = OutputWindow::new(OutputId(1), WIDTH, HEIGHT, 1.0, adapter, component)
             .expect("create simulated output");
-        // The host compositor already supplies a cursor for this ordinary
-        // window. Drawing Vigil's DRM/session cursor too creates a misleading
-        // duplicate whose coordinates diverge under output scaling.
         scene.set_cursor_visible(false);
         scene.set_clock("13:37");
         scene.set_user_name("mason");
@@ -388,10 +358,6 @@ impl Simulator {
                 scene.set_status_banner("SIMULATED LOCK — host session unaffected");
             }
             Mode::Warning => {
-                // The fake desktop is exclusively the pre-lock plane used to
-                // verify capture-free frost. It must never back Login or the
-                // committed Lock state, where the resolved lock wallpaper is
-                // opaque before authentication becomes visible.
                 scene.set_background((*self.desktop_sharp).clone(), WIDTH, HEIGHT);
                 scene.set_panel_visible(false);
                 scene.set_power_visible(false);
@@ -399,25 +365,11 @@ impl Simulator {
                 scene.set_sessions(&[]);
                 scene.show_info("SIMULATED WARNING — press any key to cancel");
                 scene.set_status_banner("Frost stage (simulated compositor blur)");
-                // `--config PATH` previews the ramp against a real config;
-                // without one the built-in preview policy stands, so the
-                // simulator reads no ambient config and a scenario run is
-                // reproducible on any machine.
                 let mut policy = self.config.clone().unwrap_or_default();
-                // A config with no idle warning configured still has a ramp
-                // to look at: 0 ms would render nothing at all.
                 if policy.warning.duration_ms == 0 {
                     policy.warning.duration_ms = 10_000;
                 }
-                // Grace is the one controller feature keyed to the real
-                // monotonic and wall clocks rather than the simulated
-                // one; leaving it on would make scenario runs
-                // wall-clock dependent and flake the byte-comparison in
-                // check-sim-scenario.sh.
                 policy.grace_secs = 0;
-                // Origin zero, sampled at sim_now: building it at
-                // flow_now() would start the ramp *at* --at-ms N, so every
-                // keyframe rendered as t=0 and the seek did nothing.
                 let (flow, boot) = LockFlow::new(
                     Now {
                         elapsed: Duration::ZERO,
@@ -438,8 +390,6 @@ impl Simulator {
                 self.accept_warning_input = false;
                 self.warning_pointer_origin = None;
                 self.warning_visual_key = None;
-                // Winit/compositors emit synthetic enter/motion events while
-                // mapping a new window. They are not user activity.
                 self.warning_input_after = Instant::now() + Duration::from_secs(1);
             }
         }
@@ -460,10 +410,6 @@ impl Simulator {
 
     fn dispatch(&mut self, event: InputEvent) {
         self.trace.borrow_mut().push(format!("input: {event:?}"));
-        // While the controller is live it decides what reaches the UI:
-        // input it consumes (a cancelling keypress) comes back as nothing,
-        // input it does not comes back as FlowCmd::DispatchInput. Dispatching
-        // unconditionally as well is the double-dispatch production avoids.
         if self.mode == Mode::Warning
             && !self.paused
             && !self.drawer_open
@@ -573,11 +519,8 @@ impl Simulator {
         if self.warning.is_none() {
             return;
         }
-        // The controller decides; the simulator only renders and reacts.
         let cmds = self.step_flow(FlowEvent::Tick);
         self.run_flow(cmds);
-        // Written before the render short-circuit: the state file is a
-        // machine surface and must not depend on a *visual* key.
         self.write_state();
         if self.mode != Mode::Warning {
             return;
@@ -601,9 +544,6 @@ impl Simulator {
                 wallpaper,
             );
             scene.set_background(frame, WIDTH, HEIGHT);
-            // The production frost plane is supplied by the compositor. The
-            // simulator models that plane in pixels, so disable the old tint
-            // placeholder rather than stacking it over the preview.
             scene.set_warning_progress(0.0, 0.0);
             for element in &elements {
                 scene.set_warning_element(&element.selector, element.progress);
@@ -620,7 +560,6 @@ impl Simulator {
         }
     }
 
-    /// Advance the controller with one event at the simulated clock.
     fn step_flow(&mut self, event: FlowEvent) -> Vec<FlowCmd> {
         let now = self.flow_now();
         let cmds = self
@@ -629,17 +568,10 @@ impl Simulator {
             .map(|flow| flow.step(now, event))
             .unwrap_or_default();
         self.warning_phase = self.warning.as_ref().map(LockFlow::phase);
-        // The controller owns the frame schedule; without this the sim is
-        // paced by whatever incidental events the host compositor happens
-        // to deliver.
         self.warning_wait = self.warning.as_ref().and_then(LockFlow::next_wake);
         cmds
     }
 
-    /// All three of the controller's clocks derived from the simulated one.
-    /// `Now::at` fills `mono`/`wall` from the real clocks, which would make
-    /// anything keyed to them (the grace window) nondeterministic in a
-    /// scenario run that byte-compares two passes.
     fn flow_now(&self) -> Now {
         Now {
             elapsed: self.sim_now,
@@ -648,15 +580,7 @@ impl Simulator {
         }
     }
 
-    /// Execute controller commands against the simulator's fakes. The
-    /// privileged ones are deliberately absent: `vigil-sim` links no PAM,
-    /// logind, or session-lock code, so there is nothing here that could
-    /// acquire a real lock (issue #43 acceptance).
     fn run_flow(&mut self, cmds: Vec<FlowCmd>) {
-        // Mode changes rebuild the Slint scene, so they are applied after
-        // the batch rather than from inside it: `select_mode` re-entered
-        // mid-iteration would apply the remaining commands against a scene
-        // that did not exist when they were produced.
         let mut pending_mode = None;
         for cmd in cmds {
             match cmd {
@@ -675,16 +599,8 @@ impl Simulator {
                     self.warning_panel = visible;
                     self.warning_visual_key = None;
                 }
-                // {note:?} not {note}: the trace is a test surface, and the
-                // typed note exists so a test can assert which degradation.
                 FlowCmd::Journal(note) => self.record(format!("flow: {note:?}")),
-                // Recorded, so a scenario can assert *where* a transition
-                // sits relative to everything else the controller emitted.
                 FlowCmd::PhaseChanged { from, to } => {
-                    // phase_label, not Display: this crate already owns a
-                    // label scheme that its fixtures compare exactly, and
-                    // two spellings of the same phase in one state file
-                    // would be a contract with itself it cannot keep.
                     self.record(format!(
                         "flow: phase {} -> {}",
                         Self::phase_label(from),
@@ -696,18 +612,10 @@ impl Simulator {
                     pending_mode = Some(Mode::Lock);
                 }
                 FlowCmd::Exit(outcome) => {
-                    // Every terminal outcome returns the preview to Login.
-                    // Denied/Invalidated are unreachable until the fake
-                    // compositor can refuse, but dropping them silently is
-                    // how a controller change goes unnoticed here.
                     self.record(format!("flow: exit {outcome:?}"));
                     pending_mode = Some(Mode::Login);
                 }
                 FlowCmd::DispatchInput(event) => {
-                    // Input the controller did NOT consume. Anything it did
-                    // consume (a cancelling keypress) must not also reach
-                    // the UI — that is the double-dispatch production
-                    // avoids.
                     if let Some(scene) = self.scene.as_mut() {
                         scene.dispatch(event);
                     }
@@ -715,11 +623,6 @@ impl Simulator {
                         window.request_redraw();
                     }
                 }
-                // Deliberately inert: vigil-sim links no PAM, logind or
-                // session-lock code, so these have nothing to act on. Listed
-                // rather than caught by `_` so a NEW privileged command
-                // fails to compile here and a human decides, instead of
-                // being silently swallowed into a green scenario baseline.
                 FlowCmd::StartAuth
                 | FlowCmd::ShowAuthError(_)
                 | FlowCmd::ShowAccountLocked { .. }
@@ -732,19 +635,12 @@ impl Simulator {
             }
         }
         if let Some(mode) = pending_mode {
-            // The fake compositor grants immediately — stepped BEFORE
-            // select_mode, which drops the controller on the way out of
-            // Warning. Stepping after left the flow dead in Committing and
-            // ShowPanel(true) unexecuted, so `panel_visible` reported false
-            // while the Lock scene plainly showed the card.
             let confirmed = if mode == Mode::Lock {
                 self.step_flow(FlowEvent::LockConfirmed)
             } else {
                 Vec::new()
             };
             self.select_mode(mode);
-            // Bounded at one more batch: LockConfirmed never yields
-            // RequestSessionLock.
             self.run_flow(confirmed);
         }
     }
@@ -754,8 +650,6 @@ impl Simulator {
             self.sim_now = Duration::ZERO;
             self.last_tick = Instant::now();
         } else {
-            // The controller does not outlive its mode: left alive, a
-            // drawer button would step it from Login or Lock.
             self.warning = None;
             self.warning_phase = None;
         }
@@ -838,8 +732,6 @@ impl Simulator {
     fn apply_command(&mut self, command: &str) -> Result<Option<std::path::PathBuf>, String> {
         let mut export = None;
         match parse_control_command(command)? {
-            // Mirrors `vigil-lock --wait`: the socket response is emitted
-            // only after the resulting lock frame has been presented.
             ControlCommand::LockWait => self.select_mode(Mode::Lock),
             ControlCommand::State(mode) => self.select_mode(mode),
             ControlCommand::Pause => {
@@ -1218,15 +1110,9 @@ fn fake_desktop() -> Vec<u8> {
     rgba
 }
 
-/// CPU blur exists only in the safe simulator. Production uses the Wayland
-/// background-effect protocol and never captures or reads desktop pixels.
 fn blur_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())
         .expect("simulator desktop dimensions");
-    // A full-resolution Gaussian is several seconds in an unoptimized dev
-    // build and delays the very harness intended to accelerate UI work.
-    // Downsample/upsample is a deterministic, sub-frame approximation of the
-    // compositor blur plane and is deliberately simulator-only.
     let small = image::imageops::resize(
         &image,
         (width / 16).max(1),
@@ -1306,9 +1192,6 @@ struct ScenarioFixture {
     commands: Vec<String>,
     expect_mode: Option<String>,
     expect_phase: Option<String>,
-    /// Pin the ramp itself. `expect_phase` collapses every pre-lock state
-    /// into "prelock", so without these a fixture passes identically at
-    /// 0 ms and 9999 ms — which is how a broken `at_ms` seek went unnoticed.
     expect_frost: Option<f32>,
     expect_wallpaper: Option<f32>,
 }
@@ -1318,8 +1201,6 @@ struct ScenarioResult {
     mode: String,
     warning_phase: Option<String>,
     time_ms: u128,
-    /// Overlay compositing values behind the frame. A phase label cannot
-    /// explain a frame-hash diff; these can.
     frost: f32,
     wallpaper: f32,
     panel_visible: bool,
@@ -1328,8 +1209,6 @@ struct ScenarioResult {
 }
 
 fn frame_hash(bytes: &[u8]) -> String {
-    // Stable FNV-1a rather than DefaultHasher, whose algorithm is deliberately
-    // unspecified. This value is an observability fingerprint, not security.
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -1345,8 +1224,6 @@ fn run_scenario(platform: VigilPlatform, path: &std::path::Path) -> Result<(), S
         .map_err(|error| format!("parse scenario {}: {error}", path.display()))?;
     let mode = Mode::parse(&fixture.mode)
         .ok_or_else(|| format!("scenario has unknown mode {:?}", fixture.mode))?;
-    // No config path: a scenario is a fixture, and must not vary with
-    // whatever /etc/greetd/vigil.toml the host happens to have.
     let mut simulator = Simulator::new(
         mode,
         platform,
@@ -1424,8 +1301,6 @@ fn render_scenario_frame(simulator: &mut Simulator) -> Result<(), String> {
 
 fn main() {
     let args = SimArgs::parse();
-    // Resolved before anything is installed or opened: a --config the user
-    // mistyped should say so at once, not after a window appears.
     let preview = args.config.as_deref().map(load_preview_config);
     let platform = VigilPlatform::install().expect("install Vigil Slint platform");
     if let Some(path) = args.scenario.as_deref() {

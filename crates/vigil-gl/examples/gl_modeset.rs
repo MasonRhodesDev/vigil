@@ -1,16 +1,3 @@
-//! The full GL path: render the real theme with femtovg into a GBM surface
-//! and scan the result out on a real CRTC.
-//!
-//! Needs DRM master, so run it through the GPU harness:
-//!
-//!   cargo build -p vigil-gl --example gl_modeset
-//!   tests/gpu/run.sh -- target/debug/examples/gl_modeset
-//!   tests/gpu/run.sh --accel -- target/debug/examples/gl_modeset
-//!
-//! With `--screenshot`, the harness captures the guest's display afterwards,
-//! which is the only way to prove the frame really reached the screen rather
-//! than merely being committed without error.
-
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
@@ -40,7 +27,6 @@ impl Platform for GlPlatform {
     }
 }
 
-/// A card fd usable as a DRM control device.
 struct Card(DrmDeviceFd);
 
 impl std::os::fd::AsFd for Card {
@@ -60,13 +46,10 @@ fn main() {
         .open(&node)
         .expect("open card");
     let fd = Arc::new(OwnedFd::from(file));
-    // Duplicate rather than re-open: DRM master rides on the open file
-    // description, so a second open would not be master.
     let drm = Card(DrmDeviceFd::new(DeviceFd::from(
         fd.try_clone().expect("dup card fd"),
     )));
 
-    // Pick the first connected connector and its preferred mode.
     let resources = drm.resource_handles().expect("drm resources");
     let (connector, mode) = resources
         .connectors()
@@ -135,7 +118,6 @@ fn main() {
     window.render().expect("render");
     println!("rendered the default theme through femtovg: ok");
 
-    // SAFETY: a swap just happened; the buffer is released after the flip.
     let bo = unsafe { gbm.lock_front_buffer() }.expect("lock front buffer");
     let buffer = GbmBuffer::from_bo(bo, true);
     let fb = framebuffer_from_bo(&drm.0, &buffer, false).expect("drm framebuffer");
@@ -151,7 +133,6 @@ fn main() {
     .expect("set_crtc");
     println!("MODESET OK: a GL frame is on the CRTC");
 
-    // Hold the mode long enough for the harness to capture the display.
     let hold = std::env::var("VIGIL_GL_HOLD_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -160,7 +141,6 @@ fn main() {
     println!("DONE");
 }
 
-/// The interpreter's compile future resolves immediately without a runtime.
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -168,7 +148,6 @@ fn spin_on<F: std::future::Future>(future: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    // SAFETY: the vtable is a no-op waker over a null pointer it never reads.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);

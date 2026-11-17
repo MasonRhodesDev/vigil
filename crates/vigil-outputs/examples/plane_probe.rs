@@ -1,16 +1,3 @@
-//! Print every DRM plane the kernel exposes to this client, with type and
-//! formats — the ground truth for cursor-plane availability (#25).
-//!
-//! Run through the GPU harness (needs DRM master):
-//!
-//!   cargo build -p vigil-outputs --example plane_probe
-//!   tests/gpu/run.sh -- target/debug/examples/plane_probe
-//!
-//! Prints the plane list twice: once with only universal planes enabled,
-//! once after also declaring DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT and
-//! ATOMIC — virtualized drivers hide their cursor plane from atomic
-//! clients without the hotspot declaration (kernel 6.8+).
-
 use smithay::reexports::drm::control::{Device as ControlDevice, PlaneType};
 use smithay::reexports::drm::{ClientCapability, Device};
 
@@ -85,8 +72,6 @@ fn main() {
     println!("UniversalPlanes: {r:?}");
     dump(&card, "universal planes only");
 
-    // Order matters: the kernel refuses CURSOR_PLANE_HOTSPOT with EINVAL
-    // unless the client is already atomic (drm_ioctl.c, drm_setclientcap).
     let r = card.set_client_capability(ClientCapability::Atomic, true);
     println!("Atomic: {r:?}");
     let r = card.set_client_capability(ClientCapability::CursorPlaneHotspot, true);

@@ -1,9 +1,3 @@
-//! The vigil binary: calloop wiring ONLY (DESIGN.md §5). Every subsystem
-//! lives in its crate; this file assembles them behind vigil-core seams.
-//!
-//! Config file support is M2; for M1 everything is CLI flags (greetd's
-//! `command =` line carries them).
-
 mod autologin;
 mod hold;
 mod layout;
@@ -37,20 +31,13 @@ use vigil_session::SessionManager;
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, UiSnapshot, VigilPlatform, apply_kit_tokens_from_system};
 
-/// How often the banner file is re-read. Host integrations update it at
-/// human timescale; a 1s poll costs one small read and needs no watcher.
 const BANNER_POLL: Duration = Duration::from_secs(1);
-/// Cap so a runaway file cannot break the theme's layout.
 const BANNER_MAX: usize = 200;
 
-/// Cycler slot that returns the panel to typing a name.
-/// Present failures are retried every frame; log one in this many so a stuck
-/// output leaves a trail without flooding the journal.
 const PRESENT_LOG_EVERY: u32 = 60;
 
 const OTHER_USER: &str = "Other…";
 
-/// Fingerprint of `*.toml` under a profiles dir (path + len + mtime).
 fn profiles_dir_fingerprint(dir: &std::path::Path) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -136,7 +123,6 @@ fn parse_cli() -> Result<Cli, String> {
     Ok(cli)
 }
 
-/// Effective settings after CLI-over-config-over-default merge.
 struct Resolved {
     user: Option<String>,
     theme: Option<PathBuf>,
@@ -172,10 +158,6 @@ fn appearance_fit(fit: appearance_profiles::Fit) -> BackgroundFit {
     }
 }
 
-/// Session preselected at startup. Precedence: the user's own last
-/// successful session (when it still exists) > the operator's
-/// `[sessions] default` > first. A remembered name that no longer matches
-/// any entry falls through instead of stranding the user (issue #22).
 fn initial_session(
     sessions: &[sessions::SessionEntry],
     state: Option<&vigil_config::State>,
@@ -191,13 +173,6 @@ fn initial_session(
         .unwrap_or(0)
 }
 
-/// One live output: its swapchain and its scene.
-/// Run `compose` on a CPU-side frame and write the result into `target` with
-/// one forward copy. A presenter's buffer is a mapping of GPU memory,
-/// typically write-combined: writes are cheap, but every read is an
-/// uncached fetch, on the order of tens of MB/s. A mix that reads its
-/// destination (`Splash::blend_over`) must therefore never be pointed at
-/// the mapping itself; a 4K frame read back that way takes seconds.
 fn composed(
     scratch: &mut Vec<u32>,
     target: &mut FrameTarget<'_>,
@@ -230,40 +205,24 @@ struct Entry {
     height: u32,
     presenter: Box<dyn Presenter>,
     window: OutputWindow,
-    /// The presenter shows the pointer on a cursor plane; the scene must
-    /// not composite one.
     hw_cursor: bool,
-    /// Consecutive failed presents, for throttling the log. Reset on success.
     present_failures: u32,
-    /// The splash for this output (software outputs only), kept for the
-    /// post-login hand-off after the greeter owns the screen.
     splash: Option<splash::Splash>,
-    /// Present while the splash still covers, or is fading off, this output.
     cover: Option<splash::Cover>,
-    /// The stage tag drawn on every frame, when debug tags are on.
     tag: Option<splash::Tag>,
-    /// A greeter frame has been presented on this output.
     shown_once: bool,
-    /// CPU-side frame for the passes that mix two pictures (the fade and
-    /// the hand-off), see [`composed`]. u32-backed so the bytes are
-    /// 4-aligned, as the renderer's rotate path requires.
     scratch: Vec<u32>,
 }
 
-/// An output the splash already owns: claimed, drawn and shown before the
-/// toolkit loaded, waiting for its greeter window.
 struct Early {
     presenter: DumbBufferPresenter,
     splash: splash::Splash,
     tag: Option<splash::Tag>,
-    /// The first frame reached the CRTC.
     shown: bool,
 }
 
-/// What the splash bring-up hands to the app.
 #[derive(Default)]
 struct EarlySplash {
-    /// Hotplug events the bring-up scan consumed; the first rescan replays them.
     events: Vec<OutputEvent>,
     outputs: BTreeMap<OutputId, Early>,
 }
@@ -282,7 +241,6 @@ struct BackgroundResult {
     outputs: Vec<(OutputId, DecodedBackground)>,
 }
 
-/// Fan-out AuthUi: every monitor mirrors the auth state.
 struct FanUi<'a> {
     entries: &'a mut [Entry],
     snapshot: &'a mut UiSnapshot,
@@ -317,10 +275,6 @@ impl AuthUi for FanUi<'_> {
 
 struct App {
     session: SessionManager,
-    /// One manager per GPU (outputs can span cards); index == the
-    /// `OutputId` namespace.
-    /// One manager per GPU; the index IS the `OutputId` namespace, so a
-    /// card that vanishes at runtime is tombstoned (`None`), never removed.
     outputs: Vec<Option<OutputManager>>,
     profiles_dir: Option<PathBuf>,
     profiles_fingerprint: u64,
@@ -337,7 +291,6 @@ struct App {
     state: vigil_config::State,
     auto_streak: u32,
     remembered_user: Option<String>,
-    /// Loaded once the toolkit is up, which is after the splash is on screen.
     theme: Option<Theme>,
     platform: VigilPlatform,
     entries: Vec<Entry>,
@@ -361,11 +314,7 @@ struct App {
     caps_lock: bool,
     last_clock: (Instant, String),
     snapshot: UiSnapshot,
-    /// False while VT-switched away: DRM is paused, rendering must stop.
     active: bool,
-    /// logind sleep signals. Suspend never revokes DRM master, so no session
-    /// event fires across it and this is the greeter's only notice that the
-    /// kernel may have dropped its display state.
     login_rx: std::sync::mpsc::Receiver<LoginEvent>,
     #[allow(dead_code)]
     signal: LoopSignal,
@@ -377,33 +326,18 @@ struct App {
     present_retry: std::collections::BTreeMap<OutputId, (Instant, u32)>,
     exit_code: i32,
     splash_cfg: vigil_config::Splash,
-    /// The shared scene spec the splash follows.
     scene: scene::Scene,
-    /// Draw the stage tags.
     debug_tags: bool,
-    /// The one timeline every covered output follows, until the greeter owns
-    /// the screens.
     timeline: Option<splash::Timeline>,
-    /// Outputs the splash claimed before the toolkit was up.
     early: BTreeMap<OutputId, Early>,
-    /// Events the splash bring-up consumed, replayed by the first rescan.
     pending_events: Vec<OutputEvent>,
-    /// `[splash] on_first_frame` has been considered (run or empty).
     first_frame_hook_done: bool,
     started: Instant,
-    /// Set when start_session was accepted: the screens cross-fade to the
-    /// rest frame and the process exits as soon as every one has shown it.
     leaving: Option<Instant>,
-    /// Scaled-wallpaper cache directory, if one can be used.
     bg_cache_dir: Option<PathBuf>,
-    /// `[render] hold_last_frame_on_exit`: how long the exit holder waits
-    /// for the next owner, or None when the holder is off.
     hold_timeout: Option<Duration>,
 }
 
-/// Match a profile against the connected outputs and choose each output's
-/// mode. Returns the resolved layout and the outputs to skip (profile says
-/// disabled).
 fn apply_profile(
     gpus: &mut [Option<OutputManager>],
     profiles: &[Profile],
@@ -466,14 +400,6 @@ fn apply_profile(
     (resolved.outputs, disabled)
 }
 
-/// Claim every connected output for the splash and show its first frame on
-/// all of them at once.
-///
-/// This runs before anything slow: loading the toolkit alone blocks for about
-/// a second, and the greeter windows come after it. Every output is claimed
-/// and every first frame drawn (in parallel) before any is committed, so the
-/// screens light within a few milliseconds of each other instead of one
-/// output's startup cost after the next's.
 fn splash_bringup(
     gpus: &mut [Option<OutputManager>],
     profiles: &[Profile],
@@ -487,8 +413,6 @@ fn splash_bringup(
     for gpu in gpus.iter_mut().flatten() {
         match gpu.scan() {
             Ok(batch) => events.extend(batch),
-            // Left for the first rescan, which also knows how to retire a
-            // vanished card.
             Err(e) => eprintln!("vigil: initial scan failed: {e}"),
         }
     }
@@ -506,8 +430,6 @@ fn splash_bringup(
         transform: u8,
         presenter: DumbBufferPresenter,
         shown: bool,
-        /// Whether the first commit changes the CRTC's mode, as read before
-        /// it (None: unreadable).
         modeset: Option<bool>,
     }
     let mut claimed = Vec::new();
@@ -564,8 +486,6 @@ fn splash_bringup(
         return out;
     }
 
-    // Every splash is built at once, off the one thread that would otherwise
-    // pay for them in turn.
     let t_build = vigil_core::uptime_ms();
     let splashes: Vec<splash::Splash> = std::thread::scope(|scope| {
         claimed
@@ -583,7 +503,6 @@ fn splash_bringup(
         vigil_core::uptime_ms() - t_build
     );
 
-    // Draw every first frame into its back buffer, then commit them all.
     let mut parts: Vec<(Claimed, splash::Splash, Option<splash::Tag>)> = claimed
         .into_iter()
         .zip(splashes)
@@ -638,8 +557,6 @@ fn splash_bringup(
             }
         }
     }
-    // The state the boot splash left was refused. Start from nothing, as
-    // vigil always did, and show every frame again.
     for ns in failed_gpus {
         eprintln!("vigil: gpu {ns}: kept display state refused; resetting it");
         if let Some(gpu) = gpus.get_mut(ns).and_then(Option::as_mut)
@@ -685,8 +602,6 @@ impl App {
             WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
             WaitDecision::Indefinite => None,
         };
-        // These are real application deadlines, not a frame clock. The clock
-        // and host banner are sampled only when their displayed value may change.
         let clock = clock_interval(&self.clock_format).saturating_sub(self.last_clock.0.elapsed());
         let banner = self
             .banner_file
@@ -702,7 +617,6 @@ impl App {
             Some(Duration::from_millis(5))
         } else if let Some(timeline) = &self.timeline {
             if timeline.is_ready() {
-                // Fading: frames come off the greeter's own render path.
                 Some(splash::FRAME_EVERY)
             } else {
                 self.entries
@@ -737,9 +651,6 @@ impl App {
                 for gpu in self.outputs.iter_mut().flatten() {
                     let _ = gpu.activate();
                 }
-                // A render racing the pause can hit DeviceInactive and drop
-                // its entry, and no udev event replays a VT switch — so any
-                // output a manager still knows but we lost gets rebuilt.
                 let known: Vec<OutputId> = self
                     .outputs
                     .iter()
@@ -754,8 +665,6 @@ impl App {
                     }
                 }
                 self.rebuild_row();
-                // Reclaiming the device does not restore our CRTC state, so
-                // the presenters must be told to modeset rather than flip.
                 for e in self.entries.iter_mut() {
                     e.presenter.invalidate();
                     e.window.request_present();
@@ -765,34 +674,21 @@ impl App {
                     }
                 }
                 self.apply_panel();
-                // Rebuilt outputs lost their bitmaps with their windows;
-                // the per-user cache (or the scaled-wallpaper cache) refills
-                // them without decoding again.
                 self.refresh_backgrounds_async();
             }
         }
     }
 
-    /// Drain logind's sleep signals.
     fn pump_login(&mut self) {
         while let Ok(event) = self.login_rx.try_recv() {
             match event {
                 LoginEvent::PrepareForSleep(true) => {}
                 LoginEvent::PrepareForSleep(false) => self.on_resume(),
-                // The greeter has no session to lock or unlock.
                 LoginEvent::Lock | LoginEvent::Unlock => {}
             }
         }
     }
 
-    /// Rebuild the scanout state after a system resume.
-    ///
-    /// Nothing pauses the greeter across suspend — logind revokes DRM master
-    /// on a VT switch, not on sleep — so the presenters still believe their
-    /// CRTCs hold the mode they set before the machine went down. Flipping
-    /// onto that either fails or scans out nothing, and a greeter showing a
-    /// black screen has no way to notice. Force a full modeset and a present
-    /// that does not trust the surviving buffer contents.
     fn on_resume(&mut self) {
         for entry in self.entries.iter_mut() {
             entry.presenter.invalidate();
@@ -801,7 +697,6 @@ impl App {
                 c.reset_slots();
             }
         }
-        // The clock is now wrong by however long the machine slept.
         let text = clock_text(&self.clock_format);
         for entry in self.entries.iter_mut() {
             entry.window.set_clock(&text);
@@ -809,8 +704,6 @@ impl App {
         self.last_clock = (Instant::now(), text);
     }
 
-    /// Match a profile against the connected outputs and cache its resolved
-    /// geometry. Returns the outputs to skip (profile says disabled).
     fn resolve_profile(&mut self) -> Vec<OutputId> {
         self.reload_profiles_from_disk();
         let (layout, disabled) = apply_profile(&mut self.outputs, &self.profiles);
@@ -818,8 +711,6 @@ impl App {
         disabled
     }
 
-    /// Re-read `profiles_dir` when its TOML set changes (#31). No-op when
-    /// the fingerprint matches; degrades to an empty set if the dir is gone.
     fn reload_profiles_from_disk(&mut self) -> bool {
         let Some(dir) = &self.profiles_dir else {
             return false;
@@ -837,8 +728,6 @@ impl App {
         true
     }
 
-    /// Route a page-flip completion to the presenter it belongs to. CRTC
-    /// ids are per-device, so the namespace disambiguates across GPUs.
     fn vblank(&mut self, namespace: u32, crtc: u32) {
         for e in self.entries.iter_mut() {
             if e.id.0 >> 24 == namespace && e.presenter.crtc_id() == Some(crtc) {
@@ -855,12 +744,6 @@ impl App {
                 Ok(batch) => events.extend(batch),
                 Err(e) if gpu.alive() => eprintln!("vigil: hotplug scan failed: {e}"),
                 Err(_) => {
-                    // The whole card is gone (a dock GPU unplugged at the
-                    // greeter, #6). Tombstone the manager — the namespace is
-                    // the vec index, so it can never be removed — and retire
-                    // its outputs; a re-plugged card comes back as a device
-                    // this process has no manager for and stays ignored
-                    // until the next greeter start.
                     let ns = gpu.namespace();
                     eprintln!("vigil: gpu {ns} vanished; dropping its outputs");
                     events.extend(
@@ -897,13 +780,11 @@ impl App {
         }
         self.rebuild_row();
         if added {
-            // The cached set of per-output bitmaps predates these outputs.
             self.background_cache.remove(&self.background_cache_key);
             self.refresh_backgrounds_async();
         }
     }
 
-    /// The manager owning `id` (its namespace is the vec index).
     fn gpu_for(&mut self, id: OutputId) -> Result<&mut OutputManager, String> {
         let index = (id.0 >> 24) as usize;
         self.outputs
@@ -912,10 +793,6 @@ impl App {
             .ok_or_else(|| format!("no GPU {index} for output {id:?}"))
     }
 
-    /// Build a GL window and presenter for one output.
-    ///
-    /// Absent the `gl` feature this always fails, so a config asking for GL
-    /// on a software build says so once per output and carries on.
     #[cfg(feature = "gl")]
     fn gl_output(
         &mut self,
@@ -927,36 +804,22 @@ impl App {
         device_fd: vigil_outputs::DrmDeviceFd,
     ) -> Result<(OutputWindow, Box<dyn Presenter>), String> {
         use std::sync::Arc;
-        // Flipped variants rotate-without-the-flip, same as software.
         let transform = transform % 4;
-        // The cursor rides a DRM cursor plane, which needs atomic
-        // commits — smithay's legacy path drives only the primary plane.
         if !atomic {
             return Err("legacy modesetting has no cursor plane".into());
         }
-        // No plane, no GL: a mouse-driven greeter without a pointer is not
-        // deployable (#25), and software composites a perfectly good one.
-        // Probed BEFORE the surface is consumed so the fallback can have it.
         if !surface_slot
             .as_ref()
             .is_some_and(|s| vigil_present_gl::GbmPresenter::probe_cursor(s, transform))
         {
             return Err("no usable ARGB8888 cursor plane".into());
         }
-        // Duplicate the device's own descriptor: DRM master rides on the
-        // open file description, so re-opening the node would not be master.
         let fd = Arc::new(
             std::os::fd::AsFd::as_fd(&device_fd)
                 .try_clone_to_owned()
                 .map_err(|e| format!("dup drm fd: {e}"))?,
         );
         let context = Rc::new(vigil_gl::GlContext::from_fd(fd).map_err(|e| e.to_string())?);
-        // Ask the hardware whether it will rotate a scanout buffer before
-        // committing to GL at all: a TEST-ONLY atomic commit on the borrowed
-        // surface. Refusal (virtio-gpu has no rotation property; some
-        // hardware rejects some angles) falls back to software, which
-        // rotates correctly — a rendering preference must never be why
-        // someone cannot log in (#26).
         if let Some(s) = surface_slot.as_ref()
             && let Err(e) =
                 vigil_present_gl::GbmPresenter::test_transform(s, &device_fd, &context, transform)
@@ -967,8 +830,6 @@ impl App {
         let (presenter, gl_surface) =
             vigil_present_gl::GbmPresenter::new(surface, device_fd, context, scale, transform)
                 .map_err(|e| e.to_string())?;
-        // The probe above said yes, so construction claiming the plane is
-        // the invariant this asserts, not a fallback path.
         if !presenter.has_cursor() {
             return Err("cursor plane vanished between probe and claim".into());
         }
@@ -983,11 +844,6 @@ impl App {
         ));
         gl_window.set_size(vigil_gl::PhysicalSizeExport::new(w, h));
 
-        // One instantiation asks for an adapter more than once, so the
-        // override is held across it and cleared after.
-        // Count across the instantiation rather than checking for any
-        // unclaimed adapter: earlier outputs leave their own behind, and a
-        // leftover is not evidence about this one.
         let before = self.platform.adapters_created();
         self.platform.set_next_output(id);
         self.platform.use_next_adapter(gl_window.clone());
@@ -1025,7 +881,6 @@ impl App {
     }
 
     fn add_output(&mut self, id: OutputId) -> Result<(), String> {
-        // The splash may already own this output (and its surface).
         let early = self.early.remove(&id);
         let gpu = self.gpu_for(id)?;
         let info = gpu.info(id).cloned().ok_or("no info for output")?;
@@ -1037,7 +892,6 @@ impl App {
         let atomic = gpu.is_atomic();
         let want_gl =
             early.is_none() && self.looks.config.render.backend.eq_ignore_ascii_case("gl");
-        // Precedence: [output."NAME"] > monitor profile > EDID-derived default.
         let profile_scale = self
             .layout
             .iter()
@@ -1052,24 +906,17 @@ impl App {
             .filter(|s| s.is_finite() && *s > 0.0)
             .or(profile_scale)
             .unwrap_or(info.scale);
-        // A rotated output renders an upright scene at swapped dimensions;
-        // the presenter still scans out the panel's own geometry.
         let transform = self
             .layout
             .iter()
             .find(|o| o.name == info.connector)
             .map_or(0, |o| o.transform);
-        // 4..=7 are the flipped (mirrored) variants. Rotating without the
-        // flip is wrong, but it is legibly wrong and still lets someone log
-        // in, which beats refusing to drive the output at all.
         if transform > 3 {
             eprintln!(
                 "vigil: {}: flipped transform {transform} not supported,                  rotating without the flip",
                 info.connector
             );
         }
-        // A rendering preference must never be why someone cannot log in, so
-        // a GL failure degrades to software with a log line, per output.
         let mut surface_slot = surface;
         let resolved_background = self.appearance_registry.resolve(
             &appearance_profiles::OutputIdentity::new(&info.connector, info.description()),
@@ -1146,9 +993,6 @@ impl App {
         };
         let (scene_width, scene_height) = window.scene_size();
 
-        // The background itself arrives from the async job rescan() starts
-        // (decoded once, cached, scaled off this thread). Decoding it here,
-        // once per output, was most of the sequential output bring-up.
         window.set_clock(&self.last_clock.1);
         window.set_caps_lock(self.caps_lock);
         window.set_status_banner(&self.banner);
@@ -1191,8 +1035,6 @@ impl App {
                 }
                 (Some(splash), Some(cover), tag)
             }
-            // No splash claimed it (a hotplug, or the splash is off): the
-            // greeter alone, tagged when asked.
             None => (
                 None,
                 None,
@@ -1209,15 +1051,12 @@ impl App {
         if background.is_none()
             && let Some(cover) = cover.as_mut()
         {
-            // Nothing to wait for: the greeter is ready as it stands.
             cover.mark_ready();
         }
         self.entries.push(Entry {
             id,
             connector: info.connector.clone(),
             description: info.description(),
-            // Scene dimensions: pointer routing works in the space the user
-            // sees, so a portrait monitor must present as portrait here.
             width: scene_width,
             height: scene_height,
             hw_cursor,
@@ -1292,7 +1131,6 @@ impl App {
         for (i, e) in self.entries.iter_mut().enumerate() {
             let on_panel = i == self.panel;
             e.window.set_panel_visible(on_panel);
-            // The panel output is by construction the one under the pointer.
             if e.hw_cursor {
                 let (px, py) = e.window.pointer();
                 e.presenter
@@ -1305,9 +1143,6 @@ impl App {
     }
 
     fn route(&mut self, events: Vec<InputEvent>) {
-        // XF86Switch_VT_1..=XF86Switch_VT_12: the greeter owns Ctrl+Alt+Fn
-        // because taking libinput disabled the kernel's handling. Without
-        // this the greeter VT is a roach motel.
         const VT_FIRST: u32 = 0x1008_FE01;
         const VT_LAST: u32 = 0x1008_FE0C;
         const ESCAPE: u32 = 0xff1b;
@@ -1370,7 +1205,6 @@ impl App {
 
     fn pump_messages(&mut self) {
         if self.leaving.is_some() {
-            // Signed in: nothing typed from here on can matter.
             self.queue.borrow_mut().clear();
             return;
         }
@@ -1407,7 +1241,6 @@ impl App {
         }
     }
 
-    /// `automatic`: no user input led to start_session.
     fn finish_login(&mut self, automatic: bool) {
         self.exit_code = 0;
         let mut state = if automatic {
@@ -1425,10 +1258,6 @@ impl App {
         self.begin_leaving();
     }
 
-    /// start_session was accepted. greetd runs the session only once this
-    /// process exits, so the one job left is to hand every screen back to
-    /// the rest frame (the next stage starts on it) and get out of the way,
-    /// not to tear down gracefully.
     fn begin_leaving(&mut self) {
         let now = Instant::now();
         self.leaving = Some(now);
@@ -1444,10 +1273,6 @@ impl App {
         }
     }
 
-    /// Drive the hand-off to the rest frame; exit the process as soon as
-    /// every screen that has a splash shows it and the flip had a vblank to
-    /// land. One timeline for all outputs: every frame in a pass uses the
-    /// same `now`.
     fn render_leaving(&mut self) {
         let now = Instant::now();
         let started = self.leaving.unwrap_or(now);
@@ -1463,8 +1288,6 @@ impl App {
         let deadline = Duration::from_millis(500) + Duration::from_secs_f64(fade);
         let mut expired = false;
         for entry in self.entries.iter_mut() {
-            // A slow output must not stretch the exit: the deadline is
-            // measured on the clock before every entry, not once per pass.
             if started.elapsed() >= deadline {
                 expired = true;
                 break;
@@ -1483,14 +1306,12 @@ impl App {
                 continue;
             };
             if !cover.final_shown() && cover.due(now) {
-                // The greeter as it stands, with the rest frame mixed in.
                 window.request_present();
                 let t0 = Instant::now();
                 let mut drawn = None;
                 let shown = presenter.with_frame(&mut |canvas| match canvas {
                     Canvas::Cpu(mut target) => {
                         let ok = if last_frame {
-                            // Write-only: the rest frame replaces the buffer.
                             sp.draw_full(&mut target, 0.0)
                         } else {
                             composed(scratch, &mut target, |frame| {
@@ -1536,8 +1357,6 @@ impl App {
                 }
             }
             if cover.final_shown() {
-                // Shown means on the display, not just handed to the kernel:
-                // the process must not exit while the last flip is in flight.
                 pending |= presenter.flip_pending();
             } else {
                 pending = true;
@@ -1551,16 +1370,10 @@ impl App {
                 waited.as_millis()
             );
             self.hold_last_frame();
-            // No teardown: the kernel closes the DRM and input fds, and
-            // every millisecond here is a millisecond of the session not
-            // starting.
             std::process::exit(self.exit_code);
         }
     }
 
-    /// `[render] hold_last_frame_on_exit`: leave a detached child holding the
-    /// DRM fds so the rest frame stays up after this process exits. Every
-    /// failure is a log line and a normal exit.
     fn hold_last_frame(&self) {
         let Some(timeout) = self.hold_timeout else {
             return;
@@ -1578,7 +1391,6 @@ impl App {
         let t0 = vigil_core::uptime_ms();
         match hold::start(&devices, timeout) {
             Ok(pid) => {
-                // One write, so the child's first line cannot land inside it.
                 use std::io::Write as _;
                 let line = format!(
                     "vigil: [t+{}ms] hold: child {pid} keeps the last frame on {} screen(s) for up to {} ms ({} ms to set up)\n",
@@ -1593,9 +1405,6 @@ impl App {
         }
     }
 
-    /// Power actions go through logind (the greeter's session is active on
-    /// the seat, so polkit's allow_active rule applies — no root needed).
-    /// Config and `VIGIL_POWER_INHIBIT` can turn them into log lines.
     fn power(&mut self, action: PowerAction) {
         let arg = match action {
             PowerAction::Reboot => "reboot",
@@ -1613,8 +1422,6 @@ impl App {
         }
     }
 
-    /// Session choice is the binary's product logic: remember it, hand the
-    /// command line to the auth machine, and mirror it on every output.
     fn select_session(&mut self, index: usize) {
         let Some(session) = self.sessions.get(index) else {
             return;
@@ -1627,8 +1434,6 @@ impl App {
         }
     }
 
-    /// User choice is product logic: it only changes which name an empty
-    /// submit uses — `Other…` clears it so the field is typed into instead.
     fn select_user(&mut self, index: usize) {
         let Some(name) = self.users.get(index).cloned() else {
             return;
@@ -1709,8 +1514,6 @@ impl App {
         std::thread::spawn(move || {
             use std::collections::HashMap;
             use std::sync::{Arc, OnceLock};
-            // One lazily decoded source per file, shared by every output
-            // that needs it. Lazy so a full cache hit never decodes at all.
             type Source = OnceLock<Result<Arc<vigil_ui::BackgroundImage>, String>>;
             let mut sources: HashMap<PathBuf, Source> = HashMap::new();
             for (_, path, _, _, _, prepared) in &requests {
@@ -1827,7 +1630,6 @@ impl App {
             let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
                 continue;
             };
-            // Whatever the outcome, the greeter has stopped waiting for it.
             if let Some(cover) = entry.cover.as_mut() {
                 cover.mark_ready();
             }
@@ -1888,7 +1690,6 @@ impl App {
         if self.last_banner.elapsed() >= BANNER_POLL {
             self.last_banner = Instant::now();
             self.refresh_banner();
-            // Shared profile TOML can change while the greeter is up (#31).
             if self.reload_profiles_from_disk() {
                 let _ = self.resolve_profile();
                 self.rebuild_row();
@@ -1900,9 +1701,6 @@ impl App {
         self.render(&dirty);
     }
 
-    /// Re-read the banner file and push any change to every output. A
-    /// missing or unreadable file means no banner: a host-integration
-    /// channel must never be able to break the login screen.
     fn refresh_banner(&mut self) {
         let Some(path) = &self.banner_file else {
             return;
@@ -1918,9 +1716,6 @@ impl App {
         }
     }
 
-    /// The shared timeline's phase at `now`, or None once no output is
-    /// covered any more. The timeline is ready when every covered output's
-    /// greeter is.
     fn cover_phase(&mut self, now: Instant) -> Option<splash::Phase> {
         let timeline = self.timeline.as_mut()?;
         let mut covered = self
@@ -1959,15 +1754,8 @@ impl App {
             return;
         }
         let mut dead = Vec::new();
-        // One timeline for every covered output, sampled once per pass: no
-        // screen runs ahead of another because its neighbour was slow to draw.
         let now = Instant::now();
         let phase = self.cover_phase(now);
-        // `dirty` is advisory (see vigil-wayland: the software adapter cannot
-        // intercept Slint's request_redraw, so gating on it froze animations
-        // and input on metal). Every entry is offered a frame, but the scene
-        // is probed first (ADR 0007) so a clean output costs a shadow
-        // repaint instead of a buffer map that is then discarded.
         let _ = dirty;
         for (i, entry) in self.entries.iter_mut().enumerate() {
             let Entry {
@@ -1981,8 +1769,6 @@ impl App {
                 scratch,
                 ..
             } = entry;
-            // The splash covers a fresh output until the greeter is ready on
-            // every output, then the whole set cross-fades off together.
             let mut fade: Option<f32> = None;
             if let (Some(c), Some(phase)) = (cover.as_mut(), phase) {
                 match phase {
@@ -2013,8 +1799,6 @@ impl App {
                                 Err(e) => eprintln!("vigil: splash present: {e}"),
                             }
                         }
-                        // While the glow eases out, the greeter's first
-                        // frame is drawn off screen so the fade starts on it.
                         if self
                             .timeline
                             .as_ref()
@@ -2035,22 +1819,11 @@ impl App {
                 }
             }
             let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
-            // Probe before asking the presenter for a frame. On DRM that
-            // costs a dumb-buffer map (ioctl + mmap) or a GBM surface
-            // round; on a clean scene the draw closure would then return
-            // false and all of it is thrown away. The lock binary had the
-            // same shape against Wayland, where the discarded buffer's
-            // destroy is answered with delete_id and wakes the loop that
-            // acquired it -- desktop-commons ADR 0007. There is no
-            // compositor here to reply, so this is waste rather than a
-            // spin, but the rule is the same for every presenter.
             if !window.scene_needs_present() {
                 continue;
             }
             self.metrics.record_buffer_acquire();
             match presenter.with_frame(&mut |canvas| {
-                // Either canvas: the window knows which backend it has, and
-                // the presenter hands out the matching kind.
                 let Canvas::Cpu(mut target) = canvas else {
                     return window.render(canvas);
                 };
@@ -2058,10 +1831,6 @@ impl App {
                     target.stride * (target.height as usize / 2),
                     target.width as usize * 4,
                 );
-                // The fade reads the greeter back to mix the rest frame
-                // over it, so it composes on a CPU-side frame (see
-                // `composed`) and only the finished picture reaches the
-                // mapping.
                 let drew = match (fade, splash.as_ref()) {
                     (Some(alpha), Some(sp)) => composed(scratch, &mut target, |frame| {
                         let drew = window.render_if_needed(FrameTarget {
@@ -2073,8 +1842,6 @@ impl App {
                         if drew {
                             sp.blend_over(frame, alpha);
                             if let Some(tag) = tag.as_ref() {
-                                // Whichever stage holds more of the picture
-                                // owns the tag.
                                 let stage = if alpha > 0.5 {
                                     splash::Stage::GreeterSplash
                                 } else {
@@ -2116,20 +1883,11 @@ impl App {
                 }
                 Err(PresentError::DeviceLost) => dead.push(i),
                 Err(e) => {
-                    // The frame was drawn and the scene's dirty flag consumed,
-                    // but nothing reached the CRTC. Re-arm the scene, while
-                    // preserving the presenter's modeset state: turning a
-                    // failed page flip into a full modeset can race an in-flight
-                    // flip and produces an endless ENOMEM loop on amdgpu.
-                    // Resume/VT activation explicitly invalidate presenters at
-                    // the point where a modeset is actually required.
                     window.request_present_deferred();
                     let exponent = (*present_failures).min(5);
                     let delay = Duration::from_millis(100 * (1_u64 << exponent));
                     self.present_retry
                         .insert(entry.id, (Instant::now() + delay, *present_failures));
-                    // A persistent failure retries every frame; do not narrate
-                    // it every frame.
                     if *present_failures % PRESENT_LOG_EVERY == 0 {
                         eprintln!("vigil: present: {e} (retrying)");
                     }
@@ -2148,8 +1906,6 @@ impl App {
         self.maybe_first_frame_hook();
     }
 
-    /// Run `[splash] on_first_frame` once, when every output shows a frame
-    /// of ours and no flip is still in flight.
     fn maybe_first_frame_hook(&mut self) {
         if self.first_frame_hook_done || self.entries.is_empty() {
             return;
@@ -2182,7 +1938,6 @@ impl App {
             .spawn()
         {
             Ok(mut child) => {
-                // Reaped off the render path.
                 std::thread::spawn(move || {
                     let _ = child.wait();
                 });
@@ -2192,10 +1947,6 @@ impl App {
     }
 }
 
-/// Normalize banner-file contents into one display line: non-whitespace
-/// control characters are dropped (an escape sequence must not reach the
-/// scene), whitespace runs — newlines included — collapse to single
-/// spaces, and the result is capped.
 fn banner_text(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -2205,8 +1956,6 @@ fn banner_text(raw: &str) -> String {
     line.chars().take(BANNER_MAX).collect()
 }
 
-/// HH:MM via `date`; std has no local-time formatting and a chrono dependency
-/// is not worth it for a clock string (M2 revisits with proper config).
 fn clock_text(format: &str) -> String {
     std::process::Command::new("date")
         .arg(format!("+{format}"))
@@ -2222,9 +1971,7 @@ fn run() -> Result<i32, String> {
     let process_start = Instant::now();
     let cli = parse_cli()?;
 
-    // Author/CI tool: validate a theme and exit without touching the seat.
     if let Some(path) = &cli.theme_check {
-        // The interpreter needs a platform to instantiate the probe component.
         VigilPlatform::install().map_err(|e| e.to_string())?;
         return match vigil_theme::check(path) {
             Ok(()) => {
@@ -2241,9 +1988,6 @@ fn run() -> Result<i32, String> {
     let config = Config::load(cli.config.as_deref());
     let resolved = resolve(&cli, &config);
 
-    // Profiles are optional. A missing dir, unreadable files, or no matching
-    // profile all degrade to today's scan-order layout — this is the login
-    // screen; a layout file must never keep someone from logging in.
     let profiles_dir = config.profiles.dir.clone();
     let (profiles, profiles_fingerprint) = match &profiles_dir {
         Some(dir) => {
@@ -2270,11 +2014,6 @@ fn run() -> Result<i32, String> {
     let seat = session.seat_name();
     let mut session = session;
 
-    // One manager per GPU on the seat, primary first — outputs can span
-    // cards (found on the founding machine: the dock's DP hangs off the
-    // dGPU while boot_vga drives the panel). A card that fails to open or
-    // init is skipped with a log line, not fatal: a greeter with fewer
-    // monitors beats no greeter.
     let mut outputs = Vec::new();
     let mut drm_notifiers = Vec::new();
     for path in vigil_outputs::all_gpu_paths(&seat).map_err(|e| e.to_string())? {
@@ -2299,9 +2038,6 @@ fn run() -> Result<i32, String> {
     }
     let udev = vigil_outputs::udev_monitor(&seat).map_err(|e| e.to_string())?;
 
-    // The splash goes up first, on every output at once: registering the
-    // toolkit below blocks for about a second, and the greeter windows need
-    // it. The screens sit on the rest frame meanwhile.
     let splash_cfg = match &cli.splash_config {
         Some(path) => vigil_config::Splash::load_file(path),
         None => config.splash.clone(),
@@ -2342,9 +2078,6 @@ fn run() -> Result<i32, String> {
         .try_clone_to_owned()
         .map_err(|e| format!("dup input fd: {e}"))?;
 
-    // `--cmd` pins a single fixed session (kiosk/test mode); otherwise the
-    // installed wayland-/x-session entries are offered, defaulting to the
-    // first. The list is never empty (login-shell fallback).
     let session_list = if resolved.cmd.is_empty() {
         sessions::enumerate(&config.sessions.dirs)
     } else {
@@ -2355,8 +2088,6 @@ fn run() -> Result<i32, String> {
         }]
     };
 
-    // Kiosk --cmd mode never remembers; otherwise preselect last session and
-    // let an empty username submit the last user.
     let remember = resolved.cmd.is_empty() && config.sessions.remember;
     let stored = vigil_config::State::load(&config.sessions.state_file);
     let remembered = remember.then_some(stored.as_ref()).flatten();
@@ -2364,7 +2095,6 @@ fn run() -> Result<i32, String> {
     let auto_streak = match verdict {
         autologin::Verdict::Allow { streak } | autologin::Verdict::Pause { streak, .. } => streak,
     };
-    // A pinned --user/[greeter] user is kiosk mode: no list, no choosing.
     let user_list = if resolved.user.is_none() && config.users.show_list {
         let mut list = users::enumerate();
         if !list.is_empty() {
@@ -2375,7 +2105,6 @@ fn run() -> Result<i32, String> {
         Vec::new()
     };
     let remembered_user = remembered.map(|s| s.user.clone()).filter(|u| !u.is_empty());
-    // Preselect the remembered user when it is still a real account.
     let selected_user = remembered_user
         .as_ref()
         .and_then(|u| user_list.iter().position(|name| name == u))
@@ -2383,8 +2112,6 @@ fn run() -> Result<i32, String> {
     let initial_session = initial_session(&session_list, remembered, &config.sessions.default);
 
     let mut auth = AuthMachine::connect(cli.socket.as_deref()).map_err(|e| e.to_string())?;
-    // With a list, the selected entry is the default an empty submit uses;
-    // without one, the remembered name still is (G2).
     auth.set_default_user(match user_list.get(selected_user) {
         Some(name) if name != OTHER_USER => Some(name.clone()),
         Some(_) => None,
@@ -2404,10 +2131,6 @@ fn run() -> Result<i32, String> {
     let dirty = std::sync::Arc::new(DirtySet::new());
     let metrics = std::sync::Arc::new(Metrics::new());
 
-    // Sleep signals on a worker thread (the vigil-pam pattern: the event loop
-    // is calloop-driven and must never block on D-Bus). logind being absent
-    // is survivable — the greeter then behaves exactly as it did before, so
-    // this must never be fatal.
     let (login_tx, login_worker_rx) = std::sync::mpsc::channel();
     let (login_app_tx, login_rx) = std::sync::mpsc::channel();
     let login_wake = wake.clone();
@@ -2519,16 +2242,11 @@ fn run() -> Result<i32, String> {
     if !app.early.is_empty() {
         app.timeline = Some(splash::Timeline::new(app.started, &app.splash_cfg));
     }
-    // The slow part, with the splash already on every screen.
     app.platform.register().map_err(|e| e.to_string())?;
-    // Validating the theme instantiates it once, before any runtime exists.
     app.theme = Some(Theme::load_or_default(resolved.theme.as_deref()));
     app.platform
         .set_runtime(app.wake.clone(), app.dirty.clone(), app.metrics.clone());
 
-    // Rescan also starts the background job for the outputs it brought up
-    // (decode once, scale in parallel, or read the scaled-wallpaper cache),
-    // so the first greeter frame is not held behind an image decode.
     app.rescan();
     app.refresh_banner();
     {
@@ -2592,11 +2310,6 @@ fn run() -> Result<i32, String> {
             app.rescan();
         })
         .map_err(|e| format!("udev source: {e}"))?;
-    // Page-flip completion events re-open each presenter's submission gate
-    // (Presenter::vblank). Without this, flips under load race the vblank
-    // into EBUSY and the recovery modeset dies with ENOMEM on amdgpu —
-    // found on metal the moment continuous pointer motion met the cursor
-    // plane (#25).
     for (namespace, notifier) in drm_notifiers {
         handle
             .insert_source(notifier, move |event, _, app: &mut App| match event {
@@ -2611,19 +2324,11 @@ fn run() -> Result<i32, String> {
             Generic::new(input_fd, Interest::READ, Mode::Level),
             |_, _, app: &mut App| {
                 let events = app.input.dispatch();
-                // Never log event contents: keystrokes include the password.
                 if std::env::var_os("VIGIL_DEBUG_FRAMES").is_some() && !events.is_empty() {
                     eprintln!("vigil: input ready: {} event(s)", events.len());
                 }
                 let had_events = !events.is_empty();
                 app.route(events);
-                // Input must unpause the render loop. The GL path bridges
-                // Slint redraw requests into the dirty set via
-                // set_redraw_handle, but the software path has no reliable
-                // bridge — observed on metal: 49k input callbacks, zero
-                // frames, a greeter that paints once and then ignores the
-                // user forever. route() leaves self.panel on the output
-                // under the cursor/keyboard, so mark that one explicitly.
                 if had_events && let Some(entry) = app.entries.get(app.panel) {
                     app.dirty.mark(entry.id);
                 }
@@ -2632,8 +2337,6 @@ fn run() -> Result<i32, String> {
         )
         .map_err(|e| format!("input source: {e}"))?;
 
-    // A static scene has no frame timer. calloop blocks until input, DRM,
-    // lifecycle/worker wakeups, or a real Slint/application deadline.
     while app.running {
         let timeout = app.wait_timeout();
         event_loop
@@ -2672,20 +2375,17 @@ mod config_tests {
             stride,
         };
         let mut scratch = Vec::new();
-        // Refused: the mapping is untouched.
         assert!(!composed(&mut scratch, &mut target, |f| {
             f.buffer.fill(1);
             false
         }));
         assert!(target.buffer.iter().all(|&b| b == 7));
-        // Accepted: the scratch frame has the target's stride and lands whole.
         assert!(composed(&mut scratch, &mut target, |f| {
             assert_eq!((f.stride, f.buffer.len()), (stride, stride * 2));
             f.buffer.fill(9);
             true
         }));
         assert!(target.buffer.iter().all(|&b| b == 9));
-        // A target too small for its own geometry is refused, not indexed.
         let mut short = [0u8; 8];
         let mut small = FrameTarget {
             buffer: &mut short[..],

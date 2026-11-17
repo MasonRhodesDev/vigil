@@ -1,13 +1,3 @@
-//! Lock-state oracle for the nested-compositor harness (tests/nested/).
-//!
-//! Requests an ext-session-lock. If the compositor grants it (`locked`
-//! event), the session WAS unlocked — the probe immediately unlocks and
-//! exits 0. If the compositor answers `finished`, another client holds the
-//! lock — the session IS locked — exit 10. Anything else exits 2.
-//!
-//! Only run at quiescent checkpoints: while a vigil warning is pending the
-//! probe would win the lock race and steal the session lock.
-
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::session_lock::{
     SessionLock, SessionLockHandler, SessionLockState, SessionLockSurface,
@@ -26,14 +16,12 @@ struct Probe {
 
 impl SessionLockHandler for Probe {
     fn locked(&mut self, conn: &Connection, _qh: &QueueHandle<Self>, session_lock: SessionLock) {
-        // Granted: the session was unlocked. Restore it before reporting.
         session_lock.unlock();
         let _ = conn.roundtrip();
         self.outcome = Some(0);
     }
 
     fn finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
-        // Denied: someone else holds the lock — the session is locked.
         self.outcome = Some(10);
     }
 

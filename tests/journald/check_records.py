@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Assert the locker's trace survived journald intact.
-
-Reads `journalctl -o json` output and checks the properties the record
-format depends on but cannot verify about itself: that journald keeps one
-entry per record, that its own clock agrees with the in-record ordering,
-and that the tree is complete.
-
-Filtering by trace id matters: the journal window catches every run in the
-last two minutes, and each process starts its own `seq` at zero, so mixing
-runs manufactures ordering violations that are not real. That is not
-hypothetical - it produced two phantom inversions the first time this was
-measured by hand.
-"""
 
 import json
 import sys
@@ -32,7 +19,7 @@ def main(path, trace_id):
     records = []
     for entry in entries:
         message = entry.get("MESSAGE", "")
-        if isinstance(message, list):  # journald returns bytes for non-UTF8
+        if isinstance(message, list):
             message = bytes(message).decode("utf-8", "replace")
         if not message.startswith(("span=", "event=")):
             continue
@@ -55,9 +42,6 @@ def main(path, trace_id):
     if not records:
         return 1
 
-    # One entry per record. A record split across entries would leave a
-    # fragment that parses as a different record, which is the failure mode
-    # the single write_all exists to prevent.
     check(all("\n" not in m for _, _, m, _ in records), "no record was split or merged")
 
     spans = [f for _, f, _, _ in records if "span" in f]
@@ -70,9 +54,6 @@ def main(path, trace_id):
     check(sorted(seqs) == list(range(len(seqs))),
           "seq is contiguous from zero", f"min={min(seqs)} max={max(seqs)} n={len(seqs)}")
 
-    # The claim the format rests on: journald's clock can order records the
-    # same way the producer did, so a reader correlating across processes
-    # gets the real order.
     ordered = sorted(records, key=lambda r: int(r[1]["seq"]))
     inversions = sum(1 for a, b in zip(ordered, ordered[1:]) if a[0] > b[0])
     check(inversions == 0, "__MONOTONIC_TIMESTAMP agrees with seq order",
@@ -90,8 +71,6 @@ def main(path, trace_id):
           "the session recorded its outcome",
           sessions[0].get("span", "") if sessions else "no session record")
 
-    # journald stamps these; the format deliberately omits them, so their
-    # absence would mean the records carry no wall-clock anchor at all.
     first = records[0][3]
     for key in ("__MONOTONIC_TIMESTAMP", "_BOOT_ID", "_PID", "_COMM"):
         check(key in first, f"journald stamped {key}")

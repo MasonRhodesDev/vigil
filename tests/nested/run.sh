@@ -1,17 +1,4 @@
 #!/bin/sh
-# Nested-compositor integration suite for lock readiness (issue #44).
-#
-# Runs vigil-lock against a headless sway (ext-session-lock-v1, layer-shell,
-# runtime output hotplug, input injection — and deliberately NO
-# ext-background-effect, so this is the tint-fallback tier) inside a private
-# XDG_RUNTIME_DIR. Every vigil-lock run is traced with WAYLAND_DEBUG=1 and
-# check_trace.py asserts protocol ordering: locked precedes readiness, no
-# capture global is ever bound, the warning-to-lock handoff never exposes
-# the desktop, a cancel never requests the lock, and a locker told to
-# terminate closes its trace without touching the lock (issue #79).
-#
-# Opt-in locally (skips cleanly without sway); gates release in CI.
-# Every scenario runs under timeout: a hang IS the failure (issue #49).
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 
@@ -20,9 +7,6 @@ command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 not installed"; exit
 command -v flock >/dev/null 2>&1 || { echo "SKIP: flock (util-linux) not installed"; exit 0; }
 command -v wtype >/dev/null 2>&1 || { echo "SKIP: wtype not installed (virtual keyboard — the headless seat has no real inputs)"; exit 0; }
 
-# Wherever cargo put the build: a box that shares one target directory
-# between checkouts sets CARGO_TARGET_DIR, and the harness must find the
-# same binaries cargo just wrote rather than demand a second build.
 TARGET=${CARGO_TARGET_DIR:-$REPO/target}
 VLOCK=$TARGET/debug/vigil-lock
 PROBE=$TARGET/debug/examples/lock_probe
@@ -35,16 +19,7 @@ WORK=$(mktemp -d)
 SWAY_PID=
 cleanup() {
     [ -n "$SWAY_PID" ] && kill "$SWAY_PID" 2>/dev/null || true
-    # Reap any harness locker that survived a failed scenario. Matching the
-    # target/debug path never touches a system /usr/bin/vigil-lock.
     pkill -f "$VLOCK" 2>/dev/null || true
-    # Give the developer their account back (issue #91). Every scenario that
-    # tears down a held lock aborts a live PAM conversation, and an aborted
-    # `pam_authenticate` returns AUTH_ERR, which pam_faillock counts. Three
-    # scenarios is `deny`, so a clean run of this suite locks the user who
-    # ran it out of their own machine -- measured, twice, on the reference
-    # box. The strikes are the harness's own, so the harness clears them.
-    # No privilege needed: /run/faillock/$USER is owned by the user.
     command -v faillock >/dev/null 2>&1 &&
         faillock --user "$(id -un)" --reset >/dev/null 2>&1 || true
     if [ -n "${VIGIL_NESTED_KEEP:-}" ]; then
@@ -59,19 +34,6 @@ export XDG_RUNTIME_DIR=$WORK/run
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
-# Config isolation. The locker layers $XDG_CONFIG_HOME/vigil/config.toml
-# over /etc/greetd/vigil.toml over its defaults, and both layers change what
-# these scenarios measure: the reference machine's system config sets
-# [lock.warning] wallpaper_in_ms = 10000, which moves every handoff timing
-# the gates read. Without pinning, CI and a workstation run different
-# scenarios under the same names, and a developer's own config decides
-# whether a gate passes.
-#
-# An empty file rather than an unset path: --config takes an explicit file
-# and skips both layers, so the scenarios exercise the shipped defaults plus
-# whatever they pass on the command line, and nothing else. XDG_CONFIG_HOME
-# is redirected too, for anything that reads it without going through
-# Config::load_layered.
 export XDG_CONFIG_HOME=$WORK/config
 mkdir -p "$XDG_CONFIG_HOME"
 CFG=$WORK/vigil.toml
@@ -81,7 +43,6 @@ export WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
 
 sway -c "$REPO/tests/nested/sway.cfg" >"$WORK/sway.log" 2>&1 &
 SWAY_PID=$!
-# sway names its own socket inside our private runtime dir; adopt it.
 i=0
 while :; do
     for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
@@ -101,8 +62,6 @@ SOCK=$XDG_RUNTIME_DIR/vigil-lock-$WAYLAND_DISPLAY.sock
 fail() { echo "FAIL: $*"; exit 1; }
 pass() { echo "  ok: $*"; }
 
-# Wait until no live locker owns the singleton (kernel releases the flock on
-# death, so this is exact — leftover files do not matter).
 wait_free() {
     i=0
     while ! flock -n "$LOCKFILE" true 2>/dev/null; do
@@ -119,19 +78,10 @@ wait_held() {
         sleep 0.1
     done
 }
-# errexit-safe: the probe exits 10 on purpose; || keeps set -e from aborting.
 probe_state() {
     "$PROBE" >/dev/null 2>&1 && echo 0 || echo $?
 }
-# The headless seat reports capabilities(0): swaymsg cursor injection goes
-# nowhere. wtype attaches a zwp_virtual_keyboard, which gives the seat a
-# keyboard and delivers a real key press to the focused (lock or warning)
-# surface — a key press dismisses the grace window and cancels a pending
-# warning ("activity before commitment").
-# -s keeps the transient virtual keyboard alive long enough for the seat
-# capability, keymap, and focus enter to reach the client before the key.
 tap() { wtype -s 800 x; }
-# Teardown invariants after every scenario (issue #44 checklist).
 teardown_check() {
     wait_free "$1"
     sm -t get_version >/dev/null || fail "$1: sway died"
@@ -139,19 +89,11 @@ teardown_check() {
 }
 
 echo "S1: readiness — locked event precedes --wait success"
-# On lock: a short non-cancelable frost transition (warning-role overlay,
-# blur ramp + wallpaper fade-in) precedes the lock - blur is the "about to
-# lock" warning. On unlock: instant, with NO reveal overlay (the shipped
-# default). --handoff checks the warning surface never exposes the desktop;
-# --no-reveal checks unlock created no vigil-reveal surface. The reveal is an
-# opt-in modular slot (LockTransition.wallpaper_out_ms > 0), covered by
-# vigil-flow and vigil-warning unit tests rather than a nested scenario.
 [ "$(probe_state)" = 0 ] || fail "S1: fresh session reports locked"
 WAYLAND_DEBUG=1 timeout 30 "$VLOCK" --config "$CFG" --wait --no-warn --grace 300 2>"$WORK/s1.trace" && rc=0 || rc=$?
 [ "$rc" = 0 ] || { grep -v '^\[' "$WORK/s1.trace" | tail -5; fail "S1: --wait exited $rc"; }
 s1_probe=$(probe_state)
 [ "$s1_probe" = 10 ] || {
-    # Diagnostics: is the locker still alive, did it panic, what did sway say.
     echo "S1 diag: probe exit=$s1_probe (0=unlocked, 10=locked, 2=probe error)"
     echo "S1 diag: locker holds singleton: $(flock -n "$LOCKFILE" true 2>/dev/null && echo no || echo yes)"
     echo "S1 diag: non-protocol lines from the locker:"
@@ -164,13 +106,6 @@ s1_probe=$(probe_state)
 }
 tap
 teardown_check S1
-# --locked-to-commit-ms bounds the interval this output is actually
-# uncovered: `locked` (where the compositor stops drawing normal surfaces)
-# to that output's first lock-surface commit-with-buffer. 100 ms against a
-# measured ~3 ms is deliberately loose — it catches a whole scheduling round
-# being added before the first commit and does not pretend this tier's
-# timing predicts the seat's. It is NOT the #86 check: the black-committing
-# code passed this too, fast. S4's --first-frame-not-black is that check.
 python3 "$REPO/tests/nested/check_trace.py" "$WORK/s1.trace" --expect locked --handoff --locked-to-commit-ms 100 --no-reveal || fail "S1: trace check"
 pass "S1"
 
@@ -205,12 +140,6 @@ pass "S3"
 
 echo "S4: two-output warning handoff never exposes the desktop"
 sm create_output >/dev/null
-# VIGIL_FRAME_HASH=1 fingerprints every committed frame into this trace, so
-# --first-frame-not-black can assert the positive: an output whose warning
-# painted must not get an all-black first lock frame (issue #86 — the old
-# handoff committed instantly and committed black). Hashing walks the whole
-# buffer per frame, so this trace's timings are inflated; the gap gate lives
-# on the unhashed S1 and the numbers here are printed, not gated.
 timeout 60 env WAYLAND_DEBUG=1 VIGIL_FRAME_HASH=1 "$VLOCK" --config "$CFG" --wait --warn 2 --grace 300 2>"$WORK/s4.trace" && rc=0 || rc=$?
 [ "$rc" = 0 ] || fail "S4: exited $rc"
 python3 "$REPO/tests/nested/check_trace.py" "$WORK/s4.trace" --expect locked --handoff --first-frame-not-black --outputs 2 || fail "S4: trace check"
@@ -237,8 +166,6 @@ echo "S7b: an output hotplugged while locked gets a lock surface"
 timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --config "$CFG" --wait --no-warn --grace 300 2>"$WORK/s7b.trace" || fail "S7b: lock failed"
 sm create_output >/dev/null
 sleep 2
-# The detached child appends to the same trace fd; assert the new output's
-# lock surface was created and committed after the hotplug.
 python3 "$REPO/tests/nested/check_trace.py" "$WORK/s7b.trace" --expect locked --outputs 2 || fail "S7b: trace check"
 sm output HEADLESS-2 unplug >/dev/null 2>&1 || true
 sleep 1
@@ -257,8 +184,6 @@ pass "S8"
 echo "S9: hotplug during the transition commits instead of cancelling"
 timeout 30 env WAYLAND_DEBUG=1 "$VLOCK" --config "$CFG" --wait --no-warn --grace 300 2>"$WORK/s9.trace" &
 A=$!
-# Race the 400 ms ramp; whichever side of the commit the new output lands
-# on, the locker must end up locked (never exit 3) with both outputs covered.
 sleep 0.15
 sm create_output >/dev/null
 wait $A && rc=0 || rc=$?
@@ -273,15 +198,8 @@ teardown_check S9
 pass "S9"
 
 echo "S10: SIGTERM closes the trace and leaves the lock to the compositor (issue #79)"
-# No --wait: the locker is timeout's direct child, so its own exit status
-# comes back through `wait`. SPAN_LINES=frames turns on the per-wake
-# loop.iteration spans the issue counted dangling: 33 of them, every one
-# parented to a lock.session that was never written.
 timeout 30 env WAYLAND_DEBUG=1 SPAN_LINES=frames "$VLOCK" --config "$CFG" --no-warn --grace 300 2>"$WORK/s10.trace" &
 A=$!
-# Wait for the compositor's `locked` in the trace itself, not via the probe:
-# during the 400 ms transition the probe would win the race and take the
-# lock the scenario is about to signal.
 i=0
 while ! grep -q 'ext_session_lock_v1.*\.locked' "$WORK/s10.trace" 2>/dev/null; do
     i=$((i + 1))
@@ -289,22 +207,11 @@ while ! grep -q 'ext_session_lock_v1.*\.locked' "$WORK/s10.trace" 2>/dev/null; d
     sleep 0.1
 done
 sleep 1
-# The signal goes to the locker, not to timeout (which would also raise it
-# on itself and return before the locker has finished writing). `pgrep -P`
-# is exact: without --wait the locker forks nothing of its own.
 LOCKER=$(pgrep -P "$A") || fail "S10: no locker under timeout"
 kill -TERM "$LOCKER"
 wait $A && rc=0 || rc=$?
-# 128 + SIGTERM, the code the parent saw before the locker learned to exit
-# on its own. It reads 143 whether the locker exited 143 or SIGTERM killed
-# it (timeout re-raises a child's fatal signal), so the exit code checks the
-# contract and the trace check below is what tells the two apart.
 [ "$rc" = 143 ] || fail "S10: expected exit 143 (128 + SIGTERM), got $rc"
 python3 "$REPO/tests/nested/check_trace.py" "$WORK/s10.trace" --expect locked --session-outcome Terminated:SIGTERM --no-unlock || fail "S10: trace check"
-# Teardown: sway hands an abandoned lock to the next client that asks, and
-# in teardown_check that client is the probe, which unlocks. That is the
-# harness restoring the session, not evidence the locker released anything;
-# --no-unlock above is that evidence.
 teardown_check S10
 pass "S10"
 

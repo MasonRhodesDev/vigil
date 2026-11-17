@@ -1,11 +1,3 @@
-//! Pointer routing over a 2D output layout. Pure and unit-tested; the event
-//! loop feeds it deltas and normalized absolute positions and gets back
-//! (output index, output-local coords).
-//!
-//! Outputs may be placed anywhere by a monitor profile, so rects can leave
-//! gaps. A pointer must never be stranded in one: [`Row::clamp`] snaps a
-//! position outside every rect onto the nearest one.
-
 use vigil_core::OutputId;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,7 +14,6 @@ impl Span {
         x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
     }
 
-    /// Nearest point inside the rect (its own coordinates if already inside).
     fn nearest(&self, x: f64, y: f64) -> (f64, f64) {
         (
             x.clamp(self.x, self.x + self.width - 1.0),
@@ -30,25 +21,19 @@ impl Span {
         )
     }
 
-    /// Squared distance from (x, y) to this rect; 0 when inside.
     fn distance2(&self, x: f64, y: f64) -> f64 {
-        // Measure to the geometric edge, while `nearest` returns a valid
-        // pixel coordinate just inside that edge.
         let nx = x.clamp(self.x, self.x + self.width);
         let ny = y.clamp(self.y, self.y + self.height);
         (x - nx).powi(2) + (y - ny).powi(2)
     }
 }
 
-/// The global layout space.
 #[derive(Debug, Default)]
 pub struct Row {
     spans: Vec<Span>,
 }
 
 impl Row {
-    /// Rebuild from `(id, x, y, width, height)`. Callers that have no
-    /// profile use [`Self::rebuild_scan_order`].
     pub fn rebuild(&mut self, outputs: &[(OutputId, i32, i32, u32, u32)]) {
         self.spans = outputs
             .iter()
@@ -62,8 +47,6 @@ impl Row {
             .collect();
     }
 
-    /// Left-to-right at y=0 in the given order — the layout used when no
-    /// profile applies, identical to vigil's behavior before profiles.
     pub fn rebuild_scan_order(&mut self, outputs: &[(OutputId, u32, u32)]) {
         let mut x = 0i32;
         let placed: Vec<_> = outputs
@@ -77,7 +60,6 @@ impl Row {
         self.rebuild(&placed);
     }
 
-    /// Bounding box of every output, as `(min_x, min_y, max_x, max_y)`.
     fn bounds(&self) -> (f64, f64, f64, f64) {
         self.spans.iter().fold(
             (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
@@ -108,9 +90,6 @@ impl Row {
         y1 - y0
     }
 
-    /// Snap a position into the layout: unchanged when it lands on an
-    /// output, else moved onto the nearest one by squared distance (ties to
-    /// the lowest index, so the choice is deterministic).
     pub fn clamp(&self, x: f64, y: f64) -> (f64, f64) {
         if self.spans.is_empty() {
             return (0.0, 0.0);
@@ -132,7 +111,6 @@ impl Row {
         best.nearest(x, y)
     }
 
-    /// Output index and output-local coordinates for a position.
     pub fn locate(&self, x: f64, y: f64) -> Option<(usize, f64, f64)> {
         if self.spans.is_empty() {
             return None;
@@ -147,8 +125,6 @@ impl Row {
         Some((idx, cx - span.x, cy - span.y))
     }
 
-    /// Map normalized (0..1) coordinates over the bounding box to a global
-    /// position.
     pub fn denormalize(&self, nx: f64, ny: f64) -> (f64, f64) {
         if self.spans.is_empty() {
             return (0.0, 0.0);

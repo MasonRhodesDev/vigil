@@ -1,19 +1,3 @@
-//! Smoke test for the GL path's foundation, on a render node — no DRM
-//! master, no VT, no seat.
-//!
-//! What this proves:
-//!   - an EGL context comes up on a GBM device;
-//!   - Slint accepts `GlWindow` as a window adapter;
-//!   - the real theme compiles and instantiates against the FemtoVG renderer.
-//!
-//! What it deliberately does NOT do is produce a picture. femtovg draws into
-//! the default framebuffer, which exists only once there is an EGL window
-//! surface over a GBM surface. Rendering without one silently yields black
-//! pixels rather than an error, so a preview here would be a picture of
-//! nothing dressed up as a passing test.
-//!
-//!   cargo run -p vigil-gl --example gl_smoke
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -68,7 +52,6 @@ fn main() {
     println!("\nscanout is not wired up yet: see the crate docs (issue #17)");
 }
 
-/// The interpreter's compile future resolves immediately without a runtime.
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -76,7 +59,6 @@ fn spin_on<F: std::future::Future>(future: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    // SAFETY: the vtable is a no-op waker over a null pointer it never reads.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);
