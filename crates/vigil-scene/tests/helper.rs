@@ -284,8 +284,13 @@ fn status_field(pid: u32, key: &str) -> Option<String> {
 #[test]
 fn the_shipped_helper_draws_under_its_syscall_filter() {
     let svg = mark();
-    let ours: u32 =
-        status_field(std::process::id(), "Seccomp_filters:").map_or(0, |v| v.parse().unwrap());
+    let filters = |status: &str| -> u32 {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Seccomp_filters:"))
+            .map_or(0, |v| v.trim().parse().unwrap())
+    };
+    let ours = filters(&std::fs::read_to_string("/proc/self/status").unwrap());
     let (reader, mut writer) = std::io::pipe().unwrap();
     let mut child = Command::new(BIN)
         .args(["layer", "--mode", "4096x4096", "--transform", "0"])
@@ -294,29 +299,34 @@ fn the_shipped_helper_draws_under_its_syscall_filter() {
         .args(["--abi", vigil_scene::HELPER_ABI])
         .stdin(reader)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let pid = child.id();
     std::io::Write::write_all(&mut writer, &svg).unwrap();
     drop(writer);
     let mut seen = None;
-    while child.try_wait().unwrap().is_none() {
-        let Some(filters) = status_field(pid, "Seccomp_filters:") else {
+    while seen.is_none() && child.try_wait().unwrap().is_none() {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
             continue;
         };
-        let filters: u32 = filters.parse().unwrap();
-        if filters > ours {
-            let environ = std::fs::read(format!("/proc/{pid}/environ"));
-            seen = Some((filters, status_field(pid, "NoNewPrivs:"), environ));
-            break;
+        if filters(&status) > ours {
+            match std::fs::read(format!("/proc/{pid}/environ")) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                environ => seen = Some((status, environ)),
+            }
         }
     }
-    let status = child.wait().unwrap();
-    assert!(status.success(), "{status:?}");
-    let (filters, nnp, environ) = seen.expect("the helper ran under a new seccomp filter");
-    assert_eq!(filters, ours + 1);
-    assert_eq!(nnp.as_deref(), Some("1"));
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{:?}", out.status);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.is_empty() || said == "vigil-scene: notice: this kernel has no Landlock\n",
+        "Landlock failed rather than being absent: {said}"
+    );
+    let (status, environ) = seen.expect("the helper ran under a new seccomp filter");
+    assert_eq!(filters(&status), ours + 1);
+    assert!(status.contains("NoNewPrivs:\t1"), "{status}");
     if !rustix::process::getuid().is_root() {
         let denied = environ.expect_err("a helper that is not dumpable hides its environ");
         assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
