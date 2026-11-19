@@ -10,6 +10,7 @@ pub const MAX_LOGO_BYTES: u64 = 512 * 1024;
 pub const MAX_EDGE: u32 = 2048;
 pub const MAX_RASTER_BYTES: u64 = 16 << 20;
 const MAX_RASTER_SIDE: u32 = 8192;
+const MAX_RASTER_PIXELS: u64 = MAX_EDGE as u64 * MAX_EDGE as u64;
 const MAX_NODES: u32 = 10_000;
 const MAX_DEPTH: usize = 64;
 const MAX_REF_DEPTH: usize = 128;
@@ -138,15 +139,28 @@ impl Logo {
     }
 
     pub fn raster(data: &[u8]) -> Result<Logo, Error> {
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(MAX_RASTER_SIDE);
-        limits.max_image_height = Some(MAX_RASTER_SIDE);
-        limits.max_alloc = Some(256 << 20);
-        let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
-            .with_guessed_format()
+        let reader = || {
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(MAX_RASTER_SIDE);
+            limits.max_image_height = Some(MAX_RASTER_SIDE);
+            limits.max_alloc = Some(64 << 20);
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+                .with_guessed_format()
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            reader.limits(limits);
+            Ok::<_, Error>(reader)
+        };
+        let (w, h) = reader()?
+            .into_dimensions()
             .map_err(|e| Error::Invalid(e.to_string()))?;
-        reader.limits(limits);
-        let img = reader.decode().map_err(|e| Error::Invalid(e.to_string()))?;
+        if u64::from(w) * u64::from(h) > MAX_RASTER_PIXELS {
+            return Err(Error::TooLarge(format!(
+                "a {w}x{h} raster is over {MAX_RASTER_PIXELS} pixels"
+            )));
+        }
+        let img = reader()?
+            .decode()
+            .map_err(|e| Error::Invalid(e.to_string()))?;
         Ok(Logo::Raster(img.into_rgba8()))
     }
 
