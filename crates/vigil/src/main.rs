@@ -3,7 +3,10 @@ mod hold;
 mod keys;
 mod layout;
 mod scene;
+#[cfg(test)]
+mod scripted_greetd;
 mod sessions;
+mod signin;
 mod splash;
 mod users;
 
@@ -1233,7 +1236,7 @@ impl App {
             }
             if let UiMessage::SelectUser(index) = msg {
                 self.select_user(index);
-                self.forget_unprompted_user_once_asked();
+                self.store_what_auth_learned();
                 if self.auth.is_complete() {
                     self.finish_login(false);
                     return;
@@ -1252,7 +1255,7 @@ impl App {
             if let Err(e) = self.auth.handle(msg, &mut fan) {
                 eprintln!("vigil: auth: {e}");
             }
-            self.forget_unprompted_user_once_asked();
+            self.store_what_auth_learned();
             if !asking_name
                 && self.auth.awaiting_username()
                 && let Some(row) = users::username_stage_row(&self.users, self.selected_user)
@@ -1266,28 +1269,23 @@ impl App {
         }
     }
 
-    fn forget_unprompted_user_once_asked(&mut self) {
-        if !self.state.unprompted_user.is_empty() && self.auth.unprompted().is_none() {
-            self.state.unprompted_user.clear();
+    fn store_what_auth_learned(&mut self) {
+        if signin::observe(&mut self.state, &self.auth) {
             self.state.store(&self.state_file);
         }
     }
 
     fn finish_login(&mut self, automatic: bool) {
         self.exit_code = 0;
-        let mut state = if automatic {
+        let state = if automatic {
             autologin::record_auto_start(&self.state, autologin::now_secs(), self.auto_streak)
         } else {
             autologin::record_user_start(&self.state)
         };
-        if self.remember
-            && let Some(user) = self.auth.user()
-        {
-            state.user = user.to_owned();
-            state.session = self.sessions[self.selected_session].name.clone();
-        }
-        state.unprompted_user = autologin::unprompted_user(self.auth.user(), self.auth.spoke());
-        state.store(&self.state_file);
+        let session = self
+            .remember
+            .then(|| self.sessions[self.selected_session].name.as_str());
+        signin::signed_in(state, &self.auth, session).store(&self.state_file);
         self.begin_leaving();
     }
 
@@ -2164,12 +2162,9 @@ fn run() -> Result<i32, String> {
         Some(_) => None,
         None => remembered_user.clone(),
     });
-    auth.set_unprompted(
-        stored
-            .as_ref()
-            .map(|state| state.unprompted_user.clone())
-            .filter(|user| !user.is_empty()),
-    );
+    if let Some(state) = &stored {
+        signin::seed(&mut auth, state);
+    }
     auth.set_session(
         session_list[initial_session].cmd.clone(),
         session_list[initial_session].env.clone(),
@@ -2358,7 +2353,7 @@ fn run() -> Result<i32, String> {
             fan.show_error(&notice);
         }
     }
-    app.forget_unprompted_user_once_asked();
+    app.store_what_auth_learned();
     if app.auth.is_complete() {
         app.finish_login(true);
     }
