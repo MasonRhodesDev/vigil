@@ -4548,7 +4548,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vigil-auth"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "greetd_ipc",
  "serde_json",
@@ -4559,7 +4559,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-config"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "serde",
  "toml 0.9.12+spec-1.1.0",
@@ -4569,7 +4569,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-core"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "monitor-profiles",
  "vigil-secret",
@@ -4590,7 +4590,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-input"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "input 0.9.1",
  "smithay",
@@ -4601,14 +4601,14 @@ dependencies = [
 
 [[package]]
 name = "vigil-log"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "vigil-secret"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "libc",
  "rustix 1.1.6",
@@ -4618,7 +4618,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-theme"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "slint",
  "slint-interpreter",
