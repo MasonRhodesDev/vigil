@@ -29,13 +29,14 @@ GHOST=vigil-attack-ghost
 WORK=$(mktemp -d)
 # `--wait` re-runs the locker under setsid, so neither its process group nor
 # its path tells this run's lockers from one the user runs from the same
-# build. The environment they inherit does.
-export VIGIL_ATTACK_RUN="$WORK"
+# build. Every config this run passes lives in $WORK, and `--wait` passes its
+# arguments on. The command line is read, not the environment: vigil-lock is
+# not dumpable, so its /proc environ is closed even to its own user.
 ours() {
     for pid in $(pgrep -x vigil-lock); do
-        tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null |
-            grep -qxF "VIGIL_ATTACK_RUN=$WORK" && echo "$pid"
-    done
+        tr '\0' '\n' 2>/dev/null <"/proc/$pid/cmdline" |
+            grep -qF "$WORK/" && echo "$pid"
+    done 2>/dev/null
     return 0
 }
 SWAY_PID=
