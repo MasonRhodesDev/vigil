@@ -280,14 +280,46 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
     drop(writer);
 }
 
-fn fake_helper(name: &str, script: &str) -> Helper {
+fn fake_script(name: &str, script: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("vigil-scene-fake-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    Helper::new(path, Duration::from_millis(300))
+    path
+}
+
+fn fake_helper(name: &str, script: &str) -> Helper {
+    Helper::new(fake_script(name, script), Duration::from_millis(300))
+}
+
+#[test]
+fn a_fake_helper_runs_while_other_threads_spawn() {
+    let svg = mark();
+    let req = request(&svg, Layer::Logo);
+    let need = req.bytes().unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = Command::new("true").status();
+                }
+            });
+        }
+        for i in 0..200 {
+            let script = fake_script(&format!("busy-{i}"), &format!("printf '%0{need}d' 0"));
+            let helper = Helper::new(script, PATIENT);
+            let mut out = vec![0u8; need];
+            let got = helper.draw(&req, &mut out);
+            if got.is_err() {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            got.unwrap_or_else(|e| panic!("run {i}: {e}"));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 #[test]
