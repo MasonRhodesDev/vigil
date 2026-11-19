@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use rustix::fs::{CWD, FileType, Mode};
-use vigil_unlock_token::{Moment, WINDOW, admit};
+use vigil_unlock_token::{Moment, Owners, WINDOW, admit};
 
 const SESSION: &str = "c1";
 const BOOT: &str = "6b1f0c4e-2d3a-4f5b-8c7d-9e0f1a2b3c4d";
@@ -31,7 +31,10 @@ enum Kind {
 
 #[derive(Debug, Clone)]
 pub struct Case {
-    trusted: bool,
+    token_trusted: bool,
+    dir_trusted: bool,
+    parent_trusted: bool,
+    parent_mode: u32,
     dir_mode: u32,
     kind: Kind,
     file_mode: u32,
@@ -69,7 +72,10 @@ fn admissible(content: &[u8]) -> bool {
 }
 
 fn expected(case: &Case) -> bool {
-    case.trusted
+    case.token_trusted
+        && case.dir_trusted
+        && case.parent_trusted
+        && case.parent_mode & 0o022 == 0
         && case.kind == Kind::Regular
         && case.file_mode & !0o644 == 0
         && case.dir_mode & 0o022 == 0
@@ -155,6 +161,7 @@ fn build(case: &Case) -> Result<Scene, String> {
         Kind::Missing => {}
     }
     chmod(&dir, case.dir_mode)?;
+    chmod(&base, case.parent_mode)?;
     Ok(scene)
 }
 
@@ -164,16 +171,17 @@ fn me() -> u32 {
 
 fn judge(case: &Case) -> Result<(), String> {
     let scene = build(case)?;
-    let owner = if case.trusted {
-        me()
-    } else {
-        me().wrapping_add(1)
+    let owner = |trusted| if trusted { me() } else { me().wrapping_add(1) };
+    let owners = Owners {
+        token: owner(case.token_trusted),
+        dir: owner(case.dir_trusted),
+        parent: owner(case.parent_trusted),
     };
     let at = Moment {
         boot: BOOT.into(),
         since_boot: NOW,
     };
-    let verdict = admit(&scene.dir, owner, SESSION, &at);
+    let verdict = admit(&scene.dir, owners, SESSION, &at);
     if verdict.is_ok() != expected(case) {
         return Err(format!(
             "admit said {verdict:?}, the reference says {}admit",
@@ -252,9 +260,16 @@ fn kind() -> impl Strategy<Value = Kind> {
 }
 
 fn case() -> impl Strategy<Value = Case> {
+    let mode =
+        || prop_oneof![3 => Just(0o700u32), 1 => (0..0o100u32).prop_map(|bits| 0o700 | bits)];
     (
-        proptest::bool::weighted(0.85),
-        prop_oneof![3 => Just(0o700u32), 1 => (0..0o100u32).prop_map(|bits| 0o700 | bits)],
+        [
+            proptest::bool::weighted(0.95),
+            proptest::bool::weighted(0.95),
+            proptest::bool::weighted(0.95),
+        ],
+        mode(),
+        mode(),
         kind(),
         prop_oneof![
             3 => Just(0o644u32),
@@ -263,13 +278,25 @@ fn case() -> impl Strategy<Value = Case> {
         ],
         content(),
     )
-        .prop_map(|(trusted, dir_mode, kind, file_mode, content)| Case {
-            trusted,
-            dir_mode,
-            kind,
-            file_mode,
-            content,
-        })
+        .prop_map(
+            |(
+                [token_trusted, dir_trusted, parent_trusted],
+                parent_mode,
+                dir_mode,
+                kind,
+                file_mode,
+                content,
+            )| Case {
+                token_trusted,
+                dir_trusted,
+                parent_trusted,
+                parent_mode,
+                dir_mode,
+                kind,
+                file_mode,
+                content,
+            },
+        )
 }
 
 pub fn attack(cases: u32, seed: u64) -> bool {
@@ -304,7 +331,10 @@ pub fn attack(cases: u32, seed: u64) -> bool {
 fn pinned() -> Vec<(&'static str, bool, Case)> {
     let fresh = token(SESSION, BOOT, &issued_at(Duration::from_secs(1)));
     let good = Case {
-        trusted: true,
+        token_trusted: true,
+        dir_trusted: true,
+        parent_trusted: true,
+        parent_mode: 0o755,
         dir_mode: 0o755,
         kind: Kind::Regular,
         file_mode: 0o644,
@@ -337,7 +367,26 @@ fn pinned() -> Vec<(&'static str, bool, Case)> {
             with(|c| c.file_mode = 0o400),
         ),
         ("no token", false, with(|c| c.kind = Kind::Missing)),
-        ("a token the user owns", false, with(|c| c.trusted = false)),
+        (
+            "a token the user owns",
+            false,
+            with(|c| c.token_trusted = false),
+        ),
+        (
+            "root's token in a directory the user owns",
+            false,
+            with(|c| c.dir_trusted = false),
+        ),
+        (
+            "root's token under a parent the user owns",
+            false,
+            with(|c| c.parent_trusted = false),
+        ),
+        (
+            "root's token under a parent others can write",
+            false,
+            with(|c| c.parent_mode = 0o777),
+        ),
         (
             "a token one nanosecond stale",
             false,

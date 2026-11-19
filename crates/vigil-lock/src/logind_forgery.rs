@@ -13,7 +13,7 @@ use vigil_config::Lock;
 use vigil_core::{AppearanceEvent, ColorScheme, LoginEvent};
 use vigil_flow::{FlowCmd, FlowEvent, FlowPhase, LockFlow, LockOutcome, Now};
 use vigil_login::{AppearanceWatcher, LoginSession};
-use vigil_unlock_token::{Moment, WINDOW, issue, render};
+use vigil_unlock_token::{Moment, Owners, WINDOW, issue, render};
 use zbus::export::futures_core::Stream;
 use zbus::fdo::DBusProxy;
 use zbus::{Connection, Message, MessageStream, OwnedObjectPath, Variant, block_on};
@@ -598,25 +598,31 @@ fn forged_portal_setting_is_ignored() {
 }
 
 struct TokenDir {
+    base: PathBuf,
     path: PathBuf,
     elsewhere: PathBuf,
 }
 
 impl TokenDir {
     // Each scenario runs in a process of its own, so the trust set here is the only one.
-    fn trusting(owner: u32) -> Self {
-        let path = std::env::temp_dir().join(format!("vigil-test-unlock-{}", std::process::id()));
-        let elsewhere = path.with_extension("elsewhere");
-        for dir in [&path, &elsewhere] {
-            let _ = std::fs::remove_dir_all(dir);
+    fn trusting(owners: Owners) -> Self {
+        let base = std::env::temp_dir().join(format!("vigil-test-unlock-{}", std::process::id()));
+        let path = base.join("unlock");
+        let elsewhere = base.join("elsewhere");
+        let _ = std::fs::remove_dir_all(&base);
+        for dir in [&base, &path, &elsewhere] {
             std::fs::create_dir(dir).expect("create a token directory");
             std::fs::set_permissions(dir, Permissions::from_mode(0o755))
                 .expect("chmod a token directory");
         }
         super::TEST_TRUST
-            .set((path.clone(), owner))
+            .set((path.clone(), owners))
             .expect("one trust per scenario process");
-        Self { path, elsewhere }
+        Self {
+            base,
+            path,
+            elsewhere,
+        }
     }
 
     fn plant(&self, name: &str, content: &str) {
@@ -628,13 +634,16 @@ impl TokenDir {
 
 impl Drop for TokenDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-        let _ = std::fs::remove_dir_all(&self.elsewhere);
+        let _ = std::fs::remove_dir_all(&self.base);
     }
 }
 
 fn me() -> u32 {
     rustix::process::getuid().as_raw()
+}
+
+fn mine() -> Owners {
+    Owners::all(me())
 }
 
 fn now() -> Moment {
@@ -643,7 +652,7 @@ fn now() -> Moment {
 
 fn unlock_with_token(
     address: &str,
-    trusted: u32,
+    trusted: Owners,
     plant: impl FnOnce(&TokenDir),
 ) -> (LockFlow, Vec<FlowCmd>) {
     let owner = logind(address);
@@ -670,13 +679,13 @@ fn assert_refused(flow: &LockFlow, cmds: &[FlowCmd]) {
     );
 }
 
-fn refused_with(address: &str, trusted: u32, plant: impl FnOnce(&TokenDir)) {
+fn refused_with(address: &str, trusted: Owners, plant: impl FnOnce(&TokenDir)) {
     let (flow, cmds) = unlock_with_token(address, trusted, plant);
     assert_refused(&flow, &cmds);
 }
 
 fn owner_unlock_without_token(address: &str) {
-    refused_with(address, me(), |_| {});
+    refused_with(address, mine(), |_| {});
 }
 
 #[test]
@@ -691,7 +700,7 @@ fn owner_unlock_during_warning(address: &str) {
     let owner = logind(address);
     let (session, rx) = subscribed_session(&owner);
     let mut flow = warning_flow();
-    let _tokens = TokenDir::trusting(me());
+    let _tokens = TokenDir::trusting(mine());
     send(&owner, None, LoginEvent::Unlock);
     send(&owner, None, LoginEvent::Lock);
     let events = until(&rx, LoginEvent::Lock);
@@ -711,8 +720,12 @@ fn the_owners_unlock_during_the_warning_is_refused() {
 }
 
 fn user_owned_token(address: &str) {
-    refused_with(address, me().wrapping_add(1), |tokens| {
-        issue(&tokens.path, me(), SESSION_ID, &now()).expect("issue as the user");
+    let trusted = Owners {
+        token: me().wrapping_add(1),
+        ..mine()
+    };
+    refused_with(address, trusted, |tokens| {
+        issue(&tokens.path, mine(), SESSION_ID, &now()).expect("issue as the user");
     });
 }
 
@@ -721,14 +734,32 @@ fn a_token_the_user_owns_is_refused() {
     on_private_bus("a_token_the_user_owns_is_refused", user_owned_token);
 }
 
+fn user_owned_dir(address: &str) {
+    let trusted = Owners {
+        dir: me().wrapping_add(1),
+        ..mine()
+    };
+    refused_with(address, trusted, |tokens| {
+        issue(&tokens.path, mine(), SESSION_ID, &now()).expect("issue as the user");
+    });
+}
+
+#[test]
+fn a_root_token_in_a_directory_the_user_owns_is_refused() {
+    on_private_bus(
+        "a_root_token_in_a_directory_the_user_owns_is_refused",
+        user_owned_dir,
+    );
+}
+
 fn stale_token(address: &str) {
-    refused_with(address, me(), |tokens| {
+    refused_with(address, mine(), |tokens| {
         let now = now();
         let then = Moment {
             since_boot: now.since_boot - WINDOW - Duration::from_secs(1),
             ..now
         };
-        issue(&tokens.path, me(), SESSION_ID, &then).expect("issue a stale token");
+        issue(&tokens.path, mine(), SESSION_ID, &then).expect("issue a stale token");
     });
 }
 
@@ -738,9 +769,9 @@ fn a_stale_token_is_refused() {
 }
 
 fn other_session_token(address: &str) {
-    refused_with(address, me(), |tokens| {
+    refused_with(address, mine(), |tokens| {
         tokens.plant(SESSION_ID, &render("c2", &now()));
-        issue(&tokens.path, me(), "c2", &now()).expect("issue for c2");
+        issue(&tokens.path, mine(), "c2", &now()).expect("issue for c2");
     });
 }
 
@@ -753,7 +784,7 @@ fn a_token_for_another_session_is_refused() {
 }
 
 fn other_boot_token(address: &str) {
-    refused_with(address, me(), |tokens| {
+    refused_with(address, mine(), |tokens| {
         let now = now();
         let boot = if now.boot.starts_with('0') { "1" } else { "0" };
         let other = Moment {
@@ -770,8 +801,8 @@ fn a_token_from_another_boot_is_refused() {
 }
 
 fn symlinked_token(address: &str) {
-    refused_with(address, me(), |tokens| {
-        issue(&tokens.elsewhere, me(), SESSION_ID, &now()).expect("issue elsewhere");
+    refused_with(address, mine(), |tokens| {
+        issue(&tokens.elsewhere, mine(), SESSION_ID, &now()).expect("issue elsewhere");
         std::os::unix::fs::symlink(
             tokens.elsewhere.join(SESSION_ID),
             tokens.path.join(SESSION_ID),
@@ -786,8 +817,8 @@ fn a_symlinked_token_is_refused() {
 }
 
 fn writable_dir_token(address: &str) {
-    refused_with(address, me(), |tokens| {
-        issue(&tokens.path, me(), SESSION_ID, &now()).expect("issue");
+    refused_with(address, mine(), |tokens| {
+        issue(&tokens.path, mine(), SESSION_ID, &now()).expect("issue");
         std::fs::set_permissions(&tokens.path, Permissions::from_mode(0o777))
             .expect("open the directory to everyone");
     });
@@ -802,8 +833,8 @@ fn a_token_in_a_directory_others_can_write_is_refused() {
 }
 
 fn root_token(address: &str) {
-    let (_flow, cmds) = unlock_with_token(address, me(), |tokens| {
-        issue(&tokens.path, me(), SESSION_ID, &now()).expect("issue as root");
+    let (_flow, cmds) = unlock_with_token(address, mine(), |tokens| {
+        issue(&tokens.path, mine(), SESSION_ID, &now()).expect("issue as root");
     });
     assert!(
         unlocks(&cmds),

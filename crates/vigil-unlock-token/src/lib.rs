@@ -6,16 +6,15 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::time::Duration;
 
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{self, AtFlags, CWD, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use rustix::time::{ClockId, clock_gettime};
 
 pub const DIR: &str = "/run/vigil/unlock";
-pub const ROOT: u32 = 0;
 pub const WINDOW: Duration = Duration::from_secs(10);
 
 const MAGIC: &str = "vigil-unlock 1";
@@ -25,6 +24,27 @@ const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 const TOKEN_MODE: u32 = 0o644;
 const DIR_MODE: u32 = 0o755;
 const WRITABLE_BY_OTHERS: u32 = 0o022;
+
+/// Who must own the token, its directory, and that directory's parent. Root owns all three on
+/// a real system; tests vary each one alone so every ownership check is pinned by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owners {
+    pub token: u32,
+    pub dir: u32,
+    pub parent: u32,
+}
+
+impl Owners {
+    pub const ROOT: Self = Self::all(0);
+
+    pub const fn all(uid: u32) -> Self {
+        Self {
+            token: uid,
+            dir: uid,
+            parent: uid,
+        }
+    }
+}
 
 /// Where and when a token is written or judged. `since_boot` reads `CLOCK_BOOTTIME`, which
 /// never steps with the wall clock and keeps counting through suspend, and `boot` keeps a
@@ -63,8 +83,11 @@ pub enum Refusal {
     NotRoot,
     Loose,
     Linked,
+    DirSymlink,
     DirNotRoot,
     DirWritable,
+    ParentNotRoot,
+    ParentWritable,
     Malformed,
     OtherSession,
     OtherBoot,
@@ -84,8 +107,15 @@ impl fmt::Display for Refusal {
             Self::NotRoot => f.write_str("the token is not owned by root"),
             Self::Loose => f.write_str("the token's mode is looser than 0644"),
             Self::Linked => f.write_str("the token has another hard link"),
+            Self::DirSymlink => {
+                f.write_str("the token directory or its parent is a symlink or not a directory")
+            }
             Self::DirNotRoot => f.write_str("the token directory is not owned by root"),
             Self::DirWritable => f.write_str("the token directory is writable by others"),
+            Self::ParentNotRoot => f.write_str("the token directory's parent is not owned by root"),
+            Self::ParentWritable => {
+                f.write_str("the token directory's parent is writable by others")
+            }
             Self::Malformed => f.write_str("the token is malformed"),
             Self::OtherSession => f.write_str("the token names another session"),
             Self::OtherBoot => f.write_str("the token is from another boot"),
@@ -113,18 +143,26 @@ pub fn render(session: &str, at: &Moment) -> String {
     )
 }
 
-/// Ok only for a fresh token that `owner` wrote for `session` in a directory only `owner` can
-/// change. The checks run on descriptors, so a path swapped between them cannot pass.
-pub fn admit(dir: &Path, owner: u32, session: &str, at: &Moment) -> Result<(), Refusal> {
+/// Ok only for a fresh token that `owners.token` wrote for `session` in a directory, under a
+/// parent, that only their owners can change. The checks run on descriptors, so a path
+/// swapped between them cannot pass.
+pub fn admit(dir: &Path, owners: Owners, session: &str, at: &Moment) -> Result<(), Refusal> {
     if !valid_session(session) {
         return Err(Refusal::BadSession);
     }
-    let dir = open_dir(dir).map_err(|errno| match errno {
-        Errno::NOENT => Refusal::NoToken,
-        errno => Refusal::Unreadable(errno),
-    })?;
+    let dir = trusted_dir(dir, owners)?;
+    admit_in(&dir, owners, session, at)
+}
+
+/// [`admit`] against the system directory, root, and this moment.
+pub fn admit_now(session: &str) -> Result<(), Refusal> {
+    let at = Moment::now().map_err(|_| Refusal::NoMoment)?;
+    admit(Path::new(DIR), Owners::ROOT, session, &at)
+}
+
+fn admit_in(dir: &OwnedFd, owners: Owners, session: &str, at: &Moment) -> Result<(), Refusal> {
     let token = fs::openat(
-        &dir,
+        dir,
         session,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
         Mode::empty(),
@@ -138,7 +176,7 @@ pub fn admit(dir: &Path, owner: u32, session: &str, at: &Moment) -> Result<(), R
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
         return Err(Refusal::NotRegular);
     }
-    if stat.st_uid != owner {
+    if stat.st_uid != owners.token {
         return Err(Refusal::NotRoot);
     }
     if stat.st_mode & 0o7777 & !TOKEN_MODE != 0 {
@@ -147,7 +185,6 @@ pub fn admit(dir: &Path, owner: u32, session: &str, at: &Moment) -> Result<(), R
     if stat.st_nlink != 1 {
         return Err(Refusal::Linked);
     }
-    trusted_dir(&dir, owner)?;
     let mut content = Vec::with_capacity(MAX_LEN + 1);
     File::from(token)
         .take(MAX_LEN as u64 + 1)
@@ -156,29 +193,53 @@ pub fn admit(dir: &Path, owner: u32, session: &str, at: &Moment) -> Result<(), R
     judge(&content, session, at)
 }
 
-/// [`admit`] against the system directory, root, and this moment.
-pub fn admit_now(session: &str) -> Result<(), Refusal> {
-    let at = Moment::now().map_err(|_| Refusal::NoMoment)?;
-    admit(Path::new(DIR), ROOT, session, &at)
-}
-
-fn open_dir(dir: &Path) -> Result<OwnedFd, Errno> {
-    fs::open(
-        dir,
+fn open_level(at: impl rustix::fd::AsFd, path: &Path) -> Result<OwnedFd, Refusal> {
+    fs::openat(
+        at,
+        path,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
+    .map_err(|errno| match errno {
+        Errno::NOENT => Refusal::NoToken,
+        Errno::LOOP | Errno::NOTDIR => Refusal::DirSymlink,
+        errno => Refusal::Unreadable(errno),
+    })
 }
 
-fn trusted_dir(dir: &OwnedFd, owner: u32) -> Result<(), Refusal> {
-    let stat = fs::fstat(dir).map_err(Refusal::Unreadable)?;
+fn owned_shut(
+    level: &OwnedFd,
+    owner: u32,
+    not_owned: Refusal,
+    writable: Refusal,
+) -> Result<(), Refusal> {
+    let stat = fs::fstat(level).map_err(Refusal::Unreadable)?;
     if stat.st_uid != owner {
-        return Err(Refusal::DirNotRoot);
+        return Err(not_owned);
     }
     if stat.st_mode & WRITABLE_BY_OTHERS != 0 {
-        return Err(Refusal::DirWritable);
+        return Err(writable);
     }
     Ok(())
+}
+
+/// Opens `dir` through its parent, neither one followed as a symlink, and checks that only
+/// their owners can change either. Whoever could rename or replace the token directory could
+/// plant a token, so the parent counts as much as the directory itself.
+fn trusted_dir(dir: &Path, owners: Owners) -> Result<OwnedFd, Refusal> {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        return Err(Refusal::Unreadable(Errno::INVAL));
+    };
+    let parent = open_level(CWD, parent)?;
+    owned_shut(
+        &parent,
+        owners.parent,
+        Refusal::ParentNotRoot,
+        Refusal::ParentWritable,
+    )?;
+    let dir = open_level(&parent, Path::new(name))?;
+    owned_shut(&dir, owners.dir, Refusal::DirNotRoot, Refusal::DirWritable)?;
+    Ok(dir)
 }
 
 fn judge(content: &[u8], session: &str, at: &Moment) -> Result<(), Refusal> {
@@ -222,6 +283,10 @@ fn canonical_nanos(digits: &str) -> Option<u64> {
     canonical.then(|| digits.parse().ok()).flatten()
 }
 
+fn refused(why: Refusal) -> io::Error {
+    io::Error::other(why.to_string())
+}
+
 /// Creates `dir` and its parent with mode 0755 when they are missing. Root runs this, so a
 /// lock still reads its token on an install whose tmpfiles entry has not run yet.
 pub fn prepare(dir: &Path) -> io::Result<()> {
@@ -235,45 +300,77 @@ pub fn prepare(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Writes the token for `session` as `owner` would leave it: a temporary file in the same
-/// directory, renamed over the name [`admit`] opens, so a reader never sees half a token.
-pub fn issue(dir: &Path, owner: u32, session: &str, at: &Moment) -> io::Result<()> {
+/// Writes the token for `session` as `owners.token` would leave it. The token is written to
+/// an unnamed file and linked in whole, so a reader never sees half a token and a run killed
+/// part way leaves no temporary file behind.
+pub fn issue(dir: &Path, owners: Owners, session: &str, at: &Moment) -> io::Result<()> {
     if !valid_session(session) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{session:?} is not a logind session id"),
         ));
     }
-    let dir = open_dir(dir)?;
-    trusted_dir(&dir, owner).map_err(|why| io::Error::other(why.to_string()))?;
-    let temp = format!(".{session}.{}", std::process::id());
-    let written = fs::openat(
+    let dir = trusted_dir(dir, owners).map_err(refused)?;
+    let fd = fs::openat(
         &dir,
-        &temp,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        ".",
+        OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
         Mode::from_raw_mode(TOKEN_MODE),
-    )
-    .map_err(io::Error::from)
-    .and_then(|fd| {
-        fs::fchmod(&fd, Mode::from_raw_mode(TOKEN_MODE))?;
-        File::from(fd).write_all(render(session, at).as_bytes())?;
-        fs::renameat(&dir, &temp, &dir, session)?;
-        Ok(())
-    });
-    if written.is_err() {
-        let _ = fs::unlinkat(&dir, &temp, AtFlags::empty());
+    )?;
+    fs::fchmod(&fd, Mode::from_raw_mode(TOKEN_MODE))?;
+    let mut file = File::from(fd);
+    file.write_all(render(session, at).as_bytes())?;
+    let unnamed = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let link = || {
+        fs::linkat(
+            CWD,
+            unnamed.as_str(),
+            &dir,
+            session,
+            AtFlags::SYMLINK_FOLLOW,
+        )
+    };
+    match link() {
+        Err(Errno::EXIST) => {
+            fs::unlinkat(&dir, session, AtFlags::empty())?;
+            link()?;
+        }
+        linked => linked?,
     }
-    written
+    Ok(())
 }
 
 pub fn revoke(dir: &Path, session: &str) -> io::Result<()> {
     if !valid_session(session) {
         return Ok(());
     }
-    match fs::unlinkat(open_dir(dir)?, session, AtFlags::empty()) {
+    let dir = open_level(CWD, dir).map_err(refused)?;
+    match fs::unlinkat(&dir, session, AtFlags::empty()) {
         Ok(()) | Err(Errno::NOENT) => Ok(()),
         Err(errno) => Err(errno.into()),
     }
+}
+
+/// Removes every entry of a trusted `dir` that is not a fresh token. A run cut short before it
+/// revoked leaves a token that lapses after [`WINDOW`]; the next run clears it away here.
+pub fn sweep(dir: &Path, owners: Owners, at: &Moment) -> io::Result<()> {
+    let opened = trusted_dir(dir, owners).map_err(refused)?;
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let fresh = name
+            .to_str()
+            .is_some_and(|name| valid_session(name) && admit_in(&opened, owners, name, at).is_ok());
+        if !fresh {
+            match fs::unlinkat(&opened, name.as_os_str(), AtFlags::empty()) {
+                Ok(()) | Err(Errno::NOENT) => {}
+                Err(Errno::ISDIR) => {
+                    let _ = fs::unlinkat(&opened, name.as_os_str(), AtFlags::REMOVEDIR);
+                }
+                Err(errno) => return Err(errno.into()),
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -303,31 +400,202 @@ mod tests {
         assert!(now.since_boot > Duration::ZERO);
     }
 
+    fn me() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
+    fn mine() -> Owners {
+        Owners::all(me())
+    }
+
+    fn someone_else() -> u32 {
+        me().wrapping_add(1)
+    }
+
+    struct Scene {
+        base: std::path::PathBuf,
+        dir: std::path::PathBuf,
+    }
+
+    impl Scene {
+        fn new(name: &str) -> Self {
+            let base = std::env::temp_dir()
+                .join(format!("vigil-token-unit-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir(&base).expect("create the base directory");
+            let dir = base.join("vigil").join("unlock");
+            prepare(&dir).expect("create both levels");
+            Self { base, dir }
+        }
+
+        fn parent(&self) -> &Path {
+            self.dir.parent().expect("parent")
+        }
+
+        fn names(&self) -> Vec<String> {
+            let mut names: Vec<_> = std::fs::read_dir(&self.dir)
+                .expect("list")
+                .map(|e| e.expect("entry").file_name().into_string().expect("utf-8"))
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for Scene {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        fs::chmod(path, Mode::from_raw_mode(mode)).expect("chmod");
+    }
+
     #[test]
     fn prepare_issue_admit_revoke_round_trip() {
-        let base = std::env::temp_dir().join(format!("vigil-token-unit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir(&base).expect("create the base directory");
-        let dir = base.join("vigil").join("unlock");
-        prepare(&dir).expect("create both levels");
-        prepare(&dir).expect("prepare again");
-        for level in [dir.parent().expect("parent"), dir.as_path()] {
+        let scene = Scene::new("round-trip");
+        prepare(&scene.dir).expect("prepare again");
+        for level in [scene.parent(), scene.dir.as_path()] {
             let mode = fs::stat(level).expect("stat").st_mode & 0o7777;
             assert_eq!(mode, DIR_MODE, "{}", level.display());
         }
-        let me = rustix::process::getuid().as_raw();
         let now = Moment::now().expect("this boot");
-        issue(&dir, me, "c1", &now).expect("issue");
-        assert_eq!(admit(&dir, me, "c1", &now), Ok(()));
-        revoke(&dir, "c1").expect("revoke");
-        revoke(&dir, "c1").expect("revoke again");
-        assert_eq!(admit(&dir, me, "c1", &now), Err(Refusal::NoToken));
+        issue(&scene.dir, mine(), "c1", &now).expect("issue");
+        issue(&scene.dir, mine(), "c1", &now).expect("issue over an earlier token");
+        assert_eq!(admit(&scene.dir, mine(), "c1", &now), Ok(()));
+        assert_eq!(scene.names(), ["c1"], "only the token is in the directory");
+        revoke(&scene.dir, "c1").expect("revoke");
+        revoke(&scene.dir, "c1").expect("revoke again");
+        assert_eq!(admit(&scene.dir, mine(), "c1", &now), Err(Refusal::NoToken));
+        assert!(scene.names().is_empty(), "{:?}", scene.names());
+    }
+
+    #[test]
+    fn a_token_someone_else_owns_is_refused_in_a_trusted_directory() {
+        let scene = Scene::new("token-owner");
+        let now = Moment::now().expect("this boot");
+        issue(&scene.dir, mine(), "c1", &now).expect("issue");
+        let owners = Owners {
+            token: someone_else(),
+            ..mine()
+        };
+        assert_eq!(admit(&scene.dir, owners, "c1", &now), Err(Refusal::NotRoot));
+    }
+
+    #[test]
+    fn a_trusted_token_in_a_directory_someone_else_owns_is_refused() {
+        let scene = Scene::new("dir-owner");
+        let now = Moment::now().expect("this boot");
+        issue(&scene.dir, mine(), "c1", &now).expect("issue");
+        let owners = Owners {
+            dir: someone_else(),
+            ..mine()
+        };
         assert_eq!(
-            std::fs::read_dir(&dir).expect("list").count(),
-            0,
-            "a temporary file stayed"
+            admit(&scene.dir, owners, "c1", &now),
+            Err(Refusal::DirNotRoot)
         );
-        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_token_under_a_parent_someone_else_owns_is_refused() {
+        let scene = Scene::new("parent-owner");
+        let now = Moment::now().expect("this boot");
+        issue(&scene.dir, mine(), "c1", &now).expect("issue");
+        let owners = Owners {
+            parent: someone_else(),
+            ..mine()
+        };
+        assert_eq!(
+            admit(&scene.dir, owners, "c1", &now),
+            Err(Refusal::ParentNotRoot)
+        );
+        assert!(issue(&scene.dir, owners, "c1", &now).is_err());
+    }
+
+    #[test]
+    fn a_token_under_a_parent_others_can_write_is_refused() {
+        let scene = Scene::new("parent-writable");
+        let now = Moment::now().expect("this boot");
+        issue(&scene.dir, mine(), "c1", &now).expect("issue");
+        chmod(scene.parent(), 0o777);
+        assert_eq!(
+            admit(&scene.dir, mine(), "c1", &now),
+            Err(Refusal::ParentWritable)
+        );
+        assert!(issue(&scene.dir, mine(), "c1", &now).is_err());
+    }
+
+    #[test]
+    fn a_symlinked_token_directory_is_refused() {
+        let scene = Scene::new("dir-symlink");
+        let now = Moment::now().expect("this boot");
+        let real = scene.parent().join("real");
+        std::fs::rename(&scene.dir, &real).expect("move the directory aside");
+        std::os::unix::fs::symlink(&real, &scene.dir).expect("link it back");
+        issue(&real, mine(), "c1", &now).expect("issue in the real directory");
+        assert_eq!(admit(&real, mine(), "c1", &now), Ok(()));
+        assert_eq!(
+            admit(&scene.dir, mine(), "c1", &now),
+            Err(Refusal::DirSymlink)
+        );
+        assert!(issue(&scene.dir, mine(), "c1", &now).is_err());
+    }
+
+    #[test]
+    fn a_symlinked_parent_is_refused() {
+        let scene = Scene::new("parent-symlink");
+        let now = Moment::now().expect("this boot");
+        issue(&scene.dir, mine(), "c1", &now).expect("issue");
+        let linked = scene.base.join("linked");
+        std::os::unix::fs::symlink(scene.parent(), &linked).expect("link the parent");
+        assert_eq!(
+            admit(&linked.join("unlock"), mine(), "c1", &now),
+            Err(Refusal::DirSymlink)
+        );
+    }
+
+    #[test]
+    fn a_temporary_file_left_by_a_killed_run_does_not_block_the_next() {
+        let scene = Scene::new("stale-temp");
+        let now = Moment::now().expect("this boot");
+        std::fs::write(
+            scene.dir.join(format!(".c1.{}", std::process::id())),
+            "half",
+        )
+        .expect("plant a temporary file");
+        issue(&scene.dir, mine(), "c1", &now).expect("issue");
+        assert_eq!(admit(&scene.dir, mine(), "c1", &now), Ok(()));
+    }
+
+    #[test]
+    fn sweep_removes_what_a_cut_short_run_left_and_keeps_fresh_tokens() {
+        let scene = Scene::new("sweep");
+        let now = Moment::now().expect("this boot");
+        let then = Moment {
+            since_boot: now.since_boot - WINDOW - Duration::from_secs(1),
+            ..now.clone()
+        };
+        issue(&scene.dir, mine(), "fresh", &now).expect("issue a fresh token");
+        issue(&scene.dir, mine(), "stale", &then).expect("issue a stale token");
+        std::fs::write(scene.dir.join(".c1.123"), "half").expect("plant a temporary file");
+        std::fs::write(scene.dir.join("junk"), "not a token").expect("plant junk");
+        sweep(&scene.dir, mine(), &now).expect("sweep");
+        assert_eq!(scene.names(), ["fresh"]);
+    }
+
+    #[test]
+    fn sweep_leaves_an_untrusted_directory_alone() {
+        let scene = Scene::new("sweep-untrusted");
+        let now = Moment::now().expect("this boot");
+        std::fs::write(scene.dir.join("junk"), "not a token").expect("plant junk");
+        let owners = Owners {
+            dir: someone_else(),
+            ..mine()
+        };
+        assert!(sweep(&scene.dir, owners, &now).is_err());
+        assert_eq!(scene.names(), ["junk"]);
     }
 
     #[test]
