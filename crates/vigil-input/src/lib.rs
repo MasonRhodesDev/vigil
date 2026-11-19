@@ -397,6 +397,26 @@ mod tests {
     }
 
     #[test]
+    fn keypad_enter_never_repeats() {
+        const KEY_KPENTER: u32 = 96;
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
+        let now = Instant::now();
+        let _ = keyboard.key(KEY_KPENTER, true, now);
+        assert_eq!(keyboard.next_repeat_deadline(), None);
+        assert!(keyboard.tick_repeat(now + REPEAT_DELAY * 4).is_empty());
+    }
+
+    #[test]
+    fn a_stalled_loop_gets_one_repeat_not_the_backlog() {
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
+        let now = Instant::now();
+        let _ = keyboard.key(KEY_A, true, now);
+        let late = now + REPEAT_DELAY + REPEAT_INTERVAL * 30;
+        assert_eq!(keyboard.tick_repeat(late).len(), 1);
+        assert_eq!(keyboard.next_repeat_deadline(), Some(late + REPEAT_INTERVAL));
+    }
+
+    #[test]
     fn enter_ends_the_repeat_of_a_held_key() {
         let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         let now = Instant::now();

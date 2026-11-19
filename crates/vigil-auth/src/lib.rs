@@ -894,6 +894,32 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_enter_never_answers_a_secret_question() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Visible, "Login:"),
+            secret_prompt(),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(
+            sent(&requests),
+            ["create alice", "answer ", "answer hunter2", "start"],
+            "an empty visible answer is sent, an empty secret one is not"
+        );
+        assert!(machine.is_complete());
+    }
+
+    #[test]
     fn handles_multiple_prompts() {
         let Some((server, requests)) = scripted(vec![
             auth_message(AuthMessageType::Visible, "Login:"),

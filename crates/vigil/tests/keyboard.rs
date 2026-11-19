@@ -615,3 +615,17 @@ fn control_z_never_brings_back_a_deleted_password() {
     g.tap(RETURN);
     assert_eq!(g.take(), [Sent::Respond("".into())]);
 }
+
+#[test]
+fn a_held_enter_or_keypad_enter_submits_once() {
+    const KP_ENTER: u32 = 0xff8d;
+    let mut g = Greeter::new();
+    for enter in [RETURN, KP_ENTER] {
+        g.type_text("pw");
+        for _ in 0..5 {
+            g.event(enter, Some("\r"), true);
+        }
+        g.event(enter, None, false);
+        assert_eq!(g.take(), [Sent::Respond("pw".into())], "{enter:#x}");
+    }
+}

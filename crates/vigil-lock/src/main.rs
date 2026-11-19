@@ -1524,6 +1524,38 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_enter_never_answers_a_secret_question() {
+        let answered: Rc<RefCell<Vec<String>>> = Rc::default();
+        let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
+        let probe = answered.clone();
+        let mut worker = None;
+        track.start(|tx| {
+            worker = Some(tx);
+            FakeAttempt {
+                answered: probe,
+                ..FakeAttempt::default()
+            }
+        });
+        let worker = worker.expect("worker");
+        let prompt = |text: &str, secret| AuthEvent::Prompt {
+            text: text.into(),
+            secret,
+        };
+        let _ = worker.send(prompt("Password:", true));
+        let _ = track.drain();
+        track.respond(String::new());
+        track.respond("hunter2".into());
+        let _ = worker.send(prompt("Code:", false));
+        let _ = track.drain();
+        track.respond(String::new());
+        assert_eq!(
+            *answered.borrow(),
+            ["hunter2", ""],
+            "an empty visible answer is sent, an empty secret one is not"
+        );
+    }
+
+    #[test]
     fn a_rejected_credential_is_still_shown_and_reprompted() {
         assert_eq!(
             done_outcome(
