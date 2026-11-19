@@ -392,7 +392,8 @@ export component DefaultTheme inherits Window {
                         font-size: 13px;
                         wrap: word-wrap;
                         vertical-alignment: center;
-                        text: root.auth-state == "busy" ? "Checking…"
+                        text: root.info-message != "" && root.auth-state == "busy" ? root.info-message
+                            : root.auth-state == "busy" ? "Checking…"
                             : root.error-message != "" ? root.error-message
                             : root.info-message != "" ? root.info-message
                             : root.key-hint != "" ? root.key-hint
