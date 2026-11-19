@@ -296,6 +296,7 @@ fn the_shipped_helper_draws_under_its_syscall_filter() {
         .args(["layer", "--mode", "4096x4096", "--transform", "0"])
         .args(["--layer", "frame", "--value", "1", "--spec-len", "0"])
         .args(["--svg-len", &svg.len().to_string(), "--deadline-ms", "5000"])
+        .args(["--out-len", &(4096 * 4096 * 4).to_string()])
         .args(["--abi", vigil_scene::HELPER_ABI])
         .stdin(reader)
         .stdout(Stdio::null())
@@ -359,6 +360,8 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
             "64",
             "--deadline-ms",
             "2500",
+            "--out-len",
+            "4096",
             "--abi",
             vigil_scene::HELPER_ABI,
         ])
@@ -390,7 +393,7 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
     assert_eq!(limit("Max open files"), ("3", "3"));
     assert_eq!(limit("Max core file size"), ("0", "0"));
     assert_eq!(limit("Max processes"), ("0", "0"));
-    assert_eq!(limit("Max file size"), ("268439552", "268439552"));
+    assert_eq!(limit("Max file size"), ("8192", "8192"));
     let mut fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -408,7 +411,8 @@ fn the_helper_never_raises_a_soft_limit_it_inherits() {
     let mut child = Command::new("sh")
         .args(["-c", r#"ulimit -S -t 1 && exec "$@""#, "sh", BIN])
         .args(["mask", "--format", "svg", "--edge", "64"])
-        .args(["--deadline-ms", "2500", "--abi", vigil_scene::HELPER_ABI])
+        .args(["--deadline-ms", "2500", "--out-len", "4096"])
+        .args(["--abi", vigil_scene::HELPER_ABI])
         .stdin(reader)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -449,6 +453,25 @@ fn a_helper_of_another_version_is_a_helper_fault() {
     let said = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(14), "{said}");
     assert!(said.contains("0.0.0-elsewhere"), "{said}");
+}
+
+#[test]
+fn a_helper_that_would_write_another_size_writes_nothing() {
+    let svg = mark();
+    let mut child = Command::new(BIN)
+        .args(["mask", "--format", "svg", "--edge", "8", "--out-len", "65"])
+        .args(["--deadline-ms", "5000", "--abi", vigil_scene::HELPER_ABI])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), &svg).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(14), "{said}");
+    assert!(said.contains("65"), "{said}");
+    assert!(out.stdout.is_empty(), "{} bytes written", out.stdout.len());
 }
 
 // A script this process opened for writing cannot be run while any child
@@ -705,6 +728,8 @@ fn the_helper_dies_with_the_thread_that_started_it() {
                 "64",
                 "--deadline-ms",
                 "60000",
+                "--out-len",
+                "4096",
                 "--abi",
                 vigil_scene::HELPER_ABI,
             ])
