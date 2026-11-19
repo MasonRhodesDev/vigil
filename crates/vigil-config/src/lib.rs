@@ -863,6 +863,7 @@ pub struct State {
     pub session: String,
     pub auto_started_at: Option<u64>,
     pub auto_streak: u32,
+    pub unprompted_user: String,
 }
 
 impl State {
@@ -894,6 +895,12 @@ impl State {
         );
         if let Some(at) = self.auto_started_at {
             body.push_str(&format!("auto_started_at = {at}\n"));
+        }
+        if !self.unprompted_user.is_empty() {
+            body.push_str(&format!(
+                "unprompted_user = \"{}\"\n",
+                escape(&self.unprompted_user)
+            ));
         }
         let tmp = path.with_extension("tmp");
         let result = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
@@ -1844,6 +1851,7 @@ not_a_key = 1
             session: "Test DE".into(),
             auto_started_at: Some(1_700_000_000),
             auto_streak: 2,
+            unprompted_user: "al\"ice".into(),
         };
         state.store(&tmp);
         assert_eq!(State::load(&tmp), Some(state));
@@ -1859,6 +1867,7 @@ not_a_key = 1
         assert_eq!(state.user, "alice");
         assert_eq!(state.auto_started_at, None);
         assert_eq!(state.auto_streak, 0);
+        assert_eq!(state.unprompted_user, "");
         std::fs::remove_file(tmp).unwrap();
     }
 

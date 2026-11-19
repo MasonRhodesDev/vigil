@@ -60,6 +60,13 @@ pub fn record_pause(prev: &State, streak: u32) -> State {
     }
 }
 
+pub fn unprompted_user(user: Option<&str>, asked: bool) -> String {
+    match user {
+        Some(user) if !asked => user.to_owned(),
+        _ => String::new(),
+    }
+}
+
 pub fn notice(last_secs: Option<u64>, default_user: Option<&str>) -> String {
     let why = match last_secs {
         Some(secs) => format!("The last session ended after {secs} s"),
@@ -171,6 +178,24 @@ mod tests {
         assert_eq!(after.session, "DE");
         assert_eq!(after.auto_started_at, None);
         assert_eq!(after.auto_streak, 0);
+    }
+
+    #[test]
+    fn only_a_sign_in_that_asked_nothing_names_an_unprompted_user() {
+        assert_eq!(unprompted_user(Some("alice"), false), "alice");
+        assert_eq!(unprompted_user(Some("alice"), true), "");
+        assert_eq!(unprompted_user(None, false), "");
+    }
+
+    #[test]
+    fn pausing_and_resuming_keep_the_unprompted_user() {
+        let state = State {
+            unprompted_user: "alice".into(),
+            ..stored("alice")
+        };
+        let paused = record_pause(&state, PAUSE_AFTER);
+        assert_eq!(paused.unprompted_user, "alice");
+        assert_eq!(record_user_start(&paused).unprompted_user, "alice");
     }
 
     #[test]

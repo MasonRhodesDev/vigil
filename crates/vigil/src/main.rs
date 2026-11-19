@@ -1233,6 +1233,7 @@ impl App {
             }
             if let UiMessage::SelectUser(index) = msg {
                 self.select_user(index);
+                self.forget_unprompted_user_once_asked();
                 if self.auth.is_complete() {
                     self.finish_login(false);
                     return;
@@ -1251,6 +1252,7 @@ impl App {
             if let Err(e) = self.auth.handle(msg, &mut fan) {
                 eprintln!("vigil: auth: {e}");
             }
+            self.forget_unprompted_user_once_asked();
             if !asking_name
                 && self.auth.awaiting_username()
                 && let Some(row) = users::username_stage_row(&self.users, self.selected_user)
@@ -1261,6 +1263,13 @@ impl App {
                 self.finish_login(false);
                 return;
             }
+        }
+    }
+
+    fn forget_unprompted_user_once_asked(&mut self) {
+        if !self.state.unprompted_user.is_empty() && self.auth.unprompted().is_none() {
+            self.state.unprompted_user.clear();
+            self.state.store(&self.state_file);
         }
     }
 
@@ -1277,6 +1286,7 @@ impl App {
             state.user = user.to_owned();
             state.session = self.sessions[self.selected_session].name.clone();
         }
+        state.unprompted_user = autologin::unprompted_user(self.auth.user(), self.auth.asked());
         state.store(&self.state_file);
         self.begin_leaving();
     }
@@ -2154,6 +2164,12 @@ fn run() -> Result<i32, String> {
         Some(_) => None,
         None => remembered_user.clone(),
     });
+    auth.set_unprompted(
+        stored
+            .as_ref()
+            .map(|state| state.unprompted_user.clone())
+            .filter(|user| !user.is_empty()),
+    );
     auth.set_session(
         session_list[initial_session].cmd.clone(),
         session_list[initial_session].env.clone(),
@@ -2298,7 +2314,8 @@ fn run() -> Result<i32, String> {
                     vigil_core::uptime_ms(),
                     autologin::SHORT_SESSION_SECS
                 );
-                autologin::record_pause(&app.state, streak).store(&app.state_file);
+                app.state = autologin::record_pause(&app.state, streak);
+                app.state.store(&app.state_file);
                 if let Some(user) = resolved.user.as_deref() {
                     app.auth.set_default_user(Some(user.to_owned()));
                 }
@@ -2341,6 +2358,7 @@ fn run() -> Result<i32, String> {
             fan.show_error(&notice);
         }
     }
+    app.forget_unprompted_user_once_asked();
     if app.auth.is_complete() {
         app.finish_login(true);
     }
