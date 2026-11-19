@@ -1306,9 +1306,21 @@ fn signal_ready_fd(ready_fd: Option<i32>) {
     }
 }
 
+// A panic on any thread ends the lock before it can sit half alive with a dead
+// PAM worker or a poisoned lock. ext-session-lock keeps the session locked
+// when its client dies. _exit leaves no core, which would hold the password.
+fn exit_on_panic() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        unsafe { libc::_exit(101) };
+    }));
+}
+
 fn main() {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
+    exit_on_panic();
     tracing_subscriber::registry()
         .with(span_lines::tracing_layer::install(&["vigil"]))
         .init();
