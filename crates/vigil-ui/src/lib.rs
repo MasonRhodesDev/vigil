@@ -628,6 +628,11 @@ impl AuthUi for OutputWindow {
         self.set_property("error-message", Value::String("".into()));
         self.set_property("auth-state", Value::String("prompting".into()));
     }
+    fn reset_input(&mut self) {
+        if let Ok(Value::Number(serial)) = self.component.get_property("prompt-serial") {
+            self.set_optional_property("prompt-serial", Value::Number(serial + 1.0));
+        }
+    }
     fn show_info(&mut self, text: &str) {
         self.set_property("info-message", Value::String(text.into()));
     }

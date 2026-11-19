@@ -1,5 +1,14 @@
 const NON_LOGIN_SHELLS: &[&str] = &["nologin", "false", "true", "sync", "shutdown", "halt"];
 
+pub const OTHER_USER: &str = "Other…";
+
+pub fn username_stage_row(users: &[String], selected: usize) -> Option<usize> {
+    users
+        .iter()
+        .position(|name| name == OTHER_USER)
+        .filter(|&row| row != selected)
+}
+
 pub fn enumerate() -> Vec<String> {
     let (uid_min, uid_max) = std::fs::read_to_string("/etc/login.defs")
         .map(|defs| parse_uid_range(&defs))
@@ -55,10 +64,10 @@ mod tests {
     fn filter_users_keeps_only_login_capable() {
         let fixture = "root:x:0:0::/root:/bin/bash\n\
 greeter:x:968:966::/var/lib/greetd:/sbin/nologin\n\
-mason:x:1000:1000::/home/mason:/bin/bash\n\
+alice:x:1000:1000::/home/alice:/bin/bash\n\
 nixbld1:x:30001:30000::/var/empty:/sbin/nologin\n\
 svc:x:1500:1500::/srv:/bin/false\n";
-        assert_eq!(filter_users(fixture, 1000, 60000), ["mason"]);
+        assert_eq!(filter_users(fixture, 1000, 60000), ["alice"]);
     }
 
     #[test]
@@ -80,5 +89,27 @@ late:x:70000:70000::/home/late:/bin/bash\n";
     #[test]
     fn parse_uid_range_falls_back() {
         assert_eq!(parse_uid_range(""), (1000, 60000));
+    }
+
+    fn list(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_username_stage_shows_the_manual_entry_row() {
+        let users = list(&["alice", "bob", OTHER_USER]);
+        assert_eq!(username_stage_row(&users, 0), Some(2));
+        assert_eq!(username_stage_row(&users, 1), Some(2));
+    }
+
+    #[test]
+    fn the_manual_entry_row_is_left_alone_once_shown() {
+        let users = list(&["alice", "bob", OTHER_USER]);
+        assert_eq!(username_stage_row(&users, 2), None);
+    }
+
+    #[test]
+    fn without_a_user_list_there_is_no_row_to_show() {
+        assert_eq!(username_stage_row(&[], 0), None);
     }
 }

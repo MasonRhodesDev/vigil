@@ -12,6 +12,9 @@ use xkbcommon::xkb::compose;
 
 const REPEAT_DELAY: Duration = Duration::from_millis(500);
 const REPEAT_INTERVAL: Duration = Duration::from_millis(33);
+const RETURN: u32 = 0xff0d;
+const ESCAPE: u32 = 0xff1b;
+const ONE_SHOT: [u32; 2] = [RETURN, ESCAPE];
 
 #[derive(Debug)]
 pub struct InputError(pub String);
@@ -253,7 +256,8 @@ impl KeyboardState {
         }
 
         if pressed {
-            self.repeat = self.keymap.key_repeats(keycode).then_some(Repeat {
+            let one_shot = ONE_SHOT.contains(&self.state.key_get_one_sym(keycode).raw());
+            self.repeat = (!one_shot && self.keymap.key_repeats(keycode)).then_some(Repeat {
                 keycode,
                 deadline: now + REPEAT_DELAY,
             });
@@ -304,6 +308,7 @@ mod tests {
     const KEY_GRAVE: u32 = 41;
     const KEY_LEFTSHIFT: u32 = 42;
     const KEY_CAPSLOCK: u32 = 58;
+    const KEY_ESC: u32 = 1;
     const KEY_ENTER: u32 = 28;
 
     fn key_parts(event: InputEvent) -> (u32, Option<String>, bool) {
@@ -376,6 +381,27 @@ mod tests {
             Some(first + REPEAT_INTERVAL)
         );
         let _ = keyboard.key(KEY_A, false, first);
+        assert_eq!(keyboard.next_repeat_deadline(), None);
+    }
+
+    #[test]
+    fn enter_and_escape_never_repeat() {
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
+        let now = Instant::now();
+        for key in [KEY_ENTER, KEY_ESC] {
+            let _ = keyboard.key(key, true, now);
+            assert_eq!(keyboard.next_repeat_deadline(), None);
+            assert!(keyboard.tick_repeat(now + REPEAT_DELAY * 4).is_empty());
+            let _ = keyboard.key(key, false, now);
+        }
+    }
+
+    #[test]
+    fn enter_ends_the_repeat_of_a_held_key() {
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
+        let now = Instant::now();
+        let _ = keyboard.key(KEY_A, true, now);
+        let _ = keyboard.key(KEY_ENTER, true, now);
         assert_eq!(keyboard.next_repeat_deadline(), None);
     }
 

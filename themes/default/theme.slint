@@ -58,6 +58,7 @@ export component DefaultTheme inherits Window {
     in property <string> info-message;
     in property <string> error-message;
     in property <int> error-serial;
+    in property <int> prompt-serial;
     in property <[string]> sessions;
     in property <int> selected-session;
     in property <[string]> users;
@@ -81,6 +82,7 @@ export component DefaultTheme inherits Window {
 
     changed prompt-text => { input.text = ""; root.reveal = false; }
     changed prompt-is-secret => { input.text = ""; root.reveal = false; }
+    changed prompt-serial => { input.text = ""; root.reveal = false; }
 
     property <int> shake-count;
     changed error-serial => { root.shake-count += 1; }
