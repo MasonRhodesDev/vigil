@@ -325,10 +325,10 @@ impl LockFlow {
                     if self.grace_secs > 0 && !self.grace_forbidden {
                         self.grace = Some(Grace::new(now.mono, now.wall, self.grace_secs));
                     }
-                    cmds.push(FlowCmd::SignalReady);
                     if self.unlock_latched {
                         self.unlock_authorized(now, &mut cmds);
                     } else {
+                        cmds.push(FlowCmd::SignalReady);
                         cmds.push(FlowCmd::ShowPanel(true));
                         cmds.push(FlowCmd::SetLockedHint(true));
                         cmds.push(FlowCmd::StartAuth);
@@ -1261,7 +1261,10 @@ pub(crate) mod tests {
         flow.step(at(100), FlowEvent::LogindUnlock);
         flow.step(at(400), FlowEvent::Tick);
         let cmds = flow.step(at(410), FlowEvent::LockConfirmed);
-        assert!(has(&cmds, &FlowCmd::SignalReady), "readiness is still owed");
+        assert!(
+            !has(&cmds, &FlowCmd::SignalReady),
+            "a lock that unlocks at once is never reported held"
+        );
         assert!(!has(&cmds, &FlowCmd::StartAuth), "{cmds:?}");
         assert!(!has(&cmds, &FlowCmd::ShowPanel(true)), "{cmds:?}");
         assert!(has(&cmds, &FlowCmd::CreateRevealOverlays));

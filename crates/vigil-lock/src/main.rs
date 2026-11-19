@@ -1200,6 +1200,11 @@ fn follow_flow(ipc: &Mutex<LockIpcState>, cmd: &FlowCmd) -> bool {
                 state.hold = Hold::Releasing;
                 return false;
             }
+            // A signal leaves a held lock to the compositor, so it stays held.
+            FlowCmd::Exit(outcome) if !matches!(outcome, LockOutcome::Terminated(_)) => {
+                state.hold = Hold::Releasing;
+                return false;
+            }
             _ => return false,
         }
     };

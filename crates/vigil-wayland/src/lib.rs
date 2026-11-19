@@ -489,7 +489,10 @@ impl<S: LockSession> App<S> {
                         phase = %to
                     ));
                 }
-                FlowCmd::Exit(outcome) => self.outcome = Some(outcome),
+                FlowCmd::Exit(outcome) => {
+                    self.outcome = Some(outcome);
+                    self.session.flow_command(&FlowCmd::Exit(outcome));
+                }
                 ref session_cmd @ (FlowCmd::ShowPanel(_)
                 | FlowCmd::DispatchInput(_)
                 | FlowCmd::StartAuth
