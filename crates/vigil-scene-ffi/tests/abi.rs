@@ -184,22 +184,18 @@ fn bad_arguments_are_refused_before_any_drawing() {
     );
 }
 
-// The test binary sits in <target>/<profile dir>/deps, and the cdylib must
-// come from that same profile, whatever the cargo version names its files.
+// The C program links the cdylib from a profile like the test's own. Cargo
+// says where it put it, since the layout of the target dir changes between
+// cargo versions.
 fn cdylib() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let profile = match exe
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-    {
-        Some(d) if d == "debug" => "dev".to_owned(),
-        Some(d) => d.to_string_lossy().into_owned(),
-        None => "dev".to_owned(),
+    let profile = if cfg!(debug_assertions) {
+        "dev"
+    } else {
+        "release"
     };
     let built = Command::new(env!("CARGO"))
         .args(["build", "--frozen", "--lib", "--message-format=json"])
-        .args(["-p", "vigil-scene-ffi", "--profile", &profile])
+        .args(["-p", "vigil-scene-ffi", "--profile", profile])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap();
