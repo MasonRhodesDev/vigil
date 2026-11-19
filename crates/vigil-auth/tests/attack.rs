@@ -388,6 +388,7 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
     let mut typed: Vec<String> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut heard: Vec<String> = Vec::new();
+    let mut heard_now: Vec<String> = Vec::new();
     let mut last_request: Option<Req> = None;
     let mut step = Step::default();
 
@@ -410,6 +411,7 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                     }
                 }
                 submitted |= text.is_some();
+                heard_now.clear();
                 step = Step {
                     op: Some(op.clone()),
                     text,
@@ -494,6 +496,9 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                 let conversing = matches!(last_request, Some(Req::Create(_) | Req::Answer(_)));
                 ack_due = false;
                 granted = false;
+                if let Reply::Refuse(text) | Reply::Message(_, text) = reply {
+                    heard_now.push(text.clone());
+                }
                 if let Reply::Refuse(text) = reply {
                     heard.push(text.clone());
                 }
@@ -550,10 +555,18 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                 if let Some(line) = text.lines().find(|line| !line.starts_with("vigil: ")) {
                     return Err(format!("a journal line is not vigil's own: {line:?}"));
                 }
-                let forged = heard
-                    .iter()
-                    .flat_map(|said| said.split('\n').skip(1))
-                    .find(|rest| !rest.is_empty() && text.lines().any(|line| line == *rest));
+                // A forged line follows the journal line that ends with the
+                // text before greetd's newline, in the step that heard it.
+                let lines: Vec<&str> = text.lines().collect();
+                let forged = heard_now.iter().find_map(|said| {
+                    let parts: Vec<&str> = said.lines().collect();
+                    parts.windows(2).find_map(|part| {
+                        let joined = lines
+                            .windows(2)
+                            .any(|line| line[0].ends_with(part[0]) && line[1] == part[1]);
+                        (!part[1].is_empty() && joined).then_some(part[1])
+                    })
+                });
                 if let Some(line) = forged {
                     return Err(format!(
                         "text from greetd wrote its own journal line: {line:?}"
