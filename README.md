@@ -10,7 +10,7 @@ runtime `.slint` themes with a compiled-in fallback.
 **Status: greeter-spec complete (M1.5).** The full DM flow works
 end-to-end in QEMU (`tests/e2e/run.sh`): username entry, wrong-password
 error with automatic retry, Escape back to the username stage, a
-mouse-driven session picker over the installed
+keyboard and pointer session picker over the installed
 wayland-sessions/xsessions, VT switching away and back (Ctrl+Alt+Fn),
 power buttons, and a successful `start_session` handoff with
 `XDG_SESSION_*` env. Next up is the on-metal VT test
@@ -115,6 +115,39 @@ desktop. `--immediate` skips both ramps. On Hyprland the blur strength follows
 the ramp via `hyprland-surface-v1` opacity (`wp-alpha-modifier-v1` where a
 compositor ties blur to surface alpha); elsewhere the tint ramps over a fixed
 blur.
+
+## Keyboard
+
+Every greeter control works without a pointer. The password or username
+field has focus at start, and typing always goes there.
+
+| Key | Where | Does |
+|---|---|---|
+| Tab, Shift+Tab | anywhere | Move focus through the user picker, the field, show/hide, the session picker, Restart, and Shut Down, in that order, and wrap. |
+| Enter | field | Submit. |
+| Esc | field | Cancel the attempt and start over. |
+| Esc | any other control | Return focus to the field. |
+| Left, Right, Up, Down, Space | user or session picker | Pick the previous or next entry. |
+| Enter | user or session picker | Return focus to the field. |
+| Space, Enter | show/hide | Show or hide the password. |
+| Alt+F8 | anywhere | Show or hide the password. |
+| Space, Enter | Restart, Shut Down | Ask to confirm. Focus starts on Cancel. |
+| Tab, Left, Right | confirm | Move between Cancel and the action. |
+| Space, Enter | confirm | Run the focused choice. |
+| Esc | confirm | Close it without acting. |
+| a letter or digit | any control but a confirm | Return focus to the field and type there. |
+| Ctrl+Alt+F*n* | anywhere | Switch to VT *n*. |
+
+A line under the field names the keys for the focused control. A
+two-tone ring marks the focused control once you press Tab. Arrow keys
+inside the field keep editing the text, so they never switch users.
+Picking a user or a session by keyboard is the same local change as a
+click. No PAM conversation opens until you press Enter in the field.
+Holding a key on a control acts once, so key repeat never cycles
+through users. Only Tab and Shift+Tab repeat there.
+
+A pointer click on Restart or Shut Down asks to confirm too. vigil-lock
+has the same field and show/hide keys and shows no power buttons.
 
 ## Monitor layout
 
