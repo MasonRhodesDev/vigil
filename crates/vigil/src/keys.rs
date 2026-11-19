@@ -264,6 +264,52 @@ mod tests {
     }
 
     #[test]
+    fn escape_clears_a_fixed_users_password_field() {
+        let Some(greetd) = Greetd::scripted(
+            "fixed-escape",
+            vec![
+                secret(),
+                Response::Success,
+                secret(),
+                Response::Success,
+                Response::Success,
+            ],
+        ) else {
+            return;
+        };
+        let mut rig = Rig::new(&greetd);
+        rig.auth
+            .begin(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        for event in text("x") {
+            route(&mut rig, event);
+        }
+        rig.tick();
+        for event in tap(ESCAPE, None) {
+            route(&mut rig, event);
+        }
+        rig.tick();
+        let mut batch = text("pw");
+        batch.extend(tap(RETURN, None));
+        for event in batch {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        drop(rig);
+        assert_eq!(
+            greetd.finish(),
+            [
+                "create alice",
+                "cancel",
+                "create alice",
+                "answer pw",
+                "start"
+            ]
+        );
+    }
+
+    #[test]
     fn escape_a_name_and_a_password_in_one_batch_sign_that_user_in() {
         let Some(greetd) = Greetd::scripted(
             "escape",

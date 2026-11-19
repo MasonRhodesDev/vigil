@@ -368,6 +368,40 @@ mod tests {
         row.locate(x, y).expect("an output").id
     }
 
+    #[test]
+    fn home_is_the_output_at_the_origin_not_a_neighbour_touching_it() {
+        let left = Row::place(&[
+            listed(1, "OUT-L", (-1920, 0), (1920, 1080)),
+            listed(2, "OUT-O", (0, 0), (1920, 1080)),
+        ]);
+        assert_eq!(left.home(), Some(OutputId(2)));
+        let above = Row::place(&[
+            listed(1, "OUT-U", (0, -1080), (1920, 1080)),
+            listed(2, "OUT-O", (0, 0), (1920, 1080)),
+        ]);
+        assert_eq!(above.home(), Some(OutputId(2)));
+    }
+
+    #[test]
+    fn relative_motion_reaches_an_unlisted_output_beside_a_stacked_layout() {
+        let row = Row::place(&[
+            listed(1, "OUT-A", (0, 0), (1920, 1080)),
+            listed(2, "OUT-B", (0, 1080), (2560, 1440)),
+            unlisted(3, "OUT-Z", (1920, 1080)),
+        ]);
+        let (mut x, y) = (1280.0, 1800.0);
+        let mut reached = false;
+        for _ in 0..400 {
+            let (cx, cy) = row.clamp(x + 50.0, y);
+            x = cx;
+            if at(&row, cx, cy) == OutputId(3) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "{row}");
+    }
+
     fn row() -> Row {
         Row::place(&[
             unlisted(1, "DP-1", (1920, 1080)),
