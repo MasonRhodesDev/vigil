@@ -551,9 +551,32 @@ impl Refusal {
     }
 }
 
-fn login_flow_event(event: LoginEvent) -> Option<FlowEvent> {
+#[cfg(test)]
+static TEST_TRUST: std::sync::OnceLock<(PathBuf, vigil_unlock_token::Owners)> =
+    std::sync::OnceLock::new();
+
+// logind lets the session's owner Unlock without polkit and the signal names no caller, so
+// only root's token tells an Unlock root asked for from one the user's own processes sent.
+fn root_asked(session: Option<&str>) -> Result<(), String> {
+    let session = session.ok_or("no logind session")?;
+    #[cfg(test)]
+    if let Some((dir, owners)) = TEST_TRUST.get() {
+        let at = vigil_unlock_token::Moment::now().map_err(|e| e.to_string())?;
+        return vigil_unlock_token::admit(dir, *owners, session, &at)
+            .map_err(|why| why.to_string());
+    }
+    vigil_unlock_token::admit_now(session).map_err(|why| why.to_string())
+}
+
+fn login_flow_event(event: LoginEvent, session: Option<&str>) -> Option<FlowEvent> {
     match event {
-        LoginEvent::Unlock => Some(FlowEvent::LogindUnlock),
+        LoginEvent::Unlock => match root_asked(session) {
+            Ok(()) => Some(FlowEvent::LogindUnlock),
+            Err(why) => {
+                vigil_log::say!("vigil-lock: unlock ignored: {why}");
+                None
+            }
+        },
         LoginEvent::Lock => Some(FlowEvent::CommitRequested),
         LoginEvent::PrepareForSleep(sleeping) => Some(FlowEvent::PrepareForSleep(sleeping)),
     }
@@ -775,7 +798,8 @@ impl Locker {
 
     fn pump_login(&mut self) {
         while let Ok(event) = self.login_rx.try_recv() {
-            if let Some(event) = login_flow_event(event) {
+            let session = self.login.as_ref().map(LoginSession::id);
+            if let Some(event) = login_flow_event(event, session) {
                 self.pending.push(event);
             }
         }
