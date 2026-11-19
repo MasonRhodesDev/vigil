@@ -1491,4 +1491,30 @@ mod tests {
             "the second selection waits for a submit"
         );
     }
+
+    #[test]
+    fn a_message_alone_ends_the_expectation_of_an_unasked_sign_in() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Info, "Place your finger on the reader"),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.begin(Some("alice"), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer <none>", "start"]);
+        assert!(machine.is_complete());
+        assert_eq!(
+            machine.unprompted(),
+            None,
+            "a stack that speaks may go on to ask, so it is not opened unasked again"
+        );
+        assert!(
+            machine.asked(),
+            "a sign-in during which PAM said anything is not recorded as unprompted"
+        );
+    }
 }
