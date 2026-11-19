@@ -181,6 +181,8 @@ fn shapes_far_outside_the_box_are_refused() {
         r##"<path d="M0 0 L100 100" stroke="#000" stroke-width="1e30"/>"##,
         r#"<rect width="100" height="100" transform="scale(1e6)"/>"#,
         r#"<clipPath id="c"><rect x="-1e9" width="9" height="9"/></clipPath><rect width="9" height="9" clip-path="url(#c)"/>"#,
+        r#"<clipPath id="f"><rect x="-1e5" width="9" height="9"/></clipPath><clipPath id="c" clip-path="url(#f)"><rect width="100" height="100"/></clipPath><rect width="100" height="100" clip-path="url(#c)"/>"#,
+        r##"<mask id="f"><rect x="-1e5" width="9" height="9" fill="#fff"/></mask><mask id="m" mask="url(#f)"><rect width="100" height="100" fill="#fff"/></mask><rect width="100" height="100" mask="url(#m)"/>"##,
     ] {
         let why = refused(&svg(body));
         assert!(
