@@ -8,9 +8,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use vigil_scene::{
-    Error, Logo, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Plate, Scene, Sprite, check_output,
-};
+use vigil_scene::{Error, Layout, Logo, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Placement, Plate, Scene};
 
 pub const VIGIL_SCENE_OK: i32 = 0;
 pub const VIGIL_SCENE_ERR_ARGUMENT: i32 = -1;
@@ -72,7 +70,6 @@ struct Request<'a> {
     mode: (u32, u32),
     transform: u8,
     layer: Layer,
-    value: f64,
 }
 
 fn code(e: &Error) -> i32 {
@@ -101,54 +98,63 @@ fn parse(raw: &VigilSceneRequest) -> Result<(u8, Layer, f64), i32> {
     Ok((transform, layer, raw.value))
 }
 
-fn draw(req: &Request<'_>) -> Result<(VigilScenePlacement, Vec<u8>), i32> {
+struct Prepared {
+    spec: Scene,
+    layout: Layout,
+    logo: Option<Logo>,
+}
+
+fn prepare(req: &Request<'_>) -> Result<Prepared, i32> {
     let spec = match req.spec {
         Some(bytes) => std::str::from_utf8(bytes)
-            .ok()
-            .and_then(|text| Scene::parse(text).ok())
-            .ok_or(VIGIL_SCENE_ERR_INVALID)?,
+            .map_err(|_| VIGIL_SCENE_ERR_INVALID)
+            .and_then(|text| Scene::parse(text).map_err(|e| code(&e)))?,
         None => Scene::default(),
     };
-    check_output(&spec, req.mode, req.transform).map_err(|e| code(&e))?;
-    let scene = if req.transform % 2 == 1 {
-        (req.mode.1, req.mode.0)
-    } else {
-        req.mode
-    };
-    let plate = match (req.svg, req.layer) {
-        (Some(svg), _) => {
-            let logo = Logo::svg(svg).map_err(|e| code(&e))?;
-            Plate::new(&spec, &logo, scene, req.transform).map_err(|e| code(&e))?
-        }
-        (None, Layer::Frame | Layer::Bar) => Plate::ground_only(&spec, scene, req.transform),
-        (None, Layer::Logo | Layer::Glow) => return Err(VIGIL_SCENE_ERR_ARGUMENT),
-    };
-    let sprite = |s: Option<Sprite>| {
-        let s = s.ok_or(VIGIL_SCENE_ERR_ARGUMENT)?;
-        let placement = VigilScenePlacement {
-            x: s.x,
-            y: s.y,
-            width: s.width,
-            height: s.height,
-            stride: s.width as usize * 4,
-        };
-        Ok((placement, s.rgba))
-    };
-    match req.layer {
-        Layer::Frame => Ok((
-            VigilScenePlacement {
-                x: 0,
-                y: 0,
-                width: req.mode.0,
-                height: req.mode.1,
-                stride: req.mode.0 as usize * 4,
-            },
-            plate.frame(req.value),
-        )),
-        Layer::Logo => sprite(plate.logo_sprite()),
-        Layer::Glow => sprite(plate.glow_sprite(req.value)),
-        Layer::Bar => sprite(Some(plate.bar_sprite(req.value))),
+    let layout = Layout::new(&spec, req.mode, req.transform).map_err(|e| code(&e))?;
+    let logo = req.svg.map(Logo::svg).transpose().map_err(|e| code(&e))?;
+    if logo.is_none() && matches!(req.layer, Layer::Logo | Layer::Glow) {
+        return Err(VIGIL_SCENE_ERR_ARGUMENT);
     }
+    Ok(Prepared { spec, layout, logo })
+}
+
+fn place(p: &Prepared, layer: Layer) -> Result<VigilScenePlacement, i32> {
+    let (width, height) = p.layout.panel();
+    let at = match layer {
+        Layer::Frame => Some(Placement {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }),
+        Layer::Logo => p.layout.logo(),
+        Layer::Glow => p.layout.glow(),
+        Layer::Bar => p.layout.bar(),
+    }
+    .ok_or(VIGIL_SCENE_ERR_REFUSED)?;
+    Ok(VigilScenePlacement {
+        x: at.x,
+        y: at.y,
+        width: at.width,
+        height: at.height,
+        stride: at.width as usize * 4,
+    })
+}
+
+fn draw(p: &Prepared, layer: Layer, value: f64) -> Result<Vec<u8>, i32> {
+    let (scene, transform) = (p.layout.scene(), p.layout.transform());
+    let plate = match &p.logo {
+        Some(logo) => Plate::new(&p.spec, logo, scene, transform).map_err(|e| code(&e))?,
+        None => Plate::ground_only(&p.spec, scene, transform),
+    };
+    let sprite = match layer {
+        Layer::Frame => return Ok(plate.frame(value)),
+        Layer::Logo => plate.logo_sprite(),
+        Layer::Glow => plate.glow_sprite(value),
+        Layer::Bar => plate.bar_sprite(value),
+    };
+    sprite.map(|s| s.rgba).ok_or(VIGIL_SCENE_ERR_REFUSED)
 }
 
 /// # Safety
@@ -170,8 +176,8 @@ unsafe fn bytes<'a>(ptr: *const u8, len: usize, cap: usize) -> Result<Option<&'a
 /// Draws one layer of the scene into `out` and says where it goes.
 ///
 /// Returns `VIGIL_SCENE_OK`, or a negative `VIGIL_SCENE_ERR_*`. With `out`
-/// null and `out_len` 0 it only fills `placement`, so a caller can size the
-/// buffer; the bytes needed are `placement.stride * placement.height`. When
+/// null and `out_len` 0 it only fills `placement`, without drawing, so a
+/// caller can size the buffer; the bytes needed are `placement.stride * placement.height`. When
 /// `out_len` is too small it fills `placement` and returns
 /// `VIGIL_SCENE_ERR_BUFFER`.
 ///
@@ -221,20 +227,29 @@ pub unsafe extern "C" fn vigil_scene_render(
         mode: (raw.mode_width, raw.mode_height),
         transform,
         layer,
-        value,
     };
-    let (place, pixels) = match catch_unwind(AssertUnwindSafe(|| draw(&req))) {
-        Ok(Ok(drawn)) => drawn,
+    let (prepared, at) = match catch_unwind(AssertUnwindSafe(|| {
+        prepare(&req).and_then(|p| place(&p, layer).map(|at| (p, at)))
+    })) {
+        Ok(Ok(placed)) => placed,
         Ok(Err(code)) => return code,
         Err(_) => return VIGIL_SCENE_ERR_PANIC,
     };
     // SAFETY: placement is non-null and aligned, and the caller guarantees it
     // is valid for writes and overlaps no other argument.
-    unsafe { placement.write(place) };
+    unsafe { placement.write(at) };
     if out.is_null() {
         return VIGIL_SCENE_OK;
     }
-    if out_len < pixels.len() {
+    if out_len < at.stride * at.height as usize {
+        return VIGIL_SCENE_ERR_BUFFER;
+    }
+    let pixels = match catch_unwind(AssertUnwindSafe(|| draw(&prepared, layer, value))) {
+        Ok(Ok(pixels)) => pixels,
+        Ok(Err(code)) => return code,
+        Err(_) => return VIGIL_SCENE_ERR_PANIC,
+    };
+    if pixels.len() > out_len {
         return VIGIL_SCENE_ERR_BUFFER;
     }
     // SAFETY: out is non-null, the caller guarantees out_len writable bytes

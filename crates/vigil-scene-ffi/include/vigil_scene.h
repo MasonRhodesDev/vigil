@@ -81,8 +81,8 @@ extern "C" {
  * Draws one layer of the scene into `out` and says where it goes.
  *
  * Returns `VIGIL_SCENE_OK`, or a negative `VIGIL_SCENE_ERR_*`. With `out`
- * null and `out_len` 0 it only fills `placement`, so a caller can size the
- * buffer; the bytes needed are `placement.stride * placement.height`. When
+ * null and `out_len` 0 it only fills `placement`, without drawing, so a
+ * caller can size the buffer; the bytes needed are `placement.stride * placement.height`. When
  * `out_len` is too small it fills `placement` and returns
  * `VIGIL_SCENE_ERR_BUFFER`.
  *

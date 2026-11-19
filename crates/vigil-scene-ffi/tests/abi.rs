@@ -75,7 +75,11 @@ fn every_layer_matches_the_library() {
             0.3,
             plate.glow_sprite(0.3).unwrap().rgba,
         ),
-        (VIGIL_SCENE_LAYER_BAR, 0.5, plate.bar_sprite(0.5).rgba),
+        (
+            VIGIL_SCENE_LAYER_BAR,
+            0.5,
+            plate.bar_sprite(0.5).unwrap().rgba,
+        ),
     ] {
         let mut req = request(&svg, layer);
         req.transform = 3;
@@ -167,7 +171,7 @@ fn bad_arguments_are_refused_before_any_drawing() {
     let spec = br#"{"version":2,"ref_short_side":4000000000}"#;
     req.spec_json = spec.as_ptr();
     req.spec_len = spec.len();
-    assert_eq!(render(&req, &mut []).0, VIGIL_SCENE_ERR_TOO_LARGE);
+    assert_eq!(render(&req, &mut []).0, VIGIL_SCENE_ERR_REFUSED);
 
     let req = request(&svg, VIGIL_SCENE_LAYER_LOGO);
     let mut short = vec![0u8; 10];

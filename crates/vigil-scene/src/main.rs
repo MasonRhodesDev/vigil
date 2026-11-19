@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use image::ImageEncoder;
 use vigil_scene::{
-    Error, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE, MAX_SPEC_BYTES, Plate, Scene, Sprite,
-    check_output, emit_spec, read_bounded,
+    Error, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE, MAX_SPEC_BYTES, Plate, Scene, Sprite,
+    emit_spec, read_bounded,
 };
 
 const USAGE: &str = "usage:
@@ -161,12 +161,9 @@ fn draw(args: &Args, stage: Stage) -> Result<Picture, String> {
         if transform > 3 {
             return Err(format!("--transform {transform} is outside 0..3"));
         }
-        check_output(&spec, panel, transform).map_err(|e| e.to_string())?;
-        let scene = if transform % 2 == 1 {
-            (panel.1, panel.0)
-        } else {
-            panel
-        };
+        let scene = Layout::new(&spec, panel, transform)
+            .map_err(|e| e.to_string())?
+            .scene();
         let plate = match (&logo, stage) {
             (None, Stage::GrubHandoff | Stage::Splash | Stage::Bar) => {
                 Plate::ground_only(&spec, scene, transform)
@@ -194,7 +191,9 @@ fn draw(args: &Args, stage: Stage) -> Result<Picture, String> {
         }
         Stage::Bar => {
             let progress = args.unit("progress", 0.0)?;
-            Ok(Picture::Sprite(plate()?.0.bar_sprite(progress)))
+            Ok(Picture::Sprite(
+                plate()?.0.bar_sprite(progress).ok_or("no bar")?,
+            ))
         }
         Stage::Icon => {
             let edge = args

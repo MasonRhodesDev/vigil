@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::Error;
+use crate::{Error, MAX_SIDE};
 
 pub const DEFAULT_SPEC: &str = include_str!("../../../tests/fixtures/scene.json");
 pub const MAX_SPEC_BYTES: u64 = 1 << 20;
@@ -137,15 +137,15 @@ impl Scene {
         }
     }
 
-    pub fn parse(text: &str) -> Result<Scene, String> {
-        let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    pub fn parse(text: &str) -> Result<Scene, Error> {
+        let v: Value = serde_json::from_str(text).map_err(|e| Error::Invalid(e.to_string()))?;
         Scene::from_value(&v)
     }
 
-    fn from_value(v: &Value) -> Result<Scene, String> {
+    fn from_value(v: &Value) -> Result<Scene, Error> {
         match at(v, &["version"]).and_then(Value::as_u64) {
             Some(2) => {}
-            other => return Err(format!("unsupported version {other:?}")),
+            other => return Err(Error::Invalid(format!("unsupported version {other:?}"))),
         }
         let d = Scene::default();
         let num = |path: &[&str], default: f64| {
@@ -157,8 +157,7 @@ impl Scene {
         let int = |path: &[&str], default: u32| {
             at(v, path)
                 .and_then(Value::as_u64)
-                .and_then(|x| u32::try_from(x).ok())
-                .unwrap_or(default)
+                .map_or(default, |x| u32::try_from(x).unwrap_or(u32::MAX))
         };
         let color = |path: &[&str], default: [u8; 3]| {
             at(v, path)
@@ -166,18 +165,18 @@ impl Scene {
                 .and_then(parse_color)
                 .unwrap_or(default)
         };
-        Ok(Scene {
+        let scene = Scene {
             ref_short_side: at(v, &["ref_short_side"])
                 .and_then(Value::as_u64)
-                .and_then(|x| u32::try_from(x).ok())
+                .map(|x| u32::try_from(x).unwrap_or(u32::MAX))
                 .filter(|x| *x > 0),
             bg: color(&["palette", "bg"], d.bg),
             accent: color(&["palette", "accent"], d.accent),
             mark: color(&["palette", "mark"], d.mark),
             track: color(&["palette", "track"], d.track),
             logo_frac: num(&["geometry", "logo_frac"], d.logo_frac),
-            glow_mult: int(&["geometry", "glow_mult"], d.glow_mult).max(1),
-            glow_blur_div: int(&["geometry", "glow_blur_div"], d.glow_blur_div).max(1),
+            glow_mult: int(&["geometry", "glow_mult"], d.glow_mult),
+            glow_blur_div: int(&["geometry", "glow_blur_div"], d.glow_blur_div),
             centre_frac: num(&["geometry", "centre_frac_of_h"], d.centre_frac),
             gap_frac: num(&["geometry", "gap_frac"], d.gap_frac),
             bar_w_frac: num(&["geometry", "bar_w_frac"], d.bar_w_frac),
@@ -185,7 +184,7 @@ impl Scene {
             bar_h_min: int(&["geometry", "bar_h_min"], d.bar_h_min),
             in_s: num(&["motion", "in_s"], d.in_s),
             out_s: num(&["motion", "out_s"], d.out_s),
-            breath_period_s: num(&["motion", "breath_period_s"], d.breath_period_s).max(0.001),
+            breath_period_s: num(&["motion", "breath_period_s"], d.breath_period_s),
             glow_min: num(&["motion", "glow_min"], d.glow_min),
             glow_max: num(&["motion", "glow_max"], d.glow_max),
             stage_fade_s: num(&["motion", "stage_fade_s"], d.stage_fade_s),
@@ -199,7 +198,45 @@ impl Scene {
             debug_pt_frac: num(&["debug", "pt_frac"], d.debug_pt_frac),
             splash_debug: color(&["stages", "greeter-splash", "debug"], d.splash_debug),
             greeter_debug: color(&["stages", "greeter", "debug"], d.greeter_debug),
-        })
+        };
+        scene.check()?;
+        Ok(scene)
+    }
+
+    pub fn check(&self) -> Result<(), Error> {
+        let side = f64::from(MAX_SIDE);
+        let ranges = [
+            ("logo_frac", self.logo_frac, f64::MIN_POSITIVE, 1.0),
+            ("centre_frac_of_h", self.centre_frac, 0.0, 1.0),
+            ("gap_frac", self.gap_frac, 0.0, 1.0),
+            ("bar_w_frac", self.bar_w_frac, 0.0, 1.0),
+            ("bar_h_frac", self.bar_h_frac, 0.0, 1.0),
+            ("in_s", self.in_s, 0.0, 60.0),
+            ("out_s", self.out_s, 0.0, 60.0),
+            ("breath_period_s", self.breath_period_s, 0.001, 60.0),
+            ("glow_min", self.glow_min, 0.0, 1.0),
+            ("glow_max", self.glow_max, 0.0, 1.0),
+            ("stage_fade_s", self.stage_fade_s, 0.0, 60.0),
+            ("border_frac", self.debug_border_frac, 0.0, 1.0),
+            ("margin_frac", self.debug_margin_frac, 0.0, 1.0),
+            ("pt_frac", self.debug_pt_frac, 0.0, 1.0),
+            ("glow_mult", f64::from(self.glow_mult), 1.0, 16.0),
+            ("glow_blur_div", f64::from(self.glow_blur_div), 1.0, 1000.0),
+            ("bar_h_min", f64::from(self.bar_h_min), 0.0, side),
+            ("border_min", f64::from(self.debug_border_min), 0.0, side),
+            (
+                "ref_short_side",
+                self.ref_short_side.map_or(1.0, f64::from),
+                1.0,
+                side,
+            ),
+        ];
+        match ranges.iter().find(|(_, v, lo, hi)| !(lo..=hi).contains(&v)) {
+            Some((name, v, lo, hi)) => {
+                Err(Error::Refused(format!("{name} {v} is outside {lo}..={hi}")))
+            }
+            None => Ok(()),
+        }
     }
 
     fn short_side(&self, w: u32, h: u32) -> f64 {
@@ -273,7 +310,7 @@ pub fn ease(x: f64) -> f64 {
 pub fn emit_spec(source: Option<&str>, ref_short_side: Option<u32>) -> Result<String, Error> {
     let mut v: Value = serde_json::from_str(source.unwrap_or(DEFAULT_SPEC))
         .map_err(|e| Error::Invalid(format!("scene spec: {e}")))?;
-    Scene::from_value(&v).map_err(|e| Error::Invalid(format!("scene spec: {e}")))?;
+    Scene::from_value(&v)?;
     if let (Some(r), Some(doc)) = (ref_short_side, v.as_object_mut()) {
         doc.insert(
             "ref_short_side".into(),
@@ -311,6 +348,43 @@ mod tests {
         );
         assert!(emit_spec(Some(r#"{"version":3}"#), None).is_err());
         assert!(emit_spec(Some("[1]"), None).is_err());
+    }
+
+    #[test]
+    fn values_outside_their_range_are_refused() {
+        for (field, bad) in [
+            ("\"geometry\":{\"logo_frac\"", "0"),
+            ("\"geometry\":{\"logo_frac\"", "1.01"),
+            ("\"geometry\":{\"centre_frac_of_h\"", "1e18"),
+            ("\"geometry\":{\"centre_frac_of_h\"", "-1e300"),
+            ("\"geometry\":{\"gap_frac\"", "-0.1"),
+            ("\"geometry\":{\"bar_w_frac\"", "2"),
+            ("\"geometry\":{\"bar_h_frac\"", "1e300"),
+            ("\"geometry\":{\"glow_mult\"", "0"),
+            ("\"geometry\":{\"glow_mult\"", "17"),
+            ("\"geometry\":{\"glow_blur_div\"", "0"),
+            ("\"geometry\":{\"bar_h_min\"", "16385"),
+            ("\"motion\":{\"in_s\"", "-1"),
+            ("\"motion\":{\"breath_period_s\"", "0"),
+            ("\"motion\":{\"glow_max\"", "1.5"),
+            ("\"debug\":{\"border_frac\"", "9"),
+            ("\"ref_short_side\"", "16385"),
+        ] {
+            let close = if field.contains('{') { "}" } else { "" };
+            let text = format!("{{\"version\":2,{field}:{bad}{close}}}");
+            assert!(
+                matches!(Scene::parse(&text), Err(Error::Refused(_))),
+                "{text}"
+            );
+        }
+        let edges = r#"{"version":2,"ref_short_side":16384,
+            "geometry":{"logo_frac":1,"centre_frac_of_h":0,"gap_frac":1,"glow_mult":16,"glow_blur_div":1},
+            "motion":{"in_s":0,"glow_min":0,"glow_max":1}}"#;
+        assert!(Scene::parse(edges).is_ok());
+        assert!(matches!(
+            Scene::parse(r#"{"version":3}"#),
+            Err(Error::Invalid(_))
+        ));
     }
 
     #[test]

@@ -32,6 +32,10 @@ fn a_hostile_scene_spec_cannot_ask_for_huge_pictures() {
             "glow",
             r#"{"version":2,"geometry":{"glow_mult":4000000000}}"#,
         ),
+        (
+            "bar area",
+            r#"{"version":2,"ref_short_side":16384,"geometry":{"logo_frac":0.01,"bar_w_frac":1,"bar_h_frac":1}}"#,
+        ),
     ] {
         let path = scratch(&format!("{name}.json"));
         std::fs::write(&path, spec).unwrap();
@@ -49,7 +53,10 @@ fn a_hostile_scene_spec_cannot_ask_for_huge_pictures() {
                 "--out",
                 out,
             ]);
-            assert!(why.contains("the scene asks for"), "{name} {stage}: {why}");
+            assert!(
+                why.contains("the scene asks for") || why.contains("is outside"),
+                "{name} {stage}: {why}"
+            );
         }
     }
     let big = scratch("big.json");
