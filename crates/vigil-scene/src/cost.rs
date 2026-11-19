@@ -330,8 +330,6 @@ impl Walk {
     }
 }
 
-/// Refuses a tree whose drawing at `edge` pixels, through `fit`, would take
-/// more than the work budget or hold more than the memory budget.
 pub(crate) fn check(tree: &usvg::Tree, fit: Transform, edge: u32) -> Result<(), Error> {
     let e = f64::from(edge);
     let canvas = Area {

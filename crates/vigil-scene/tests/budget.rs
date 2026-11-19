@@ -98,7 +98,7 @@ fn draw_in_child(path: &Path) -> (Duration, u64) {
     )
 }
 
-// Timed in release only: an unoptimised tiny-skia is tens of times slower,
+// Timed in release only. An unoptimised tiny-skia is tens of times slower,
 // so a debug run would measure the build, not the budget.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "timed; run with --release")]

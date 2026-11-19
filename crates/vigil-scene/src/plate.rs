@@ -19,8 +19,8 @@ pub fn to_panel(transform: u8, scene: (u32, u32), x: i64, y: i64) -> Option<(i64
     })
 }
 
-// Maps an offset inside a scene-space box of `size` to the offset of the same
-// pixel inside that box turned onto the panel.
+// Pixels inside a sprite are mapped by their offset in its box, which cannot
+// overflow the way sums of scene coordinates can.
 fn local(transform: u8, size: (usize, usize), x: usize, y: usize) -> (usize, usize) {
     let (w, h) = size;
     match transform % 4 {
@@ -63,8 +63,6 @@ impl Layout {
         }
     }
 
-    /// The scene's geometry on a panel of `panel` pixels turned by `transform`,
-    /// refused unless every size and placement is in range.
     pub fn new(spec: &Scene, panel: (u32, u32), transform: u8) -> Result<Layout, Error> {
         spec.check()?;
         let (w, h) = panel;
