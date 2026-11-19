@@ -351,9 +351,13 @@ impl AuthMachine {
 
     fn heard(&mut self) {
         self.spoke = true;
+        self.stop_opening_unasked("PAM spoke to");
+    }
+
+    fn stop_opening_unasked(&mut self, why: &str) {
         if self.unprompted.is_some() && self.unprompted == self.user {
             eprintln!(
-                "vigil: auth: PAM spoke to user={}; no longer opening unasked",
+                "vigil: auth: {why} user={}; no longer opening unasked",
                 self.logged_user()
             );
             self.unprompted = None;
@@ -361,6 +365,7 @@ impl AuthMachine {
     }
 
     fn fail(&mut self, ui: &mut dyn AuthUi, description: &str) {
+        self.stop_opening_unasked("sign-in failed for");
         let text = self.show_error(ui, description);
         let _ = self.transact(&Request::CancelSession, ui);
         self.offer(ui);
