@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::rc::Rc;
 
 use smithay::backend::allocator::gbm::GbmBuffer;
@@ -171,6 +173,7 @@ impl Presenter for GbmPresenter {
         true
     }
 
+    #[allow(unsafe_code)]
     fn with_frame(
         &mut self,
         draw: &mut dyn FnMut(Canvas<'_>) -> bool,
@@ -202,6 +205,10 @@ impl Presenter for GbmPresenter {
             return Ok(true);
         }
 
+        #[expect(
+            clippy::undocumented_unsafe_blocks,
+            reason = "unjustified: one swap per lock rests on the draw closure telling the truth about drew"
+        )]
         let bo = unsafe { self.gbm.lock_front_buffer() }.map_err(backend)?;
         let buffer = GbmBuffer::from_bo(bo, true);
         let fb = framebuffer_from_bo(&self.drm, &buffer, false).map_err(backend)?;

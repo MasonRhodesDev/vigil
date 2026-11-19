@@ -1,11 +1,13 @@
+#![deny(unsafe_code)]
+// Miri cannot call into libpam.
+#![cfg(not(miri))]
+
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
 use std::sync::{Arc, Mutex, mpsc};
 
-use pam_client::Context;
-use vigil_core::AuthEvent;
-
-use super::Bridge;
+use pam_client::{Context, ConversationHandler};
+use vigil_core::{AuthEvent, Secret};
 
 const PAM_CONV: c_int = 5;
 const PAM_SUCCESS: c_int = 0;
@@ -40,38 +42,37 @@ struct Conversation {
     appdata: *mut c_void,
 }
 
-type Sink = Box<dyn Fn(AuthEvent)>;
-
-struct Module {
-    context: Context<Bridge<Sink>>,
+struct Module<C: ConversationHandler> {
+    context: Context<C>,
     events: Arc<Mutex<Vec<AuthEvent>>>,
-    field: Option<mpsc::Sender<String>>,
+    field: Option<mpsc::Sender<Secret>>,
 }
 
-impl Module {
-    fn load() -> Option<Self> {
-        let events: Arc<Mutex<Vec<AuthEvent>>> = Arc::default();
-        let sink = events.clone();
-        let (field, answers) = mpsc::channel();
-        let emit: Sink = Box::new(move |event| sink.lock().unwrap().push(event));
-        match Context::new(
-            "vigil-hostile-module",
-            Some("nobody"),
-            Bridge::new(emit, answers),
-        ) {
-            Ok(context) => Some(Self {
-                context,
-                events,
-                field: Some(field),
-            }),
-            Err(error) if std::env::var_os("CI").is_none() => {
-                eprintln!("SKIP: libpam would not start here ({error})");
-                None
-            }
-            Err(error) => panic!("pam_start: {error}"),
+fn load() -> Option<Module<impl ConversationHandler>> {
+    let events: Arc<Mutex<Vec<AuthEvent>>> = Arc::default();
+    let sink = events.clone();
+    let (field, answers) = mpsc::channel();
+    let emit = move |event| sink.lock().unwrap().push(event);
+    match Context::new(
+        "vigil-hostile-module",
+        Some("nobody"),
+        vigil_pam::conversation(emit, answers),
+    ) {
+        Ok(context) => Some(Module {
+            context,
+            events,
+            field: Some(field),
+        }),
+        Err(error) if std::env::var_os("CI").is_none() => {
+            eprintln!("SKIP: libpam would not start here ({error})");
+            None
         }
+        Err(error) => panic!("pam_start: {error}"),
     }
+}
 
+#[allow(unsafe_code)]
+impl<C: ConversationHandler> Module<C> {
     fn typed(&self, text: &str) {
         self.field.as_ref().unwrap().send(text.into()).unwrap();
     }
@@ -104,28 +105,29 @@ impl Module {
         let mut pointers: Vec<*const Message> = messages.iter().map(ptr::from_ref).collect();
         let untouched = ptr::dangling_mut::<Response>();
         let mut out = untouched;
-        let code = self.raw(messages.len() as c_int, pointers.as_mut_ptr(), &mut out);
+        let code = self.raw(messages.len() as c_int, pointers.as_mut_ptr(), &raw mut out);
         if code != PAM_SUCCESS {
             assert_eq!(out, untouched, "a failed conversation handed memory back");
             return Err(code);
         }
-        // SAFETY: on success the module owns the array and every answer in
-        // it, and releases each with free(), as libpam's modules do.
-        let answers = unsafe {
-            let answers = std::slice::from_raw_parts(out, messages.len())
-                .iter()
-                .map(|response| {
-                    assert_eq!(response.retcode, 0);
-                    (!response.text.is_null()).then(|| {
-                        let text = CStr::from_ptr(response.text).to_owned();
-                        libc::free(response.text.cast());
-                        text
-                    })
+        // SAFETY: on success `out` is an array of one response per message,
+        // which the module now owns.
+        let responses = unsafe { std::slice::from_raw_parts(out, messages.len()) };
+        let answers = responses
+            .iter()
+            .map(|response| {
+                assert_eq!(response.retcode, 0);
+                (!response.text.is_null()).then(|| {
+                    // SAFETY: a non-null answer is a C string the conversation allocated.
+                    let text = unsafe { CStr::from_ptr(response.text) }.to_owned();
+                    // SAFETY: the module releases each answer with free(), as libpam's modules do.
+                    unsafe { libc::free(response.text.cast()) };
+                    text
                 })
-                .collect();
-            libc::free(out.cast());
-            answers
-        };
+            })
+            .collect();
+        // SAFETY: and the array too, once every answer in it is copied out.
+        unsafe { libc::free(out.cast()) };
         Ok(answers)
     }
 }
@@ -143,7 +145,7 @@ fn prompt(text: &str, secret: bool) -> AuthEvent {
 
 #[test]
 fn each_answer_is_the_modules_own_allocation() {
-    let Some(module) = Module::load() else { return };
+    let Some(module) = load() else { return };
     module.typed("hunter2");
     module.typed("123456");
     let (password, note, code) = (text("Password: "), text("note"), text("Code: "));
@@ -167,7 +169,7 @@ fn each_answer_is_the_modules_own_allocation() {
 
 #[test]
 fn the_largest_message_count_libpam_allows_is_answered() {
-    let Some(module) = Module::load() else { return };
+    let Some(module) = load() else { return };
     let question = text("Password: ");
     for index in 0..PAM_MAX_NUM_MSG {
         module.typed(&format!("answer {index}"));
@@ -182,7 +184,7 @@ fn the_largest_message_count_libpam_allows_is_answered() {
 
 #[test]
 fn a_count_no_module_may_send_is_refused() {
-    let Some(module) = Module::load() else { return };
+    let Some(module) = load() else { return };
     let question = text("Password: ");
     let message = Message {
         style: ECHO_OFF,
@@ -193,7 +195,7 @@ fn a_count_no_module_may_send_is_refused() {
         let untouched = ptr::dangling_mut::<Response>();
         let mut out = untouched;
         assert_eq!(
-            module.raw(count, pointers.as_mut_ptr(), &mut out),
+            module.raw(count, pointers.as_mut_ptr(), &raw mut out),
             PAM_BUF_ERR,
             "count {count}"
         );
@@ -204,7 +206,7 @@ fn a_count_no_module_may_send_is_refused() {
 
 #[test]
 fn null_arguments_are_refused() {
-    let Some(module) = Module::load() else { return };
+    let Some(module) = load() else { return };
     let question = text("Password: ");
     let message = Message {
         style: ECHO_OFF,
@@ -212,7 +214,7 @@ fn null_arguments_are_refused() {
     };
     let mut pointers = [ptr::from_ref(&message)];
     let mut out = ptr::null_mut();
-    assert_eq!(module.raw(1, ptr::null_mut(), &mut out), PAM_BUF_ERR);
+    assert_eq!(module.raw(1, ptr::null_mut(), &raw mut out), PAM_BUF_ERR);
     assert_eq!(
         module.raw(1, pointers.as_mut_ptr(), ptr::null_mut()),
         PAM_BUF_ERR
@@ -223,7 +225,7 @@ fn null_arguments_are_refused() {
 
 #[test]
 fn a_message_without_text_is_an_empty_question() {
-    let Some(module) = Module::load() else { return };
+    let Some(module) = load() else { return };
     module.typed("hunter2");
     let answers = module.ask(&[(ECHO_OFF, None), (ERROR_MSG, None)]).unwrap();
     assert_eq!(answers, [Some(text("hunter2")), None]);
@@ -235,7 +237,7 @@ fn a_message_without_text_is_an_empty_question() {
 
 #[test]
 fn an_oversized_message_arrives_whole_and_bad_utf8_is_replaced() {
-    let Some(module) = Module::load() else { return };
+    let Some(module) = load() else { return };
     let mut bytes = vec![b'A'; 1 << 20];
     bytes.extend_from_slice(b"\xff\xfe\xc3");
     let huge = CString::new(bytes).unwrap();
@@ -250,7 +252,7 @@ fn an_oversized_message_arrives_whole_and_bad_utf8_is_replaced() {
 
 #[test]
 fn an_unknown_style_ends_the_conversation_and_frees_what_was_answered() {
-    let Some(module) = Module::load() else { return };
+    let Some(module) = load() else { return };
     let question = text("Password: ");
     for style in [0, -1, 6, 99, c_int::MAX, BINARY_PROMPT] {
         module.typed("hunter2");
@@ -262,7 +264,7 @@ fn an_unknown_style_ends_the_conversation_and_frees_what_was_answered() {
 
 #[test]
 fn an_answer_with_a_nul_fails_the_conversation_instead_of_being_cut_short() {
-    let Some(module) = Module::load() else { return };
+    let Some(module) = load() else { return };
     let question = text("Password: ");
     module.typed("hun\0ter2");
     assert_eq!(
@@ -273,7 +275,7 @@ fn an_answer_with_a_nul_fails_the_conversation_instead_of_being_cut_short() {
 
 #[test]
 fn a_field_that_went_away_fails_the_conversation() {
-    let Some(mut module) = Module::load() else {
+    let Some(mut module) = load() else {
         return;
     };
     module.field = None;

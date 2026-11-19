@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::time::{Duration, Instant, SystemTime};
 
 pub mod greet;

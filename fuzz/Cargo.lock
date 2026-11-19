@@ -4553,6 +4553,7 @@ dependencies = [
  "greetd_ipc",
  "serde_json",
  "vigil-core",
+ "vigil-secret",
 ]
 
 [[package]]
@@ -4569,6 +4570,7 @@ name = "vigil-core"
 version = "0.4.3"
 dependencies = [
  "monitor-profiles",
+ "vigil-secret",
 ]
 
 [[package]]
@@ -4592,6 +4594,15 @@ dependencies = [
  "smithay",
  "vigil-core",
  "xkbcommon 0.9.0",
+]
+
+[[package]]
+name = "vigil-secret"
+version = "0.4.3"
+dependencies = [
+ "libc",
+ "rustix 1.1.6",
+ "zeroize",
 ]
 
 [[package]]
@@ -5333,6 +5344,12 @@ dependencies = [
  "syn 3.0.10",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 
 [[package]]
 name = "zerotrie"

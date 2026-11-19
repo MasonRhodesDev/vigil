@@ -1076,7 +1076,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3873,7 +3873,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4574,7 +4574,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5129,6 +5129,7 @@ dependencies = [
  "vigil-outputs",
  "vigil-present-dumb",
  "vigil-present-gl",
+ "vigil-secret",
  "vigil-session",
  "vigil-theme",
  "vigil-ui",
@@ -5139,10 +5140,10 @@ name = "vigil-auth"
 version = "0.4.3"
 dependencies = [
  "greetd_ipc",
- "libc",
  "proptest",
  "serde_json",
  "vigil-core",
+ "vigil-secret",
 ]
 
 [[package]]
@@ -5159,6 +5160,7 @@ name = "vigil-core"
 version = "0.4.3"
 dependencies = [
  "monitor-profiles",
+ "vigil-secret",
 ]
 
 [[package]]
@@ -5202,6 +5204,7 @@ dependencies = [
  "image",
  "libc",
  "monitor-profiles",
+ "rustix 1.1.6",
  "singleton-guard",
  "slint-idle-runtime",
  "span-lines",
@@ -5211,6 +5214,7 @@ dependencies = [
  "vigil-flow",
  "vigil-login",
  "vigil-pam",
+ "vigil-secret",
  "vigil-theme",
  "vigil-ui",
  "vigil-warning",
@@ -5242,6 +5246,7 @@ dependencies = [
  "libc",
  "pam-client",
  "vigil-core",
+ "vigil-secret",
 ]
 
 [[package]]
@@ -5277,6 +5282,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vigil-secret"
+version = "0.4.3"
+dependencies = [
+ "libc",
+ "rustix 1.1.6",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "vigil-session"
 version = "0.4.3"
 dependencies = [
@@ -5298,6 +5313,7 @@ dependencies = [
  "vigil-config",
  "vigil-core",
  "vigil-flow",
+ "vigil-secret",
  "vigil-theme",
  "vigil-ui",
  "winit",
@@ -5655,7 +5671,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -6344,6 +6360,12 @@ dependencies = [
  "syn 2.0.119",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 
 [[package]]
 name = "zerotrie"

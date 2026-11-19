@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use vigil_core::{PowerAction, UiMessage};
+use vigil_core::{PowerAction, Secret, UiMessage};
 
 use crate::Now;
 
@@ -17,7 +17,7 @@ pub enum GreetdReply {
     Error { auth: bool, description: String },
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 pub enum GreetEvent {
     Ui(UiMessage),
     GreetdReply(GreetdReply),
@@ -25,14 +25,14 @@ pub enum GreetEvent {
     Tick,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 pub enum GreetCmd {
     ShowPrompt { text: String, secret: bool },
     ShowInfo(String),
     ShowError(String),
     SetBusy(bool),
     CreateSession(String),
-    PostResponse(Option<String>),
+    PostResponse(Option<Secret>),
     StartSession { cmd: Vec<String>, env: Vec<String> },
     CancelSession,
     SelectedUser { index: usize, user: Option<String> },
@@ -217,7 +217,11 @@ impl GreetFlow {
         match message {
             UiMessage::Respond(text) => match self.phase {
                 GreetPhase::AwaitingUser => {
-                    let text = text.trim().to_owned();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "credential adapter: the username field shares Respond"
+                    )]
+                    let text = text.expose().trim().to_owned();
                     let user = if text.is_empty() {
                         self.default_user.clone()
                     } else {

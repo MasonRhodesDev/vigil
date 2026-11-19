@@ -17,7 +17,11 @@ thread_local! {
 
 fn typed(event: Option<InputEvent>) {
     if let Some(InputEvent::Key { utf8, .. }) = event {
-        assert_ne!(utf8.as_deref(), Some(""), "a key carried empty text");
+        assert_ne!(
+            utf8.as_ref().map(|text| text.as_str()),
+            Some(""),
+            "a key carried empty text"
+        );
     }
 }
 

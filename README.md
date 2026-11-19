@@ -198,6 +198,68 @@ scan order with a DPI-derived scale from the monitor's EDID. A profile that is
 unreadable, unmatched, or nonsensical degrades the same way — a layout file
 must never be what keeps someone from logging in.
 
+## Safety gates
+
+vigil handles passwords, so CI rejects unsafe patterns instead of trusting
+review to catch them. `tests/check.sh` runs the checks of CI's check job in
+the same order, so a failure shows up before a push.
+
+- **Fence.** `python3 -I tests/gates/gate.py fence` reads every file under
+  `crates/` and counts, per file, the word `unsafe` (comments included), the
+  word `expose`, and each `allow`, `expect` or `warn` that names an unsafe
+  lint, a clippy lint, `warnings`, or a rustc lint group that holds a denied
+  lint, such as `rust_2024_compatibility`. `tests/gates/baseline.tsv` records
+  those counts per file. A count above its row, or a file with no row, fails.
+  After removing some, run `python3 -I tests/gates/gate.py fence --update`
+  and commit the smaller baseline. Growing a row takes `--update
+  --allow-growth`, and the pull request must say why.
+- **Rejected outright.** `include!`, `#[path]`, a build script or proc macro
+  in any path package, a path dependency that is not a workspace member under
+  `crates/` (a `[patch]` to a path included), a `cfg` on `clippy`, `unsafe`
+  inside `macro_rules!`, a symlink under `crates/`, any `clippy.toml`,
+  `.cargo/` or `rust-toolchain` file except the root `clippy.toml`, a crate
+  that does not take `[lints] workspace = true`, a workspace lint below
+  `deny`, `unsafe_op_in_unsafe_fn` below `forbid`, and a binary whose `main`
+  does not begin with `vigil_secret::exit_on_panic()`. Line 1 of every crate
+  root, examples and tests included, is `#![forbid(unsafe_code)]`, or
+  `#![deny(unsafe_code)]` when its module tree holds fenced unsafe code.
+- **New dependencies.** The fence lists every registry or git package in
+  `Cargo.lock` that the base branch's lock does not have, and marks new
+  crates, build scripts and proc macros. It reports them for the reviewer and
+  does not fail on them.
+- **What the fence cannot see.** It counts per file, so removing one unsafe
+  block and adding another in the same file keeps the count. A credential
+  that never enters a `Secret` never meets the `expose` ban. Code under
+  another target's `cfg`, such as `cfg(target_os = "freebsd")`, is counted
+  but never linted, since CI builds only for Linux. Code a dependency's macro
+  generates is not read.
+- **Canary.** `crates/vigil-secret/examples/lint_canary.rs` breaks every
+  unsafe and plaintext rule. `gate.py canary` runs clippy on it and fails
+  unless each lint still rejects it, so drift in the lint configuration fails
+  loudly.
+- **Credentials.** Typed text travels as `vigil_secret::Secret`, which wipes
+  itself on drop and never prints. `clippy.toml` disallows `Secret::expose`,
+  and `crates/vigil-secret/tests/api.rs` fails to compile if `Secret` gains a
+  trait that hands out its text. The few adapters that hand plaintext to
+  greetd or PAM carry `#[expect(clippy::disallowed_methods)]`.
+- **Process.** Every binary's `main` first installs
+  `vigil_secret::exit_on_panic()`, then sets `RLIMIT_CORE` to 0 and clears
+  `PR_SET_DUMPABLE`, which keeps its memory out of core dumps and away from
+  same-user ptrace. A panic on any thread ends the process at once with
+  status 101, so a dead worker cannot leave a live locker that no longer
+  authenticates, and the session lock stays held. The report names only the
+  file and line, since a panic message can quote typed text. Work wrapped in
+  `vigil_secret::cosmetic`, such as a wallpaper render, loses only its result
+  when it panics.
+- **Dependencies.** `gate.py advisories` parses `deny.toml` and requires every
+  advisory ignore to be a table with an `id` and a reason that starts
+  `expires YYYY-MM-DD:`, at most 183 days out.
+- **Who judges.** On a pull request, CI runs the base branch's copy of the
+  gates against the pull request, then the pull request's own copy. A change
+  to a gate, the lint configuration, `deny.toml`, the `Secret` crate or a
+  baseline row is an ordinary edit. The pull request must justify it, and it
+  passes the usual independent review.
+
 ## License
 
 [GPL-3.0](LICENSE). Slint is used under its GPLv3 license option.

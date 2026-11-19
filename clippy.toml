@@ -1,0 +1,5 @@
+disallowed-methods = [
+    { path = "vigil_secret::Secret::expose", reason = "plaintext leaves a Secret only in a credential adapter, marked #[expect(clippy::disallowed_methods)]" },
+    { path = "std::panic::set_hook", reason = "the one hook is vigil_secret::exit_on_panic, first in every main; another set_hook replaces it and a worker panic would leave the process half alive" },
+    { path = "std::panic::take_hook", reason = "taking the hook removes vigil_secret::exit_on_panic" },
+]

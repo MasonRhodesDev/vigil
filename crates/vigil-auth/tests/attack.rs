@@ -1,11 +1,13 @@
+#![forbid(unsafe_code)]
+
 use std::collections::hash_map::RandomState;
 use std::fs::File;
 use std::hash::BuildHasher;
 use std::io::Write;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -14,11 +16,12 @@ use greetd_ipc::{AuthMessageType, ErrorType, Request, Response};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
 use vigil_auth::{AuthMachine, Prompt};
-use vigil_core::{AuthUi, UiMessage};
+use vigil_core::{AuthUi, Secret, UiMessage};
 
 const USERS: [&str; 3] = ["alice", "bob", "carol"];
 const MARK: &str = "Zq7typed";
 const ECHO: &str = "{user}";
+const JOURNAL: &str = "VIGIL_ATTACK_JOURNAL";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {
@@ -120,31 +123,15 @@ impl AuthUi for Ui {
 
 struct Journal {
     file: File,
-    saved: OwnedFd,
     read: u64,
 }
 
 impl Journal {
-    fn open(dir: &std::path::Path) -> Self {
-        let path = dir.join("stderr");
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .expect("open the stderr capture");
-        let saved = std::io::stderr()
-            .as_fd()
-            .try_clone_to_owned()
-            .expect("save stderr");
-        // SAFETY: both descriptors are open and owned by this process.
-        assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), 2) }, 2);
-        Self {
-            file,
-            saved,
-            read: 0,
-        }
+    fn open() -> Self {
+        let path = std::env::var_os(JOURNAL).expect("the parent names this process's stderr");
+        let file = File::open(path).expect("open the stderr capture");
+        let read = file.metadata().expect("stat the capture").len();
+        Self { file, read }
     }
 
     fn take(&mut self) -> String {
@@ -158,11 +145,31 @@ impl Journal {
     }
 }
 
-impl Drop for Journal {
-    fn drop(&mut self) {
-        // SAFETY: `saved` is the stderr this process started with.
-        unsafe { libc::dup2(self.saved.as_raw_fd(), 2) };
+// The auth machine journals to stderr, so the cases run in a child whose
+// stderr is a file it reads back after each step.
+fn supervise() -> ! {
+    let path = std::env::temp_dir().join(format!("vigil-attack-{}.stderr", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let capture = File::options()
+        .append(true)
+        .create_new(true)
+        .open(&path)
+        .expect("create the stderr capture");
+    let status = Command::new(std::env::current_exe().expect("this harness's path"))
+        .env(JOURNAL, &path)
+        .stderr(capture)
+        .status()
+        .expect("run the attack");
+    if !status.success() {
+        let text = std::fs::read(&path).unwrap_or_default();
+        let tail = &text[text.len().saturating_sub(4096)..];
+        println!(
+            "attack: the run ended with {status}; its stderr ends:\n{}",
+            String::from_utf8_lossy(tail)
+        );
     }
+    let _ = std::fs::remove_file(&path);
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 struct Greetd {
@@ -294,7 +301,7 @@ fn drive(greetd: &Greetd, case: &Case) -> Vec<Event> {
     let mut machine =
         AuthMachine::connect(socket.to_str()).expect("connect to the scripted greetd");
     let mut ui = Ui(trace.clone());
-    let mut journal = Journal::open(&greetd.dir);
+    let mut journal = Journal::open();
     machine.set_session(vec!["session".into()], Vec::new());
     machine.set_default_user(case.default_user.map(|user| USERS[user].to_owned()));
     machine.set_unprompted(case.unprompted.map(|user| USERS[user].to_owned()));
@@ -316,12 +323,12 @@ fn drive(greetd: &Greetd, case: &Case) -> Vec<Event> {
         let result = match op {
             Op::Begin(user) => machine.begin(name(user), &mut ui),
             Op::Pick(user) => machine.select_user(name(user), &mut ui),
-            Op::Type(text) => machine.handle(UiMessage::Respond(text.clone()), &mut ui),
+            Op::Type(text) => machine.handle(UiMessage::Respond(text.as_str().into()), &mut ui),
             Op::TypeDefaultName => {
-                let text = name(&case.default_user).unwrap_or_default().to_owned();
-                machine.handle(UiMessage::Respond(text), &mut ui)
+                let text = name(&case.default_user).unwrap_or_default();
+                machine.handle(UiMessage::Respond(text.into()), &mut ui)
             }
-            Op::Enter => machine.handle(UiMessage::Respond(String::new()), &mut ui),
+            Op::Enter => machine.handle(UiMessage::Respond(Secret::default()), &mut ui),
             Op::Escape => machine.handle(UiMessage::Cancel, &mut ui),
             Op::Session(command) => {
                 machine.set_session(command.clone(), Vec::new());
@@ -913,6 +920,10 @@ fn replay(greetd: &Greetd) -> bool {
 }
 
 fn main() {
+    vigil_secret::exit_on_panic();
+    if std::env::var_os(JOURNAL).is_none() {
+        supervise();
+    }
     let greetd = match Greetd::bind() {
         Ok(greetd) => greetd,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
