@@ -250,6 +250,7 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    #[ignore = "talks to the real D-Bus; run by hand with --ignored"]
     fn logind_session_resolves_read_only() {
         let Some(session) = LoginSession::connect() else {
             vigil_log::say!("skipped: no system bus or no logind session");
@@ -275,6 +276,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "talks to the real D-Bus; run by hand with --ignored"]
     fn portal_read_initial_is_harmless() {
         let Some(watcher) = AppearanceWatcher::connect() else {
             vigil_log::say!("skipped: no session bus");
