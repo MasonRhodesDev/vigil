@@ -15,6 +15,8 @@ libfuzzer-sys = "0.4"
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 vigil-auth = { path = "../crates/vigil-auth" }
 vigil-config = { path = "../crates/vigil-config" }
+vigil-core = { path = "../crates/vigil-core" }
+vigil-input = { path = "../crates/vigil-input", features = ["fuzzing"] }
 
 [[bin]]
 name = "greetd_response"
@@ -33,6 +35,13 @@ bench = false
 [[bin]]
 name = "config_overlay"
 path = "fuzz_targets/config_overlay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keyboard"
+path = "fuzz_targets/keyboard.rs"
 test = false
 doc = false
 bench = false
