@@ -113,6 +113,76 @@ fn style_sheets_may_paint_with_gradients_but_not_fan_out() {
     assert!(refused(&svg(&clips)).contains("expands"));
 }
 
+fn screened(text: &str) -> Result<(), String> {
+    match Logo::svg(text.as_bytes()) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[test]
+fn style_sheets_hold_only_rules_on_one_type_class_or_id() {
+    let start = Instant::now();
+    let (_, nested) = &common::review_inputs()[0];
+    assert!(refused(nested).contains("style sheet"));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+
+    let simple = r#"<style>/* g g g */ rect{fill:red} .a{fill:blue} #b, *{stroke:none}</style><rect class="a" id="b" width="100" height="100"/>"#;
+    assert_eq!(coverage(&svg(simple), 8), 64);
+    for sheet in [
+        "g rect{fill:red}",
+        "g>rect{fill:red}",
+        "g+rect{fill:red}",
+        "rect.a{fill:red}",
+        "rect:first-child{fill:red}",
+        "[x]{fill:red}",
+        "@import url(x.css);",
+        "rect{fill:red}}g g{fill:red",
+        "rect{fill:\"}g g{\"}",
+    ] {
+        let why = refused(&svg(&format!(
+            r#"<style>{sheet}</style><rect width="9" height="9"/>"#
+        )));
+        assert!(why.contains("style sheet"), "{sheet}: {why}");
+    }
+    let many = "rect{fill:red}".repeat(65);
+    assert!(refused(&svg(&format!("<style>{many}</style>"))).contains("64 rules"));
+    let foreign =
+        r#"<x:style xmlns:x="urn:x">h g g{fill:red}</x:style><rect width="9" height="9"/>"#;
+    assert!(refused(&svg(foreign)).contains("style sheet"));
+}
+
+#[test]
+fn path_data_is_counted_by_its_bytes_for_every_copy() {
+    for (what, text) in &common::review_inputs()[1..3] {
+        let start = Instant::now();
+        let why = refused(text);
+        assert!(why.contains("path data"), "{what}: {why}");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{what}: {:?}",
+            start.elapsed()
+        );
+    }
+    let path = |uses: usize| {
+        let d: String = (0..20_000)
+            .map(|i| format!(" L{} {}", i % 97, i % 89))
+            .collect();
+        svg(&format!(
+            r##"<defs><path id="p" fill="none" stroke="#000" d="M0 0{d}"/></defs>{}"##,
+            r##"<use href="#p"/>"##.repeat(uses)
+        ))
+    };
+    if let Err(why) = screened(&path(15)) {
+        assert!(!why.contains("path data"), "15 copies of 136 KB: {why}");
+    }
+    assert!(refused(&path(40)).contains("path data"));
+}
+
 #[test]
 fn reference_loops_are_refused() {
     assert!(refused(&svg(r##"<g id="a"><use href="#a"/></g>"##)).contains("loop"));
