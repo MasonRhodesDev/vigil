@@ -1936,6 +1936,31 @@ not_a_key = 1
     }
 
     #[test]
+    fn a_bad_first_question_entry_is_skipped_and_the_rest_of_the_state_kept() {
+        let tmp =
+            std::env::temp_dir().join(format!("vigil-state-badq-{}.toml", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "user = \"alice\"\nunprompted_user = \"alice\"\n\n\
+             [[first_question]]\nuser = \"bob\"\ntext = \"PIN: \"\n\n\
+             [[first_question]]\nuser = \"carol\"\ntext = \"PIN: \"\nsecret = true\n",
+        )
+        .unwrap();
+        let state = State::load(&tmp).unwrap();
+        assert_eq!(state.user, "alice");
+        assert_eq!(state.unprompted_user, "alice");
+        assert_eq!(
+            state.first_question,
+            vec![FirstQuestion {
+                user: "carol".into(),
+                text: "PIN: ".into(),
+                secret: true,
+            }]
+        );
+        std::fs::remove_file(tmp).unwrap();
+    }
+
+    #[test]
     fn state_load_missing_is_none() {
         assert_eq!(
             State::load(Path::new("/nonexistent/vigil-state.toml")),

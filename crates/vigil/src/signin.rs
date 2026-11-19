@@ -163,6 +163,34 @@ mod tests {
     const PIN: &str = "Security token PIN: ";
 
     #[test]
+    fn the_unasked_record_is_off_disk_while_its_sign_in_is_open_and_back_after_success() {
+        let Some(greetd) = Greetd::scripted(
+            "unprompted-claimed",
+            vec![Response::Success, Response::Success],
+        ) else {
+            return;
+        };
+        State {
+            user: "alice".into(),
+            unprompted_user: "alice".into(),
+            ..State::default()
+        }
+        .store(&greetd.state_file());
+        let mut start = Start::new(&greetd);
+        assert_eq!(
+            on_disk(&greetd).unprompted_user,
+            "",
+            "a greeter that dies mid sign-in must not open the user unasked again"
+        );
+        assert_eq!(on_disk(&greetd).user, "alice");
+        start.choose("alice");
+        start.observed(&greetd);
+        start.finished(&greetd, Some("session"));
+        assert_eq!(on_disk(&greetd).unprompted_user, "alice");
+        assert_eq!(greetd.finish(), ["create alice", "start"]);
+    }
+
+    #[test]
     fn a_question_put_to_the_unprompted_user_takes_the_record_out_of_the_state_file() {
         let Some(greetd) = Greetd::scripted(
             "unprompted-asked",
@@ -177,8 +205,6 @@ mod tests {
         }
         .store(&greetd.state_file());
         let mut start = Start::new(&greetd);
-        assert!(!start.observed(&greetd));
-        assert_eq!(on_disk(&greetd).unprompted_user, "alice");
         start.choose("alice");
         assert!(start.observed(&greetd));
         assert_eq!(on_disk(&greetd).unprompted_user, "");
