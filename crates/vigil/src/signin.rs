@@ -202,6 +202,56 @@ mod tests {
     }
 
     #[test]
+    fn another_users_first_question_does_not_put_the_unasked_record_back_on_disk() {
+        let Some(greetd) = Greetd::scripted(
+            "unprompted-other-question",
+            vec![asks(AuthMessageType::Secret, PIN)],
+        ) else {
+            return;
+        };
+        State {
+            unprompted_user: "alice".into(),
+            ..State::default()
+        }
+        .store(&greetd.state_file());
+        let mut start = Start::new(&greetd);
+        assert_eq!(start.state.unprompted_user, "", "a later store must not carry it");
+        start.choose("bob");
+        start.submit("hunter2");
+        assert!(start.observed(&greetd));
+        assert_eq!(on_disk(&greetd).first_question, [question("bob", PIN, true)]);
+        assert_eq!(on_disk(&greetd).unprompted_user, "");
+        drop(start);
+        assert_eq!(greetd.finish(), ["create bob"]);
+    }
+
+    #[test]
+    fn the_unasked_sign_in_stays_closed_when_its_record_cannot_be_taken_off_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(greetd) = Greetd::scripted("unprompted-readonly", vec![Response::Success]) else {
+            return;
+        };
+        State {
+            unprompted_user: "alice".into(),
+            ..State::default()
+        }
+        .store(&greetd.state_file());
+        let dir = greetd.state_file().parent().unwrap().to_owned();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let writable = std::fs::write(dir.join("probe"), "").is_ok();
+        let mut start = (!writable).then(|| Start::new(&greetd));
+        if let Some(start) = &mut start {
+            start.choose("alice");
+        }
+        drop(start);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if writable {
+            return;
+        }
+        assert_eq!(greetd.finish(), [""; 0], "nothing opens unasked while the record is on disk");
+    }
+
+    #[test]
     fn a_question_put_to_the_unprompted_user_takes_the_record_out_of_the_state_file() {
         let Some(greetd) = Greetd::scripted(
             "unprompted-asked",
