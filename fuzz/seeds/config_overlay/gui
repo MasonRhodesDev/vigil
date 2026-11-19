@@ -1,0 +1,8 @@
+ÿ[lock.warning.gui]
+enabled = true
+[[lock.warning.gui.element]]
+selector = "clock"
+[[output]]
+match = "DP-1"
+[profiles]
+dir = "/p"

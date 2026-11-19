@@ -7,6 +7,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dev-dependencies]
+libc.workspace = true
+
 [dependencies]
 vigil-core.workspace = true
 vigil-secret.workspace = true

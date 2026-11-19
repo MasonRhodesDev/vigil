@@ -7,6 +7,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Opens the keyboard state to the fuzz target; nothing else enables it.
+fuzzing = []
+
 [dependencies]
 vigil-core.workspace = true
 smithay = { workspace = true, features = ["backend_libinput"] }

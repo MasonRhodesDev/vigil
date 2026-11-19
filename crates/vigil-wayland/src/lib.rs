@@ -385,6 +385,15 @@ struct App<S: LockSession + 'static> {
     protocol_events: Vec<FlowEvent>,
 }
 
+fn exit_session<S: LockSession>(
+    session: &mut S,
+    slot: &mut Option<LockOutcome>,
+    outcome: LockOutcome,
+) {
+    *slot = Some(outcome);
+    session.flow_command(&FlowCmd::Exit(outcome));
+}
+
 fn soonest_retry(
     retries: &BTreeMap<OutputId, (std::time::Instant, u32)>,
     live: impl Fn(OutputId) -> bool,
@@ -491,7 +500,9 @@ impl<S: LockSession> App<S> {
                         phase = %to
                     ));
                 }
-                FlowCmd::Exit(outcome) => self.outcome = Some(outcome),
+                FlowCmd::Exit(outcome) => {
+                    exit_session(&mut self.session, &mut self.outcome, outcome)
+                }
                 ref session_cmd @ (FlowCmd::ShowPanel(_)
                 | FlowCmd::DispatchInput(_)
                 | FlowCmd::StartAuth
@@ -1814,6 +1825,56 @@ mod tests {
         assert_eq!(
             super::soonest_retry(&retries, |id| id == super::OutputId(1), now),
             Some(Duration::from_millis(800))
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingSession {
+        commands: Vec<vigil_flow::FlowCmd>,
+    }
+
+    impl super::LockSession for RecordingSession {
+        fn output_ready(&mut self, _: super::OutputId, _: &super::OutputInfo) {}
+        fn output_resized(&mut self, _: super::OutputId, _: &super::OutputInfo) {}
+        fn force_copy_out(&mut self, _: super::OutputId) {}
+        fn output_gone(&mut self, _: super::OutputId) {}
+        fn focus_output(&mut self, _: super::OutputId) {}
+        fn caps_lock(&mut self, _: bool) {}
+        fn flow_command(&mut self, cmd: &vigil_flow::FlowCmd) {
+            self.commands.push(cmd.clone());
+        }
+        fn tick(&mut self) {}
+        fn render(&mut self, _: super::OutputId, _: super::FrameTarget<'_>) -> bool {
+            false
+        }
+        fn wait_decision(&self) -> super::WaitDecision {
+            super::WaitDecision::Indefinite
+        }
+    }
+
+    #[test]
+    fn an_invalidated_lock_tells_the_session_it_exited() {
+        use vigil_flow::{FlowCmd, FlowEvent, LockFlow, LockOutcome, Now};
+        let lock = vigil_config::Lock::default();
+        let (mut flow, _) = LockFlow::new(Now::at(Duration::ZERO), &lock, Some(0));
+        let cmds = flow.step(
+            Now::at(Duration::from_millis(100)),
+            FlowEvent::LockInvalidated,
+        );
+        let mut session = RecordingSession::default();
+        let mut outcome = None;
+        for cmd in cmds {
+            if let FlowCmd::Exit(exit) = cmd {
+                super::exit_session(&mut session, &mut outcome, exit);
+            }
+        }
+        assert_eq!(outcome, Some(LockOutcome::Invalidated));
+        assert!(
+            session
+                .commands
+                .contains(&FlowCmd::Exit(LockOutcome::Invalidated)),
+            "the session must hear the exit so it stops confirming joins: {:?}",
+            session.commands
         );
     }
 

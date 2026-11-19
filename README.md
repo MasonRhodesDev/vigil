@@ -34,6 +34,55 @@ is its own display backend, so the login path depends only on the kernel,
 libseat, libinput, xkbcommon, and greetd — none of which a desktop upgrade
 touches.
 
+## Security tests
+
+The greeter and the lock are attacked by tests that run in CI. Each one
+can be run alone.
+
+| What is attacked | Run it |
+|---|---|
+| `AuthMachine` against a scripted greetd, by generated message and input sequences | `cargo test -p vigil-auth --test attack` |
+| The greetd reply decoder, the state file, the config overlay, the keyboard state and the theme loader, by fuzzing | `fuzz/run.sh 300` |
+| The PAM conversation callback, by a hostile module under AddressSanitizer | `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p vigil-pam --target x86_64-unknown-linux-gnu` |
+| The pure Rust half of `vigil-pam`, under Miri | `MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p vigil-pam` |
+| A locked session: signals, memory starvation, input flood, unlock race, compositor death | `tests/nested/attack.sh` |
+
+`VIGIL_ATTACK_CASES` sets how many sequences the `AuthMachine` attack
+generates per greetd model (default 1500). Each run draws a new seed and
+prints it first. `VIGIL_ATTACK_SEED=<seed>` with the same case count
+draws the same sequences again, so a red CI run replays locally. A
+failure prints the shortest sequence that breaks an invariant; add it to
+`pinned()` in `crates/vigil-auth/tests/attack.rs` before fixing it.
+
+`fuzz/run.sh [seconds] [target...]` needs `cargo install cargo-fuzz
+--locked` and a toolchain that accepts `-Z` flags: a rustup nightly, or
+a stable toolchain that ships the sanitizer runtimes. CI runs every
+target for 30 seconds. Seeds live in `fuzz/seeds`; the working corpus in
+`fuzz/corpus` and crashes in `fuzz/artifacts` are untracked. To keep a
+crash, minimise it with `cargo fuzz tmin <target> <artifact>`, add it to
+`fuzz/seeds/<target>` and write a regression test for it.
+
+`tests/nested/attack.sh` needs sway, wtype and the debug builds of
+`vigil-lock` and the `lock_probe` example. It signs in as a user that
+does not exist, so it never counts a failure against a real account. Both
+D-Bus addresses name a socket nobody listens on, so neither the lock
+client nor a PAM module reaches the host's D-Bus. The run is otherwise
+not sealed off the host: NSS looks the ghost user up through
+`/run/systemd/userdb`, and PAM modules write to `/dev/log`. The script
+kills only lockers that carry its own `VIGIL_ATTACK_RUN`, so a locker the
+user runs from the same build survives it.
+
+Not covered yet: a VT switch away from a locked session. Headless sway
+has no seat session, so there is no VT to switch. The test needs sway on
+a DRM device inside the QEMU guest that `tests/e2e` boots, with
+`vigil-lock` holding the lock, `chvt` to a second VT and back, and a
+framebuffer capture on each VT to show that the session contents never
+reach the screen.
+
+Not covered yet: a compositor that restarts in place. Headless sway
+cannot restart without ending its session, so A9 shows only that the
+lock client exits with its compositor and frees the singleton.
+
 ## Installation
 
 Arch, from the [mason] pacman repo:
@@ -105,8 +154,10 @@ when its contract changes.
 
 `vigil-lock --wait` detaches and returns success only after the compositor has
 confirmed that the session is locked (`--daemonize` remains a compatibility
-alias). `vigil-lock --warn 10` presents a cancelable, capture-free idle warning before
-locking. It requests `ext-background-effect-v1` blur when available and uses a
+alias). It exits 1 when a logind unlock lands before the compositor confirms
+the lock, and also when the compositor invalidates the lock, so a caller told
+the session is locked never sees it unlock first. `vigil-lock --warn 10`
+presents a cancelable, capture-free idle warning before locking. It requests `ext-background-effect-v1` blur when available and uses a
 tint-only fallback otherwise. Activity before commitment exits 3. `--no-warn`,
 manual lock, and suspend paths run a short **non-cancelable** frost transition
 instead (`[lock.transition]`, default 400 ms; input is ignored and hotplug
