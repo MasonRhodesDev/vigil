@@ -61,6 +61,31 @@ struct Prompt {
     secret: bool,
 }
 
+impl Prompt {
+    fn password() -> Self {
+        Self {
+            text: PASSWORD_PROMPT.into(),
+            secret: true,
+        }
+    }
+
+    // The PAM worker's locale is unknown here, so behind vigil's own
+    // "Password" label only libpam's untranslated default is recognised.
+    fn is_the_question_under(&self, field: &Prompt) -> bool {
+        let label = self
+            .text
+            .trim_end_matches(|c: char| c == ':' || c.is_whitespace());
+        self.secret == field.secret
+            && (self.text == field.text
+                || (field.text == PASSWORD_PROMPT && label == PASSWORD_PROMPT))
+    }
+}
+
+struct Typed {
+    text: String,
+    field: Prompt,
+}
+
 pub struct AuthMachine {
     stream: UnixStream,
     command: Vec<String>,
@@ -230,10 +255,7 @@ impl AuthMachine {
     fn offered(&self) -> Prompt {
         match (&self.first_question, &self.user) {
             (Some((user, prompt)), Some(current)) if user == current => prompt.clone(),
-            _ => Prompt {
-                text: PASSWORD_PROMPT.into(),
-                secret: true,
-            },
+            _ => Prompt::password(),
         }
     }
 
@@ -247,7 +269,7 @@ impl AuthMachine {
 
     // greetd can end a conversation that has asked a question only with an
     // answer or with a failure PAM counts, so none is opened before a submit.
-    fn open(&mut self, answer: Option<String>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+    fn open(&mut self, typed: Option<Typed>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         let Some(user) = self.user.clone() else {
             self.prompt_username(ui);
             return Ok(());
@@ -256,7 +278,7 @@ impl AuthMachine {
         self.asked = false;
         self.spoke = false;
         let response = self.transact(&Request::CreateSession { username: user }, ui)?;
-        self.process_response(response, answer, ui)
+        self.process_response(response, typed, ui)
     }
 
     pub fn handle(&mut self, msg: UiMessage, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
@@ -272,7 +294,10 @@ impl AuthMachine {
                         self.choose(Some(name), typed, ui)
                     }
                 }
-                State::AwaitingCommit => self.open(Some(text).filter(|text| !text.is_empty()), ui),
+                State::AwaitingCommit => {
+                    let field = self.offered();
+                    self.open((!text.is_empty()).then_some(Typed { text, field }), ui)
+                }
                 State::AwaitingPrompt => {
                     let response = self.transact(
                         &Request::PostAuthMessageResponse {
@@ -345,7 +370,7 @@ impl AuthMachine {
     fn process_response(
         &mut self,
         mut response: Response,
-        mut answer: Option<String>,
+        mut typed: Option<Typed>,
         ui: &mut dyn AuthUi,
     ) -> Result<(), AuthError> {
         loop {
@@ -358,20 +383,28 @@ impl AuthMachine {
                         text: auth_message,
                         secret: matches!(kind, AuthMessageType::Secret),
                     };
-                    let offered = self.offered();
                     if !std::mem::replace(&mut self.asked, true) {
                         self.first_question = self.user.clone().map(|user| (user, prompt.clone()));
                     }
                     self.heard();
-                    if let Some(answer) = answer.take().filter(|_| prompt.secret == offered.secret)
-                    {
-                        response = self.transact(
-                            &Request::PostAuthMessageResponse {
-                                response: Some(answer),
-                            },
-                            ui,
-                        )?;
-                        continue;
+                    match typed.take() {
+                        Some(typed) if prompt.is_the_question_under(&typed.field) => {
+                            response = self.transact(
+                                &Request::PostAuthMessageResponse {
+                                    response: Some(typed.text),
+                                },
+                                ui,
+                            )?;
+                            continue;
+                        }
+                        Some(_) => {
+                            eprintln!(
+                                "vigil: auth withheld user={}; the first question is not the one the field showed",
+                                self.logged_user()
+                            );
+                            ui.reset_input();
+                        }
+                        None => {}
                     }
                     ui.show_prompt(&prompt.text, prompt.secret);
                     self.state = State::AwaitingPrompt;
@@ -958,6 +991,95 @@ mod tests {
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
         assert_eq!(sent(&requests), ["create alice", "answer hunter2", "start"]);
         assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn typed_text_that_is_withheld_is_cleared_from_the_field() {
+        let Some((server, _requests)) = scripted(vec![auth_message(
+            AuthMessageType::Secret,
+            "Security token PIN: ",
+        )]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(
+            fields(&ui),
+            ["reset", "Password", "reset", "Security token PIN: "]
+        );
+    }
+
+    #[test]
+    fn a_learned_question_is_answered_only_when_pam_asks_it_again_word_for_word() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Security token PIN: "),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+            auth_message(AuthMessageType::Secret, "Security token PIN: "),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+            auth_message(AuthMessageType::Secret, "Recovery key: "),
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("111111".into()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("222222".into()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("333333".into()), &mut ui);
+        assert_eq!(
+            sent(&requests),
+            [
+                "create alice",
+                "answer 111111",
+                "cancel",
+                "create alice",
+                "answer 222222",
+                "cancel",
+                "create alice"
+            ]
+        );
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Recovery key: ".into(), true))
+        );
+    }
+
+    #[test]
+    fn the_password_field_answers_only_the_plain_password_question() {
+        let asked = |kind, text: &str| {
+            let (server, requests) = scripted(vec![
+                auth_message(kind, text),
+                Response::Success,
+                Response::Success,
+            ])?;
+            let mut machine = machine(&server);
+            let mut ui = RecordingUi::default();
+            let _ = machine.select_user(Some("alice"), &mut ui);
+            let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+            Some(sent(&requests))
+        };
+        let answered = ["create alice", "answer hunter2", "start"];
+        for text in ["Password: ", "Password:", "Password"] {
+            let Some(sent) = asked(AuthMessageType::Secret, text) else {
+                return;
+            };
+            assert_eq!(sent, answered, "{text:?}");
+        }
+        for (kind, text) in [
+            (AuthMessageType::Secret, "Password for alice: "),
+            (AuthMessageType::Secret, "New password: "),
+            (AuthMessageType::Visible, "Password: "),
+        ] {
+            let Some(sent) = asked(kind, text) else {
+                return;
+            };
+            assert_eq!(sent, ["create alice"], "{text:?}");
+        }
     }
 
     #[test]
