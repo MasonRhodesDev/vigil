@@ -15,7 +15,7 @@ use vigil_scene::{
 const BIN: &str = env!("CARGO_BIN_EXE_vigil-scene");
 const CHILD: &str = "VIGIL_SCENE_HELPER_TEST";
 const PATIENT: Duration = Duration::from_secs(300);
-// Only a smoke check: a loaded host has overshot a deadline by 650 ms. The
+// Only a smoke check: a loaded host has overshot a deadline by 1.35 s. The
 // deadline itself is checked by the Timeout, the kill and the reaping.
 const SMOKE: Duration = Duration::from_secs(5);
 

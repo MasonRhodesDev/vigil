@@ -452,7 +452,7 @@ fn a_missing_helper_is_its_own_code_and_the_ground_still_draws() {
 
 const CHILD: &str = "VIGIL_SCENE_ABI_TEST";
 
-// Only a smoke check: a loaded host has overshot a deadline by 650 ms.
+// Only a smoke check: a loaded host has overshot a deadline by 1.35 s.
 const SMOKE: Duration = Duration::from_secs(5);
 
 fn spinner(name: &str) -> PathBuf {

@@ -170,8 +170,9 @@ unsafe fn bytes<'a>(ptr: *const u8, len: usize, cap: usize) -> Result<Option<&'a
 /// library, and the call returns within `deadline_ms`, plus the kernel's
 /// teardown of a killed helper and the copy of the layer into `out`, whatever
 /// the logo holds. Past the deadline that has taken under 10 ms on an idle
-/// host and about 340 ms on a loaded one, in a debug build. A request
-/// without a logo is drawn in the calling process.
+/// host. With a load average of 50 to 77 on 12 cores it took up to 233 ms
+/// for the helper and 1.35 s for a shell script in its place, in a debug
+/// build. A request without a logo is drawn in the calling process.
 /// On any error `out` is left unwritten, and a caller should draw the
 /// ground-only scene by asking again without the logo.
 ///
