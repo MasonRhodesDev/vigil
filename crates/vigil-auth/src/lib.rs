@@ -1131,6 +1131,22 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_that_echoes_a_typed_name_never_reaches_the_stage_line() {
+        let Some((server, _requests)) = scripted(vec![auth_message(
+            AuthMessageType::Secret,
+            "hunter2's password:",
+        )]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.begin(None, &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert!(!machine.stage().contains("hunter2"), "{}", machine.stage());
+        assert_eq!(machine.stage(), "user=<typed> prompt=<19 chars> secret");
+    }
+
+    #[test]
     fn a_typed_name_never_reaches_the_stage_line() {
         let Some((server, requests)) = scripted(vec![
             secret_prompt(),
@@ -1146,7 +1162,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let _ = machine.begin(None, &mut ui);
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
-        assert_eq!(machine.stage(), "user=<typed> prompt=\"Password:\" secret");
+        assert_eq!(machine.stage(), "user=<typed> prompt=<9 chars> secret");
         let _ = machine.handle(UiMessage::Respond("again".into()), &mut ui);
         assert_eq!(
             machine.stage(),
