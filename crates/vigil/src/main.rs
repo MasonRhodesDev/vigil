@@ -297,7 +297,7 @@ struct App {
     entries: Vec<Entry>,
     row: layout::Row,
     cursor: (f64, f64),
-    panel: usize,
+    panel: Option<OutputId>,
     queue: Rc<RefCell<VecDeque<UiMessage>>>,
     looks: vigil_ui::Looks,
     appearance_registry: appearance_profiles::Registry,
@@ -1076,9 +1076,6 @@ impl App {
 
     fn remove_output(&mut self, id: OutputId) {
         self.entries.retain(|e| e.id != id);
-        if self.panel >= self.entries.len() {
-            self.panel = 0;
-        }
     }
 
     fn rebuild_row(&mut self) {
@@ -1106,26 +1103,32 @@ impl App {
                 eprintln!("vigil: layout: {overlap}");
             }
         }
+        let settled = layout::settle(&self.row, &row, self.panel, self.cursor);
         self.row = row;
-        let (cx, cy) = self.row.clamp(self.cursor.0, self.cursor.1);
-        self.cursor = (cx, cy);
-        if let Some(origin) = self.layout.iter().find(|output| output.position == (0, 0))
-            && let Some(index) = self
-                .entries
-                .iter()
-                .position(|entry| entry.connector == origin.name)
-        {
-            self.panel = index;
-            if let Some(centre) = self.row.centre(self.entries[index].id) {
-                self.cursor = centre;
+        if let Some(settled) = settled {
+            self.cursor = settled.cursor;
+            self.panel = Some(settled.panel);
+            if let Some(reason) = settled.moved {
+                self.log_panel(reason);
             }
         }
         self.apply_panel();
     }
 
+    fn log_panel(&self, reason: layout::PanelReason) {
+        if let Some(connector) = self.panel.and_then(|id| self.row.connector(id)) {
+            eprintln!("vigil: panel -> {connector} ({reason})");
+        }
+    }
+
+    fn panel_entry(&mut self) -> Option<&mut Entry> {
+        let panel = self.panel?;
+        self.entries.iter_mut().find(|e| e.id == panel)
+    }
+
     fn apply_panel(&mut self) {
-        for (i, e) in self.entries.iter_mut().enumerate() {
-            let on_panel = i == self.panel;
+        for e in self.entries.iter_mut() {
+            let on_panel = Some(e.id) == self.panel;
             e.window.set_panel_visible(on_panel);
             if e.hw_cursor {
                 let (px, py) = e.window.pointer();
@@ -1160,7 +1163,7 @@ impl App {
                     if pressed && keysym == ESCAPE {
                         self.queue.borrow_mut().push_back(UiMessage::Cancel);
                     }
-                    if let Some(e) = self.entries.get_mut(self.panel) {
+                    if let Some(e) = self.panel_entry() {
                         e.window.dispatch(event);
                     }
                 }
@@ -1172,7 +1175,7 @@ impl App {
                     self.move_cursor(gx, gy);
                 }
                 InputEvent::PointerButton { .. } => {
-                    if let Some(e) = self.entries.get_mut(self.panel) {
+                    if let Some(e) = self.panel_entry() {
                         e.window.dispatch(event);
                     }
                 }
@@ -1186,18 +1189,17 @@ impl App {
         let Some(hit) = self.row.locate(cx, cy) else {
             return;
         };
-        let Some(idx) = self.entries.iter().position(|e| e.id == hit.id) else {
-            return;
-        };
-        if idx != self.panel {
-            self.panel = idx;
+        if self.panel != Some(hit.id) {
+            self.panel = Some(hit.id);
+            self.log_panel(layout::PanelReason::Pointer);
             self.apply_panel();
         }
-        let e = &mut self.entries[idx];
-        e.window
-            .dispatch(InputEvent::PointerAbsolute { x: hit.x, y: hit.y });
-        if e.hw_cursor {
-            e.presenter.set_cursor(Some((hit.x as i32, hit.y as i32)));
+        if let Some(e) = self.panel_entry() {
+            e.window
+                .dispatch(InputEvent::PointerAbsolute { x: hit.x, y: hit.y });
+            if e.hw_cursor {
+                e.presenter.set_cursor(Some((hit.x as i32, hit.y as i32)));
+            }
         }
     }
 
@@ -1890,13 +1892,14 @@ impl App {
                 }
             }
         }
+        let lost = !dead.is_empty();
         for i in dead.into_iter().rev() {
             let id = self.entries[i].id;
             eprintln!("vigil: output {id:?} lost; awaiting rescan");
             self.entries.remove(i);
         }
-        if self.panel >= self.entries.len() {
-            self.panel = 0;
+        if lost {
+            self.rebuild_row();
         }
         self.maybe_first_frame_hook();
     }
@@ -2185,7 +2188,7 @@ fn run() -> Result<i32, String> {
         entries: Vec::new(),
         row: layout::Row::default(),
         cursor: (0.0, 0.0),
-        panel: 0,
+        panel: None,
         queue: Rc::new(RefCell::new(VecDeque::new())),
         looks: vigil_ui::Looks {
             cli_background: cli.background.clone(),
@@ -2324,8 +2327,8 @@ fn run() -> Result<i32, String> {
                 }
                 let had_events = !events.is_empty();
                 app.route(events);
-                if had_events && let Some(entry) = app.entries.get(app.panel) {
-                    app.dirty.mark(entry.id);
+                if had_events && let Some(panel) = app.panel {
+                    app.dirty.mark(panel);
                 }
                 Ok(PostAction::Continue)
             },

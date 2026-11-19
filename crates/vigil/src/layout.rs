@@ -154,11 +154,34 @@ impl Row {
         &self.overlaps
     }
 
+    pub fn contains(&self, id: OutputId) -> bool {
+        self.span(id).is_some()
+    }
+
+    pub fn connector(&self, id: OutputId) -> Option<&str> {
+        self.span(id).map(|span| span.connector.as_str())
+    }
+
     pub fn centre(&self, id: OutputId) -> Option<(f64, f64)> {
+        self.span(id).map(Span::centre)
+    }
+
+    pub fn point(&self, id: OutputId, x: f64, y: f64) -> Option<(f64, f64)> {
+        self.span(id)
+            .map(|span| span.nearest(span.x + x / span.scale, span.y + y / span.scale))
+    }
+
+    pub fn home(&self) -> Option<OutputId> {
+        let listed = self.spans.iter().any(|span| span.placed == Placed::Profile);
         self.spans
             .iter()
-            .find(|span| span.id == id)
-            .map(Span::centre)
+            .filter(|span| !listed || span.placed == Placed::Profile)
+            .min_by(|a, b| a.distance2(0.0, 0.0).total_cmp(&b.distance2(0.0, 0.0)))
+            .map(|span| span.id)
+    }
+
+    fn span(&self, id: OutputId) -> Option<&Span> {
+        self.spans.iter().find(|span| span.id == id)
     }
 
     fn bounds(&self) -> (f64, f64, f64, f64) {
@@ -248,6 +271,57 @@ fn units(value: f64) -> String {
     } else {
         format!("{value:.2}")
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelReason {
+    Origin,
+    Removed,
+    Pointer,
+}
+
+impl fmt::Display for PanelReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PanelReason::Origin => "origin",
+            PanelReason::Removed => "removed",
+            PanelReason::Pointer => "pointer",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settled {
+    pub panel: OutputId,
+    pub cursor: (f64, f64),
+    pub moved: Option<PanelReason>,
+}
+
+pub fn settle(
+    _old: &Row,
+    new: &Row,
+    panel: Option<OutputId>,
+    cursor: (f64, f64),
+) -> Option<Settled> {
+    let origin = new
+        .spans
+        .iter()
+        .find(|span| span.placed == Placed::Profile && span.x == 0.0 && span.y == 0.0);
+    if let Some(origin) = origin {
+        return Some(Settled {
+            panel: origin.id,
+            cursor: origin.centre(),
+            moved: (panel != Some(origin.id)).then_some(PanelReason::Origin),
+        });
+    }
+    let panel = panel
+        .filter(|&id| new.contains(id))
+        .or(new.spans.first().map(|span| span.id))?;
+    Some(Settled {
+        panel,
+        cursor: new.clamp(cursor.0, cursor.1),
+        moved: None,
+    })
 }
 
 #[cfg(test)]
@@ -411,8 +485,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_centre_locates_to_its_own_output() {
+    fn random_layouts(mut check: impl FnMut(&[Geometry<'static>], &mut dyn FnMut(u64) -> u64)) {
         const SCENES: [(u32, u32); 5] = [
             (1920, 1080),
             (2560, 1440),
@@ -423,7 +496,7 @@ mod tests {
         const SCALES: [f64; 4] = [1.0, 1.25, 1.5, 2.0];
         const NAMES: [&str; 6] = ["DP-1", "DP-2", "DP-3", "HDMI-A-1", "HDMI-A-2", "eDP-1"];
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = |bound: u64| {
+        let mut next = move |bound: u64| {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
@@ -441,8 +514,15 @@ mod tests {
                     scale: SCALES[next(4) as usize],
                 })
                 .collect();
-            let row = Row::place(&outputs);
-            for output in &outputs {
+            check(&outputs, &mut next);
+        }
+    }
+
+    #[test]
+    fn every_centre_locates_to_its_own_output() {
+        random_layouts(|outputs, _| {
+            let row = Row::place(outputs);
+            for output in outputs {
                 let (x, y) = row.centre(output.id).expect("placed");
                 let hit = row.locate(x, y).expect("located");
                 assert_eq!(hit.id, output.id, "{row} from {outputs:?}");
@@ -451,7 +531,134 @@ mod tests {
                     "{hit:?} outside {output:?}"
                 );
             }
-        }
+        });
+    }
+
+    fn side_by_side() -> Row {
+        two((0, 0), (1920, 0))
+    }
+
+    #[test]
+    fn the_first_build_puts_the_panel_on_the_origin_output() {
+        let row = Row::place(&[
+            listed(2, "DP-2", (1920, 0), (1920, 1080)),
+            listed(1, "DP-1", (0, 0), (1920, 1080)),
+            unlisted(3, "DP-0", (1920, 1080)),
+        ]);
+        assert_eq!(
+            settle(&Row::default(), &row, None, (0.0, 0.0)),
+            Some(Settled {
+                panel: OutputId(1),
+                cursor: (960.0, 540.0),
+                moved: Some(PanelReason::Origin),
+            })
+        );
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_panel_where_the_pointer_left_it() {
+        let row = side_by_side();
+        assert_eq!(
+            settle(&row, &row, Some(OutputId(2)), (2020.0, 200.0)),
+            Some(Settled {
+                panel: OutputId(2),
+                cursor: (2020.0, 200.0),
+                moved: None,
+            })
+        );
+    }
+
+    #[test]
+    fn the_pointer_keeps_its_spot_on_the_panel_when_the_layout_shifts() {
+        let old = side_by_side();
+        let new = Row::place(&[
+            listed(1, "DP-1", (0, 0), (2560, 1440)),
+            listed(2, "DP-2", (2560, 0), (1920, 1080)),
+        ]);
+        assert_eq!(
+            settle(&old, &new, Some(OutputId(2)), (2020.0, 200.0)),
+            Some(Settled {
+                panel: OutputId(2),
+                cursor: (2660.0, 200.0),
+                moved: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_removed_panel_output_falls_back_to_the_origin() {
+        let old = side_by_side();
+        let new = Row::place(&[listed(1, "DP-1", (0, 0), (1920, 1080))]);
+        assert_eq!(
+            settle(&old, &new, Some(OutputId(2)), (2020.0, 200.0)),
+            Some(Settled {
+                panel: OutputId(1),
+                cursor: (960.0, 540.0),
+                moved: Some(PanelReason::Removed),
+            })
+        );
+    }
+
+    #[test]
+    fn without_an_origin_the_panel_starts_on_the_listed_output_nearest_it() {
+        let row = Row::place(&[
+            unlisted(3, "DP-0", (1920, 1080)),
+            listed(2, "DP-2", (500, 500), (1920, 1080)),
+            listed(1, "DP-1", (-1920, -100), (1920, 1080)),
+        ]);
+        let settled = settle(&Row::default(), &row, None, (0.0, 0.0)).expect("settled");
+        assert_eq!(settled.panel, OutputId(1));
+        assert_eq!(settled.cursor, (-960.0, 440.0));
+    }
+
+    #[test]
+    fn without_a_profile_the_panel_starts_on_the_leftmost_output() {
+        let row = Row::place(&[
+            unlisted(2, "HDMI-A-1", (1920, 1080)),
+            unlisted(1, "DP-1", (1920, 1080)),
+        ]);
+        let settled = settle(&Row::default(), &row, None, (0.0, 0.0)).expect("settled");
+        assert_eq!(settled.panel, OutputId(1));
+    }
+
+    #[test]
+    fn no_outputs_means_no_panel() {
+        assert_eq!(
+            settle(
+                &side_by_side(),
+                &Row::default(),
+                Some(OutputId(1)),
+                (5.0, 5.0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_pointer_is_always_on_the_panel_after_a_rebuild() {
+        let mut previous: Option<(Row, OutputId)> = None;
+        random_layouts(|outputs, next| {
+            let new = Row::place(outputs);
+            let (old, panel, cursor) = match previous.take() {
+                Some((old, panel)) => {
+                    let cursor = old.centre(panel).expect("centre");
+                    (old, Some(panel), cursor)
+                }
+                None => (Row::default(), None, (0.0, 0.0)),
+            };
+            let settled = settle(&old, &new, panel, cursor).expect("settled");
+            assert_eq!(
+                new.locate(settled.cursor.0, settled.cursor.1)
+                    .map(|hit| hit.id),
+                Some(settled.panel),
+                "{old} then {new}"
+            );
+            if panel.is_some_and(|id| new.contains(id)) {
+                assert_eq!((Some(settled.panel), settled.moved), (panel, None));
+            }
+            let pick = outputs[next(outputs.len() as u64) as usize].id;
+            previous = Some((new, pick));
+        });
     }
 
     #[test]
