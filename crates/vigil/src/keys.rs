@@ -6,6 +6,7 @@ const ESCAPE: u32 = 0xff1b;
 
 pub trait KeySink {
     fn change_vt(&mut self, vt: i32);
+    fn field_focused(&self) -> bool;
     fn cancel(&mut self);
     fn forward(&mut self, event: InputEvent);
     fn settle(&mut self);
@@ -20,9 +21,13 @@ pub fn route(sink: &mut impl KeySink, event: InputEvent) {
     };
     if pressed && (VT_FIRST..=VT_LAST).contains(&keysym) {
         sink.change_vt((keysym - VT_FIRST + 1) as i32);
+        for release in vigil_core::modifier_releases() {
+            sink.forward(release);
+        }
+        sink.settle();
         return;
     }
-    if keysym == ESCAPE {
+    if keysym == ESCAPE && sink.field_focused() {
         if pressed {
             sink.cancel();
             sink.settle();
@@ -75,6 +80,9 @@ mod tests {
         fn change_vt(&mut self, vt: i32) {
             self.vts.push(vt);
         }
+        fn field_focused(&self) -> bool {
+            true
+        }
         fn cancel(&mut self) {
             self.cancels += 1;
         }
@@ -104,7 +112,10 @@ mod tests {
         let mut sink = Recorder::default();
         route(&mut sink, tap(VT_FIRST + 2, None)[0].clone());
         assert_eq!(sink.vts, [3]);
-        assert!(sink.forwarded.is_empty());
+        assert!(
+            sink.forwarded.iter().all(|(_, pressed)| !pressed),
+            "only modifier releases follow a VT switch"
+        );
     }
 
     struct Rig {
@@ -173,6 +184,9 @@ mod tests {
 
     impl KeySink for Rig {
         fn change_vt(&mut self, _vt: i32) {}
+        fn field_focused(&self) -> bool {
+            self.window.field_focused()
+        }
         fn cancel(&mut self) {
             self.queue.borrow_mut().push_back(UiMessage::Cancel);
         }

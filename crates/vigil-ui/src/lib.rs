@@ -14,8 +14,8 @@ use slint::platform::{
     Key, Platform, PlatformError, PointerEventButton, WindowAdapter, WindowEvent,
 };
 use slint::{
-    Color, ComponentHandle, Image, LogicalPosition, PhysicalSize, Rgba8Pixel, SharedPixelBuffer,
-    WindowSize,
+    Color, ComponentHandle, Image, LogicalPosition, Model, PhysicalSize, Rgba8Pixel,
+    SharedPixelBuffer, WindowSize,
 };
 use slint_idle_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use slint_interpreter::{ComponentInstance, Value};
@@ -25,7 +25,10 @@ use vigil_core::{
 };
 use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 
+mod focus;
 mod scanout;
+
+use focus::{Card, Effect, Focus, Picker, Stop};
 
 #[derive(Clone, Default)]
 pub struct VigilPlatform {
@@ -166,6 +169,8 @@ pub struct OutputWindow {
     revision: std::cell::Cell<u64>,
     component: ComponentInstance,
     panel: (u32, u32),
+    focus: Focus,
+    held: u8,
 }
 
 pub struct SoftwareBackend {
@@ -210,7 +215,7 @@ impl OutputWindow {
                 scale_factor: scale,
             });
         component.show()?;
-        Ok(Self {
+        let window = Self {
             _id: id,
             backend,
             width,
@@ -222,7 +227,11 @@ impl OutputWindow {
             revision: std::cell::Cell::new(0),
             component,
             panel: (width, height),
-        })
+            focus: Focus::default(),
+            held: 0,
+        };
+        window.publish_focus();
+        Ok(window)
     }
 
     pub fn with_transform(
@@ -249,7 +258,7 @@ impl OutputWindow {
             });
         adapter.set_size(PhysicalSize::new(width, height));
         component.show()?;
-        Ok(Self {
+        let window = Self {
             _id: id,
             backend: Box::new(SoftwareBackend {
                 shadow: vec![0u8; width as usize * height as usize * 4],
@@ -274,7 +283,11 @@ impl OutputWindow {
             revision: std::cell::Cell::new(0),
             component,
             panel: (panel_width, panel_height),
-        })
+            focus: Focus::default(),
+            held: 0,
+        };
+        window.publish_focus();
+        Ok(window)
     }
 
     pub fn request_present(&mut self) {
@@ -351,10 +364,153 @@ impl OutputWindow {
 
     pub fn set_panel_visible(&mut self, visible: bool) {
         self.set_property("panel-visible", Value::Bool(visible));
+        if !visible {
+            self.reset_focus();
+        }
     }
 
     pub fn set_power_visible(&mut self, visible: bool) {
         self.set_optional_property("power-visible", Value::Bool(visible));
+        if !visible {
+            self.reset_focus();
+        }
+    }
+
+    pub fn field_focused(&self) -> bool {
+        self.card()
+            .is_none_or(|card| self.focus.settle(&card).stop == Stop::Field)
+    }
+
+    fn reset_focus(&mut self) {
+        self.set_optional_property("confirm-power", Value::String("".into()));
+        self.focus = Focus::default();
+        self.publish_focus();
+    }
+
+    fn publish_focus(&self) {
+        self.set_optional_property(
+            "keyboard-focus",
+            Value::String(self.focus.property().into()),
+        );
+        self.set_optional_property("key-hint", Value::String(self.focus.stop.hint().into()));
+    }
+
+    fn card(&self) -> Option<Card> {
+        let c = &self.component;
+        c.get_property("keyboard-focus").ok()?;
+        if !matches!(c.get_property("panel-visible"), Ok(Value::Bool(true))) {
+            return None;
+        }
+        let flag = |name| matches!(c.get_property(name), Ok(Value::Bool(true)));
+        let picker = |list, index| Picker {
+            count: match c.get_property(list) {
+                Ok(Value::Model(model)) => model.row_count(),
+                _ => 0,
+            },
+            index: match c.get_property(index) {
+                Ok(Value::Number(n)) if n >= 0.0 => n as usize,
+                _ => 0,
+            },
+        };
+        let confirm = c.get_property("confirm-power");
+        Some(Card {
+            users: picker("users", "selected-user"),
+            sessions: picker("sessions", "selected-session"),
+            reveal: flag("prompt-is-secret") && c.get_property("reveal").is_ok(),
+            power: confirm.is_ok()
+                && !matches!(c.get_property("power-visible"), Ok(Value::Bool(false))),
+            confirming: match confirm {
+                Ok(Value::String(name)) => focus::parse_action(&name),
+                _ => None,
+            },
+        })
+    }
+
+    fn modifiers(&self) -> (bool, bool, bool) {
+        (
+            self.held & 0b11 != 0,
+            self.held & 0b1100 != 0,
+            self.held & 0b11_0000 != 0,
+        )
+    }
+
+    fn focus_key(&self, keysym: u32, utf8: Option<&str>) -> focus::Key {
+        use focus::Key as K;
+        let (shift, control, alt) = self.modifiers();
+        let plain = !control && !alt;
+        match keysym {
+            0xff09 if plain && shift => K::BackTab,
+            0xff09 if plain => K::Tab,
+            0xfe20 if plain => K::BackTab,
+            0xff0d | 0xff8d => K::Enter,
+            0x20 if plain => K::Space,
+            0xff1b => K::Escape,
+            0xff51 => K::Left,
+            0xff52 => K::Up,
+            0xff53 => K::Right,
+            0xff54 => K::Down,
+            0xffc5 if alt && !control => K::RevealShortcut,
+            _ if plain && utf8.is_some_and(printable) => K::Text,
+            _ => K::Other,
+        }
+    }
+
+    fn key(&mut self, keysym: u32, utf8: Option<String>, pressed: bool) {
+        if let Some(at) = vigil_core::MODIFIER_KEYSYMS
+            .iter()
+            .position(|k| *k == keysym)
+        {
+            if pressed {
+                self.held |= 1 << at;
+            } else {
+                self.held &= !(1 << at);
+            }
+            self.send_key(keysym, utf8, pressed);
+            return;
+        }
+        let card = match self.card() {
+            Some(card) if pressed => card,
+            _ => return self.send_key(keysym, utf8, pressed),
+        };
+        let (focus, effect) = self
+            .focus
+            .step(&card, self.focus_key(keysym, utf8.as_deref()));
+        self.focus = focus;
+        let c = &self.component;
+        let action = |action| Value::String(focus::action_name(action).into());
+        match effect {
+            Effect::Forward => self.send_key(keysym, utf8, true),
+            Effect::Consume => {}
+            Effect::User(index) => {
+                let _ = c.invoke("user-changed", &[Value::Number(index as f64)]);
+            }
+            Effect::Session(index) => {
+                let _ = c.invoke("session-changed", &[Value::Number(index as f64)]);
+            }
+            Effect::ToggleReveal => {
+                if let Ok(Value::Bool(shown)) = c.get_property("reveal") {
+                    self.set_optional_property("reveal", Value::Bool(!shown));
+                }
+            }
+            Effect::Arm(power) => self.set_optional_property("confirm-power", action(power)),
+            Effect::Disarm => self.set_optional_property("confirm-power", Value::String("".into())),
+            Effect::Fire(power) => {
+                self.set_optional_property("confirm-power", Value::String("".into()));
+                let _ = c.invoke("power-action", &[action(power)]);
+            }
+        }
+        self.publish_focus();
+    }
+
+    fn send_key(&self, keysym: u32, utf8: Option<String>, pressed: bool) {
+        if let Some(text) = key_text(keysym, utf8) {
+            let event = if pressed {
+                WindowEvent::KeyPressed { text }
+            } else {
+                WindowEvent::KeyReleased { text }
+            };
+            self.component.window().dispatch_event(event);
+        }
     }
 
     pub fn set_warning_progress(&mut self, frost: f32, wallpaper: f32) {
@@ -407,6 +563,11 @@ impl OutputWindow {
                 }
             }
             InputEvent::PointerButton { button, pressed } => {
+                if pressed && !matches!(self.focus.stop, Stop::Cancel(_) | Stop::Confirm(_)) {
+                    self.focus = Focus::default();
+                    self.publish_focus();
+                }
+                let window = self.component.window();
                 let button = pointer_button(button);
                 let position = self.pointer_position();
                 let event = if pressed {
@@ -420,16 +581,7 @@ impl OutputWindow {
                 keysym,
                 utf8,
                 pressed,
-            } => {
-                if let Some(text) = key_text(keysym, utf8) {
-                    let event = if pressed {
-                        WindowEvent::KeyPressed { text }
-                    } else {
-                        WindowEvent::KeyReleased { text }
-                    };
-                    window.dispatch_event(event);
-                }
-            }
+            } => self.key(keysym, utf8, pressed),
         }
     }
 
@@ -717,9 +869,17 @@ fn pointer_button(button: u32) -> PointerEventButton {
     }
 }
 
+fn printable(text: &str) -> bool {
+    !text.is_empty() && !text.chars().all(char::is_control)
+}
+
 fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
     let key = match keysym {
-        0xff0d => Key::Return,
+        0xffe1 | 0xffe2 => Key::Shift,
+        0xffe3 | 0xffe4 => Key::Control,
+        0xffe9 | 0xffea => Key::Alt,
+        0xffeb | 0xffec => Key::Meta,
+        0xff0d | 0xff8d => Key::Return,
         0xff08 => Key::Backspace,
         0xff09 => Key::Tab,
         0xff1b => Key::Escape,
@@ -732,8 +892,13 @@ fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
         0xff57 => Key::End,
         _ => {
             return utf8
-                .filter(|text| !text.is_empty() && !text.chars().all(char::is_control))
-                .map(Into::into);
+                .filter(|text| printable(text))
+                .map(Into::into)
+                .or_else(|| {
+                    (0x20..0x7f)
+                        .contains(&keysym)
+                        .then(|| char::from(keysym as u8).to_string().into())
+                });
         }
     };
     Some(key.into())

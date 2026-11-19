@@ -263,6 +263,18 @@ pub struct KeymapSettings {
     pub options: String,
 }
 
+pub const MODIFIER_KEYSYMS: [u32; 8] = [
+    0xffe1, 0xffe2, 0xffe3, 0xffe4, 0xffe9, 0xffea, 0xffeb, 0xffec,
+];
+
+pub fn modifier_releases() -> impl Iterator<Item = InputEvent> {
+    MODIFIER_KEYSYMS.into_iter().map(|keysym| InputEvent::Key {
+        keysym,
+        utf8: None,
+        pressed: false,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent {
     Key {

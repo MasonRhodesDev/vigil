@@ -861,6 +861,7 @@ impl LockSession for Locker {
         window.set_clock(&self.last_clock.1);
         window.set_caps_lock(self.caps_lock);
         window.set_panel_visible(false);
+        window.set_power_visible(false);
         window.set_user_name(&self.user);
         apply_kit_tokens_from_disk(&mut window, self.scheme.as_theme_str());
         self.snapshot.apply(&mut window);
