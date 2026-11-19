@@ -170,7 +170,7 @@ impl Helper {
             Err(e) => return Err(io(e)),
         };
         if !exited? {
-            return Err(Error::Refused(format!(
+            return Err(Error::Timeout(format!(
                 "the helper was stopped at its {} ms deadline",
                 self.deadline.as_millis()
             )));
@@ -178,6 +178,11 @@ impl Helper {
         match status.map(|s| (s.code(), s.signal())) {
             Some((Some(0), _)) => {}
             Some((Some(code), _)) => return Err(Error::from_exit(code, message(&stderr))),
+            Some((None, Some(libc::SIGSYS))) => {
+                return Err(Error::Helper(
+                    "the helper's sandbox stopped it at a forbidden system call".into(),
+                ));
+            }
             Some((None, signal)) => {
                 return Err(Error::Refused(format!(
                     "the helper was killed by signal {}",

@@ -15,6 +15,12 @@
 
 #define VIGIL_SCENE_ERR_TOO_LARGE -2
 
+/**
+ * The logo or the scene is refused: drawing it would pass the limits on
+ * time, memory or features. The same request is refused again on every
+ * call, so a caller should remember it, keyed by a hash of the logo and the
+ * spec, and draw the ground-only scene instead.
+ */
 #define VIGIL_SCENE_ERR_REFUSED -3
 
 #define VIGIL_SCENE_ERR_INVALID -4
@@ -24,10 +30,18 @@
 #define VIGIL_SCENE_ERR_PANIC -6
 
 /**
- * The helper could not be started: it is missing from its installed path,
- * or it is not the version this library was built with.
+ * The helper failed for a reason that says nothing about the logo: it is
+ * missing from its installed path, it is not the version this library was
+ * built with, or its sandbox stopped it. Do not remember it as a refusal.
  */
 #define VIGIL_SCENE_ERR_HELPER -7
+
+/**
+ * The helper was stopped at `deadline_ms`. A slow or loaded host can cause
+ * it, so a caller must not remember it as a refusal: draw the ground-only
+ * scene now and try the logo again later.
+ */
+#define VIGIL_SCENE_ERR_TIMEOUT -8
 
 /**
  * The whole frame, XRGB8888: bytes B, G, R, 0xff per pixel.
@@ -108,11 +122,15 @@ extern "C" {
  * A request with a logo is drawn by the helper process installed with this
  * library, and the call returns within `deadline_ms`, plus the kernel's
  * teardown of a killed helper and the copy of the layer into `out`, whatever
- * the logo holds. A request without one is drawn
- * in the calling process. On any error `out` is left unwritten, and a caller
- * should draw the ground-only scene by asking again without the logo. The
- * same logo is refused again on the next call, so a caller that remembers
- * the refusal stalls for one deadline at most.
+ * the logo holds. A request without one is drawn in the calling process.
+ * On any error `out` is left unwritten, and a caller should draw the
+ * ground-only scene by asking again without the logo.
+ *
+ * The call blocks for up to `deadline_ms`, so a compositor calls it off its
+ * main thread. Pass a modest `deadline_ms`, 300 to 500: a 4K frame takes
+ * about 55 ms. Remember `VIGIL_SCENE_ERR_REFUSED` per logo, so a hostile
+ * logo stalls one call at most, but never `VIGIL_SCENE_ERR_TIMEOUT` or
+ * `VIGIL_SCENE_ERR_HELPER`, which say nothing about the logo.
  *
  * # Safety
  *

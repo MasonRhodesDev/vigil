@@ -27,6 +27,9 @@ pub enum Error {
     Refused(String),
     TooLarge(String),
     Helper(String),
+    /// The helper was stopped at its deadline. A slow host can cause it, so
+    /// unlike a refusal it says nothing about the logo.
+    Timeout(String),
 }
 
 // The helper reports which error it hit by its exit status.
@@ -38,6 +41,7 @@ impl Error {
             Error::Refused(_) => 12,
             Error::TooLarge(_) => 13,
             Error::Helper(_) => 14,
+            Error::Timeout(_) => 15,
         }
     }
 
@@ -59,7 +63,8 @@ impl std::fmt::Display for Error {
             | Error::Invalid(m)
             | Error::Refused(m)
             | Error::TooLarge(m)
-            | Error::Helper(m) => f.write_str(m),
+            | Error::Helper(m)
+            | Error::Timeout(m) => f.write_str(m),
         }
     }
 }
