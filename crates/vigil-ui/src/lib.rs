@@ -171,6 +171,7 @@ pub struct OutputWindow {
     panel: (u32, u32),
     focus: Focus,
     held: u8,
+    down: Option<u32>,
 }
 
 pub struct SoftwareBackend {
@@ -229,6 +230,7 @@ impl OutputWindow {
             panel: (width, height),
             focus: Focus::default(),
             held: 0,
+            down: None,
         };
         window.publish_focus();
         Ok(window)
@@ -285,6 +287,7 @@ impl OutputWindow {
             panel: (panel_width, panel_height),
             focus: Focus::default(),
             held: 0,
+            down: None,
         };
         window.publish_focus();
         Ok(window)
@@ -363,10 +366,17 @@ impl OutputWindow {
     }
 
     pub fn set_panel_visible(&mut self, visible: bool) {
-        self.set_property("panel-visible", Value::Bool(visible));
         if !visible {
+            for (at, keysym) in vigil_core::MODIFIER_KEYSYMS.into_iter().enumerate() {
+                if self.held & (1 << at) != 0 {
+                    self.send_key(keysym, None, false);
+                }
+            }
+            self.held = 0;
+            self.down = None;
             self.reset_focus();
         }
+        self.set_property("panel-visible", Value::Bool(visible));
     }
 
     pub fn set_power_visible(&mut self, visible: bool) {
@@ -468,13 +478,24 @@ impl OutputWindow {
             self.send_key(keysym, utf8, pressed);
             return;
         }
+        let repeat = pressed && self.down == Some(keysym);
+        if pressed {
+            self.down = Some(keysym);
+        } else if self.down == Some(keysym) {
+            self.down = None;
+        }
         let card = match self.card() {
             Some(card) if pressed => card,
             _ => return self.send_key(keysym, utf8, pressed),
         };
-        let (focus, effect) = self
-            .focus
-            .step(&card, self.focus_key(keysym, utf8.as_deref()));
+        let key = self.focus_key(keysym, utf8.as_deref());
+        if repeat
+            && self.focus.settle(&card).stop != Stop::Field
+            && !matches!(key, focus::Key::Tab | focus::Key::BackTab)
+        {
+            return;
+        }
+        let (focus, effect) = self.focus.step(&card, key);
         self.focus = focus;
         let c = &self.component;
         let action = |action| Value::String(focus::action_name(action).into());
