@@ -472,6 +472,13 @@ fn forwarded_channel<T: Send + 'static>(
     (source_tx, app_rx)
 }
 
+// The field keeps a retry typed while the attempt was checked. The failure
+// hides it, and wiping it would turn the rest of the retry into a wrong password.
+fn show_failure(window: &mut OutputWindow, message: &str) {
+    window.show_error(message);
+    window.set_busy(false);
+}
+
 fn login_flow_event(event: LoginEvent) -> Option<FlowEvent> {
     match event {
         LoginEvent::Unlock => Some(FlowEvent::LogindUnlock),
@@ -684,6 +691,12 @@ impl Locker {
                 self.pending.push(FlowEvent::AuthErr(message));
             }
         }
+    }
+
+    fn show_failure(&mut self, message: String) {
+        self.snapshot.error = message.clone();
+        self.snapshot.busy = false;
+        self.each_window(|window| show_failure(window, &message));
     }
 
     fn pump_ui(&mut self) {
@@ -1039,23 +1052,9 @@ impl LockSession for Locker {
                     self.start_attempt();
                 }
             }
-            FlowCmd::ShowAuthError(message) => {
-                self.snapshot.error = message.clone();
-                self.snapshot.busy = false;
-                let message = message.clone();
-                self.each_window(move |window| {
-                    window.show_error(&message);
-                    window.set_busy(false);
-                });
-            }
+            FlowCmd::ShowAuthError(message) => self.show_failure(message.clone()),
             FlowCmd::ShowAccountLocked { remaining } => {
-                let message = account_locked_message(*remaining);
-                self.snapshot.error = message.clone();
-                self.snapshot.busy = false;
-                self.each_window(move |window| {
-                    window.show_error(&message);
-                    window.set_busy(false);
-                });
+                self.show_failure(account_locked_message(*remaining))
             }
             FlowCmd::DetachAuth => self.detach_auth(),
             FlowCmd::SetLockedHint(on) => {
@@ -1990,6 +1989,78 @@ mod tests {
             status.code(),
             Some(0),
             "the panic costs the wallpaper and the lock goes on without it"
+        );
+    }
+
+    #[test]
+    fn a_retry_typed_during_the_check_survives_the_failure_hidden() {
+        const W: u32 = 1280;
+        const H: u32 = 800;
+        let platform = VigilPlatform::install().unwrap();
+        let component = Theme::load_or_default(None).instantiate().unwrap();
+        let adapter = platform.claim_last_adapter().unwrap();
+        let mut window = OutputWindow::new(OutputId(1), W, H, 1.0, adapter, component).unwrap();
+        let sent: Rc<RefCell<Vec<UiMessage>>> = Rc::default();
+        let sink = sent.clone();
+        window.on_ui_message(Rc::new(move |message| sink.borrow_mut().push(message)));
+        window.set_panel_visible(true);
+        window.show_prompt("Password", true);
+        let key = |window: &mut OutputWindow, keysym: u32, utf8: Option<&str>, pressed| {
+            window.dispatch(vigil_core::InputEvent::Key {
+                keysym,
+                utf8: utf8.map(str::to_owned),
+                pressed,
+            });
+        };
+        let tap = |window: &mut OutputWindow, keysym: u32, utf8: Option<&str>| {
+            key(window, keysym, utf8, true);
+            key(window, keysym, utf8, false);
+        };
+        let field = |window: &mut OutputWindow| {
+            std::thread::sleep(Duration::from_millis(400));
+            vigil_ui::advance_timers();
+            let mut buf = vec![0u8; (W * H * 4) as usize];
+            window.render_if_needed(FrameTarget {
+                buffer: &mut buf,
+                width: W,
+                height: H,
+                stride: (W * 4) as usize,
+                damage: None,
+            });
+            let row = 419 * W as usize * 4;
+            buf[row + 500 * 4..row + 735 * 4].to_vec()
+        };
+
+        "aaaa"
+            .chars()
+            .for_each(|_| tap(&mut window, 0x61, Some("a")));
+        let masked = field(&mut window);
+        tap(&mut window, 0xff0d, Some("\r"));
+        window.set_busy(true);
+        "aa".chars().for_each(|_| tap(&mut window, 0x61, Some("a")));
+        key(&mut window, 0xffe9, None, true);
+        tap(&mut window, 0xffc5, None);
+        key(&mut window, 0xffe9, None, false);
+        show_failure(&mut window, "Authentication failure");
+        window.show_prompt("Password", true);
+        "aa".chars().for_each(|_| tap(&mut window, 0x61, Some("a")));
+        assert!(
+            masked == field(&mut window),
+            "four masked dots after the failure: the retry is kept and hidden"
+        );
+        tap(&mut window, 0xff0d, Some("\r"));
+        let answers: Vec<_> = sent
+            .borrow()
+            .iter()
+            .filter_map(|message| match message {
+                UiMessage::Respond(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            ["aaaa", "aaaa"],
+            "the retry typed during the check is kept"
         );
     }
 
