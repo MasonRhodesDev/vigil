@@ -180,15 +180,43 @@ fn bad_arguments_are_refused_before_any_drawing() {
     );
 }
 
+// The test binary sits in <target>/<profile dir>/deps, and the cdylib must
+// come from that same profile, whatever the cargo version names its files.
+fn cdylib() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let profile = match exe
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+    {
+        Some(d) if d == "debug" => "dev".to_owned(),
+        Some(d) => d.to_string_lossy().into_owned(),
+        None => "dev".to_owned(),
+    };
+    let built = Command::new(env!("CARGO"))
+        .args(["build", "--frozen", "--lib", "--message-format=json"])
+        .args(["-p", "vigil-scene-ffi", "--profile", &profile])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "cargo build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "vigil_scene_ffi")
+        .flat_map(|m| m["filenames"].as_array().cloned().unwrap_or_default())
+        .filter_map(|f| f.as_str().map(PathBuf::from))
+        .find(|f| f.extension().is_some_and(|e| e == "so"))
+        .expect("cargo names the cdylib it built")
+}
+
 #[test]
 fn c_program_gets_the_same_pixels_through_the_header() {
-    let exe = std::env::current_exe().unwrap();
-    let deps = exe.parent().unwrap();
-    let lib = [deps, deps.parent().unwrap()]
-        .iter()
-        .map(|d| d.join("libvigil_scene_ffi.so"))
-        .find(|p| p.exists())
-        .expect("the cdylib is built beside the tests");
+    let lib = cdylib();
     let dir = std::env::temp_dir().join(format!("vigil-scene-abi-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("smoke");

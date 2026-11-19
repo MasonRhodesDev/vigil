@@ -5230,6 +5230,7 @@ version = "0.4.3"
 dependencies = [
  "cbindgen",
  "image",
+ "serde_json",
  "vigil-scene",
 ]
 

@@ -16,3 +16,4 @@ vigil-scene = { path = "../vigil-scene" }
 [dev-dependencies]
 cbindgen = { version = "0.29", default-features = false }
 image.workspace = true
+serde_json.workspace = true
