@@ -39,7 +39,7 @@
 /**
  * The helper was stopped at `deadline_ms`. A slow or loaded host can cause
  * it, so a caller must not remember it as a refusal: draw the ground-only
- * scene now and try the logo again later.
+ * scene now and try the logo once more with `VIGIL_SCENE_MAX_DEADLINE_MS`.
  */
 #define VIGIL_SCENE_ERR_TIMEOUT -8
 
@@ -72,6 +72,14 @@
  * The longest deadline a request may ask for.
  */
 #define VIGIL_SCENE_MAX_DEADLINE_MS 5000
+
+/**
+ * After this many `VIGIL_SCENE_ERR_TIMEOUT`s for one logo and spec, the
+ * library returns `VIGIL_SCENE_ERR_REFUSED` for them, without running the
+ * helper, until the process exits. Timeouts of calls that overlap count
+ * once, and a drawing of that logo and spec clears the count.
+ */
+#define VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL 3
 
 /**
  * What to draw. `svg` and `spec_json` are each null with a length of 0, or
@@ -127,10 +135,15 @@ extern "C" {
  * ground-only scene by asking again without the logo.
  *
  * The call blocks for up to `deadline_ms`, so a compositor calls it off its
- * main thread. Pass a modest `deadline_ms`, 300 to 500: a 4K frame takes
- * about 55 ms. Remember `VIGIL_SCENE_ERR_REFUSED` per logo, so a hostile
- * logo stalls one call at most, but never `VIGIL_SCENE_ERR_TIMEOUT` or
- * `VIGIL_SCENE_ERR_HELPER`, which say nothing about the logo.
+ * main thread. Pass a modest `deadline_ms` first, 500: a 4K frame takes
+ * about 55 ms in a release build. On `VIGIL_SCENE_ERR_TIMEOUT`, draw the
+ * ground-only scene and retry once with `VIGIL_SCENE_MAX_DEADLINE_MS`, so a
+ * loaded host still gets the logo. The library refuses a logo that keeps
+ * timing out (`VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL`), so a spinning logo
+ * costs a few deadlines per process. Remember `VIGIL_SCENE_ERR_REFUSED` per
+ * logo, so a refused logo costs one call at most, but never
+ * `VIGIL_SCENE_ERR_TIMEOUT` or `VIGIL_SCENE_ERR_HELPER`, which say nothing
+ * about the logo.
  *
  * # Safety
  *

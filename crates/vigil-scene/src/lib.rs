@@ -8,6 +8,7 @@ mod logo;
 mod plate;
 mod sandbox;
 mod spec;
+mod timeouts;
 
 pub use helper::{DEFAULT_DEADLINE, HELPER_ABI, Helper, INSTALLED_HELPER, MAX_DEADLINE};
 pub use layer::{Layer, Request};
@@ -21,6 +22,7 @@ pub use sandbox::{NOTICE, confine, lock_down};
 pub use spec::{
     DEFAULT_SPEC, Geometry, MAX_SPEC_BYTES, Scene, TagGeometry, ease, emit_spec, parse_color,
 };
+pub use timeouts::TIMEOUTS_BEFORE_REFUSAL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {

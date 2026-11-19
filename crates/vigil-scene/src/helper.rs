@@ -12,6 +12,7 @@ use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
+use crate::timeouts;
 use crate::{Error, Format, MAX_EDGE, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Mask, NOTICE, Request};
 
 /// Where packages install the helper. A crate that calls it takes the path
@@ -43,7 +44,8 @@ macro_rules! installed_helper {
 /// byte, and a deadline after which it is killed and reaped. Whatever the
 /// logo does, a call returns within the deadline, plus the kernel's teardown
 /// of a killed helper and the copy of the result, and the caller's memory
-/// grows by the result alone.
+/// grows by the result alone. A logo and spec that time out
+/// `TIMEOUTS_BEFORE_REFUSAL` times are refused from then on.
 #[derive(Debug, Clone)]
 pub struct Helper {
     path: PathBuf,
@@ -72,6 +74,7 @@ impl Helper {
         }
         let mut alpha = vec![0u8; edge as usize * edge as usize];
         self.run(
+            timeouts::key(&[format.name().as_bytes(), logo]),
             &[
                 "mask",
                 "--format",
@@ -108,6 +111,7 @@ impl Helper {
         }
         let (mode, transform) = (format!("{}x{}", req.mode.0, req.mode.1), req.transform);
         self.run(
+            timeouts::key(&[Format::Svg.name().as_bytes(), svg, spec]),
             &[
                 "layer",
                 "--mode",
@@ -128,8 +132,20 @@ impl Helper {
         )
     }
 
-    fn run(&self, args: &[&str], input: &[&[u8]], out: &mut [u8]) -> Result<(), Error> {
-        let by = Instant::now() + self.deadline;
+    fn run(&self, key: u64, args: &[&str], input: &[&[u8]], out: &mut [u8]) -> Result<(), Error> {
+        timeouts::refused(key)?;
+        let started = Instant::now();
+        let got = self.run_once(started + self.deadline, args, input, out);
+        timeouts::settle(key, started, got)
+    }
+
+    fn run_once(
+        &self,
+        by: Instant,
+        args: &[&str],
+        input: &[&[u8]],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
         let mut stdin = memfd("vigil-scene-in")?;
         for part in input {
             stdin.write_all(part).map_err(io)?;

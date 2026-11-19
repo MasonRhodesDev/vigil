@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use vigil_scene::{
     DEFAULT_DEADLINE, Error, Helper, Layer, MAX_DEADLINE, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Request,
+    TIMEOUTS_BEFORE_REFUSAL,
 };
 
 pub const VIGIL_SCENE_OK: i32 = 0;
@@ -25,7 +26,7 @@ pub const VIGIL_SCENE_ERR_PANIC: i32 = -6;
 pub const VIGIL_SCENE_ERR_HELPER: i32 = -7;
 /// The helper was stopped at `deadline_ms`. A slow or loaded host can cause
 /// it, so a caller must not remember it as a refusal: draw the ground-only
-/// scene now and try the logo again later.
+/// scene now and try the logo once more with `VIGIL_SCENE_MAX_DEADLINE_MS`.
 pub const VIGIL_SCENE_ERR_TIMEOUT: i32 = -8;
 
 /// The whole frame, XRGB8888: bytes B, G, R, 0xff per pixel.
@@ -41,9 +42,15 @@ pub const VIGIL_SCENE_LAYER_BAR: u32 = 3;
 pub const VIGIL_SCENE_DEFAULT_DEADLINE_MS: u32 = 1500;
 /// The longest deadline a request may ask for.
 pub const VIGIL_SCENE_MAX_DEADLINE_MS: u32 = 5000;
+/// After this many `VIGIL_SCENE_ERR_TIMEOUT`s for one logo and spec, the
+/// library returns `VIGIL_SCENE_ERR_REFUSED` for them, without running the
+/// helper, until the process exits. Timeouts of calls that overlap count
+/// once, and a drawing of that logo and spec clears the count.
+pub const VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL: u32 = 3;
 
 const _: () = assert!(VIGIL_SCENE_DEFAULT_DEADLINE_MS as u128 == DEFAULT_DEADLINE.as_millis());
 const _: () = assert!(VIGIL_SCENE_MAX_DEADLINE_MS as u128 == MAX_DEADLINE.as_millis());
+const _: () = assert!(VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL == TIMEOUTS_BEFORE_REFUSAL);
 
 /// What to draw. `svg` and `spec_json` are each null with a length of 0, or
 /// point to that many bytes. Without `spec_json` the built-in scene is used.
@@ -152,10 +159,15 @@ unsafe fn bytes<'a>(ptr: *const u8, len: usize, cap: usize) -> Result<Option<&'a
 /// ground-only scene by asking again without the logo.
 ///
 /// The call blocks for up to `deadline_ms`, so a compositor calls it off its
-/// main thread. Pass a modest `deadline_ms`, 300 to 500: a 4K frame takes
-/// about 55 ms. Remember `VIGIL_SCENE_ERR_REFUSED` per logo, so a hostile
-/// logo stalls one call at most, but never `VIGIL_SCENE_ERR_TIMEOUT` or
-/// `VIGIL_SCENE_ERR_HELPER`, which say nothing about the logo.
+/// main thread. Pass a modest `deadline_ms` first, 500: a 4K frame takes
+/// about 55 ms in a release build. On `VIGIL_SCENE_ERR_TIMEOUT`, draw the
+/// ground-only scene and retry once with `VIGIL_SCENE_MAX_DEADLINE_MS`, so a
+/// loaded host still gets the logo. The library refuses a logo that keeps
+/// timing out (`VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL`), so a spinning logo
+/// costs a few deadlines per process. Remember `VIGIL_SCENE_ERR_REFUSED` per
+/// logo, so a refused logo costs one call at most, but never
+/// `VIGIL_SCENE_ERR_TIMEOUT` or `VIGIL_SCENE_ERR_HELPER`, which say nothing
+/// about the logo.
 ///
 /// # Safety
 ///
