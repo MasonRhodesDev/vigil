@@ -272,6 +272,15 @@ class Fence(Scratch):
         self.write("clippy.toml", "".join("# " + line for line in text.splitlines(keepends=True)))
         self.assertRefused("fence", "clippy-config")
 
+    def test_a_panic_hook_ban_removed_from_clippy_toml_is_refused(self):
+        for hook in ("std::panic::set_hook", "std::panic::take_hook"):
+            with self.subTest(hook=hook):
+                text = self.read("clippy.toml")
+                kept = "".join(line for line in text.splitlines(keepends=True) if hook not in line)
+                self.write("clippy.toml", kept)
+                self.assertRefused("fence", "clippy-config")
+                self.write("clippy.toml", text)
+
     def test_a_symlink_under_crates_is_refused(self):
         os.symlink("/dev/null", self.path("crates/vigil-lock/src/link.rs"))
         self.assertRefused("fence", "symlink")
