@@ -2,8 +2,6 @@
 import json, socket, sys, time
 
 qmp_path, outdir = sys.argv[1], sys.argv[2]
-ROW_WIDTH = int(sys.argv[3]) if len(sys.argv) > 3 else 1280
-ROW_HEIGHT = int(sys.argv[4]) if len(sys.argv) > 4 else 800
 s = socket.socket(socket.AF_UNIX)
 s.connect(qmp_path)
 f = s.makefile("rw")
@@ -24,20 +22,6 @@ def typestr(text):
     for k in text:
         sendkey(k)
         time.sleep(0.15)
-
-def click(x, y, width=None, height=None):
-    width, height = width or ROW_WIDTH, height or ROW_HEIGHT
-    ax, ay = int(x / width * 32767), int(y / height * 32767)
-    events = [
-        {"type": "abs", "data": {"axis": "x", "value": ax}},
-        {"type": "abs", "data": {"axis": "y", "value": ay}},
-    ]
-    cmd("input-send-event", events=events)
-    time.sleep(0.3)
-    cmd("input-send-event", events=[{"type": "btn", "data": {"down": True, "button": "left"}}])
-    time.sleep(0.15)
-    cmd("input-send-event", events=[{"type": "btn", "data": {"down": False, "button": "left"}}])
-    time.sleep(0.3)
 
 cmd("qmp_capabilities")
 
@@ -100,11 +84,14 @@ cmd("screendump", filename=f"{outdir}/4-username-again.ppm")
 typestr("demo")
 sendkey("ret"); time.sleep(1.5)
 
-click(98, 754)
+for k in ("tab", "tab", "right", "shift-tab", "spc"):
+    sendkey(k); time.sleep(0.3)
 cmd("screendump", filename=f"{outdir}/5-picker.ppm")
+sendkey("shift-tab"); time.sleep(0.3)
 
 before_typing = conversations()
 typestr("hunter2")
+sendkey("alt-f8")
 time.sleep(0.4)
 cmd("screendump", filename=f"{outdir}/6-typed.ppm")
 if conversations() != before_typing:

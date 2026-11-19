@@ -14,7 +14,7 @@ VM=$!
 for i in $(seq 120); do grep -q "vigil: output" "$WORK/vigil.log" 2>/dev/null && break; sleep 1; done
 grep -q "vigil: output" "$WORK/vigil.log" 2>/dev/null || { echo "vigil never came up; see $WORK/vigil.log"; exit 1; }
 sleep 2
-python3 "$REPO/tests/e2e/drive.py" "$QMP" "$WORK" "${VIGIL_E2E_ROW_W:-2560}" "${VIGIL_E2E_ROW_H:-800}" || {
+python3 "$REPO/tests/e2e/drive.py" "$QMP" "$WORK" || {
     echo "E2E FAIL: driver error ($WORK)"
     kill "$VM" 2>/dev/null; wait "$VM" 2>/dev/null || true
     exit 1

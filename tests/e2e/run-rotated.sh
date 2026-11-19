@@ -21,7 +21,7 @@ backend = "gl"
 [profiles]
 dir = "$WORK/profiles"
 EOF
-VIGIL_E2E_CONFIG=$WORK/vigil-rotated.toml VIGIL_E2E_ROW_W=2080 VIGIL_E2E_ROW_H=1280 \
+VIGIL_E2E_CONFIG=$WORK/vigil-rotated.toml \
     "$REPO/tests/e2e/run.sh" "$WORK"
 grep -q "rendering with GL (hardware cursor)" "$WORK/vigil.log" || {
     echo "ROTATED FAIL: no output on GL ($WORK)"; exit 1; }
