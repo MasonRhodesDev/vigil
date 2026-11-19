@@ -492,12 +492,22 @@ export component DefaultTheme inherits Window {
             focused: root.keyboard-focus == "cancel";
             clicked => { root.confirm-power = ""; }
         }
-        if root.confirm-power != "": GhostButton {
+        // It lands where the first click was, so the second click of a
+        // double click must not reach it. 500ms spans common double-click times.
+        if root.confirm-power != "": confirm := GhostButton {
+            property <bool> settled;
             text: root.confirm-power == "reboot" ? "Restart" : "Shut Down";
             focused: root.keyboard-focus == "confirm";
             clicked => {
-                root.power-action(root.confirm-power);
-                root.confirm-power = "";
+                if self.settled {
+                    root.power-action(root.confirm-power);
+                    root.confirm-power = "";
+                }
+            }
+            Timer {
+                interval: 500ms;
+                running: !confirm.settled;
+                triggered => { confirm.settled = true; }
             }
         }
     }
