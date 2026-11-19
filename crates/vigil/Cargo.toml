@@ -35,9 +35,12 @@ image.workspace = true
 resvg = { version = "0.47", default-features = false }
 
 [dev-dependencies]
+slint.workspace = true
+slint-interpreter.workspace = true
 vigil-log = { workspace = true, features = ["testing"] }
 image.workspace = true
 greetd_ipc.workspace = true
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 
 [features]
 default = ["gl"]

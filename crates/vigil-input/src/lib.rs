@@ -8,15 +8,12 @@ use smithay::reexports::input;
 use smithay::reexports::input::event::keyboard::{KeyState, KeyboardEventTrait};
 use smithay::reexports::input::event::pointer::{ButtonState, PointerEvent};
 use smithay::reexports::input::{LibinputInterface, event};
-use vigil_core::{DeviceOpener, InputEvent, KeyText, KeymapSettings};
+use vigil_core::{DeviceOpener, HeldKeys, InputEvent, KeyText, KeymapSettings};
 use xkbcommon::xkb;
 use xkbcommon::xkb::compose;
 
 const REPEAT_DELAY: Duration = Duration::from_millis(500);
 const REPEAT_INTERVAL: Duration = Duration::from_millis(33);
-const RETURN: u32 = 0xff0d;
-const ESCAPE: u32 = 0xff1b;
-const ONE_SHOT: [u32; 2] = [RETURN, ESCAPE];
 
 #[derive(Debug)]
 pub struct InputError(pub String);
@@ -153,6 +150,7 @@ struct KeyboardState {
     state: xkb::State,
     compose: Option<compose::State>,
     repeat: Option<Repeat>,
+    held: HeldKeys,
 }
 
 #[derive(Clone, Copy)]
@@ -217,10 +215,27 @@ impl KeyboardState {
             state,
             compose: compose_state(&default_compose_locale()),
             repeat: None,
+            held: HeldKeys::default(),
         })
     }
 
     fn key(&mut self, evdev_keycode: u32, pressed: bool, now: Instant) -> Option<InputEvent> {
+        let event = self.translate(evdev_keycode, pressed, now);
+        match &event {
+            Some(InputEvent::Key { keysym, .. }) if pressed => {
+                self.held.press(evdev_keycode, *keysym, None);
+                event
+            }
+            Some(InputEvent::Key { keysym, .. }) => Some(InputEvent::Key {
+                keysym: self.held.release(evdev_keycode).unwrap_or(*keysym),
+                utf8: None,
+                pressed: false,
+            }),
+            _ => event,
+        }
+    }
+
+    fn translate(&mut self, evdev_keycode: u32, pressed: bool, now: Instant) -> Option<InputEvent> {
         let keycode = xkb::Keycode::new(evdev_keycode + 8);
         self.state.update_key(
             keycode,
@@ -261,7 +276,8 @@ impl KeyboardState {
         }
 
         if pressed {
-            let one_shot = ONE_SHOT.contains(&self.state.key_get_one_sym(keycode).raw());
+            let one_shot =
+                vigil_core::ONE_SHOT_KEYSYMS.contains(&self.state.key_get_one_sym(keycode).raw());
             self.repeat = (!one_shot && self.keymap.key_repeats(keycode)).then_some(Repeat {
                 keycode,
                 deadline: now + REPEAT_DELAY,
@@ -290,13 +306,12 @@ impl KeyboardState {
         let Some(mut repeat) = self.repeat else {
             return Vec::new();
         };
-        let mut events = Vec::new();
-        while repeat.deadline <= now {
-            events.push(self.event(repeat.keycode, true));
-            repeat.deadline += REPEAT_INTERVAL;
+        if repeat.deadline > now {
+            return Vec::new();
         }
+        repeat.deadline = now + REPEAT_INTERVAL;
         self.repeat = Some(repeat);
-        events
+        vec![self.event(repeat.keycode, true)]
     }
 
     fn caps_lock(&self) -> bool {
@@ -330,6 +345,7 @@ pub mod fuzzing {
                 compose.reset();
             }
             self.state.repeat = None;
+            self.state.held = HeldKeys::default();
         }
 
         pub fn key(&mut self, evdev_keycode: u16, pressed: bool) -> Option<InputEvent> {
@@ -444,12 +460,71 @@ mod tests {
     }
 
     #[test]
+    fn keypad_enter_never_repeats() {
+        const KEY_KPENTER: u32 = 96;
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
+        let now = Instant::now();
+        let _ = keyboard.key(KEY_KPENTER, true, now);
+        assert_eq!(keyboard.next_repeat_deadline(), None);
+        assert!(keyboard.tick_repeat(now + REPEAT_DELAY * 4).is_empty());
+    }
+
+    #[test]
+    fn a_stalled_loop_gets_one_repeat_not_the_backlog() {
+        let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
+        let now = Instant::now();
+        let _ = keyboard.key(KEY_A, true, now);
+        let late = now + REPEAT_DELAY + REPEAT_INTERVAL * 30;
+        assert_eq!(keyboard.tick_repeat(late).len(), 1);
+        assert_eq!(
+            keyboard.next_repeat_deadline(),
+            Some(late + REPEAT_INTERVAL)
+        );
+    }
+
+    #[test]
     fn enter_ends_the_repeat_of_a_held_key() {
         let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         let now = Instant::now();
         let _ = keyboard.key(KEY_A, true, now);
         let _ = keyboard.key(KEY_ENTER, true, now);
         assert_eq!(keyboard.next_repeat_deadline(), None);
+    }
+
+    #[test]
+    fn a_release_reports_the_keysym_its_press_reported() {
+        const KEY_LEFTCTRL: u32 = 29;
+        const KEY_LEFTALT: u32 = 56;
+        let cases: [(&str, &[u32]); 3] = [
+            ("", &[KEY_LEFTALT, KEY_LEFTSHIFT]),
+            ("grp:lctrl_lshift_toggle", &[KEY_LEFTCTRL, KEY_LEFTSHIFT]),
+            ("altwin:meta_alt", &[KEY_LEFTALT, KEY_LEFTSHIFT]),
+        ];
+        for (options, keys) in cases {
+            for release_first in keys {
+                let mut keyboard = KeyboardState::new(&KeymapSettings {
+                    layout: "us,ru".into(),
+                    options: options.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+                let now = Instant::now();
+                let mut pressed = Vec::new();
+                for key in keys {
+                    let (keysym, _, _) = key_parts(keyboard.key(*key, true, now).expect("press"));
+                    pressed.push((*key, keysym));
+                }
+                pressed.sort_by_key(|(key, _)| *key != *release_first);
+                for (key, keysym) in pressed {
+                    let (released, _, _) =
+                        key_parts(keyboard.key(key, false, now).expect("release"));
+                    assert_eq!(
+                        released, keysym,
+                        "{options:?}: key {key} pressed as {keysym:#x}, released as {released:#x}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

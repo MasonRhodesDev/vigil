@@ -139,6 +139,7 @@ pub struct AuthMachine {
     fixed_user: bool,
     typed: bool,
     asked: bool,
+    secret: bool,
     spoke: bool,
     unprompted: Option<String>,
     first_questions: BTreeMap<String, Prompt>,
@@ -165,6 +166,7 @@ impl AuthMachine {
             fixed_user: false,
             typed: false,
             asked: false,
+            secret: false,
             spoke: false,
             unprompted: None,
             first_questions: BTreeMap::new(),
@@ -370,6 +372,7 @@ impl AuthMachine {
                     let field = self.offered();
                     self.open((!text.is_empty()).then_some(Submitted { text, field }), ui)
                 }
+                State::AwaitingPrompt if self.secret && text.is_empty() => Ok(()),
                 State::AwaitingPrompt => {
                     let response = self.answer(&text, ui)?;
                     self.process_response(response, None, ui)
@@ -479,6 +482,7 @@ impl AuthMachine {
                         None => {}
                     }
                     ui.show_prompt(&prompt.text, prompt.secret);
+                    self.secret = prompt.secret;
                     self.state = State::AwaitingPrompt;
                     self.log_stage(&prompt, false);
                     return Ok(());
@@ -1029,6 +1033,32 @@ mod tests {
         );
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
         assert_eq!(sent(&requests), ["create alice", "answer hunter2", "start"]);
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn an_empty_enter_never_answers_a_secret_question() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Visible, "Login:"),
+            secret_prompt(),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(
+            sent(&requests),
+            ["create alice", "answer ", "answer hunter2", "start"],
+            "an empty visible answer is sent, an empty secret one is not"
+        );
         assert!(machine.is_complete());
     }
 

@@ -6,6 +6,7 @@ const ESCAPE: u32 = 0xff1b;
 
 pub trait KeySink {
     fn change_vt(&mut self, vt: i32);
+    fn field_focused(&self) -> bool;
     fn cancel(&mut self);
     fn forward(&mut self, event: InputEvent);
     fn settle(&mut self);
@@ -20,13 +21,15 @@ pub fn route(sink: &mut impl KeySink, event: InputEvent) {
     };
     if pressed && (VT_FIRST..=VT_LAST).contains(&keysym) {
         sink.change_vt((keysym - VT_FIRST + 1) as i32);
+        for release in vigil_core::modifier_releases() {
+            sink.forward(release);
+        }
+        sink.settle();
         return;
     }
-    if keysym == ESCAPE {
-        if pressed {
-            sink.cancel();
-            sink.settle();
-        }
+    if keysym == ESCAPE && pressed && sink.field_focused() {
+        sink.cancel();
+        sink.settle();
         return;
     }
     sink.forward(event);
@@ -77,6 +80,9 @@ mod tests {
         fn change_vt(&mut self, vt: i32) {
             self.vts.push(vt);
         }
+        fn field_focused(&self) -> bool {
+            true
+        }
         fn cancel(&mut self) {
             self.cancels += 1;
         }
@@ -92,13 +98,17 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_and_never_reaches_the_window() {
+    fn escape_cancels_and_only_its_release_reaches_the_window() {
         let mut sink = Recorder::default();
         for event in tap(ESCAPE, None).into_iter().chain(text("a")) {
             route(&mut sink, event);
         }
         assert_eq!(sink.cancels, 1);
-        assert_eq!(sink.forwarded, [('a' as u32, true), ('a' as u32, false)]);
+        assert_eq!(
+            sink.forwarded,
+            [(ESCAPE, false), ('a' as u32, true), ('a' as u32, false)],
+            "the window sees the release, so it never takes the next Esc for a repeat"
+        );
     }
 
     #[test]
@@ -106,16 +116,32 @@ mod tests {
         let mut sink = Recorder::default();
         route(&mut sink, tap(VT_FIRST + 2, None)[0].clone());
         assert_eq!(sink.vts, [3]);
-        assert!(sink.forwarded.is_empty());
+        assert!(
+            sink.forwarded.iter().all(|(_, pressed)| !pressed),
+            "only modifier releases follow a VT switch"
+        );
     }
 
     struct Rig {
         window: OutputWindow,
         queue: Rc<RefCell<VecDeque<UiMessage>>>,
         auth: AuthMachine,
+        users: Vec<String>,
     }
 
     impl Rig {
+        fn with_pickers(greetd: &Greetd) -> Self {
+            let mut rig = Self::new(greetd);
+            rig.users = vec!["alice".into(), "bob".into()];
+            rig.window.set_users(&rig.users);
+            rig.window.set_user_index(0);
+            rig.window.set_user_name("alice");
+            rig.window
+                .set_sessions(&["Hyprland".into(), "Shell".into()]);
+            rig.window.set_session_index(0);
+            rig
+        }
+
         fn new(greetd: &Greetd) -> Self {
             let platform = VigilPlatform::install().expect("platform");
             let component = Theme::load_or_default(None)
@@ -134,6 +160,7 @@ mod tests {
                 window,
                 queue,
                 auth,
+                users: Vec::new(),
             }
         }
 
@@ -141,13 +168,29 @@ mod tests {
             loop {
                 let message = self.queue.borrow_mut().pop_front();
                 let Some(message) = message else { break };
-                let _ = self.auth.handle(message, &mut self.window);
+                match message {
+                    UiMessage::SelectUser(index) => {
+                        self.window.set_user_index(index);
+                        let user = self.users.get(index).cloned();
+                        self.auth
+                            .select_user(user.as_deref(), &mut self.window)
+                            .expect("select user");
+                    }
+                    UiMessage::SelectSession(index) => self.window.set_session_index(index),
+                    UiMessage::Power(action) => panic!("the drive powered off: {action:?}"),
+                    message => {
+                        let _ = self.auth.handle(message, &mut self.window);
+                    }
+                }
             }
         }
     }
 
     impl KeySink for Rig {
         fn change_vt(&mut self, _vt: i32) {}
+        fn field_focused(&self) -> bool {
+            self.window.field_focused()
+        }
         fn cancel(&mut self) {
             self.queue.borrow_mut().push_back(UiMessage::Cancel);
         }
@@ -259,5 +302,197 @@ mod tests {
         drop(rig);
         assert_eq!(greetd.finish(), ["create bob", "answer pw", "start"]);
         assert!(complete);
+    }
+
+    const TAB: u32 = 0xff09;
+    const SPACE: u32 = 0x20;
+    const RIGHT: u32 = 0xff53;
+    const F8: u32 = 0xffc5;
+    const SHIFT_L: u32 = 0xffe1;
+    const CONTROL_L: u32 = 0xffe3;
+    const ALT_L: u32 = 0xffe9;
+
+    fn press(keysym: u32) -> InputEvent {
+        InputEvent::Key {
+            keysym,
+            utf8: None,
+            pressed: true,
+        }
+    }
+
+    fn release(keysym: u32) -> InputEvent {
+        InputEvent::Key {
+            keysym,
+            utf8: None,
+            pressed: false,
+        }
+    }
+
+    fn every_control_by_keyboard() -> Vec<InputEvent> {
+        let mut drive = vec![press(SHIFT_L)];
+        drive.extend(tap(TAB, Some("\t")));
+        drive.push(release(SHIFT_L));
+        drive.extend(tap(RIGHT, None));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(SPACE, Some(" ")));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(RIGHT, None));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(RETURN, None));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(ESCAPE, None));
+        drive.extend(tap(ESCAPE, None));
+        drive.push(press(ALT_L));
+        drive.extend(tap(F8, None));
+        drive.push(release(ALT_L));
+        drive.extend(text("pw"));
+        drive
+    }
+
+    #[test]
+    fn keyboard_switching_opens_no_conversation_before_enter() {
+        let Some(greetd) = Greetd::scripted("keyboard-local", vec![secret()]) else {
+            return;
+        };
+        let mut rig = Rig::with_pickers(&greetd);
+        rig.auth
+            .select_user(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        for event in every_control_by_keyboard() {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        drop(rig);
+        assert_eq!(greetd.finish(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_user_picked_by_keyboard_signs_in_on_enter() {
+        let Some(greetd) = Greetd::scripted(
+            "keyboard-pick",
+            vec![secret(), Response::Success, Response::Success],
+        ) else {
+            return;
+        };
+        let mut rig = Rig::with_pickers(&greetd);
+        rig.auth
+            .select_user(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        let mut drive = every_control_by_keyboard();
+        drive.extend(tap(RETURN, None));
+        for event in drive {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        let complete = rig.auth.is_complete();
+        drop(rig);
+        assert_eq!(greetd.finish(), ["create bob", "answer pw", "start"]);
+        assert!(complete);
+    }
+
+    #[test]
+    fn control_z_after_escape_never_answers_with_the_cleared_password() {
+        let Some(greetd) = Greetd::scripted(
+            "escape-undo",
+            vec![secret(), Response::Success, Response::Success],
+        ) else {
+            return;
+        };
+        let mut rig = Rig::new(&greetd);
+        rig.auth
+            .begin(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        let mut drive = text("secret");
+        drive.extend(tap(ESCAPE, None));
+        drive.push(press(CONTROL_L));
+        drive.extend(tap('z' as u32, Some("\u{1a}")));
+        drive.push(release(CONTROL_L));
+        drive.extend(tap(RETURN, None));
+        for event in drive {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        drop(rig);
+        assert_eq!(greetd.finish(), ["create alice"]);
+    }
+
+    fn click_shut_down(rig: &mut Rig) {
+        rig.window.dispatch(InputEvent::PointerAbsolute {
+            x: 1240.0,
+            y: 754.0,
+        });
+        for pressed in [true, false] {
+            rig.window.dispatch(InputEvent::PointerButton {
+                button: 0x110,
+                pressed,
+            });
+        }
+        rig.tick();
+    }
+
+    #[test]
+    fn escape_closes_a_confirm_opened_by_a_click_and_returns_to_the_field() {
+        let Some(greetd) = Greetd::scripted("click-confirm", vec![secret()]) else {
+            return;
+        };
+        let mut rig = Rig::new(&greetd);
+        rig.auth
+            .begin(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        click_shut_down(&mut rig);
+        assert!(!rig.window.field_focused(), "the click opened the confirm");
+        for event in tap(ESCAPE, None) {
+            route(&mut rig, event);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        vigil_ui::advance_timers();
+        click_shut_down(&mut rig);
+        assert!(
+            !rig.window.field_focused(),
+            "Esc closed the confirm, so the same click opened it again instead of shutting down"
+        );
+
+        for event in tap(ESCAPE, None) {
+            route(&mut rig, event);
+        }
+        for event in tap(RETURN, None) {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        drop(rig);
+        assert_eq!(
+            greetd.finish(),
+            ["create alice"],
+            "Esc returned to the field without cancelling, and Enter reached it"
+        );
+    }
+
+    #[test]
+    fn modifiers_held_across_a_vt_switch_do_not_stick() {
+        let Some(greetd) = Greetd::scripted(
+            "vt-modifiers",
+            vec![secret(), Response::Success, Response::Success],
+        ) else {
+            return;
+        };
+        let mut rig = Rig::new(&greetd);
+        rig.auth
+            .select_user(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        let mut drive = vec![press(CONTROL_L), press(ALT_L), press(VT_FIRST + 1)];
+        drive.extend(text("pw"));
+        drive.extend(tap(RETURN, None));
+        for event in drive {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        drop(rig);
+        assert_eq!(greetd.finish(), ["create alice", "answer pw", "start"]);
     }
 }

@@ -354,7 +354,7 @@ impl Simulator {
             Mode::Lock => {
                 scene.set_background((*self.lock_wallpaper).clone(), WIDTH, HEIGHT);
                 scene.set_panel_visible(true);
-                scene.set_power_visible(true);
+                scene.set_power_visible(false);
                 scene.set_users(&["alice".into()]);
                 scene.set_sessions(&[]);
                 scene.show_prompt("Password:", true);
@@ -1182,6 +1182,12 @@ fn key_event(key: &Key) -> (u32, Option<KeyText>) {
         Key::Named(NamedKey::ArrowUp) => (0xff52, None),
         Key::Named(NamedKey::ArrowRight) => (0xff53, None),
         Key::Named(NamedKey::ArrowDown) => (0xff54, None),
+        Key::Named(NamedKey::Space) => (0x20, Some(" ".into())),
+        Key::Named(NamedKey::F8) => (0xffc5, None),
+        Key::Named(NamedKey::Shift) => (0xffe1, None),
+        Key::Named(NamedKey::Control) => (0xffe3, None),
+        Key::Named(NamedKey::Alt) => (0xffe9, None),
+        Key::Named(NamedKey::Super) => (0xffeb, None),
         _ => (0, None),
     }
 }
