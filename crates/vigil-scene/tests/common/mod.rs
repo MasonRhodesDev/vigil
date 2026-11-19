@@ -48,7 +48,6 @@ fn rotated_rects(n: usize, paint: &str) -> String {
 
 const STOPS: &str = r##"<stop offset="0" stop-color="#000"/><stop offset=".5" stop-color="#f00" stop-opacity=".5"/><stop offset="1" stop-color="#00f"/>"##;
 
-// Rects over the whole box, each painted by one gradient of a kind and spread.
 fn gradient(kind: &str, spread: &str, stops: &str, n: usize) -> String {
     let at = r#"cx="50" cy="50" r="3" gradientUnits="userSpaceOnUse""#;
     let open = match kind {

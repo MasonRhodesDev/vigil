@@ -106,8 +106,9 @@ extern "C" {
  * small it fills `placement` and returns `VIGIL_SCENE_ERR_BUFFER`.
  *
  * A request with a logo is drawn by the helper process installed with this
- * library, and the call returns within `deadline_ms` plus the copy of the
- * layer into `out`, whatever the logo holds. A request without one is drawn
+ * library, and the call returns within `deadline_ms`, plus the kernel's
+ * teardown of a killed helper and the copy of the layer into `out`, whatever
+ * the logo holds. A request without one is drawn
  * in the calling process. On any error `out` is left unwritten, and a caller
  * should draw the ground-only scene by asking again without the logo. The
  * same logo is refused again on the next call, so a caller that remembers

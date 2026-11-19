@@ -41,8 +41,9 @@ macro_rules! installed_helper {
 /// Draws untrusted logos in a child process: the `vigil-scene` binary, run
 /// with a clean environment, limits it sets on itself before it reads a
 /// byte, and a deadline after which it is killed and reaped. Whatever the
-/// logo does, a call returns within the deadline plus the copy of its result,
-/// and the caller's memory grows by the result alone.
+/// logo does, a call returns within the deadline, plus the kernel's teardown
+/// of a killed helper and the copy of the result, and the caller's memory
+/// grows by the result alone.
 #[derive(Debug, Clone)]
 pub struct Helper {
     path: PathBuf,
