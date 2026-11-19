@@ -153,7 +153,7 @@ struct Walk {
     work: f64,
     live: f64,
     reach: Area,
-    limit: Area,
+    edge: f64,
 }
 
 impl Walk {
@@ -214,8 +214,8 @@ impl Walk {
             )?;
         }
         if let Some(stroke) = stroke {
-            let scale = f64::from((ts.sx * ts.sy - ts.kx * ts.ky).abs()).sqrt();
-            let width = f64::from(stroke.width().get()) * scale;
+            let rows_per_unit = f64::from(ts.ky).hypot(f64::from(ts.sy));
+            let width = f64::from(stroke.width().get()) * rows_per_unit;
             let e = edges(p.data(), ts, height, width);
             let count = STROKE_EDGES * (e.count + e.subpaths);
             let rows = STROKE_EDGES * (e.rows + e.subpaths * width.min(height));
@@ -252,9 +252,18 @@ impl Walk {
             return Err(Error::Refused("a filter".into()));
         }
         let ts = base.pre_concat(g.abs_transform());
+        // resvg clamps a layer to five canvases around the origin of the
+        // pixmap it is drawn into, which for a nested layer is its parent's.
+        let e = self.edge;
+        let limit = Area {
+            l: target.l - 2.0 * e,
+            t: target.t - 2.0 * e,
+            r: target.l + 3.0 * e,
+            b: target.t + 3.0 * e,
+        };
         let layer = Area::of(g.layer_bounding_box().to_rect(), ts)
             .grow(2.0)
-            .meet(self.limit);
+            .meet(limit);
         let size = layer.size();
         self.alloc(4.0 * size)?;
         self.add(LAYER_NS * size)?;
@@ -347,12 +356,7 @@ pub(crate) fn check(tree: &usvg::Tree, fit: Transform, edge: u32) -> Result<(), 
             r: REACH * e,
             b: REACH * e,
         },
-        limit: Area {
-            l: -2.0 * e,
-            t: -2.0 * e,
-            r: 3.0 * e,
-            b: 3.0 * e,
-        },
+        edge: e,
     };
     walk.alloc(4.0 * canvas.size())?;
     walk.children(tree.root(), fit, canvas)
