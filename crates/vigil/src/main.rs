@@ -197,6 +197,7 @@ fn composed(
         width: target.width,
         height: target.height,
         stride: target.stride,
+        damage: None,
     };
     if !compose(&mut frame) {
         return false;
@@ -1346,6 +1347,7 @@ impl App {
                                     width: frame.width,
                                     height: frame.height,
                                     stride: frame.stride,
+                                    damage: None,
                                 }) && {
                                     sp.blend_over(frame, progress as f32);
                                     true
@@ -1880,6 +1882,7 @@ impl App {
                             width: frame.width,
                             height: frame.height,
                             stride: frame.stride,
+                            damage: None,
                         });
                         if drew {
                             sp.blend_over(frame, alpha);
@@ -1895,12 +1898,7 @@ impl App {
                         drew
                     }),
                     _ => {
-                        let drew = window.render_if_needed(FrameTarget {
-                            buffer: &mut target.buffer[..],
-                            width: target.width,
-                            height: target.height,
-                            stride: target.stride,
-                        });
+                        let drew = window.render_if_needed(target.reborrow());
                         if drew && let Some(tag) = tag.as_ref() {
                             tag.draw(&mut target, splash::Stage::Greeter);
                         }
@@ -2428,6 +2426,7 @@ mod config_tests {
             width: w,
             height: h,
             stride,
+            damage: None,
         };
         let mut scratch = Vec::new();
         assert!(!composed(&mut scratch, &mut target, |f| {
@@ -2447,6 +2446,7 @@ mod config_tests {
             width: w,
             height: h,
             stride,
+            damage: None,
         };
         assert!(!composed(&mut scratch, &mut small, |_| true));
     }

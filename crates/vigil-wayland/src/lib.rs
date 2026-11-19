@@ -794,6 +794,7 @@ impl<S: LockSession> App<S> {
                 width: w,
                 height: h,
                 stride,
+                damage: None,
             },
         );
         if drew {
@@ -869,6 +870,7 @@ impl<S: LockSession> App<S> {
                 width: w,
                 height: h,
                 stride,
+                damage: None,
             },
         );
         if !drew && force {
@@ -880,6 +882,7 @@ impl<S: LockSession> App<S> {
                     width: w,
                     height: h,
                     stride,
+                    damage: None,
                 },
             );
         }

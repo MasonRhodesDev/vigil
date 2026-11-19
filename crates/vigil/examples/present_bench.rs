@@ -2,7 +2,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
+use vigil_core::{AuthUi, BufferDamage, FrameTarget, InputEvent, OutputId};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
 
@@ -112,6 +112,7 @@ impl Slot {
 
 struct Chain {
     slots: [Slot; 2],
+    damage: BufferDamage,
     back: usize,
     panel: (u32, u32),
 }
@@ -121,6 +122,7 @@ impl Chain {
         let len = panel.0 as usize * panel.1 as usize * 4;
         Self {
             slots: [Slot::new(len, map), Slot::new(len, map)],
+            damage: BufferDamage::new(2),
             back: 0,
             panel,
         }
@@ -128,14 +130,17 @@ impl Chain {
 
     fn present(&mut self, window: &mut OutputWindow) -> bool {
         let (width, height) = self.panel;
+        let mut frame = self.damage.begin(self.back);
         let drew = self.slots[self.back].with_bytes(|buffer| {
             window.render_if_needed(FrameTarget {
                 buffer,
                 width,
                 height,
                 stride: width as usize * 4,
+                damage: Some(&mut frame),
             })
         });
+        self.damage.finish(self.back, frame, drew);
         if drew {
             self.back ^= 1;
         }

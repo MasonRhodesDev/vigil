@@ -21,10 +21,11 @@ use slint_idle_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use slint_interpreter::{ComponentInstance, Value};
 use slint_kit::TokenSet;
 use vigil_core::{
-    AuthUi, BackgroundFit, CURSOR, FrameTarget, InputEvent, OutputId, PowerAction, UiMessage,
-    scene_to_panel,
+    AuthUi, BackgroundFit, Damage, FrameTarget, InputEvent, OutputId, PowerAction, Rect, UiMessage,
 };
 use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
+
+mod scanout;
 
 #[derive(Clone, Default)]
 pub struct VigilPlatform {
@@ -177,6 +178,9 @@ pub struct SoftwareBackend {
     native_background: Option<std::sync::Arc<[u8]>>,
     native_overlay: Vec<u8>,
     full_repaint: bool,
+    unpresented: Damage,
+    cursor_drawn: Option<Rect>,
+    presented: Option<u64>,
 }
 
 impl OutputWindow {
@@ -257,6 +261,9 @@ impl OutputWindow {
                 native_background: None,
                 native_overlay: Vec::new(),
                 full_repaint: true,
+                unpresented: Damage::Full,
+                cursor_drawn: None,
+                presented: None,
             }),
             width,
             height,
@@ -1014,7 +1021,8 @@ pub fn duration_until_next_timer_update() -> Option<Duration> {
 
 impl SoftwareBackend {
     fn draw_into_shadow(&mut self, view: &SceneView) -> bool {
-        let shadow_stride = view.scene_size.0 as usize;
+        let (scene_w, scene_h) = view.scene_size;
+        let shadow_stride = scene_w as usize;
         let native_background = self.native_background.clone();
         let full = self.full_repaint;
         if self.adapter.draw_if_needed(|renderer| {
@@ -1023,7 +1031,7 @@ impl SoftwareBackend {
             } else {
                 RepaintBufferType::ReusedBuffer
             });
-            if let Some(background) = &native_background {
+            let region = if let Some(background) = &native_background {
                 let overlay = bytemuck::cast_slice_mut::<u8, Argb8888>(&mut self.native_overlay);
                 let region = renderer.render(overlay, shadow_stride);
                 if full {
@@ -1040,9 +1048,23 @@ impl SoftwareBackend {
                         );
                     }
                 }
+                region
             } else {
                 let shadow_pixels = bytemuck::cast_slice_mut::<u8, Xrgb8888>(&mut self.shadow);
-                renderer.render(shadow_pixels, shadow_stride);
+                renderer.render(shadow_pixels, shadow_stride)
+            };
+            if full {
+                self.unpresented = Damage::Full;
+            } else {
+                for (origin, size) in region.iter() {
+                    let drawn = Rect::new(
+                        origin.x.max(0) as u32,
+                        origin.y.max(0) as u32,
+                        size.width,
+                        size.height,
+                    );
+                    self.unpresented.add(drawn.clipped(scene_w, scene_h));
+                }
             }
         }) {
             self.full_repaint = false;
@@ -1123,30 +1145,32 @@ impl RenderBackend for SoftwareBackend {
         if !self.needs_present {
             return false;
         }
-        if self.transform == 0 {
-            let row_bytes = scene_w as usize * 4;
-            for y in 0..scene_h as usize {
-                target.buffer[y * target.stride..y * target.stride + row_bytes]
-                    .copy_from_slice(&self.shadow[y * row_bytes..(y + 1) * row_bytes]);
-            }
-        } else {
-            let Ok(pixels) = bytemuck::try_cast_slice_mut::<u8, Xrgb8888>(target.buffer) else {
-                if debug {
-                    eprintln!("vigil-ui: buffer not 4-byte aligned");
-                }
-                return true;
-            };
-            self.rotate_out(view.scene_size, pixels, target.stride / 4);
+        let layout = scanout::Layout {
+            transform: self.transform,
+            scene: view.scene_size,
+        };
+        let cursor = view
+            .cursor_visible
+            .then(|| scanout::cursor_rect(layout, view.scale, view.pointer));
+        let mut changed = std::mem::take(&mut self.unpresented);
+        for rect in self.cursor_drawn.iter().chain(&cursor) {
+            changed.add(*rect);
         }
-        if view.cursor_visible {
-            let Ok(pixels) = bytemuck::try_cast_slice_mut::<u8, Xrgb8888>(target.buffer) else {
-                if debug {
-                    eprintln!("vigil-ui: buffer not 4-byte aligned");
-                }
-                return true;
-            };
-            self.blit_cursor(view, pixels, target.stride / 4);
+        let changed = changed.map(|rect| layout.to_panel(rect));
+        let frame = vigil_core::next_frame_serial();
+        let repaint = match target.damage {
+            Some(damage) => damage.repaint(self.presented, frame, changed),
+            None => Damage::Full,
+        };
+        self.presented = Some(frame);
+        let shadow = bytemuck::cast_slice::<u8, u32>(&self.shadow);
+        for rect in repaint.rects(self.panel_width, self.panel_height) {
+            scanout::copy(shadow, layout, target.buffer, target.stride, rect);
         }
+        if let Some(at) = cursor {
+            scanout::blit_cursor(layout, view.scale, at, target.buffer, target.stride);
+        }
+        self.cursor_drawn = cursor;
         self.needs_present = false;
         true
     }
@@ -1205,61 +1229,9 @@ fn composite_native_span(background: &[Xrgb8888], overlay: &[Argb8888], output: 
     }
 }
 
-impl SoftwareBackend {
-    #[inline]
-    fn to_panel(&self, scene: (u32, u32), sx: usize, sy: usize) -> (usize, usize) {
-        scene_to_panel(self.transform, scene.0 as usize, scene.1 as usize, sx, sy)
-    }
-
-    fn rotate_out(&self, scene: (u32, u32), target: &mut [Xrgb8888], target_stride: usize) {
-        const TILE: usize = 16;
-        let (sw, sh) = (scene.0 as usize, scene.1 as usize);
-        let shadow = bytemuck::cast_slice::<u8, Xrgb8888>(&self.shadow);
-        for tile_y in (0..sh).step_by(TILE) {
-            let y_end = (tile_y + TILE).min(sh);
-            for tile_x in (0..sw).step_by(TILE) {
-                let x_end = (tile_x + TILE).min(sw);
-                for sy in tile_y..y_end {
-                    let row = &shadow[sy * sw + tile_x..sy * sw + x_end];
-                    for (sx, pixel) in (tile_x..x_end).zip(row) {
-                        let (px, py) = self.to_panel(scene, sx, sy);
-                        target[py * target_stride + px] = *pixel;
-                    }
-                }
-            }
-        }
-    }
-
-    fn blit_cursor(&self, view: &SceneView, pixels: &mut [Xrgb8888], pixel_stride: usize) {
-        let scale = f64::from(view.scale.max(1.0));
-        let out_w = (CURSOR[0].len() as f64 * scale) as usize;
-        let out_h = (CURSOR.len() as f64 * scale) as usize;
-        let (base_x, base_y) = (view.pointer.0 as usize, view.pointer.1 as usize);
-        for oy in 0..out_h {
-            let py = base_y + oy;
-            if py >= view.scene_size.1 as usize {
-                break;
-            }
-            let row = CURSOR[((oy as f64 / scale) as usize).min(CURSOR.len() - 1)];
-            for ox in 0..out_w {
-                let px = base_x + ox;
-                if px >= view.scene_size.0 as usize {
-                    break;
-                }
-                let (tx, ty) = self.to_panel(view.scene_size, px, py);
-                match row[((ox as f64 / scale) as usize).min(row.len() - 1)] {
-                    b'X' => pixels[ty * pixel_stride + tx] = Xrgb8888(0),
-                    b'#' => pixels[ty * pixel_stride + tx] = Xrgb8888(0x00ff_ffff),
-                    _ => {}
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::scene_to_panel;
+    use vigil_core::scene_to_panel;
 
     #[test]
     fn every_transform_is_a_bijection_onto_the_panel() {
@@ -1483,6 +1455,7 @@ mod tests {
             width: 2,
             height: 2,
             stride: 8,
+            damage: None,
         }));
         assert_eq!(
             buffer,
@@ -1511,6 +1484,7 @@ mod tests {
                 width: 3,
                 height: 3,
                 stride: 12,
+                damage: None,
             }),
             "a mismatched target must be refused, not partially painted"
         );
@@ -1524,6 +1498,7 @@ mod tests {
             width: 2,
             height: 2,
             stride: 8,
+            damage: None,
         }));
 
         let source = r#"
@@ -1555,6 +1530,7 @@ mod tests {
             width: 2,
             height: 2,
             stride: 8,
+            damage: None,
         }));
         assert_eq!(
             buffer,
@@ -1568,6 +1544,7 @@ mod tests {
             width: 2,
             height: 2,
             stride: 8,
+            damage: None,
         }));
         assert_eq!(buffer, [0xff, 0, 0, 0].repeat(4));
 

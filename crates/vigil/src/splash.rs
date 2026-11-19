@@ -329,6 +329,7 @@ impl Splash {
             width: pw as u32,
             height: ph as u32,
             stride: pw * 4,
+            damage: None,
         };
         splash.draw_glow_rect(&mut frame, 0.0);
         splash.rest = rest;
@@ -657,6 +658,7 @@ mod tests {
             width: w,
             height: h,
             stride: w as usize * 4,
+            damage: None,
         }
     }
 

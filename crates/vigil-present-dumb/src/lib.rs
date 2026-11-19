@@ -6,7 +6,7 @@ use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
 use smithay::reexports::drm::control::{Device as ControlDevice, framebuffer};
 use smithay::reexports::rustix;
 use smithay::utils::{Rectangle, Transform};
-use vigil_core::{Canvas, FrameTarget, PresentError, Presenter};
+use vigil_core::{BufferDamage, Canvas, FrameTarget, PresentError, Presenter};
 
 const BPP: u32 = 32;
 const DEPTH: u32 = 24;
@@ -54,6 +54,7 @@ struct Slot {
 pub struct DumbBufferPresenter {
     surface: DrmSurface,
     slots: [Slot; 2],
+    damage: BufferDamage,
     back: usize,
     modeset_done: bool,
     staged: bool,
@@ -108,6 +109,7 @@ impl DumbBufferPresenter {
 
         Ok(Self {
             surface,
+            damage: BufferDamage::new(slots.len()),
             slots,
             back: 0,
             modeset_done: false,
@@ -142,6 +144,7 @@ impl Presenter for DumbBufferPresenter {
     fn invalidate(&mut self) {
         self.modeset_done = false;
         self.flip_pending = false;
+        self.damage.invalidate();
     }
 
     fn vblank(&mut self) {
@@ -175,12 +178,15 @@ impl Presenter for DumbBufferPresenter {
     ) -> Result<bool, PresentError> {
         let slot = &mut self.slots[self.back];
         let stride = slot.buffer.pitch() as usize;
+        let mut frame = self.damage.begin(self.back);
         let drew = draw(Canvas::Cpu(FrameTarget {
             buffer: slot.mapping.bytes(),
             width: self.width,
             height: self.height,
             stride,
+            damage: Some(&mut frame),
         }));
+        self.damage.finish(self.back, frame, drew);
         self.staged = drew;
         Ok(drew)
     }

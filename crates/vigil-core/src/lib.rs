@@ -1,3 +1,7 @@
+mod damage;
+
+pub use damage::{BufferDamage, Damage, FrameDamage, Rect, next_frame_serial};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OutputId(pub u32);
 
@@ -64,6 +68,19 @@ pub struct FrameTarget<'a> {
     pub width: u32,
     pub height: u32,
     pub stride: usize,
+    pub damage: Option<&'a mut FrameDamage>,
+}
+
+impl FrameTarget<'_> {
+    pub fn reborrow(&mut self) -> FrameTarget<'_> {
+        FrameTarget {
+            buffer: &mut *self.buffer,
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+            damage: self.damage.as_deref_mut(),
+        }
+    }
 }
 
 pub const CURSOR: &[&[u8]] = &[
