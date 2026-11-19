@@ -66,15 +66,23 @@ thread_local! {
     static COSMETIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+static PLAIN_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 /// The first call in every main. A panic on any thread ends the process at once with status
 /// 101, so it never runs half alive with a dead PAM worker, a lost signal or a poisoned lock,
 /// and ext-session-lock keeps the session locked when its client dies. The report names only
 /// the place, since a panic message can quote typed text. It goes out through `vigil_log::say!`,
 /// which allocates nothing and never blocks or panics, so a broken stderr cannot hold up the
-/// exit. Only work run through [`cosmetic`] survives its own panic.
+/// exit. Only work run through [`cosmetic`] survives its own panic. After [`crash_plainly`] the
+/// hook instead writes the place with one write(2) and exits with the status given there.
 pub fn exit_on_panic() {
     #[expect(clippy::disallowed_methods, reason = "this is the one panic hook")]
     std::panic::set_hook(Box::new(|info| {
+        let plain = PLAIN_EXIT.load(std::sync::atomic::Ordering::Relaxed);
+        if plain >= 0 {
+            report_plainly(info.location());
+            exit_now(plain);
+        }
         let cosmetic = COSMETIC.try_with(std::cell::Cell::get).unwrap_or(false);
         let then = if cosmetic {
             "going on without it"
@@ -89,6 +97,48 @@ pub fn exit_on_panic() {
             exit_now(101);
         }
     }));
+}
+
+/// For a process about to install a seccomp filter that allows little beyond write(2) and
+/// exit. SIGSEGV and SIGBUS get their default action, so a fault ends the process by its own
+/// signal rather than in std's handler, whose sigaction the filter kills. A stack overflow then
+/// dies of SIGSEGV unannounced. Call it before the filter goes on.
+pub fn die_of_faults() -> std::io::Result<()> {
+    for signal in [libc::SIGSEGV, libc::SIGBUS] {
+        default_action(signal)?;
+    }
+    Ok(())
+}
+
+/// For a process whose seccomp filter is on. From here on, a panic writes its place to stderr
+/// in one write(2) and exits with `status`, because `say!` makes calls such a filter kills.
+/// Call it only once the filter is on, so a panic while installing it still exits 101.
+pub fn crash_plainly(status: u8) {
+    PLAIN_EXIT.store(status.into(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn report_plainly(at: Option<&std::panic::Location<'_>>) {
+    use std::io::Write;
+    let mut buf = [0u8; 512];
+    let mut rest = &mut buf[..];
+    let _ = match at {
+        Some(at) => writeln!(rest, "panic at {}:{}", at.file(), at.line()),
+        None => writeln!(rest, "panic at an unknown place"),
+    };
+    let len = 512 - rest.len();
+    let _ = rustix::io::write(rustix::stdio::stderr(), &buf[..len]);
+}
+
+#[expect(
+    unsafe_code,
+    reason = "neither std nor rustix 1.1 has a safe sigaction"
+)]
+fn default_action(signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: SIG_DFL installs no handler, so no code of this process runs on the signal.
+    if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Runs `work` so that a panic inside it costs only its result. For work the process can go
@@ -166,6 +216,22 @@ mod tests {
         ));
         assert_eq!((signal, code), (None, Some(101)), "{stderr}");
         assert!(stderr.contains("panic at "), "{stderr}");
+        assert!(stderr.contains("lib.rs:"), "{stderr}");
+        assert!(!stderr.contains("hunter2"), "{stderr}");
+    }
+
+    #[test]
+    fn a_plain_panic_exits_with_its_status_and_names_only_the_place() {
+        if in_child() {
+            crash_plainly(12);
+            let _ = std::thread::spawn(|| panic!("hunter2")).join();
+            std::process::exit(0);
+        }
+        let (signal, code, stderr) = exited(&child(
+            "tests::a_plain_panic_exits_with_its_status_and_names_only_the_place",
+        ));
+        assert_eq!((signal, code), (None, Some(12)), "{stderr}");
+        assert!(stderr.starts_with("panic at "), "{stderr}");
         assert!(stderr.contains("lib.rs:"), "{stderr}");
         assert!(!stderr.contains("hunter2"), "{stderr}");
     }
