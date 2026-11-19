@@ -671,14 +671,64 @@ mod tests {
         <rect x="10" y="10" width="80" height="80" fill="#1793d1"/>
         <rect x="0" y="0" width="2" height="2" fill="#1793d1"/></svg>"##;
 
-    fn cfg_with_logo(name: &str) -> SplashConfig {
+    const BOX_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+        <rect x="-10" y="-10" width="120" height="120"/></svg>"##;
+
+    const PLACED: [(u32, u32, u32, usize, usize, usize); 10] = [
+        (1440, 1920, 1080, 230, 845, 382),
+        (1440, 2560, 1440, 230, 1165, 562),
+        (1440, 3440, 1440, 230, 1605, 562),
+        (1440, 3840, 2160, 230, 1805, 922),
+        (1440, 2160, 3840, 230, 965, 1762),
+        (0, 1920, 1080, 173, 874, 421),
+        (0, 2560, 1440, 230, 1165, 562),
+        (0, 3440, 1440, 230, 1605, 562),
+        (0, 3840, 2160, 346, 1747, 842),
+        (0, 2160, 3840, 346, 907, 1632),
+    ];
+
+    fn cfg_with_svg(name: &str, svg: &str) -> SplashConfig {
         let dir = std::env::temp_dir().join(format!("vigil-splash-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("logo.svg");
-        std::fs::write(&path, SVG).unwrap();
+        std::fs::write(&path, svg).unwrap();
         SplashConfig {
             logo: Some(path),
             ..SplashConfig::default()
+        }
+    }
+
+    fn cfg_with_logo(name: &str) -> SplashConfig {
+        cfg_with_svg(name, SVG)
+    }
+
+    #[test]
+    fn mark_fills_the_rect_the_boot_scene_places_it_at() {
+        let cfg = cfg_with_svg("placed", BOX_SVG);
+        for (reference, w, h, logo, x, y) in PLACED {
+            let spec = Scene {
+                ref_short_side: (reference > 0).then_some(reference),
+                ..Scene::default()
+            };
+            let transform = u8::from(h > w);
+            let (sw, sh) = (w as usize, h as usize);
+            let a = scene_to_panel(transform, sw, sh, x, y);
+            let b = scene_to_panel(transform, sw, sh, x + logo - 1, y + logo - 1);
+            let want = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
+
+            let (pw, ph) = if transform == 1 { (h, w) } else { (w, h) };
+            let s = Splash::new(&cfg, &spec, (w, h), transform);
+            let mut buf = Vec::new();
+            let mut t = target(&mut buf, pw, ph);
+            assert!(s.draw_full(&mut t, 0.0));
+            let mark = [spec.mark[2], spec.mark[1], spec.mark[0], 0xff];
+            let mut got = (usize::MAX, usize::MAX, 0, 0);
+            let (pixels, _partial) = t.buffer.as_chunks::<4>();
+            for (i, _) in pixels.iter().enumerate().filter(|(_, p)| **p == mark) {
+                let (px, py) = (i % pw as usize, i / pw as usize);
+                got = (got.0.min(px), got.1.min(py), got.2.max(px), got.3.max(py));
+            }
+            assert_eq!(got, want, "{w}x{h} reference {reference}");
         }
     }
 
