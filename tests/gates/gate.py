@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 import urllib.parse
 
@@ -237,20 +238,32 @@ def attributes(tokens):
             yield tokens[j : group_end(tokens, j) + 1]
 
 
-def macro_bodies(tokens):
+def macro_groups(tokens):
     for i, token in enumerate(tokens):
-        if token == "macro_rules" and tokens[i + 1 : i + 2] == ["!"]:
-            start = i + 3
-            if tokens[start : start + 1] and tokens[start] in "([{":
-                yield tokens[start : group_end(tokens, start) + 1]
+        if tokens[i + 1 : i + 2] != ["!"] or not ident_char(token[0]):
+            continue
+        start = i + 3 if token == "macro_rules" else i + 2
+        if tokens[start : start + 1] and tokens[start] in ("(", "[", "{"):
+            yield token, tokens[start : group_end(tokens, start) + 1]
 
 
-def measure(found, path, raw):
+def weakening_levels(attribute):
+    count = 0
+    for k, token in enumerate(attribute):
+        if token in ("allow", "expect", "warn") and attribute[k + 1 : k + 2] == ["("]:
+            group = attribute[k + 1 : group_end(attribute, k + 1) + 1]
+            count += any("unsafe" in t or t in ("clippy", "warnings") for t in group)
+    return count
+
+
+def measure(found, path, raw, tokens):
     for rule, pattern in WORDS.items():
         count = len(pattern.findall(raw))
         if count:
             found.add(path, rule, f"{path}: {count} {rule}", weight=count)
     allows = sum(1 for g in groups(LINT_LEVEL, raw) if WEAKENED_LINT.search(g))
+    if tokens is not None:
+        allows = max(allows, sum(weakening_levels(a) for a in attributes(tokens)))
     if allows:
         found.add(path, "lint-allow", f"{path}: {allows} allow, expect or warn naming unsafe, clippy or warnings", weight=allows)
 
@@ -275,9 +288,11 @@ def scan_rust(found, path, raw):
     for attribute in attributes(tokens):
         if any(t == "path" and attribute[k + 1 : k + 2] == ["="] for k, t in enumerate(attribute)):
             found.add(path, "path-attribute", f"{path}: #[path] loads a module from an arbitrary file")
-    for body in macro_bodies(tokens):
-        if "unsafe" in body:
-            found.add(path, "unsafe-in-macro", f"{path}: unsafe inside macro_rules! covers every expansion with one count")
+        if "$" in attribute:
+            found.add(path, "macro-attribute", f"{path}: an attribute built from a macro argument hides its lint level")
+    for name, group in macro_groups(tokens):
+        if "unsafe" in group:
+            found.add(path, "unsafe-in-macro", f"{path}: unsafe inside {name}! covers every expansion with one count")
     return tokens
 
 
@@ -304,7 +319,10 @@ def check_roots(found, roots, tokens, unsafe):
 
 
 def metadata():
-    result = run(["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1"])
+    # outside the tree, so neither a toolchain file nor a .cargo/config in it picks the cargo that runs here
+    manifest = os.path.join(os.getcwd(), "Cargo.toml")
+    with tempfile.TemporaryDirectory() as neutral:
+        result = run(["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1", "--manifest-path", manifest], cwd=neutral)
     if result.returncode != 0:
         die(f"cargo metadata: {result.stderr.strip()}")
     return json.loads(result.stdout)
@@ -377,12 +395,11 @@ def gate_fence(found, _args):
             found.add(path, "symlink", f"{path}: a symlink can point the build outside the fence")
             continue
         raw = read_bytes(path)
-        measure(found, path, raw)
+        lexed = scan_rust(found, path, raw) if path.endswith(".rs") else None
+        if lexed is not None:
+            tokens[path] = lexed
+        measure(found, path, raw, lexed)
         unsafe[path] = len(WORDS["unsafe"].findall(raw))
-        if path.endswith(".rs"):
-            lexed = scan_rust(found, path, raw)
-            if lexed is not None:
-                tokens[path] = lexed
     check_roots(found, check_targets(found, set(files), here), tokens, unsafe)
     check_workspace(found)
 

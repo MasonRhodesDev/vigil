@@ -275,10 +275,10 @@ pub fn start(devices: &[Device], timeout: Duration) -> Result<i32, String> {
             unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
             close_others(&keep);
             let crtcs: usize = held.iter().map(|d| d.crtcs.len()).sum();
+            // SAFETY: getpid takes no arguments and cannot fail.
+            let pid = unsafe { libc::getpid() };
             say!(
-                "vigil-hold: pid {} holding {crtcs} crtc(s) on {} device(s), timeout {} ms",
-                // SAFETY: getpid takes no arguments and cannot fail.
-                unsafe { libc::getpid() },
+                "vigil-hold: pid {pid} holding {crtcs} crtc(s) on {} device(s), timeout {} ms",
                 held.len(),
                 timeout.as_millis()
             );

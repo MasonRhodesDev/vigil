@@ -189,6 +189,32 @@ class Fence(Scratch):
         )
         self.assertRefused("fence", "unsafe-in-macro")
 
+    def test_a_comment_between_the_level_and_its_paren_is_counted(self):
+        self.append("crates/vigil-lock/src/main.rs", "\n#[allow/**/(clippy::multiple_unsafe_ops_per_block)]\nfn quiet() {}\n")
+        self.assertRefused("fence", "crates/vigil-lock/src/main.rs lint-allow")
+
+    def test_a_lint_level_passed_through_a_macro_is_refused(self):
+        self.append("crates/vigil-ui/src/lib.rs", "\nmacro_rules! level {\n    ($a:ident) => {\n        #[$a(clippy::all)]\n        fn quiet() {}\n    };\n}\nlevel!(allow);\n")
+        self.assertRefused("fence", "macro-attribute")
+
+    def test_unsafe_passed_into_a_macro_is_refused(self):
+        self.replace(
+            "crates/vigil/src/hold.rs",
+            "    let r = unsafe { libc::ioctl(fd, DROP_MASTER) };",
+            "    let r = sys!(unsafe libc::ioctl(fd, DROP_MASTER), libc::sync(), libc::getpid());",
+        )
+        self.append(
+            "crates/vigil/src/hold.rs",
+            """
+            macro_rules! sys {
+                ($kw:tt $first:expr $(, $rest:expr)*) => {
+                    $kw { $first $(; $rest)* }
+                };
+            }
+            """,
+        )
+        self.assertRefused("fence", "unsafe-in-macro")
+
     def test_a_commented_forbid_is_refused(self):
         self.replace("crates/vigil-pam/src/lib.rs", "#![forbid(unsafe_code)]", "/* #![forbid(unsafe_code)] */")
         self.assertRefused("fence", "crates/vigil-pam/src/lib.rs root-attribute")
