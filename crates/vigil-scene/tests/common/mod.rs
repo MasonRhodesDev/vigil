@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 const OPEN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">"#;
 
 pub fn svg(body: &str) -> String {
@@ -36,6 +38,58 @@ fn curves(n: usize) -> String {
 }
 
 pub type Family = fn(usize) -> String;
+
+fn rotated_rects(n: usize, paint: &str) -> String {
+    svg(&format!(
+        r#"<rect x="-20" y="-20" width="140" height="140" {paint} transform="rotate(37 50 50)"/>"#
+    )
+    .repeat(n))
+}
+
+fn focal_repeat(n: usize) -> String {
+    svg(&format!(
+        r##"<radialGradient id="g" cx="50" cy="50" r="3" fx="52" fy="50" fr="1" gradientUnits="userSpaceOnUse" spreadMethod="repeat"><stop offset="0" stop-color="#000"/><stop offset=".5" stop-color="#f00" stop-opacity=".5"/><stop offset="1" stop-color="#00f"/></radialGradient>{}"##,
+        r#"<rect width="100" height="100" fill="url(#g)"/>"#.repeat(n)
+    ))
+}
+
+fn used_path(uses: usize, paint: &str) -> String {
+    svg(&format!(
+        r##"<defs><path id="p" {paint} d="{}"/></defs>{}"##,
+        zigzag(40_000),
+        r##"<use href="#p"/>"##.repeat(uses)
+    ))
+}
+
+// The round 2 review's inputs, each at the size that stalled or overran.
+pub fn review_inputs() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "B1 a descendant selector over 58 nested groups",
+            svg(&format!(
+                r#"<style>h g g g g g g g g{{fill:red}}</style>{}<rect width="100" height="100"/>{}"#,
+                "<g>".repeat(58),
+                "</g>".repeat(58)
+            )),
+        ),
+        (
+            "B2 a 260 KB stroked path used 4000 times",
+            used_path(4000, r##"fill="none" stroke="#000" stroke-width="4""##),
+        ),
+        (
+            "B2 a 260 KB filled path used 4000 times",
+            used_path(4000, ""),
+        ),
+        (
+            "C1 289 rotated rects at half fill opacity",
+            rotated_rects(289, r#"fill-opacity=".5""#),
+        ),
+        (
+            "C2 114 rects under a focal radial gradient that repeats",
+            focal_repeat(114),
+        ),
+    ]
+}
 
 pub const FAMILIES: &[(&str, usize, Family)] = &[
     ("stroked path", 60_000, |n| {

@@ -1,6 +1,11 @@
+#[path = "../../vigil-scene/tests/common/mod.rs"]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use vigil_scene::{Logo, Plate, Scene};
 use vigil_scene_ffi::*;
@@ -24,11 +29,59 @@ fn request(svg: &[u8], layer: u32) -> VigilSceneRequest {
         transform: 0,
         layer,
         value: 0.0,
+        deadline_ms: VIGIL_SCENE_MAX_DEADLINE_MS,
     }
 }
 
+fn profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "dev"
+    } else {
+        "release"
+    }
+}
+
+// Cargo says where it put what it built, since the layout of the target dir
+// changes between cargo versions.
+fn cargo_build(args: &[&str], helper: Option<&Path>) -> Vec<serde_json::Value> {
+    let mut cargo = Command::new(env!("CARGO"));
+    cargo
+        .args([
+            "build",
+            "--frozen",
+            "--message-format=json",
+            "--profile",
+            profile(),
+        ])
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+    if let Some(helper) = helper {
+        cargo.env("VIGIL_SCENE_HELPER", helper);
+    }
+    let out = cargo.output().unwrap();
+    assert!(
+        out.status.success(),
+        "cargo build: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn helper() -> &'static Path {
+    static HELPER: OnceLock<PathBuf> = OnceLock::new();
+    HELPER.get_or_init(|| {
+        cargo_build(&["-p", "vigil-scene", "--bin", "vigil-scene"], None)
+            .iter()
+            .find_map(|m| m["executable"].as_str().map(PathBuf::from))
+            .expect("cargo names the helper it built")
+    })
+}
+
 #[allow(unsafe_code)]
-fn render(req: &VigilSceneRequest, out: &mut [u8]) -> (i32, VigilScenePlacement) {
+fn render_by(helper: &Path, req: &VigilSceneRequest, out: &mut [u8]) -> (i32, VigilScenePlacement) {
     let mut at = VigilScenePlacement::default();
     let (ptr, len) = if out.is_empty() {
         (ptr::null_mut(), 0)
@@ -36,8 +89,12 @@ fn render(req: &VigilSceneRequest, out: &mut [u8]) -> (i32, VigilScenePlacement)
         (out.as_mut_ptr(), out.len())
     };
     // SAFETY: req, out and at are live, aligned and disjoint for the call.
-    let rc = unsafe { vigil_scene_render(req, ptr, len, &raw mut at) };
+    let rc = unsafe { render_with(helper, req, ptr, len, &raw mut at) };
     (rc, at)
+}
+
+fn render(req: &VigilSceneRequest, out: &mut [u8]) -> (i32, VigilScenePlacement) {
+    render_by(helper(), req, out)
 }
 
 #[test]
@@ -110,7 +167,7 @@ fn bad_arguments_are_refused_before_any_drawing() {
     assert_eq!(rc, VIGIL_SCENE_ERR_ARGUMENT);
 
     type Edit = fn(&mut VigilSceneRequest);
-    let cases: [(&str, Edit, i32); 9] = [
+    let cases: [(&str, Edit, i32); 10] = [
         ("unknown layer", |r| r.layer = 9, VIGIL_SCENE_ERR_ARGUMENT),
         ("transform 4", |r| r.transform = 4, VIGIL_SCENE_ERR_ARGUMENT),
         (
@@ -127,6 +184,11 @@ fn bad_arguments_are_refused_before_any_drawing() {
         (
             "svg without a length",
             |r| r.svg_len = 0,
+            VIGIL_SCENE_ERR_ARGUMENT,
+        ),
+        (
+            "deadline over the maximum",
+            |r| r.deadline_ms = VIGIL_SCENE_MAX_DEADLINE_MS + 1,
             VIGIL_SCENE_ERR_ARGUMENT,
         ),
         ("mode 0", |r| r.mode_width = 0, VIGIL_SCENE_ERR_TOO_LARGE),
@@ -156,10 +218,12 @@ fn bad_arguments_are_refused_before_any_drawing() {
         VIGIL_SCENE_ERR_TOO_LARGE
     );
     let hostile = br#"<svg xmlns="http://www.w3.org/2000/svg"><image href="/etc/passwd"/></svg>"#;
-    assert_eq!(
-        render(&request(hostile, VIGIL_SCENE_LAYER_LOGO), &mut []).0,
-        VIGIL_SCENE_ERR_REFUSED
-    );
+    let req = request(hostile, VIGIL_SCENE_LAYER_LOGO);
+    let (rc, at) = render(&req, &mut []);
+    assert_eq!(rc, VIGIL_SCENE_OK, "a size query does not read the logo");
+    let mut out = vec![0u8; at.stride * at.height as usize];
+    assert_eq!(render(&req, &mut out).0, VIGIL_SCENE_ERR_REFUSED);
+    assert!(out.iter().all(|&b| b == 0), "nothing written on a refusal");
     let mut req = request(&svg, VIGIL_SCENE_LAYER_LOGO);
     let spec = b"{\"version\": 3}";
     req.spec_json = spec.as_ptr();
@@ -184,29 +248,11 @@ fn bad_arguments_are_refused_before_any_drawing() {
     );
 }
 
-// The C program links the cdylib from a profile like the test's own. Cargo
-// says where it put it, since the layout of the target dir changes between
-// cargo versions.
+// The C program links a cdylib from a profile like the test's own, built to
+// run the helper this test built.
 fn cdylib() -> PathBuf {
-    let profile = if cfg!(debug_assertions) {
-        "dev"
-    } else {
-        "release"
-    };
-    let built = Command::new(env!("CARGO"))
-        .args(["build", "--frozen", "--lib", "--message-format=json"])
-        .args(["-p", "vigil-scene-ffi", "--profile", profile])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .unwrap();
-    assert!(
-        built.status.success(),
-        "cargo build: {}",
-        String::from_utf8_lossy(&built.stderr)
-    );
-    String::from_utf8_lossy(&built.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+    cargo_build(&["--lib", "-p", "vigil-scene-ffi"], Some(helper()))
+        .iter()
         .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "vigil_scene_ffi")
         .flat_map(|m| m["filenames"].as_array().cloned().unwrap_or_default())
         .filter_map(|f| f.as_str().map(PathBuf::from))
@@ -332,14 +378,14 @@ fn a_size_query_does_not_draw() {
     let (rc, at) = render(&small, &mut []);
     assert_eq!(rc, VIGIL_SCENE_OK);
     let mut out = vec![0u8; at.stride * at.height as usize];
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     assert_eq!(render(&small, &mut out).0, VIGIL_SCENE_OK);
     let drawing_small = start.elapsed();
 
     let mut huge = request(&svg, VIGIL_SCENE_LAYER_FRAME);
     huge.mode_width = 8192;
     huge.mode_height = 8192;
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let (rc, at) = render(&huge, &mut []);
     let querying_huge = start.elapsed();
     assert_eq!(rc, VIGIL_SCENE_OK);
@@ -348,4 +394,93 @@ fn a_size_query_does_not_draw() {
         querying_huge < drawing_small,
         "a size query for 8192x8192 took {querying_huge:?}, drawing 640x480 took {drawing_small:?}"
     );
+}
+
+#[test]
+fn a_missing_helper_is_its_own_code_and_the_ground_still_draws() {
+    let svg = mark();
+    let gone = Path::new("/nonexistent/vigil-scene");
+    let req = request(&svg, VIGIL_SCENE_LAYER_LOGO);
+    let (rc, at) = render_by(gone, &req, &mut []);
+    assert_eq!(rc, VIGIL_SCENE_OK);
+    let mut out = vec![0u8; at.stride * at.height as usize];
+    assert_eq!(render_by(gone, &req, &mut out).0, VIGIL_SCENE_ERR_HELPER);
+
+    let mut ground = request(&[], VIGIL_SCENE_LAYER_FRAME);
+    ground.svg = ptr::null();
+    let (rc, at) = render_by(gone, &ground, &mut []);
+    assert_eq!(rc, VIGIL_SCENE_OK);
+    let mut out = vec![0u8; at.stride * at.height as usize];
+    assert_eq!(render_by(gone, &ground, &mut out).0, VIGIL_SCENE_OK);
+    let want = Plate::ground_only(&Scene::default(), (1920, 1080), 0).frame(0.0);
+    assert!(out == want);
+}
+
+const CHILD: &str = "VIGIL_SCENE_ABI_TEST";
+
+fn peak_rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap()
+}
+
+#[test]
+fn child_calls_the_abi_with_one_review_input() {
+    let Some(index) = std::env::var_os(CHILD) else {
+        return;
+    };
+    let index: usize = index.to_str().unwrap().parse().unwrap();
+    let (what, text) = &common::review_inputs()[index];
+    let helper = PathBuf::from(std::env::var_os("VIGIL_SCENE_HELPER").unwrap());
+    let base = peak_rss_kib();
+    let fds = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let mut req = request(text.as_bytes(), VIGIL_SCENE_LAYER_FRAME);
+    req.deadline_ms = 0;
+    let start = Instant::now();
+    let (rc, at) = render_by(&helper, &req, &mut []);
+    assert_eq!(rc, VIGIL_SCENE_OK);
+    let mut out = vec![0u8; at.stride * at.height as usize];
+    let (rc, _) = render_by(&helper, &req, &mut out);
+    let took = start.elapsed();
+    let grew = peak_rss_kib().saturating_sub(base);
+    println!("ABI {what}: code {rc}, {took:?}, parent grew {grew} KiB");
+    let deadline = Duration::from_millis(VIGIL_SCENE_DEFAULT_DEADLINE_MS.into());
+    assert!(
+        took < deadline + Duration::from_millis(500),
+        "{what}: {took:?}"
+    );
+    let frame = (1920 * 1080 * 4) / 1024;
+    assert!(
+        grew < frame + 16 * 1024,
+        "{what}: the parent grew by {grew} KiB"
+    );
+    assert_eq!(std::fs::read_dir("/proc/self/fd").unwrap().count(), fds);
+}
+
+#[test]
+fn every_review_input_returns_through_the_abi_by_its_deadline() {
+    for i in 0..common::review_inputs().len() {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child_calls_the_abi_with_one_review_input"])
+            .args(["--nocapture", "--test-threads", "1"])
+            .env(CHILD, i.to_string())
+            .env("VIGIL_SCENE_HELPER", helper())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for line in stdout
+            .lines()
+            .filter_map(|l| l.find("ABI ").map(|i| &l[i..]))
+        {
+            println!("{line}");
+        }
+    }
 }

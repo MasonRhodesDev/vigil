@@ -1,0 +1,278 @@
+mod common;
+
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use vigil_scene::{
+    DEFAULT_DEADLINE, Error, Format, Helper, Layer, Logo, MAX_EDGE, Plate, Request, Scene,
+};
+
+const BIN: &str = env!("CARGO_BIN_EXE_vigil-scene");
+const CHILD: &str = "VIGIL_SCENE_HELPER_TEST";
+const PATIENT: Duration = Duration::from_secs(300);
+const SLACK: Duration = Duration::from_millis(500);
+
+fn mark() -> Vec<u8> {
+    std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mark.svg"))
+        .unwrap()
+}
+
+fn request(svg: &[u8], layer: Layer) -> Request<'_> {
+    Request {
+        svg: Some(svg),
+        spec: None,
+        mode: (1920, 1080),
+        transform: 0,
+        layer,
+        value: 0.5,
+    }
+}
+
+fn open_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd").unwrap().count()
+}
+
+fn children() -> Vec<String> {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|t| std::fs::read_to_string(t.unwrap().path().join("children")).ok())
+        .flat_map(|c| c.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+        .collect()
+}
+
+fn peak_rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap()
+}
+
+// Descriptor counts, children and peak RSS belong to the whole process, so
+// each check runs alone in a fresh copy of this test binary.
+fn in_fresh_process(test: &str, arg: &str) -> String {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .env(CHILD, arg)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout
+}
+
+#[test]
+fn the_helper_draws_what_the_library_draws() {
+    let svg = mark();
+    let logo = Logo::svg(&svg).unwrap();
+    let plate = Plate::new(&Scene::default(), &logo, (1080, 1920), 3).unwrap();
+    let helper = Helper::new(BIN, PATIENT);
+    for (layer, want) in [
+        (Layer::Frame, plate.frame(0.5)),
+        (Layer::Logo, plate.logo_sprite().unwrap().rgba),
+        (Layer::Glow, plate.glow_sprite(0.5).unwrap().rgba),
+        (Layer::Bar, plate.bar_sprite(0.5).unwrap().rgba),
+    ] {
+        let mut req = request(&svg, layer);
+        req.transform = 3;
+        let mut out = vec![0u8; want.len()];
+        helper.draw(&req, &mut out).unwrap();
+        assert!(out == want, "{layer:?}");
+    }
+    let mask = helper.mask(&svg, Format::Svg, 64).unwrap();
+    assert_eq!(mask, logo.mask(64).unwrap());
+}
+
+#[test]
+fn the_helpers_refusal_reaches_the_caller() {
+    let hostile = br#"<svg xmlns="http://www.w3.org/2000/svg"><image href="/etc/passwd"/></svg>"#;
+    let helper = Helper::new(BIN, PATIENT);
+    let mut out = vec![0u8; 173 * 173 * 4];
+    match helper.draw(&request(hostile, Layer::Logo), &mut out) {
+        Err(Error::Refused(m)) => assert!(m.contains("<image>"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(out.iter().all(|&b| b == 0), "nothing written on a refusal");
+    let mut short = vec![0u8; 10];
+    assert!(matches!(
+        helper.draw(&request(&mark(), Layer::Logo), &mut short),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
+fn a_missing_helper_is_its_own_error_and_the_ground_needs_none() {
+    let helper = Helper::new("/nonexistent/vigil-scene", PATIENT);
+    let svg = mark();
+    let mut out = vec![0u8; 173 * 173 * 4];
+    assert!(matches!(
+        helper.draw(&request(&svg, Layer::Logo), &mut out),
+        Err(Error::Helper(_))
+    ));
+    assert!(matches!(
+        helper.mask(&svg, Format::Svg, 64),
+        Err(Error::Helper(_))
+    ));
+
+    let plate = Plate::ground_only(&Scene::default(), (1920, 1080), 0);
+    let want = plate.bar_sprite(0.5).unwrap().rgba;
+    let mut req = request(&svg, Layer::Bar);
+    req.svg = None;
+    let mut out = vec![0u8; want.len()];
+    helper.draw(&req, &mut out).unwrap();
+    assert!(out == want);
+}
+
+#[test]
+fn a_size_query_never_reads_the_logo() {
+    let hostile = br#"<svg xmlns="http://www.w3.org/2000/svg"><image href="/etc/passwd"/></svg>"#;
+    let at = request(hostile, Layer::Logo).place().unwrap();
+    assert_eq!((at.x, at.y, at.width, at.height), (874, 421, 173, 173));
+}
+
+#[test]
+fn child_stops_a_helper_past_its_deadline() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    let svg = mark();
+    let mut req = request(&svg, Layer::Frame);
+    req.mode = (4096, 4096);
+    let mut out = vec![0u8; 4096 * 4096 * 4];
+    let (fds, before) = (open_fds(), children());
+    let start = Instant::now();
+    let got = Helper::new(BIN, Duration::from_millis(1)).draw(&req, &mut out);
+    let took = start.elapsed();
+    match got {
+        Err(Error::Refused(m)) => assert!(m.contains("deadline"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(took < SLACK, "returned after {took:?}");
+    assert_eq!(open_fds(), fds, "a descriptor leaked");
+    assert_eq!(children(), before, "a child was left unreaped");
+    assert!(out.iter().all(|&b| b == 0), "nothing written when stopped");
+}
+
+#[test]
+fn a_helper_past_its_deadline_is_killed_and_reaped() {
+    in_fresh_process("child_stops_a_helper_past_its_deadline", "1");
+}
+
+#[test]
+fn child_runs_one_review_input() {
+    let Some(index) = std::env::var_os(CHILD) else {
+        return;
+    };
+    let index: usize = index.to_str().unwrap().parse().unwrap();
+    let (what, text) = &common::review_inputs()[index];
+    let helper = Helper::new(BIN, DEFAULT_DEADLINE);
+    let base = peak_rss_kib();
+    let start = Instant::now();
+    let mask = helper.mask(text.as_bytes(), Format::Svg, MAX_EDGE);
+    let mut out = vec![0u8; 173 * 173 * 4];
+    let drawn = helper.draw(&request(text.as_bytes(), Layer::Logo), &mut out);
+    let took = start.elapsed();
+    let grew = peak_rss_kib().saturating_sub(base);
+    println!(
+        "REVIEW {what}: mask {:?}, layer {:?}, {took:?}, parent grew {grew} KiB",
+        mask.as_ref().map(|_| "drawn"),
+        drawn.as_ref().map(|_| "drawn")
+    );
+    assert!(
+        took < 2 * DEFAULT_DEADLINE + SLACK,
+        "{what}: two calls took {took:?}"
+    );
+    assert!(grew < 32 * 1024, "{what}: the parent grew by {grew} KiB");
+    assert_eq!(children(), Vec::<String>::new());
+}
+
+#[test]
+fn every_review_input_returns_by_its_deadline_in_bounded_memory() {
+    for i in 0..common::review_inputs().len() {
+        let out = in_fresh_process("child_runs_one_review_input", &i.to_string());
+        for line in out
+            .lines()
+            .filter_map(|l| l.find("REVIEW ").map(|i| &l[i..]))
+        {
+            println!("{line}");
+        }
+    }
+}
+
+fn limits(pid: u32) -> Vec<(String, String, String)> {
+    std::fs::read_to_string(format!("/proc/{pid}/limits"))
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let (name, rest) = l.split_at(26);
+            let mut v = rest.split_whitespace();
+            (
+                name.trim().to_owned(),
+                v.next().unwrap().to_owned(),
+                v.next().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_helper_confines_itself_before_it_reads_a_byte() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    let inherited = File::open("/dev/null").unwrap();
+    rustix::io::fcntl_setfd(&inherited, rustix::io::FdFlags::empty()).unwrap();
+    let mut child = Command::new(BIN)
+        .args([
+            "mask",
+            "--format",
+            "svg",
+            "--edge",
+            "64",
+            "--deadline-ms",
+            "2500",
+        ])
+        .stdin(reader)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    drop(inherited);
+    let pid = child.id();
+    let status = PathBuf::from(format!("/proc/{pid}/status"));
+    let start = Instant::now();
+    while !std::fs::read_to_string(&status)
+        .unwrap()
+        .contains("NoNewPrivs:\t1")
+    {
+        assert!(start.elapsed() < Duration::from_secs(10), "never confined");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let got = limits(pid);
+    let limit = |name: &str| {
+        got.iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, soft, hard)| (soft.as_str(), hard.as_str()))
+            .unwrap()
+    };
+    assert_eq!(limit("Max cpu time"), ("4", "4"));
+    assert_eq!(limit("Max address space"), ("1073741824", "1073741824"));
+    assert_eq!(limit("Max open files"), ("3", "3"));
+    assert_eq!(limit("Max core file size"), ("0", "0"));
+    assert_eq!(limit("Max processes"), ("0", "0"));
+    let mut fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    fds.sort();
+    assert_eq!(fds, ["0", "1", "2"], "only stdio survives into the helper");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(writer);
+}

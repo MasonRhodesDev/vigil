@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use vigil_scene::{Logo, Plate, Scene};
+use std::time::Duration;
+
+use vigil_scene::{Format, Helper, Layer, Logo, Plate, Request, Scene};
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -237,4 +239,71 @@ fn spec_without_a_source_is_the_scene_json_export() {
     )
     .unwrap();
     assert_eq!(got, want);
+}
+
+#[test]
+fn the_helper_draws_every_golden_exactly() {
+    let helper = Helper::new(env!("CARGO_BIN_EXE_vigil-scene"), Duration::from_secs(300));
+    let svg = std::fs::read(mark()).unwrap();
+    let raw = |name: &str| pixels(&goldens().join(name)).2;
+    for (name, c) in splash_cases() {
+        let spec = format!(r#"{{"version":2,"ref_short_side":{}}}"#, c.reference);
+        let req = Request {
+            svg: Some(&svg),
+            spec: Some(spec.as_bytes()),
+            mode: c.panel,
+            transform: c.transform,
+            layer: Layer::Frame,
+            value: c.level,
+        };
+        let mut xrgb = vec![0u8; c.panel.0 as usize * c.panel.1 as usize * 4];
+        helper.draw(&req, &mut xrgb).unwrap();
+        let rgb: Vec<u8> = xrgb.chunks(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+        assert!(rgb == raw(&name), "{name}");
+    }
+    for (name, mode, transform, layer, value) in [
+        (
+            "grub-menu-1920x1080-t0.png",
+            (1920, 1080),
+            0,
+            Layer::Logo,
+            0.0,
+        ),
+        (
+            "grub-menu-3840x2160-t1.png",
+            (3840, 2160),
+            1,
+            Layer::Logo,
+            0.0,
+        ),
+        (
+            "glow-1201x799-t3-l042.png",
+            (1201, 799),
+            3,
+            Layer::Glow,
+            0.42,
+        ),
+        (
+            "bar-1920x1080-t0-p050.png",
+            (1920, 1080),
+            0,
+            Layer::Bar,
+            0.5,
+        ),
+    ] {
+        let req = Request {
+            svg: Some(&svg),
+            spec: None,
+            mode,
+            transform,
+            layer,
+            value,
+        };
+        let at = req.place().unwrap();
+        let mut rgba = vec![0u8; at.width as usize * at.height as usize * 4];
+        helper.draw(&req, &mut rgba).unwrap();
+        assert!(rgba == raw(name), "{name}");
+    }
+    let icon = helper.mask(&svg, Format::Svg, 40).unwrap();
+    assert!(icon.sprite(Scene::default().mark) == raw("icon-40.png"));
 }

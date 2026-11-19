@@ -27,6 +27,7 @@ int main(int argc, char **argv) {
     req.mode_height = 2160;
     req.transform = 1;
     req.layer = VIGIL_SCENE_LAYER_LOGO;
+    req.deadline_ms = VIGIL_SCENE_MAX_DEADLINE_MS;
 
     VigilScenePlacement at;
     int rc = vigil_scene_render(NULL, NULL, 0, &at);
