@@ -214,66 +214,70 @@ impl BackgroundWorker {
         let rendered = self.rendered.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let cell = rendered
-                .lock()
-                .expect("background render cache poisoned")
-                .entry(key.clone())
-                .or_default()
-                .clone();
-            let cache_hit = cell.get().is_some();
-            let pixels = cell
-                .get_or_init(|| {
-                    if let Some(prepared) = prepared.as_ref() {
-                        let read_started = Instant::now();
-                        let result =
-                            appearance_profiles::read_prepared_asset(prepared).map(|asset| {
-                                match asset.format {
-                                    appearance_profiles::PixelFormat::Rgba8 => {
-                                        BackgroundData::Rgba(Arc::new(asset.bytes))
+            let (pixels, cache_hit) = vigil_secret::cosmetic(|| {
+                let cell = rendered
+                    .lock()
+                    .expect("background render cache poisoned")
+                    .entry(key.clone())
+                    .or_default()
+                    .clone();
+                let cache_hit = cell.get().is_some();
+                let pixels = cell
+                    .get_or_init(|| {
+                        if let Some(prepared) = prepared.as_ref() {
+                            let read_started = Instant::now();
+                            let result =
+                                appearance_profiles::read_prepared_asset(prepared).map(|asset| {
+                                    match asset.format {
+                                        appearance_profiles::PixelFormat::Rgba8 => {
+                                            BackgroundData::Rgba(Arc::new(asset.bytes))
+                                        }
+                                        appearance_profiles::PixelFormat::Xrgb8888Le => {
+                                            BackgroundData::Xrgb(asset.bytes.into())
+                                        }
                                     }
-                                    appearance_profiles::PixelFormat::Xrgb8888Le => {
-                                        BackgroundData::Xrgb(asset.bytes.into())
-                                    }
-                                }
-                            });
-                        vigil_log::say!(
-                            "vigil-lock: prepared background read {}: {:?}",
-                            prepared.asset.display(),
-                            read_started.elapsed()
-                        );
-                        return result.map_err(|error| error.to_string());
-                    }
-                    let source_cell = sources
-                        .lock()
-                        .expect("background source cache poisoned")
-                        .entry(key.path.clone())
-                        .or_default()
-                        .clone();
-                    let source = source_cell.get_or_init(|| {
-                        let decode_started = Instant::now();
-                        let result = vigil_ui::load_background(&key.path).map(Arc::new);
-                        vigil_log::say!(
-                            "vigil-lock: background decode {}: {:?}",
-                            key.path.display(),
-                            decode_started.elapsed()
-                        );
-                        result
-                    });
-                    source.as_ref().map_err(Clone::clone).and_then(|source| {
-                        let render_started = Instant::now();
-                        let result =
-                            vigil_ui::render_background(source, key.fit, key.width, key.height)
-                                .map(|rgba| BackgroundData::Rgba(Arc::new(rgba)));
-                        vigil_log::say!(
-                            "vigil-lock: background resize {}x{}: {:?}",
-                            key.width,
-                            key.height,
-                            render_started.elapsed()
-                        );
-                        result
+                                });
+                            vigil_log::say!(
+                                "vigil-lock: prepared background read {}: {:?}",
+                                prepared.asset.display(),
+                                read_started.elapsed()
+                            );
+                            return result.map_err(|error| error.to_string());
+                        }
+                        let source_cell = sources
+                            .lock()
+                            .expect("background source cache poisoned")
+                            .entry(key.path.clone())
+                            .or_default()
+                            .clone();
+                        let source = source_cell.get_or_init(|| {
+                            let decode_started = Instant::now();
+                            let result = vigil_ui::load_background(&key.path).map(Arc::new);
+                            vigil_log::say!(
+                                "vigil-lock: background decode {}: {:?}",
+                                key.path.display(),
+                                decode_started.elapsed()
+                            );
+                            result
+                        });
+                        source.as_ref().map_err(Clone::clone).and_then(|source| {
+                            let render_started = Instant::now();
+                            let result =
+                                vigil_ui::render_background(source, key.fit, key.width, key.height)
+                                    .map(|rgba| BackgroundData::Rgba(Arc::new(rgba)));
+                            vigil_log::say!(
+                                "vigil-lock: background resize {}x{}: {:?}",
+                                key.width,
+                                key.height,
+                                render_started.elapsed()
+                            );
+                            result
+                        })
                     })
-                })
-                .clone();
+                    .clone();
+                (pixels, cache_hit)
+            })
+            .unwrap_or_else(|| (Err("background render panicked".to_owned()), false));
             let _ = tx.send(BackgroundResult {
                 id,
                 key,
@@ -309,6 +313,7 @@ impl AuthAttempt for PamAttempt {
 struct LiveAttempt<A> {
     attempt: A,
     events: mpsc::Receiver<AuthEvent>,
+    secret: bool,
 }
 
 struct AuthTrack<A = PamAttempt> {
@@ -325,6 +330,7 @@ impl<A: AuthAttempt> AuthTrack<A> {
         self.live = Some(LiveAttempt {
             attempt: spawn(tx),
             events,
+            secret: true,
         });
     }
 
@@ -336,9 +342,13 @@ impl<A: AuthAttempt> AuthTrack<A> {
         self.live = None;
     }
 
-    fn respond(&self, text: Secret) {
-        if let Some(live) = &self.live {
-            live.attempt.respond(text);
+    fn respond(&self, text: Secret) -> bool {
+        match &self.live {
+            Some(live) if !(live.secret && text.is_empty()) => {
+                live.attempt.respond(text);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -355,10 +365,16 @@ impl<A: AuthAttempt> AuthTrack<A> {
     }
 
     fn drain(&mut self) -> Vec<AuthEvent> {
-        self.live
-            .as_ref()
-            .map(|live| live.events.try_iter().collect())
-            .unwrap_or_default()
+        let Some(live) = &mut self.live else {
+            return Vec::new();
+        };
+        let events: Vec<AuthEvent> = live.events.try_iter().collect();
+        for event in &events {
+            if let AuthEvent::Prompt { secret, .. } = event {
+                live.secret = *secret;
+            }
+        }
+        events
     }
 }
 
@@ -460,6 +476,13 @@ fn forwarded_channel<T: Send + 'static>(
         }
     });
     (source_tx, app_rx)
+}
+
+// The field keeps a retry typed while the attempt was checked. The failure
+// hides it, and wiping it would turn the rest of the retry into a wrong password.
+fn show_failure(window: &mut OutputWindow, message: &str) {
+    window.show_error(message);
+    window.set_busy(false);
 }
 
 fn login_flow_event(event: LoginEvent) -> Option<FlowEvent> {
@@ -663,18 +686,23 @@ impl Locker {
         }
     }
 
+    fn show_failure(&mut self, message: String) {
+        self.snapshot.error = message.clone();
+        self.snapshot.busy = false;
+        self.each_window(|window| show_failure(window, &message));
+    }
+
     fn pump_ui(&mut self) {
         loop {
             let msg = self.queue.borrow_mut().pop_front();
             let Some(msg) = msg else { break };
             match msg {
                 UiMessage::Respond(text) => {
-                    if self.auth.is_live() {
+                    if self.auth.respond(text) {
                         self.snapshot.busy = true;
                         self.each_window(|w| w.set_busy(true));
                         self.conversation_losses = 0;
                     }
-                    self.auth.respond(text);
                 }
                 UiMessage::Cancel => self.auth.cancel(),
                 UiMessage::SelectSession(_) | UiMessage::SelectUser(_) | UiMessage::Power(_) => {}
@@ -859,6 +887,7 @@ impl LockSession for Locker {
         window.set_clock(&self.last_clock.1);
         window.set_caps_lock(self.caps_lock);
         window.set_panel_visible(false);
+        window.set_power_visible(false);
         window.set_user_name(&self.user);
         apply_kit_tokens_from_disk(&mut window, self.scheme.as_theme_str());
         self.snapshot.apply(&mut window);
@@ -1027,23 +1056,9 @@ impl LockSession for Locker {
                     self.start_attempt();
                 }
             }
-            FlowCmd::ShowAuthError(message) => {
-                self.snapshot.error = message.clone();
-                self.snapshot.busy = false;
-                let message = message.clone();
-                self.each_window(move |window| {
-                    window.show_error(&message);
-                    window.set_busy(false);
-                });
-            }
+            FlowCmd::ShowAuthError(message) => self.show_failure(message.clone()),
             FlowCmd::ShowAccountLocked { remaining } => {
-                let message = account_locked_message(*remaining);
-                self.snapshot.error = message.clone();
-                self.snapshot.busy = false;
-                self.each_window(move |window| {
-                    window.show_error(&message);
-                    window.set_busy(false);
-                });
+                self.show_failure(account_locked_message(*remaining))
             }
             FlowCmd::DetachAuth => self.detach_auth(),
             FlowCmd::SetLockedHint(on) => {
@@ -1053,6 +1068,10 @@ impl LockSession for Locker {
             }
             _ => {}
         }
+    }
+
+    fn keyboard_left(&mut self) {
+        self.each_window(OutputWindow::release_keys);
     }
 
     fn caps_lock(&mut self, on: bool) {
@@ -1652,6 +1671,133 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_enter_never_answers_a_secret_question() {
+        let answered: Rc<RefCell<Vec<Secret>>> = Rc::default();
+        let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
+        let probe = answered.clone();
+        let mut worker = None;
+        track.start(|tx| {
+            worker = Some(tx);
+            FakeAttempt {
+                answered: probe,
+                ..FakeAttempt::default()
+            }
+        });
+        let worker = worker.expect("worker");
+        let prompt = |text: &str, secret| AuthEvent::Prompt {
+            text: text.into(),
+            secret,
+        };
+        let _ = worker.send(prompt("Password:", true));
+        let _ = track.drain();
+        track.respond(Secret::default());
+        track.respond("hunter2".into());
+        let _ = worker.send(prompt("Code:", false));
+        let _ = track.drain();
+        track.respond(Secret::default());
+        assert_eq!(
+            *answered.borrow(),
+            [Secret::from("hunter2"), Secret::default()],
+            "an empty visible answer is sent, an empty secret one is not"
+        );
+    }
+
+    fn panic_probe(stderr: std::process::Stdio) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_panic_on_any_thread_ends_the_lock_at_once_without_a_core",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("VIGIL_LOCK_PANIC_PROBE", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_panic_on_any_thread_ends_the_lock_at_once_without_a_core() {
+        use std::os::unix::process::ExitStatusExt;
+        if std::env::var_os("VIGIL_LOCK_PANIC_PROBE").is_some() {
+            vigil_secret::exit_on_panic();
+            let _ = std::thread::spawn(|| {
+                let typed = String::from("hunter\u{e9}");
+                let _ = &typed[..7];
+            })
+            .join();
+            std::process::exit(0);
+        }
+        let output = panic_probe(std::process::Stdio::piped());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), None, "no signal, so no core dump");
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "a worker panic ends the process"
+        );
+        assert!(stderr.contains("panic"), "the panic is reported: {stderr}");
+        assert!(
+            !stderr.contains("hunter") && !stderr.contains('\u{e9}'),
+            "the report names no text the panic was holding: {stderr}"
+        );
+    }
+
+    #[test]
+    fn the_lock_keeps_its_memory_out_of_core_dumps() {
+        if std::env::var_os("VIGIL_LOCK_DUMP_PROBE").is_some() {
+            vigil_secret::deny_memory_dumps().unwrap();
+            let core = rustix::process::getrlimit(rustix::process::Resource::Core);
+            let dumpable = rustix::process::dumpable_behavior().unwrap();
+            let denied = (core.current, core.maximum) == (Some(0), Some(0))
+                && dumpable == rustix::process::DumpableBehavior::NotDumpable;
+            std::process::exit(if denied { 0 } else { 3 });
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::the_lock_keeps_its_memory_out_of_core_dumps",
+                "--test-threads=1",
+            ])
+            .env("VIGIL_LOCK_DUMP_PROBE", "1")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "no core limit, not dumpable");
+    }
+
+    #[test]
+    fn a_panic_with_stderr_unwritable_still_exits_without_a_core() {
+        use std::os::unix::process::ExitStatusExt;
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let status = panic_probe(full.into()).status;
+        assert_eq!(status.signal(), None, "no abort, so no core dump");
+        assert_eq!(
+            status.code(),
+            Some(101),
+            "the report failing changes nothing"
+        );
+    }
+
+    #[test]
+    fn an_empty_enter_before_the_first_question_never_reaches_pam() {
+        let answered: Rc<RefCell<Vec<Secret>>> = Rc::default();
+        let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
+        let probe = answered.clone();
+        track.start(|_| FakeAttempt {
+            answered: probe,
+            ..FakeAttempt::default()
+        });
+        track.respond(Secret::default());
+        track.respond("hunter2".into());
+        assert_eq!(*answered.borrow(), [Secret::from("hunter2")]);
+    }
+
+    #[test]
     fn a_rejected_credential_is_still_shown_and_reprompted() {
         assert_eq!(
             done_outcome(
@@ -1960,6 +2106,128 @@ mod tests {
         wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_panic_rendering_the_wallpaper_still_locks_without_one() {
+        if std::env::var_os("VIGIL_LOCK_WALLPAPER_PROBE").is_some() {
+            vigil_secret::exit_on_panic();
+            let (tx, rx) = mpsc::channel();
+            let (wake_tx, wake_rx) = mpsc::channel();
+            let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = wake_tx.send(());
+            });
+            let key = BackgroundKey {
+                path: PathBuf::from("/nonexistent/wallpaper.png"),
+                fit: BackgroundFit::Fill,
+                width: 16,
+                height: 16,
+            };
+            let worker = BackgroundWorker::new(tx);
+            let poisoned = vigil_secret::cosmetic(|| {
+                let _held = worker.rendered.lock();
+                panic!("poison the render cache");
+            });
+            assert!(poisoned.is_none() && worker.rendered.is_poisoned());
+            worker.render_prepared(OutputId(1), key, None, Some(waker));
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            let woken = wake_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            let delivered = result.is_ok_and(|result| result.pixels.is_err());
+            std::process::exit(if delivered && woken { 0 } else { 3 });
+        }
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_panic_rendering_the_wallpaper_still_locks_without_one",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("VIGIL_LOCK_WALLPAPER_PROBE", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(full)
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the panic costs the wallpaper and the lock goes on without it"
+        );
+    }
+
+    #[test]
+    fn a_retry_typed_during_the_check_survives_the_failure_hidden() {
+        const W: u32 = 1280;
+        const H: u32 = 800;
+        let platform = VigilPlatform::install().unwrap();
+        let component = Theme::load_or_default(None).instantiate().unwrap();
+        let adapter = platform.claim_last_adapter().unwrap();
+        let mut window = OutputWindow::new(OutputId(1), W, H, 1.0, adapter, component).unwrap();
+        let sent: Rc<RefCell<Vec<UiMessage>>> = Rc::default();
+        let sink = sent.clone();
+        window.on_ui_message(Rc::new(move |message| sink.borrow_mut().push(message)));
+        window.set_panel_visible(true);
+        window.show_prompt("Password", true);
+        let key = |window: &mut OutputWindow, keysym: u32, utf8: Option<&str>, pressed| {
+            window.dispatch(vigil_core::InputEvent::Key {
+                keysym,
+                utf8: utf8.map(vigil_core::KeyText::from),
+                pressed,
+            });
+        };
+        let tap = |window: &mut OutputWindow, keysym: u32, utf8: Option<&str>| {
+            key(window, keysym, utf8, true);
+            key(window, keysym, utf8, false);
+        };
+        let field = |window: &mut OutputWindow| {
+            std::thread::sleep(Duration::from_millis(400));
+            vigil_ui::advance_timers();
+            let mut buf = vec![0u8; (W * H * 4) as usize];
+            window.render_if_needed(FrameTarget {
+                buffer: &mut buf,
+                width: W,
+                height: H,
+                stride: (W * 4) as usize,
+                damage: None,
+            });
+            let row = 419 * W as usize * 4;
+            buf[row + 500 * 4..row + 735 * 4].to_vec()
+        };
+
+        "aaaa"
+            .chars()
+            .for_each(|_| tap(&mut window, 0x61, Some("a")));
+        let masked = field(&mut window);
+        tap(&mut window, 0xff0d, Some("\r"));
+        window.set_busy(true);
+        "aa".chars().for_each(|_| tap(&mut window, 0x61, Some("a")));
+        key(&mut window, 0xffe9, None, true);
+        tap(&mut window, 0xffc5, None);
+        key(&mut window, 0xffe9, None, false);
+        show_failure(&mut window, "Authentication failure");
+        window.show_prompt("Password", true);
+        "aa".chars().for_each(|_| tap(&mut window, 0x61, Some("a")));
+        assert!(
+            masked == field(&mut window),
+            "four masked dots after the failure: the retry is kept and hidden"
+        );
+        tap(&mut window, 0xff0d, Some("\r"));
+        let sent = sent.borrow();
+        let answers: Vec<_> = sent
+            .iter()
+            .filter_map(|message| match message {
+                UiMessage::Respond(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            [&Secret::from("aaaa"), &Secret::from("aaaa")],
+            "the retry typed during the check is kept"
+        );
     }
 
     #[test]

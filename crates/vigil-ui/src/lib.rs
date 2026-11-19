@@ -16,8 +16,8 @@ use slint::platform::{
     Key, Platform, PlatformError, PointerEventButton, WindowAdapter, WindowEvent,
 };
 use slint::{
-    Color, ComponentHandle, Image, LogicalPosition, PhysicalSize, Rgba8Pixel, SharedPixelBuffer,
-    WindowSize,
+    Color, ComponentHandle, Image, LogicalPosition, Model, PhysicalSize, Rgba8Pixel,
+    SharedPixelBuffer, WindowSize,
 };
 use slint_idle_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use slint_interpreter::{ComponentInstance, Value};
@@ -28,7 +28,10 @@ use vigil_core::{
 };
 use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 
+mod focus;
 mod scanout;
+
+use focus::{Card, Effect, Focus, Picker, Stop};
 
 #[derive(Clone, Default)]
 pub struct VigilPlatform {
@@ -169,7 +172,16 @@ pub struct OutputWindow {
     revision: std::cell::Cell<u64>,
     component: ComponentInstance,
     panel: (u32, u32),
+    focus: Focus,
+    held: u8,
+    down: Option<u32>,
+    reveal_timer: slint::Timer,
+    reveal_idle: Duration,
 }
+
+// Long enough to read back a typed password, short enough that a shown one
+// does not stay on an unattended screen. Any key or click restarts it.
+pub const REVEAL_IDLE: Duration = Duration::from_secs(10);
 
 pub struct SoftwareBackend {
     shadow: Vec<u8>,
@@ -213,7 +225,7 @@ impl OutputWindow {
                 scale_factor: scale,
             });
         component.show()?;
-        Ok(Self {
+        let window = Self {
             _id: id,
             backend,
             width,
@@ -225,7 +237,14 @@ impl OutputWindow {
             revision: std::cell::Cell::new(0),
             component,
             panel: (width, height),
-        })
+            focus: Focus::default(),
+            held: 0,
+            down: None,
+            reveal_timer: slint::Timer::default(),
+            reveal_idle: REVEAL_IDLE,
+        };
+        window.publish_focus();
+        Ok(window)
     }
 
     pub fn with_transform(
@@ -252,7 +271,7 @@ impl OutputWindow {
             });
         adapter.set_size(PhysicalSize::new(width, height));
         component.show()?;
-        Ok(Self {
+        let window = Self {
             _id: id,
             backend: Box::new(SoftwareBackend {
                 shadow: vec![0u8; width as usize * height as usize * 4],
@@ -277,7 +296,14 @@ impl OutputWindow {
             revision: std::cell::Cell::new(0),
             component,
             panel: (panel_width, panel_height),
-        })
+            focus: Focus::default(),
+            held: 0,
+            down: None,
+            reveal_timer: slint::Timer::default(),
+            reveal_idle: REVEAL_IDLE,
+        };
+        window.publish_focus();
+        Ok(window)
     }
 
     pub fn request_present(&mut self) {
@@ -353,11 +379,218 @@ impl OutputWindow {
     }
 
     pub fn set_panel_visible(&mut self, visible: bool) {
+        if !visible {
+            self.release_keys();
+            self.reset_focus();
+            self.hide_password();
+        }
         self.set_property("panel-visible", Value::Bool(visible));
+    }
+
+    pub fn release_keys(&mut self) {
+        for (at, keysym) in vigil_core::MODIFIER_KEYSYMS.into_iter().enumerate() {
+            if at % 2 == 0 && self.held & (0b11 << at) != 0 {
+                self.send_key(keysym, None, false);
+            }
+        }
+        self.held = 0;
+        self.down = None;
     }
 
     pub fn set_power_visible(&mut self, visible: bool) {
         self.set_optional_property("power-visible", Value::Bool(visible));
+        if !visible {
+            self.reset_focus();
+        }
+    }
+
+    pub fn field_focused(&self) -> bool {
+        self.card()
+            .is_none_or(|card| self.focus.settle(&card).stop == Stop::Field)
+    }
+
+    pub fn set_reveal_idle(&mut self, idle: Duration) {
+        self.reveal_idle = idle;
+    }
+
+    fn watch_reveal(&self) {
+        if !matches!(self.component.get_property("reveal"), Ok(Value::Bool(true))) {
+            self.reveal_timer.stop();
+            return;
+        }
+        let component = self.component.as_weak();
+        self.reveal_timer
+            .start(slint::TimerMode::SingleShot, self.reveal_idle, move || {
+                if let Some(component) = component.upgrade() {
+                    let _ = component.set_property("reveal", Value::Bool(false));
+                }
+            });
+    }
+
+    fn hide_password(&self) {
+        self.set_optional_property("reveal", Value::Bool(false));
+    }
+
+    fn reset_focus(&mut self) {
+        self.set_optional_property("confirm-power", Value::String("".into()));
+        self.focus = Focus::default();
+        self.publish_focus();
+    }
+
+    fn publish_focus(&self) {
+        self.set_optional_property(
+            "keyboard-focus",
+            Value::String(self.focus.property().into()),
+        );
+        self.set_optional_property("key-hint", Value::String(self.focus.stop.hint().into()));
+    }
+
+    fn card(&self) -> Option<Card> {
+        let c = &self.component;
+        c.get_property("keyboard-focus").ok()?;
+        if !matches!(c.get_property("panel-visible"), Ok(Value::Bool(true))) {
+            return None;
+        }
+        let flag = |name| matches!(c.get_property(name), Ok(Value::Bool(true)));
+        let picker = |list, index| Picker {
+            count: match c.get_property(list) {
+                Ok(Value::Model(model)) => model.row_count(),
+                _ => 0,
+            },
+            index: match c.get_property(index) {
+                Ok(Value::Number(n)) if n >= 0.0 => n as usize,
+                _ => 0,
+            },
+        };
+        let confirm = c.get_property("confirm-power");
+        Some(Card {
+            users: picker("users", "selected-user"),
+            sessions: picker("sessions", "selected-session"),
+            reveal: flag("prompt-is-secret") && c.get_property("reveal").is_ok(),
+            power: confirm.is_ok()
+                && !matches!(c.get_property("power-visible"), Ok(Value::Bool(false))),
+            confirming: match confirm {
+                Ok(Value::String(name)) => focus::parse_action(&name),
+                _ => None,
+            },
+        })
+    }
+
+    fn modifiers(&self) -> (bool, bool, bool) {
+        (
+            self.held & 0b11 != 0,
+            self.held & 0b1100 != 0,
+            self.held & 0b11_0000 != 0,
+        )
+    }
+
+    fn focus_key(&self, keysym: u32, utf8: Option<&str>) -> focus::Key {
+        use focus::Key as K;
+        let (shift, control, alt) = self.modifiers();
+        let plain = !control && !alt;
+        match keysym {
+            0xff09 if plain && shift => K::BackTab,
+            0xff09 if plain => K::Tab,
+            0xfe20 if plain => K::BackTab,
+            0xff0d | 0xff8d => K::Enter,
+            0x20 if plain => K::Space,
+            0xff1b => K::Escape,
+            0xff51 => K::Left,
+            0xff52 => K::Up,
+            0xff53 => K::Right,
+            0xff54 => K::Down,
+            0xffc5 if alt && !control => K::RevealShortcut,
+            _ if plain && utf8.is_some_and(printable) => K::Text,
+            _ => K::Other,
+        }
+    }
+
+    fn key(&mut self, keysym: u32, utf8: Option<KeyText>, pressed: bool) {
+        if let Some(at) = vigil_core::MODIFIER_KEYSYMS
+            .iter()
+            .position(|k| *k == keysym)
+        {
+            let kind = 0b11 << (at & !1);
+            let was = self.held & kind != 0;
+            if pressed {
+                self.held |= 1 << at;
+            } else {
+                self.held &= !(1 << at);
+            }
+            // Slint keeps one flag per modifier kind, so it hears only the
+            // first press and the last release of the pair.
+            if was != (self.held & kind != 0) {
+                self.send_key(keysym, utf8, pressed);
+            }
+            return;
+        }
+        let repeat = pressed && self.down == Some(keysym);
+        if pressed {
+            self.down = Some(keysym);
+        } else if self.down == Some(keysym) {
+            self.down = None;
+        }
+        if repeat && vigil_core::ONE_SHOT_KEYSYMS.contains(&keysym) {
+            return;
+        }
+        // Slint's own Tab moves its focus and selects the field, so typing
+        // then replaces the password.
+        let tab = matches!(keysym, 0xff09 | 0xfe20);
+        let card = match self.card() {
+            Some(_) if tab && !pressed => return,
+            Some(card) if pressed => card,
+            _ => return self.send_key(keysym, utf8, pressed),
+        };
+        let key = self.focus_key(keysym, utf8.as_ref().map(KeyText::as_str));
+        let (focus, effect) = self.focus.step(&card, key);
+        if repeat
+            && effect != Effect::Forward
+            && !matches!(key, focus::Key::Tab | focus::Key::BackTab)
+        {
+            return;
+        }
+        self.focus = focus;
+        let c = &self.component;
+        let action = |action| Value::String(focus::action_name(action).into());
+        match effect {
+            Effect::Forward if tab => {}
+            Effect::Forward => self.send_key(keysym, utf8, true),
+            Effect::Consume => {}
+            Effect::User(index) => {
+                let _ = c.invoke("user-changed", &[Value::Number(index as f64)]);
+            }
+            Effect::Session(index) => {
+                let _ = c.invoke("session-changed", &[Value::Number(index as f64)]);
+            }
+            Effect::ToggleReveal => {
+                if let Ok(Value::Bool(shown)) = c.get_property("reveal") {
+                    self.set_optional_property("reveal", Value::Bool(!shown));
+                }
+            }
+            Effect::Arm(power) => self.set_optional_property("confirm-power", action(power)),
+            Effect::Disarm => self.set_optional_property("confirm-power", Value::String("".into())),
+            Effect::Fire(power) => {
+                self.set_optional_property("confirm-power", Value::String("".into()));
+                let _ = c.invoke("power-action", &[action(power)]);
+            }
+        }
+        self.publish_focus();
+    }
+
+    fn send_key(&self, keysym: u32, utf8: Option<KeyText>, pressed: bool) {
+        let text = if self.modifiers().1 {
+            control_text(keysym)
+        } else {
+            key_text(keysym, utf8)
+        };
+        if let Some(text) = text {
+            let event = if pressed {
+                WindowEvent::KeyPressed { text }
+            } else {
+                WindowEvent::KeyReleased { text }
+            };
+            self.component.window().dispatch_event(event);
+        }
     }
 
     pub fn set_warning_progress(&mut self, frost: f32, wallpaper: f32) {
@@ -410,6 +643,11 @@ impl OutputWindow {
                 }
             }
             InputEvent::PointerButton { button, pressed } => {
+                if pressed && !matches!(self.focus.stop, Stop::Cancel(_) | Stop::Confirm(_)) {
+                    self.focus = Focus::default();
+                    self.publish_focus();
+                }
+                let window = self.component.window();
                 let button = pointer_button(button);
                 let position = self.pointer_position();
                 let event = if pressed {
@@ -418,20 +656,15 @@ impl OutputWindow {
                     WindowEvent::PointerReleased { position, button }
                 };
                 window.dispatch_event(event);
+                self.watch_reveal();
             }
             InputEvent::Key {
                 keysym,
                 utf8,
                 pressed,
             } => {
-                if let Some(text) = key_text(keysym, utf8) {
-                    let event = if pressed {
-                        WindowEvent::KeyPressed { text }
-                    } else {
-                        WindowEvent::KeyReleased { text }
-                    };
-                    window.dispatch_event(event);
-                }
+                self.key(keysym, utf8, pressed);
+                self.watch_reveal();
             }
         }
     }
@@ -481,7 +714,11 @@ impl OutputWindow {
 
     pub fn on_ui_message(&self, sink: std::rc::Rc<dyn Fn(UiMessage)>) {
         let s = sink.clone();
+        let component = self.component.as_weak();
         let r = self.component.set_callback("submit", move |args| {
+            if let Some(component) = component.upgrade() {
+                let _ = component.set_property("reveal", Value::Bool(false));
+            }
             if let Some(Value::String(text)) = args.first() {
                 s(UiMessage::Respond(text.as_str().into()));
             }
@@ -598,6 +835,17 @@ impl OutputWindow {
                 .set_global_property("Theme", name, color.into());
         }
         self.set_optional_property("accent-color", tokens.get("primary").into());
+        let tone = |name| match self.component.get_global_property("Theme", name) {
+            Ok(Value::Brush(brush)) => Some(brush.color()),
+            _ => None,
+        };
+        if let (Some(fg), Some(bg)) = (tone("fg"), tone("page-bg")) {
+            let _ = self.component.set_global_property(
+                "FocusTones",
+                "fallback",
+                Value::Bool(contrast(fg, bg) < 9.0),
+            );
+        }
         self.touch();
     }
 
@@ -632,6 +880,7 @@ pub fn apply_kit_tokens_from_system(window: &mut OutputWindow, mode: &str) {
 
 impl AuthUi for OutputWindow {
     fn show_prompt(&mut self, text: &str, secret: bool) {
+        self.hide_password();
         self.set_property("prompt-text", Value::String(text.into()));
         self.set_property("prompt-is-secret", Value::Bool(secret));
         self.set_property("info-message", Value::String("".into()));
@@ -639,6 +888,7 @@ impl AuthUi for OutputWindow {
         self.set_property("auth-state", Value::String("prompting".into()));
     }
     fn reset_input(&mut self) {
+        self.hide_password();
         if let Ok(Value::Number(serial)) = self.component.get_property("prompt-serial") {
             self.set_optional_property("prompt-serial", Value::Number(serial + 1.0));
         }
@@ -647,6 +897,7 @@ impl AuthUi for OutputWindow {
         self.set_property("info-message", Value::String(text.into()));
     }
     fn show_error(&mut self, text: &str) {
+        self.hide_password();
         self.set_property("error-message", Value::String(text.into()));
         self.set_property("auth-state", Value::String("error".into()));
         if let Ok(Value::Number(serial)) = self.component.get_property("error-serial") {
@@ -717,6 +968,24 @@ impl TargetPixel for Argb8888 {
     }
 }
 
+fn contrast(a: Color, b: Color) -> f64 {
+    let luminance = |color: Color| {
+        let linear = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.red())
+            + 0.7152 * linear(color.green())
+            + 0.0722 * linear(color.blue())
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
 fn pointer_button(button: u32) -> PointerEventButton {
     match button {
         0x110 => PointerEventButton::Left,
@@ -728,9 +997,22 @@ fn pointer_button(button: u32) -> PointerEventButton {
     }
 }
 
+// Slint reads a control character or a code from U+F700 as a key such as
+// Return, Tab or an arrow, so text holding one would act instead of type.
+fn printable(text: &str) -> bool {
+    !text.is_empty()
+        && !text
+            .chars()
+            .any(|c| c.is_control() || ('\u{f700}'..='\u{f7ff}').contains(&c))
+}
+
 fn key_text(keysym: u32, utf8: Option<KeyText>) -> Option<slint::SharedString> {
     let key = match keysym {
-        0xff0d => Key::Return,
+        0xffe1 | 0xffe2 => Key::Shift,
+        0xffe3 | 0xffe4 => Key::Control,
+        0xffe9 | 0xffea => Key::Alt,
+        0xffeb | 0xffec => Key::Meta,
+        0xff0d | 0xff8d => Key::Return,
         0xff08 => Key::Backspace,
         0xff09 => Key::Tab,
         0xff1b => Key::Escape,
@@ -743,13 +1025,20 @@ fn key_text(keysym: u32, utf8: Option<KeyText>) -> Option<slint::SharedString> {
         0xff57 => Key::End,
         _ => {
             return utf8
-                .filter(|text| {
-                    !text.as_str().is_empty() && !text.as_str().chars().all(char::is_control)
-                })
+                .filter(|text| printable(text.as_str()))
                 .map(|text| text.as_str().into());
         }
     };
     Some(key.into())
+}
+
+// Slint maps Ctrl plus a letter to Undo, Redo, Copy, Cut and Paste, and its
+// undo history outlives a field the theme clears, so only Select All passes.
+fn control_text(keysym: u32) -> Option<slint::SharedString> {
+    match keysym {
+        0x61 => Some("a".into()),
+        _ => key_text(keysym, None),
+    }
 }
 
 pub struct Looks {

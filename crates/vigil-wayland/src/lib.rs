@@ -92,6 +92,7 @@ pub trait LockSession {
     fn overlay_elements(&mut self, _elements: &[vigil_flow::ElementSample]) {}
     fn focus_output(&mut self, id: OutputId);
     fn caps_lock(&mut self, on: bool);
+    fn keyboard_left(&mut self) {}
     fn poll_events(&mut self) -> Vec<FlowEvent> {
         Vec::new()
     }
@@ -360,6 +361,7 @@ struct App<S: LockSession + 'static> {
     fractional_mgr: Option<WpFractionalScaleManagerV1>,
     entries: Vec<Entry>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    held_keys: vigil_core::HeldKeys,
     pointer: Option<wl_pointer::WlPointer>,
     got_locked: bool,
     outcome: Option<LockOutcome>,
@@ -383,6 +385,14 @@ struct App<S: LockSession + 'static> {
     root_span: tracing::Span,
     phase_span: Option<tracing::Span>,
     protocol_events: Vec<FlowEvent>,
+}
+
+// A key released after the keyboard left is never reported, so a held Ctrl
+// would otherwise hold back every letter until it was pressed again. This is
+// not input, so it never reaches the flow, where it could end a grace window.
+fn keyboard_left<S: LockSession>(held: &mut vigil_core::HeldKeys, session: &mut S) {
+    *held = vigil_core::HeldKeys::default();
+    session.keyboard_left();
 }
 
 fn exit_session<S: LockSession>(
@@ -1296,6 +1306,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
         fractional_mgr: globals.bind(&qh, 1..=1, ()).ok(),
         entries: Vec::new(),
         keyboard: None,
+        held_keys: vigil_core::HeldKeys::default(),
         pointer: None,
         got_locked: false,
         outcome: None,
@@ -1528,6 +1539,7 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
+        keyboard_left(&mut self.held_keys, &mut self.session);
     }
     fn press_key(
         &mut self,
@@ -1537,9 +1549,12 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: u32,
         event: KeyEvent,
     ) {
+        let utf8 = event.utf8.map(KeyText::from);
+        self.held_keys
+            .press(event.raw_code, event.keysym.raw(), utf8.clone());
         self.deliver_input(InputEvent::Key {
             keysym: event.keysym.raw(),
-            utf8: event.utf8.map(KeyText::from),
+            utf8,
             pressed: true,
         });
     }
@@ -1551,9 +1566,13 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: u32,
         event: KeyEvent,
     ) {
+        let (keysym, utf8) = self
+            .held_keys
+            .pressed(event.raw_code)
+            .unwrap_or((event.keysym.raw(), None));
         self.deliver_input(InputEvent::Key {
-            keysym: event.keysym.raw(),
-            utf8: event.utf8.map(KeyText::from),
+            keysym,
+            utf8,
             pressed: true,
         });
     }
@@ -1565,8 +1584,12 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: u32,
         event: KeyEvent,
     ) {
+        let keysym = self
+            .held_keys
+            .release(event.raw_code)
+            .unwrap_or(event.keysym.raw());
         self.deliver_input(InputEvent::Key {
-            keysym: event.keysym.raw(),
+            keysym,
             utf8: None,
             pressed: false,
         });
@@ -1665,6 +1688,7 @@ impl<S: LockSession> SeatHandler for App<S> {
                 if let Some(keyboard) = self.keyboard.take() {
                     keyboard.release();
                 }
+                keyboard_left(&mut self.held_keys, &mut self.session);
             }
             Capability::Pointer => {
                 if let Some(pointer) = self.pointer.take() {
@@ -1799,6 +1823,66 @@ wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpAlph
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+
+    use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now};
+
+    #[derive(Default)]
+    struct Session {
+        left: u32,
+    }
+
+    impl super::LockSession for Session {
+        fn output_ready(&mut self, _: super::OutputId, _: &super::OutputInfo) {}
+        fn output_resized(&mut self, _: super::OutputId, _: &super::OutputInfo) {}
+        fn force_copy_out(&mut self, _: super::OutputId) {}
+        fn output_gone(&mut self, _: super::OutputId) {}
+        fn focus_output(&mut self, _: super::OutputId) {}
+        fn caps_lock(&mut self, _: bool) {}
+        fn tick(&mut self) {}
+        fn render(&mut self, _: super::OutputId, _: super::FrameTarget<'_>) -> bool {
+            false
+        }
+        fn wait_decision(&self) -> super::WaitDecision {
+            super::WaitDecision::Indefinite
+        }
+        fn keyboard_left(&mut self) {
+            self.left += 1;
+        }
+    }
+
+    #[test]
+    fn a_keyboard_leave_drops_held_keys_without_ending_grace() {
+        let at = |ms| Now::at(Duration::from_millis(ms));
+        let lock = vigil_config::Lock {
+            grace_secs: 5,
+            ..Default::default()
+        };
+        let (mut flow, _) = LockFlow::new(at(0), &lock, Some(0));
+        let total = lock.transition.in_ms();
+        flow.step(at(total), FlowEvent::Tick);
+        let cmds = flow.step(at(total + 10), FlowEvent::LockConfirmed);
+        assert!(cmds.contains(&FlowCmd::StartAuth), "{cmds:?}");
+
+        let mut held = vigil_core::HeldKeys::default();
+        held.press(50, 0xfe08, None);
+        let mut session = Session::default();
+        super::keyboard_left(&mut held, &mut session);
+        assert_eq!(session.left, 1, "the session drops its held modifiers");
+        assert_eq!(held.release(50), None, "the held press is forgotten");
+
+        let cmds = flow.step(
+            at(total + 20),
+            FlowEvent::Input(vigil_core::InputEvent::Key {
+                keysym: 0x61,
+                utf8: Some("a".into()),
+                pressed: true,
+            }),
+        );
+        assert!(
+            cmds.contains(&FlowCmd::DetachAuth),
+            "the leave was not input, so grace is still there for a key: {cmds:?}"
+        );
+    }
 
     #[test]
     fn a_retry_for_a_departed_output_cannot_steer_the_loop() {

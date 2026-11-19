@@ -626,6 +626,13 @@ impl keys::KeySink for App {
         self.queue.borrow_mut().push_back(UiMessage::Cancel);
     }
 
+    fn field_focused(&self) -> bool {
+        self.entries
+            .iter()
+            .find(|e| Some(e.id) == self.panel)
+            .is_none_or(|e| e.window.field_focused())
+    }
+
     fn forward(&mut self, event: InputEvent) {
         if let Some(e) = self.panel_entry() {
             e.window.dispatch(event);

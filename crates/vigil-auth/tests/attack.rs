@@ -486,6 +486,11 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                         let Some(question) = question else {
                             return Err("typed text was sent with no question pending".into());
                         };
+                        if text.is_empty() && question.1 {
+                            return Err(format!(
+                                "an empty Enter answered the secret question {question:?}"
+                            ));
+                        }
                         let Some(field) = &step.field else {
                             return Err("typed text was sent though no field was shown".into());
                         };
@@ -642,6 +647,16 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                 }
                 if ack_due {
                     return Err("a message from greetd was left unacknowledged".into());
+                }
+                let empty = Req::Answer(Some(String::new()));
+                if step.text.as_deref() == Some("")
+                    && matches!(&step.waiting, Some((_, false)))
+                    && !step.requests.contains(&empty)
+                {
+                    return Err(format!(
+                        "an empty Enter under the visible question {:?} was not sent",
+                        step.waiting
+                    ));
                 }
                 if error.is_some() && !started {
                     return Err(format!(
@@ -909,6 +924,44 @@ fn pinned() -> Vec<(&'static str, Case)> {
                         "refused\nvigil: auth stage user=alice prompt=\"Password\" secret".into(),
                     ),
                     Reply::Message(Kind::Secret, "Password".into()),
+                ],
+                starts: Vec::new(),
+                refuse_cancels: false,
+            },
+        ),
+        (
+            "an empty Enter under a secret question never reaches greetd",
+            Case {
+                conforming: true,
+                default_user: None,
+                unprompted: None,
+                remembered: Vec::new(),
+                ops: vec![
+                    Op::Begin(Some(0)),
+                    Op::Enter,
+                    Op::Enter,
+                    Op::Enter,
+                    Op::Type(format!("{MARK}0007")),
+                ],
+                replies: vec![
+                    Reply::Message(Kind::Secret, "Password:".into()),
+                    Reply::Success,
+                ],
+                starts: Vec::new(),
+                refuse_cancels: false,
+            },
+        ),
+        (
+            "an empty Enter under a visible question is still sent",
+            Case {
+                conforming: true,
+                default_user: None,
+                unprompted: None,
+                remembered: Vec::new(),
+                ops: vec![Op::Begin(Some(0)), Op::Enter, Op::Enter],
+                replies: vec![
+                    Reply::Message(Kind::Visible, "Code:".into()),
+                    Reply::Success,
                 ],
                 starts: Vec::new(),
                 refuse_cancels: false,

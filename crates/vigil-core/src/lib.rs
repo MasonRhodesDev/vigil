@@ -266,6 +266,45 @@ pub struct KeymapSettings {
     pub options: String,
 }
 
+// Return, keypad Enter and Escape submit or cancel, so they act once per press.
+pub const ONE_SHOT_KEYSYMS: [u32; 3] = [0xff0d, 0xff8d, 0xff1b];
+
+pub const MODIFIER_KEYSYMS: [u32; 8] = [
+    0xffe1, 0xffe2, 0xffe3, 0xffe4, 0xffe9, 0xffea, 0xffeb, 0xffec,
+];
+
+// A layout switch or a level change can turn a held key into another keysym
+// before it is released, so a release reports what its press reported.
+#[derive(Debug, Default)]
+pub struct HeldKeys(Vec<(u32, u32, Option<KeyText>)>);
+
+impl HeldKeys {
+    pub fn press(&mut self, code: u32, keysym: u32, utf8: Option<KeyText>) {
+        self.0.retain(|(held, ..)| *held != code);
+        self.0.push((code, keysym, utf8));
+    }
+
+    pub fn pressed(&self, code: u32) -> Option<(u32, Option<KeyText>)> {
+        self.0
+            .iter()
+            .find(|(held, ..)| *held == code)
+            .map(|(_, keysym, utf8)| (*keysym, utf8.clone()))
+    }
+
+    pub fn release(&mut self, code: u32) -> Option<u32> {
+        let at = self.0.iter().position(|(held, ..)| *held == code)?;
+        Some(self.0.remove(at).1)
+    }
+}
+
+pub fn modifier_releases() -> impl Iterator<Item = InputEvent> {
+    MODIFIER_KEYSYMS.into_iter().map(|keysym| InputEvent::Key {
+        keysym,
+        utf8: None,
+        pressed: false,
+    })
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct KeyText(String);
 
