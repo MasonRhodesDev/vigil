@@ -320,7 +320,7 @@ impl<A: AuthAttempt> AuthTrack<A> {
         self.live = Some(LiveAttempt {
             attempt: spawn(tx),
             events,
-            secret: false,
+            secret: true,
         });
     }
 
@@ -1308,11 +1308,15 @@ fn signal_ready_fd(ready_fd: Option<i32>) {
 
 // A panic on any thread ends the lock before it can sit half alive with a dead
 // PAM worker or a poisoned lock. ext-session-lock keeps the session locked
-// when its client dies. _exit leaves no core, which would hold the password.
+// when its client dies. _exit leaves no core, which would hold the password,
+// and the report names only the place, since a panic message can quote text.
 fn exit_on_panic() {
-    let report = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        report(info);
+    std::panic::set_hook(Box::new(|info| {
+        let place = info
+            .location()
+            .map(|at| format!("{}:{}", at.file(), at.line()))
+            .unwrap_or_default();
+        eprintln!("vigil-lock: panic at {place}; exiting");
         unsafe { libc::_exit(101) };
     }));
 }
