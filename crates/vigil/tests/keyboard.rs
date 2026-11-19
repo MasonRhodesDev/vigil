@@ -629,3 +629,22 @@ fn a_held_enter_or_keypad_enter_submits_once() {
         assert_eq!(g.take(), [Sent::Respond("pw".into())], "{enter:#x}");
     }
 }
+
+#[test]
+fn holding_alt_f8_shows_the_password_once() {
+    let mut g = Greeter::new();
+    let mut buf = vec![0u8; (W * H * 4) as usize];
+    g.type_text("aaaa");
+    let masked = field_row(&mut g.window, &mut buf);
+    g.event(ALT_L, None, true);
+    for _ in 0..4 {
+        g.event(F8, None, true);
+    }
+    g.event(F8, None, false);
+    g.event(ALT_L, None, false);
+    assert_ne!(
+        masked,
+        field_row(&mut g.window, &mut buf),
+        "key repeat on Alt+F8 toggled the password back to hidden"
+    );
+}
