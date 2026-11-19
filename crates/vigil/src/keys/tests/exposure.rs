@@ -5,7 +5,7 @@ use std::os::unix::fs::FileExt;
 use greetd_ipc::Response;
 use vigil_core::{Canvas, FrameTarget};
 
-use crate::keys::tests::{RETURN, Rig, secret, tap, text};
+use super::{RETURN, Rig, secret, tap, text};
 use crate::keys::{KeySink, route};
 use crate::scripted_greetd::Greetd;
 

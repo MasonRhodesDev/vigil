@@ -34,7 +34,7 @@ pub fn route(sink: &mut impl KeySink, event: InputEvent) {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -48,9 +48,11 @@ pub(crate) mod tests {
     use super::*;
     use crate::scripted_greetd::Greetd;
 
-    pub(crate) const RETURN: u32 = 0xff0d;
+    mod exposure;
 
-    pub(crate) fn tap(keysym: u32, utf8: Option<&str>) -> [InputEvent; 2] {
+    const RETURN: u32 = 0xff0d;
+
+    fn tap(keysym: u32, utf8: Option<&str>) -> [InputEvent; 2] {
         [true, false].map(|pressed| InputEvent::Key {
             keysym,
             utf8: utf8.map(str::to_owned),
@@ -58,7 +60,7 @@ pub(crate) mod tests {
         })
     }
 
-    pub(crate) fn text(text: &str) -> Vec<InputEvent> {
+    fn text(text: &str) -> Vec<InputEvent> {
         text.chars()
             .flat_map(|ch| tap(ch as u32, Some(&ch.to_string())))
             .collect()
@@ -107,14 +109,14 @@ pub(crate) mod tests {
         assert!(sink.forwarded.is_empty());
     }
 
-    pub(crate) struct Rig {
-        pub(crate) window: OutputWindow,
+    struct Rig {
+        window: OutputWindow,
         queue: Rc<RefCell<VecDeque<UiMessage>>>,
-        pub(crate) auth: AuthMachine,
+        auth: AuthMachine,
     }
 
     impl Rig {
-        pub(crate) fn new(greetd: &Greetd) -> Self {
+        fn new(greetd: &Greetd) -> Self {
             let platform = VigilPlatform::install().expect("platform");
             let component = Theme::load_or_default(None)
                 .instantiate()
@@ -135,7 +137,7 @@ pub(crate) mod tests {
             }
         }
 
-        pub(crate) fn tick(&mut self) {
+        fn tick(&mut self) {
             loop {
                 let message = self.queue.borrow_mut().pop_front();
                 let Some(message) = message else { break };
@@ -157,7 +159,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn secret() -> Response {
+    fn secret() -> Response {
         Response::AuthMessage {
             auth_message_type: AuthMessageType::Secret,
             auth_message: "Password:".into(),

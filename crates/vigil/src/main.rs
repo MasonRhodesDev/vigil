@@ -1,7 +1,5 @@
 mod autologin;
 mod budget;
-#[cfg(test)]
-mod exposure;
 mod hold;
 mod keys;
 mod layout;
