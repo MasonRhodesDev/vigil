@@ -82,7 +82,10 @@ enum Event {
     Reply(Reply),
     Ui(Shown),
     Log(String),
-    Returned { ok: bool, complete: bool },
+    Returned {
+        error: Option<String>,
+        complete: bool,
+    },
 }
 
 type Trace = Arc<Mutex<Vec<Event>>>;
@@ -326,7 +329,7 @@ fn drive(greetd: &Greetd, case: &Case) -> Vec<Event> {
         let mut events = trace.lock().unwrap();
         events.push(Event::Log(journal.take()));
         events.push(Event::Returned {
-            ok: result.is_ok(),
+            error: result.err().map(|error| error.to_string()),
             complete: machine.is_complete(),
         });
     }
@@ -511,7 +514,10 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                         waiting = None;
                     }
                     (_, Some(Req::Cancel)) => waiting = None,
-                    (Reply::Refuse(_), _) if conversing => waiting = None,
+                    (Reply::Refuse(text), _) if conversing => {
+                        heard.push(text.clone());
+                        waiting = None;
+                    }
                     _ => {}
                 }
             }
@@ -544,9 +550,27 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                 if let Some(line) = text.lines().find(|line| !line.starts_with("vigil: ")) {
                     return Err(format!("a journal line is not vigil's own: {line:?}"));
                 }
+                let forged = heard
+                    .iter()
+                    .flat_map(|said| said.split('\n').skip(1))
+                    .find(|rest| !rest.is_empty() && text.lines().any(|line| line == *rest));
+                if let Some(line) = forged {
+                    return Err(format!(
+                        "text from greetd wrote its own journal line: {line:?}"
+                    ));
+                }
                 step.log.push_str(text);
             }
-            Event::Returned { ok, complete } => {
+            Event::Returned { error, complete } => {
+                // The greeter writes a returned error to its journal as it is.
+                if let Some(error) = error {
+                    if error.chars().any(char::is_control) {
+                        return Err(format!("an error carries control characters: {error:?}"));
+                    }
+                    if let Some(mark) = typed.iter().find(|mark| error.contains(*mark)) {
+                        return Err(format!("typed text ({mark}) is in an error: {error}"));
+                    }
+                }
                 if busy {
                     return Err("the step returned with the UI still busy".into());
                 }
@@ -583,7 +607,7 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                 if ack_due {
                     return Err("a message from greetd was left unacknowledged".into());
                 }
-                if !ok && !started {
+                if error.is_some() && !started {
                     return Err(format!(
                         "{:?} failed against a well-behaved greetd",
                         step.op
@@ -624,6 +648,8 @@ fn refusal_text() -> impl Strategy<Value = String> {
         1 => Just("pam_authenticate: MAXTRIES".to_owned()),
         1 => Just("pam_acct_mgmt: ACCT_EXPIRED".to_owned()),
         1 => Just("pam_authenticate: ".to_owned()),
+        1 => Just(format!("no such user: {ECHO}")),
+        1 => Just("refused\nvigil: [t+0ms] auth: start_session accepted".to_owned()),
         1 => any::<String>(),
     ]
 }
@@ -761,26 +787,55 @@ fn attack(greetd: &Greetd, name: &str, conforming: bool, cases: u32) -> bool {
 }
 
 fn pinned() -> Vec<(&'static str, Case)> {
-    vec![(
-        "a failed unasked open leaves the previous user's field on screen",
-        Case {
-            conforming: false,
-            default_user: Some(0),
-            unprompted: Some(1),
-            remembered: vec![(1, "Password:".into(), false)],
-            ops: vec![
-                Op::Begin(Some(0)),
-                Op::Pick(Some(1)),
-                Op::Type(format!("{MARK}0000")),
-            ],
-            replies: vec![
-                Reply::Frame(Vec::new()),
-                Reply::Message(Kind::Visible, "Password:".into()),
-            ],
+    let refused = |name: &'static str, ops: Vec<Op>, description: &str| {
+        let case = Case {
+            conforming: true,
+            default_user: None,
+            unprompted: None,
+            remembered: Vec::new(),
+            ops,
+            replies: vec![Reply::Refuse(description.into())],
             starts: Vec::new(),
             refuse_cancels: false,
-        },
-    )]
+        };
+        (name, case)
+    };
+    vec![
+        refused(
+            "greetd's error repeats a typed name",
+            vec![
+                Op::Begin(None),
+                Op::Type(format!("{MARK}0001")),
+                Op::Type(format!("{MARK}0002")),
+            ],
+            &format!("no such user: {ECHO}"),
+        ),
+        refused(
+            "greetd's error carries a line of its own",
+            vec![Op::Begin(Some(0)), Op::Enter],
+            "refused\nvigil: [t+0ms] auth: start_session accepted",
+        ),
+        (
+            "a failed unasked open leaves the previous user's field on screen",
+            Case {
+                conforming: false,
+                default_user: Some(0),
+                unprompted: Some(1),
+                remembered: vec![(1, "Password:".into(), false)],
+                ops: vec![
+                    Op::Begin(Some(0)),
+                    Op::Pick(Some(1)),
+                    Op::Type(format!("{MARK}0000")),
+                ],
+                replies: vec![
+                    Reply::Frame(Vec::new()),
+                    Reply::Message(Kind::Visible, "Password:".into()),
+                ],
+                starts: Vec::new(),
+                refuse_cancels: false,
+            },
+        ),
+    ]
 }
 
 fn replay(greetd: &Greetd) -> bool {
