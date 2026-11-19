@@ -208,66 +208,70 @@ impl BackgroundWorker {
         let rendered = self.rendered.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let cell = rendered
-                .lock()
-                .expect("background render cache poisoned")
-                .entry(key.clone())
-                .or_default()
-                .clone();
-            let cache_hit = cell.get().is_some();
-            let pixels = cell
-                .get_or_init(|| {
-                    if let Some(prepared) = prepared.as_ref() {
-                        let read_started = Instant::now();
-                        let result =
-                            appearance_profiles::read_prepared_asset(prepared).map(|asset| {
-                                match asset.format {
-                                    appearance_profiles::PixelFormat::Rgba8 => {
-                                        BackgroundData::Rgba(Arc::new(asset.bytes))
+            let (pixels, cache_hit) = cosmetic(|| {
+                let cell = rendered
+                    .lock()
+                    .expect("background render cache poisoned")
+                    .entry(key.clone())
+                    .or_default()
+                    .clone();
+                let cache_hit = cell.get().is_some();
+                let pixels = cell
+                    .get_or_init(|| {
+                        if let Some(prepared) = prepared.as_ref() {
+                            let read_started = Instant::now();
+                            let result =
+                                appearance_profiles::read_prepared_asset(prepared).map(|asset| {
+                                    match asset.format {
+                                        appearance_profiles::PixelFormat::Rgba8 => {
+                                            BackgroundData::Rgba(Arc::new(asset.bytes))
+                                        }
+                                        appearance_profiles::PixelFormat::Xrgb8888Le => {
+                                            BackgroundData::Xrgb(asset.bytes.into())
+                                        }
                                     }
-                                    appearance_profiles::PixelFormat::Xrgb8888Le => {
-                                        BackgroundData::Xrgb(asset.bytes.into())
-                                    }
-                                }
-                            });
-                        eprintln!(
-                            "vigil-lock: prepared background read {}: {:?}",
-                            prepared.asset.display(),
-                            read_started.elapsed()
-                        );
-                        return result.map_err(|error| error.to_string());
-                    }
-                    let source_cell = sources
-                        .lock()
-                        .expect("background source cache poisoned")
-                        .entry(key.path.clone())
-                        .or_default()
-                        .clone();
-                    let source = source_cell.get_or_init(|| {
-                        let decode_started = Instant::now();
-                        let result = vigil_ui::load_background(&key.path).map(Arc::new);
-                        eprintln!(
-                            "vigil-lock: background decode {}: {:?}",
-                            key.path.display(),
-                            decode_started.elapsed()
-                        );
-                        result
-                    });
-                    source.as_ref().map_err(Clone::clone).and_then(|source| {
-                        let render_started = Instant::now();
-                        let result =
-                            vigil_ui::render_background(source, key.fit, key.width, key.height)
-                                .map(|rgba| BackgroundData::Rgba(Arc::new(rgba)));
-                        eprintln!(
-                            "vigil-lock: background resize {}x{}: {:?}",
-                            key.width,
-                            key.height,
-                            render_started.elapsed()
-                        );
-                        result
+                                });
+                            eprintln!(
+                                "vigil-lock: prepared background read {}: {:?}",
+                                prepared.asset.display(),
+                                read_started.elapsed()
+                            );
+                            return result.map_err(|error| error.to_string());
+                        }
+                        let source_cell = sources
+                            .lock()
+                            .expect("background source cache poisoned")
+                            .entry(key.path.clone())
+                            .or_default()
+                            .clone();
+                        let source = source_cell.get_or_init(|| {
+                            let decode_started = Instant::now();
+                            let result = vigil_ui::load_background(&key.path).map(Arc::new);
+                            eprintln!(
+                                "vigil-lock: background decode {}: {:?}",
+                                key.path.display(),
+                                decode_started.elapsed()
+                            );
+                            result
+                        });
+                        source.as_ref().map_err(Clone::clone).and_then(|source| {
+                            let render_started = Instant::now();
+                            let result =
+                                vigil_ui::render_background(source, key.fit, key.width, key.height)
+                                    .map(|rgba| BackgroundData::Rgba(Arc::new(rgba)));
+                            eprintln!(
+                                "vigil-lock: background resize {}x{}: {:?}",
+                                key.width,
+                                key.height,
+                                render_started.elapsed()
+                            );
+                            result
+                        })
                     })
-                })
-                .clone();
+                    .clone();
+                (pixels, cache_hit)
+            })
+            .unwrap_or_else(|| (Err("background render panicked".to_owned()), false));
             let _ = tx.send(BackgroundResult {
                 id,
                 key,
@@ -1304,19 +1308,39 @@ fn signal_ready_fd(ready_fd: Option<i32>) {
     }
 }
 
-// A panic on any thread ends the lock before it can sit half alive with a dead
-// PAM worker or a poisoned lock. ext-session-lock keeps the session locked
-// when its client dies. _exit leaves no core, which would hold the password,
-// and the report names only the place, since a panic message can quote text.
+thread_local! {
+    static COSMETIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// A panic ends the lock before it can sit half alive with a dead PAM worker,
+// a lost sleep signal or a poisoned lock. ext-session-lock keeps the session
+// locked when its client dies. _exit leaves no core, which would hold the
+// password, and the report names only the place, since a panic message can
+// quote text. Only work run through `cosmetic` survives its own panic.
 fn exit_on_panic() {
     std::panic::set_hook(Box::new(|info| {
         let place = info
             .location()
             .map(|at| format!("{}:{}", at.file(), at.line()))
             .unwrap_or_default();
-        let _ = writeln!(std::io::stderr(), "vigil-lock: panic at {place}; exiting");
-        unsafe { libc::_exit(101) };
+        let cosmetic = COSMETIC.try_with(std::cell::Cell::get).unwrap_or(false);
+        let then = if cosmetic {
+            "going on without it"
+        } else {
+            "exiting"
+        };
+        let _ = writeln!(std::io::stderr(), "vigil-lock: panic at {place}; {then}");
+        if !cosmetic {
+            unsafe { libc::_exit(101) };
+        }
     }));
+}
+
+fn cosmetic<T>(work: impl FnOnce() -> T) -> Option<T> {
+    COSMETIC.set(true);
+    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).ok();
+    COSMETIC.set(false);
+    done
 }
 
 // RLIMIT_CORE survives exec but PR_SET_DUMPABLE resets on it, so every exec'd binary calls this itself.
