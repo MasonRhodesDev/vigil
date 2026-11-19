@@ -580,14 +580,6 @@ impl Locker {
 
     fn signal_locked(&mut self) {
         eprintln!("vigil-lock: session locked");
-        let joiners = {
-            let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
-            ipc.hold = Hold::Held;
-            std::mem::take(&mut ipc.joiners)
-        };
-        for mut joiner in joiners {
-            let _ = joiner.write_all(b"locked\n");
-        }
         if let Some(fd) = self.ready_fd.take() {
             use std::io::Write;
             use std::os::fd::FromRawFd;
@@ -753,7 +745,6 @@ impl Locker {
     fn detach_auth(&mut self) {
         self.auth.detach();
         self.unlocked = true;
-        self.lock_ipc.lock().expect("lock IPC poisoned").hold = Hold::Releasing;
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(5));
             unsafe { libc::_exit(0) };
@@ -1007,6 +998,9 @@ impl LockSession for Locker {
     }
 
     fn flow_command(&mut self, cmd: &FlowCmd) {
+        if follow_flow(&self.lock_ipc, cmd) {
+            self.signal_locked();
+        }
         match cmd {
             FlowCmd::ShowPanel(true) => self.apply_panel(),
             FlowCmd::ShowPanel(false) => self.each_window(|window| {
@@ -1048,7 +1042,6 @@ impl LockSession for Locker {
                     login.set_locked_hint(*on);
                 }
             }
-            FlowCmd::SignalReady => self.signal_locked(),
             _ => {}
         }
     }
@@ -1191,6 +1184,29 @@ struct LockIpcState {
     commit_requested: bool,
     joiners: Vec<UnixStream>,
     waker: Option<WakeHandle>,
+}
+
+/// Moves the hold as the flow commands and answers the joiners a confirmed
+/// lock releases. True when `cmd` confirmed the lock.
+fn follow_flow(ipc: &Mutex<LockIpcState>, cmd: &FlowCmd) -> bool {
+    let joiners = {
+        let mut state = ipc.lock().expect("lock IPC poisoned");
+        match cmd {
+            FlowCmd::SignalReady => {
+                state.hold = Hold::Held;
+                std::mem::take(&mut state.joiners)
+            }
+            FlowCmd::DetachAuth => {
+                state.hold = Hold::Releasing;
+                return false;
+            }
+            _ => return false,
+        }
+    };
+    for mut joiner in joiners {
+        let _ = joiner.write_all(b"locked\n");
+    }
+    true
 }
 
 impl Drop for LockIpcSocket {
