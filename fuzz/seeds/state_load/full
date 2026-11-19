@@ -1,0 +1,14 @@
+user = "alice"
+session = "sway"
+auto_streak = 2
+auto_started_at = 1700000000
+unprompted_user = "alice"
+
+[[first_question]]
+user = "bob"
+text = "PIN: "
+secret = true
+
+[[first_question]]
+user = "carol"
+text = "Code\u0007:"

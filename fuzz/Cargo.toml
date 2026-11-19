@@ -1,0 +1,38 @@
+[package]
+name = "vigil-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+greetd_ipc = { version = "0.10", features = ["sync-codec"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+vigil-config = { path = "../crates/vigil-config" }
+
+[[bin]]
+name = "greetd_response"
+path = "fuzz_targets/greetd_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_load"
+path = "fuzz_targets/state_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_overlay"
+path = "fuzz_targets/config_overlay.rs"
+test = false
+doc = false
+bench = false
