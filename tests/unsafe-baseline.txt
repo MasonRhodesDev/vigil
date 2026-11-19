@@ -4,7 +4,7 @@ crates/vigil-gl/examples/gl_large_text.rs 2 2 0 0
 crates/vigil-gl/examples/gl_modeset.rs 2 2 0 0
 crates/vigil-gl/examples/gl_scanout.rs 2 2 0 0
 crates/vigil-gl/examples/gl_smoke.rs 1 1 0 0
-crates/vigil-gl/src/lib.rs 17 10 3 0
+crates/vigil-gl/src/lib.rs 16 9 2 0
 crates/vigil-input/src/lib.rs 1 1 0 0
 crates/vigil-lock/src/main.rs 9 5 2 0
 crates/vigil-pam/src/lib.rs 0 0 0 1

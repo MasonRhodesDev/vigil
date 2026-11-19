@@ -157,12 +157,6 @@ pub struct GbmWindow(Arc<gbm::Surface<()>>);
     reason = "unjustified: a cloned GbmWindow on two threads can race gbm_surface calls"
 )]
 unsafe impl Send for GbmWindow {}
-#[allow(unsafe_code)]
-#[expect(
-    clippy::undocumented_unsafe_blocks,
-    reason = "unjustified: a cloned GbmWindow on two threads can race gbm_surface calls"
-)]
-unsafe impl Sync for GbmWindow {}
 
 // SAFETY: `create` hands EGL the gbm_surface this Arc keeps alive for as long
 // as the EGLSurface holds a clone of the window.
