@@ -75,6 +75,14 @@ impl Request<'_> {
     /// Draws in this process, so only for a logo the caller trusts.
     /// `Helper::draw` runs this in the helper.
     pub fn draw(&self) -> Result<Vec<u8>, Error> {
+        let mut out = vec![0u8; self.bytes()?];
+        self.draw_into(&mut out)?;
+        Ok(out)
+    }
+
+    /// `draw` into `out`, which must be exactly `bytes()` long. Nothing is
+    /// written unless the drawing succeeds.
+    pub fn draw_into(&self, out: &mut [u8]) -> Result<(), Error> {
         let spec = self.scene()?;
         let layout = Layout::new(&spec, self.mode, self.transform)?;
         let (scene, transform) = (layout.scene(), layout.transform());
@@ -82,14 +90,23 @@ impl Request<'_> {
             Some(svg) => Plate::new(&spec, &Logo::svg(svg)?, scene, transform)?,
             None => Plate::ground_only(&spec, scene, transform),
         };
-        let sprite = match self.layer {
-            Layer::Frame => return Ok(plate.frame(self.value)),
-            Layer::Logo => plate.logo_sprite(),
-            Layer::Glow => plate.glow_sprite(self.value),
-            Layer::Bar => plate.bar_sprite(self.value),
+        let need = self.bytes()?;
+        if out.len() != need {
+            return Err(Error::Invalid(format!(
+                "the {} needs {need} bytes, not {}",
+                self.layer.name(),
+                out.len()
+            )));
+        }
+        let drawn = match self.layer {
+            Layer::Frame => {
+                plate.draw(out, layout.panel().0 as usize * 4, self.value);
+                Some(())
+            }
+            Layer::Logo => plate.logo_into(out),
+            Layer::Glow => plate.glow_into(self.value, out),
+            Layer::Bar => plate.bar_into(self.value, out),
         };
-        sprite
-            .map(|s| s.rgba)
-            .ok_or_else(|| Error::Refused(format!("this scene has no {}", self.layer.name())))
+        drawn.ok_or_else(|| Error::Refused(format!("this scene has no {}", self.layer.name())))
     }
 }

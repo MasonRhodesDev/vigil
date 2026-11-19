@@ -90,6 +90,9 @@ impl Helper {
     /// nothing to it unless the drawing succeeded. A request without a logo
     /// has nothing untrusted to draw and is drawn here.
     pub fn draw(&self, req: &Request<'_>, out: &mut [u8]) -> Result<(), Error> {
+        let Some(svg) = req.svg else {
+            return req.draw_into(out);
+        };
         let need = req.bytes()?;
         if out.len() != need {
             return Err(Error::Invalid(format!(
@@ -98,10 +101,6 @@ impl Helper {
                 out.len()
             )));
         }
-        let Some(svg) = req.svg else {
-            out.copy_from_slice(&req.draw()?);
-            return Ok(());
-        };
         let spec = req.spec.unwrap_or_default();
         if svg.len() as u64 > MAX_LOGO_BYTES || spec.len() as u64 > MAX_SPEC_BYTES {
             return Err(Error::TooLarge(

@@ -371,56 +371,83 @@ impl Plate {
         xrgb
     }
 
-    fn sprite(
+    // Checks that the sprite exists before the first write to `out`.
+    fn sprite_into(
         &self,
-        at: Placement,
+        at: Option<Placement>,
         size: (u32, u32),
+        out: &mut [u8],
         pixel: impl Fn(u32, u32) -> [u8; 4],
-    ) -> Sprite {
+    ) -> Option<()> {
+        let at = at?;
         let (w, h) = (size.0 as usize, size.1 as usize);
-        let mut rgba = vec![0u8; w * h * 4];
         for sy in 0..h {
             for sx in 0..w {
                 let (lx, ly) = local(self.layout.transform, (w, h), sx, sy);
                 let o = (ly * at.width as usize + lx) * 4;
-                rgba[o..o + 4].copy_from_slice(&pixel(sx as u32, sy as u32));
+                out[o..o + 4].copy_from_slice(&pixel(sx as u32, sy as u32));
             }
         }
-        Sprite {
+        Some(())
+    }
+
+    fn sprite(
+        &self,
+        at: Option<Placement>,
+        draw: impl FnOnce(&mut [u8]) -> Option<()>,
+    ) -> Option<Sprite> {
+        let at = at?;
+        let mut rgba = vec![0u8; at.width as usize * at.height as usize * 4];
+        draw(&mut rgba)?;
+        Some(Sprite {
             x: at.x,
             y: at.y,
             width: at.width,
             height: at.height,
             rgba,
-        }
+        })
+    }
+
+    pub fn logo_into(&self, out: &mut [u8]) -> Option<()> {
+        let logo = self.logo.as_ref()?;
+        let (edge, alpha, m) = (logo.edge(), logo.alpha(), self.mark);
+        self.sprite_into(self.layout.logo(), (edge, edge), out, |x, y| {
+            [m[0], m[1], m[2], alpha[(y * edge + x) as usize]]
+        })
+    }
+
+    pub fn glow_into(&self, level: f64, out: &mut [u8]) -> Option<()> {
+        self.logo.as_ref()?;
+        let (lvl, a) = (level_256(level), self.accent);
+        let ge = self.layout.geometry.glow;
+        self.sprite_into(self.layout.glow(), (ge, ge), out, |x, y| {
+            let alpha = (u32::from(self.glow[(y * ge + x) as usize]) * lvl) >> 8;
+            [a[0], a[1], a[2], alpha as u8]
+        })
+    }
+
+    pub fn bar_into(&self, progress: f64, out: &mut [u8]) -> Option<()> {
+        let g = self.layout.geometry;
+        let fill = rnd(progress.clamp(0.0, 1.0) * f64::from(g.bar_w)).max(0) as u32;
+        let (a, t) = (self.accent, self.track);
+        self.sprite_into(self.layout.bar(), (g.bar_w, g.bar_h), out, |x, _| {
+            let c = if x < fill { a } else { t };
+            [c[0], c[1], c[2], 0xff]
+        })
     }
 
     pub fn logo_sprite(&self) -> Option<Sprite> {
-        let logo = self.logo.as_ref()?;
-        let (edge, alpha, m) = (logo.edge(), logo.alpha(), self.mark);
-        Some(self.sprite(self.layout.logo()?, (edge, edge), |x, y| {
-            [m[0], m[1], m[2], alpha[(y * edge + x) as usize]]
-        }))
+        self.logo.as_ref()?;
+        self.sprite(self.layout.logo(), |out| self.logo_into(out))
     }
 
     pub fn glow_sprite(&self, level: f64) -> Option<Sprite> {
         self.logo.as_ref()?;
-        let (lvl, a) = (level_256(level), self.accent);
-        let ge = self.layout.geometry.glow;
-        Some(self.sprite(self.layout.glow()?, (ge, ge), |x, y| {
-            let alpha = (u32::from(self.glow[(y * ge + x) as usize]) * lvl) >> 8;
-            [a[0], a[1], a[2], alpha as u8]
-        }))
+        self.sprite(self.layout.glow(), |out| self.glow_into(level, out))
     }
 
     pub fn bar_sprite(&self, progress: f64) -> Option<Sprite> {
-        let g = self.layout.geometry;
-        let fill = rnd(progress.clamp(0.0, 1.0) * f64::from(g.bar_w)).max(0) as u32;
-        let (a, t) = (self.accent, self.track);
-        Some(self.sprite(self.layout.bar()?, (g.bar_w, g.bar_h), |x, _| {
-            let c = if x < fill { a } else { t };
-            [c[0], c[1], c[2], 0xff]
-        }))
+        self.sprite(self.layout.bar(), |out| self.bar_into(progress, out))
     }
 }
 
