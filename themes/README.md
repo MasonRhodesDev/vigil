@@ -56,14 +56,24 @@ the same callbacks that clicks run.
 `reboot`, `poweroff`, `cancel`, or `confirm`. It is empty while the
 field has focus and nobody has pressed Tab yet. Draw a ring on the
 control that matches it. The ring must show against the control and
-against whatever is behind it. The default theme draws `Theme.fg`
-between two thin `Theme.page-bg` lines. Those two colours are at least
-9:1 apart, so any neighbouring colour is at least 3:1 from one of them.
-`crates/vigil/tests/keyboard.rs` checks that ratio.
+against whatever is behind it. The default theme draws `FocusTones.line`
+between two thin `FocusTones.edge` lines. They follow `Theme.fg` and
+`Theme.page-bg`, which are at least 9:1 apart, so any neighbouring
+colour is at least 3:1 from one of them. When a colour kit puts those
+two under 9:1, vigil sets `FocusTones.fallback` and the ring turns
+white between black lines. Export a `FocusTones` global with an
+`in-out bool fallback` to get the same check.
+`crates/vigil/tests/keyboard.rs` checks the ratio with and without a
+kit.
 
 Keep the ring and the hint out of layout. A ring that pushes its
 neighbours, or a hint that wraps to a second line, moves the card on
-every key.
+every key. Show `error-message` and `info-message` in place of the hint
+when either is set. PAM's messages must stay visible wherever focus is.
+
+vigil sets `reveal` to false on a new prompt, on submit, on a failure,
+when the panel hides, and after 10 seconds without a key or a click.
+Bind the field's masking to `reveal` and keep no copy of it.
 
 A theme that declares no `keyboard-focus` keeps the old behaviour.
 Typing and Enter reach the field, and keys never reach other controls.
@@ -74,4 +84,7 @@ Alt+F8.
 
 Set `confirm-power` from a Restart or Shut Down click to ask first, as
 the default theme does. Call `power-action(confirm-power)` from the
-confirm button and then clear `confirm-power`.
+confirm button and then clear `confirm-power`. The confirm button can
+appear under the pointer, so ignore clicks on it for 500 ms after it
+appears. Otherwise the second click of a double click on Shut Down
+powers off.

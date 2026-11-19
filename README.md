@@ -124,17 +124,19 @@ field has focus at start, and typing always goes there.
 | Key | Where | Does |
 |---|---|---|
 | Tab, Shift+Tab | anywhere | Move focus through the user picker, the field, show/hide, the session picker, Restart, and Shut Down, in that order, and wrap. |
-| Enter | field | Submit. |
+| Enter, keypad Enter | field | Submit. Enter with nothing typed never answers a hidden question such as a password. |
+| Ctrl+A | field | Select the text. Other Ctrl shortcuts do nothing, so Undo can never bring back text the field cleared. |
 | Esc | field | Cancel the attempt and start over. |
 | Esc | any other control | Return focus to the field. |
 | Left, Right, Up, Down, Space | user or session picker | Pick the previous or next entry. |
 | Enter | user or session picker | Return focus to the field. |
-| Space, Enter | show/hide | Show or hide the password. |
+| Space | show/hide | Show or hide the password. |
+| Enter | show/hide | Submit, as in the field. |
 | Alt+F8 | anywhere | Show or hide the password. |
 | Space, Enter | Restart, Shut Down | Ask to confirm. Focus starts on Cancel. |
 | Tab, Left, Right | confirm | Move between Cancel and the action. |
 | Space, Enter | confirm | Run the focused choice. |
-| Esc | confirm | Close it without acting. |
+| Esc | confirm | Close it without acting. Focus returns to the button that opened it, or to the field if a click opened it. |
 | a letter or digit | any control but a confirm | Return focus to the field and type there. |
 | Ctrl+Alt+F*n* | anywhere | Switch to VT *n*. |
 
@@ -142,12 +144,28 @@ A line under the field names the keys for the focused control. A
 two-tone ring marks the focused control once you press Tab. Arrow keys
 inside the field keep editing the text, so they never switch users.
 Picking a user or a session by keyboard is the same local change as a
-click. No PAM conversation opens until you press Enter in the field.
-Holding a key on a control acts once, so key repeat never cycles
-through users. Only Tab and Shift+Tab repeat there.
+click. No PAM conversation opens until you press Enter in the field,
+with one exception. A user whose last sign-in asked no question signs
+in as soon as you pick them, by key or by click.
 
-A pointer click on Restart or Shut Down asks to confirm too. vigil-lock
-has the same field and show/hide keys and shows no power buttons.
+Enter, keypad Enter and Esc act once per press. Holding a key on a
+control acts once, so key repeat never cycles through users and never
+flips show/hide. Only Tab, Shift+Tab and typing repeat.
+
+A shown password hides again on a new question, on submit, on a failed
+attempt, when the card moves to another screen or after a VT switch,
+and after 10 seconds without a key or a click. Ten seconds is enough to
+read back what you typed, and short enough that a password does not
+stay on a screen someone walked away from.
+
+PAM's messages, such as a failed attempt or a request to touch a
+security key, stay on the line under the field while focus is on
+another control. The key hint shows only when there is no message.
+
+A pointer click on Restart or Shut Down asks to confirm too. The confirm
+ignores clicks for half a second after it opens, so a double click on
+Shut Down never shuts down. vigil-lock has the same field and show/hide
+keys and shows no power buttons.
 
 ## Monitor layout
 
