@@ -5183,8 +5183,17 @@ dependencies = [
  "smithay",
  "vigil-core",
  "vigil-gl",
+ "vigil-present-kms",
  "vigil-theme",
  "vigil-ui",
+]
+
+[[package]]
+name = "vigil-present-kms"
+version = "0.4.3"
+dependencies = [
+ "smithay",
+ "vigil-core",
 ]
 
 [[package]]

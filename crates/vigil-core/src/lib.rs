@@ -222,6 +222,10 @@ pub trait Presenter {
 
     fn invalidate(&mut self);
 
+    fn has_cursor(&self) -> bool {
+        false
+    }
+
     fn set_cursor(&mut self, pos: Option<(i32, i32)>) -> bool {
         let _ = pos;
         false

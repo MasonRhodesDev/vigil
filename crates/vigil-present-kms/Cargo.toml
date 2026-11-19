@@ -1,0 +1,12 @@
+[package]
+name = "vigil-present-kms"
+description = "KMS pieces every presenter shares: cursor plane, plane transform, error mapping"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-core.workspace = true
+smithay = { workspace = true, features = ["backend_drm"] }
