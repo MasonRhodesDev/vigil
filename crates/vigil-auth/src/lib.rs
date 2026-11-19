@@ -126,7 +126,12 @@ impl AuthMachine {
 
     fn log_stage(&mut self, user: &str, prompt: &str, secret: bool) {
         let kind = if secret { "secret" } else { "visible" };
-        let stage = format!("user={user} prompt={prompt:?} {kind}");
+        let shown = if self.typed && prompt != RETRY_PROMPT {
+            format!("<{} chars>", prompt.chars().count())
+        } else {
+            format!("{prompt:?}")
+        };
+        let stage = format!("user={user} prompt={shown} {kind}");
         if stage != self.stage {
             eprintln!("vigil: auth stage {stage}");
             self.stage = stage;
