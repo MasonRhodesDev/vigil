@@ -47,6 +47,8 @@ package() {
   install -Dm755 target/release/vigil "$pkgdir/usr/bin/vigil"
   install -Dm755 target/release/vigil-lock "$pkgdir/usr/bin/vigil-lock"
   install -Dm755 target/release/vigil-sim "$pkgdir/usr/bin/vigil-sim"
+  install -Dm755 target/release/vigil-unlock "$pkgdir/usr/bin/vigil-unlock"
+  install -Dm644 dist/vigil-unlock.8 "$pkgdir/usr/share/man/man8/vigil-unlock.8"
 
   install -Dm755 target/release/vigil-scene "$pkgdir/usr/lib/vigil/vigil-scene"
   install -Dm755 dist/setup-greetd "$pkgdir/usr/lib/vigil/setup-greetd"

@@ -46,13 +46,16 @@ can be run alone.
 | The PAM conversation callback, by a hostile module under AddressSanitizer | `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p vigil-pam --target x86_64-unknown-linux-gnu` |
 | The pure Rust half of `vigil-pam`, under Miri | `MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p vigil-pam` |
 | A locked session: signals, memory starvation, input flood, unlock race, compositor death | `tests/nested/attack.sh` |
+| A logind Unlock root did not ask for: the owner's own, and root tokens that the user owns, that are stale, name another session or boot, are symlinks, or sit in a directory others can write | `cargo test -p vigil-lock logind_forgery` |
+| The root token's contents and metadata, by generated owners, file kinds, modes and bytes | `cargo test -p vigil-auth --test attack` |
 
 `VIGIL_ATTACK_CASES` sets how many sequences the `AuthMachine` attack
 generates per greetd model (default 1500). Each run draws a new seed and
 prints it first. `VIGIL_ATTACK_SEED=<seed>` with the same case count
 draws the same sequences again, so a red CI run replays locally. A
 failure prints the shortest sequence that breaks an invariant; add it to
-`pinned()` in `crates/vigil-auth/tests/attack.rs` before fixing it.
+`pinned()` in `crates/vigil-auth/tests/attack/main.rs`, or in
+`attack/token.rs` for a root token, before fixing it.
 
 `fuzz/run.sh [seconds] [target...]` needs `cargo install cargo-fuzz
 --locked` and a toolchain that accepts `-Z` flags: a rustup nightly, or
@@ -172,8 +175,8 @@ when its contract changes.
 
 `vigil-lock --wait` detaches and returns success only after the compositor has
 confirmed that the session is locked (`--daemonize` remains a compatibility
-alias). It exits 1 when a logind unlock lands before the compositor confirms
-the lock, and also when the compositor invalidates the lock, so a caller told
+alias). It exits 1 when a logind unlock that root asked for lands before the
+compositor confirms the lock, and also when the compositor invalidates the lock, so a caller told
 the session is locked never sees it unlock first. `vigil-lock --warn 10`
 presents a cancelable, capture-free idle warning before locking. It requests `ext-background-effect-v1` blur when available and uses a
 tint-only fallback otherwise. Activity before commitment exits 3. `--no-warn`,
@@ -184,6 +187,30 @@ desktop. `--immediate` skips both ramps. On Hyprland the blur strength follows
 the ramp via `hyprland-surface-v1` opacity (`wp-alpha-modifier-v1` where a
 compositor ties blur to surface alpha); elsewhere the tint ramps over a fixed
 blur.
+
+### Unlocking as root
+
+vigil-lock obeys a logind Unlock only when root asked for it. logind
+lets the owner of a session unlock it without polkit, and the Unlock
+signal does not say who asked, so without this rule any process the user
+runs could unlock the screen without the password. Plain `loginctl
+unlock-session` no longer unlocks vigil-lock, whoever runs it.
+
+To unlock a session from another terminal or over SSH:
+
+```sh
+sudo vigil-unlock <session-id|user>
+```
+
+`vigil-unlock` writes a token to `/run/vigil/unlock/<session-id>`, calls
+logind's `UnlockSession`, waits two seconds, and removes the token. A
+user name unlocks each of that user's sessions; `loginctl list-sessions`
+lists the ids. vigil-lock accepts the token only if it is a regular file
+with one link, owned by root, mode 0644 or stricter, in a root-owned
+directory nobody else can write, and names this session, this boot, and
+a `CLOCK_BOOTTIME` time at most 10 seconds old. Otherwise it logs
+`unlock ignored:` with the reason and stays locked. `man 8 vigil-unlock`
+has the details.
 
 ## Keyboard
 

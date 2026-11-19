@@ -1,0 +1,71 @@
+.TH VIGIL-UNLOCK 8 2026-11-19 vigil "System Administration"
+.SH NAME
+vigil-unlock \- unlock a session that vigil-lock holds
+.SH SYNOPSIS
+.B vigil-unlock
+.I session-id
+|
+.I user
+.SH DESCRIPTION
+vigil-lock obeys a logind Unlock only when root asked for it.
+logind lets the owner of a session unlock it without polkit, and the
+Unlock signal does not say who asked, so without this rule any process
+the user runs could unlock the screen without the password.
+Plain
+.B loginctl unlock-session
+no longer unlocks vigil-lock, whoever runs it.
+.PP
+.B vigil-unlock
+is the recovery path, for example from another terminal or over SSH:
+.PP
+.RS
+.B sudo vigil-unlock
+.I session-id
+.RE
+.PP
+It must run as root.
+It writes a token for each chosen session to
+.IR /run/vigil/unlock/ <session-id>,
+calls logind's
+.B UnlockSession
+for it, waits two seconds, removes the token, and prints whether logind
+reports the session unlocked.
+.PP
+A session id names that session.
+Otherwise the argument is a user name and names every session of that user.
+.B loginctl list-sessions
+lists the ids.
+.SH THE TOKEN
+vigil-lock reads the token through descriptors and accepts it only if
+all of these hold:
+.IP \(bu 2
+it is a regular file, not a symlink, with one link, owned by root, with
+mode 0644 or stricter;
+.IP \(bu 2
+its directory is owned by root and nobody else can write it;
+.IP \(bu 2
+it names this session and this boot's id;
+.IP \(bu 2
+its time, read from CLOCK_BOOTTIME, is at most 10 seconds old and not
+in the future.
+.PP
+Otherwise vigil-lock logs
+.B unlock ignored:
+and the reason, and stays locked.
+A missing or bad token never ends the lock.
+.PP
+The package's tmpfiles.d entry creates
+.I /run/vigil/unlock
+at boot, root-owned with mode 0755.
+.B vigil-unlock
+creates it the same way when it is missing.
+.SH EXIT STATUS
+0 when every chosen session reports unlocked, 1 otherwise, and 2 on a
+usage error.
+.SH FILES
+.TP
+.I /run/vigil/unlock/
+Root's unlock tokens.
+.SH SEE ALSO
+.BR loginctl (1),
+.BR tmpfiles.d (5)

@@ -1,1 +1,3 @@
 d /var/lib/vigil 0750 :greeter :greeter -
+d /run/vigil 0755 root root -
+d /run/vigil/unlock 0755 root root -
