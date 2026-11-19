@@ -473,6 +473,10 @@ fn child_calls_the_abi_with_one_review_input() {
     let took = start.elapsed();
     let grew = peak_rss_kib().saturating_sub(base);
     println!("ABI {what}: code {rc}, {took:?}, parent grew {grew} KiB");
+    assert_ne!(
+        rc, VIGIL_SCENE_ERR_HELPER,
+        "{what}: the helper failed, not the logo"
+    );
     let deadline = Duration::from_millis(VIGIL_SCENE_DEFAULT_DEADLINE_MS.into());
     assert!(
         took < deadline + Duration::from_millis(500),

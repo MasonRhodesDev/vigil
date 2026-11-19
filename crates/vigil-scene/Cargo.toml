@@ -24,3 +24,7 @@ vigil-scene-corpus = { path = "../vigil-scene-corpus" }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "sandbox"
+harness = false

@@ -182,6 +182,12 @@ fn child_runs_one_review_input() {
     let drawn = helper.draw(&request(text.as_bytes(), Layer::Logo), &mut out);
     let took = start.elapsed();
     let grew = peak_rss_kib().saturating_sub(base);
+    for got in [mask.as_ref().err(), drawn.as_ref().err()] {
+        assert!(
+            !matches!(got, Some(Error::Helper(_))),
+            "{what}: the helper failed, not the logo: {got:?}"
+        );
+    }
     println!(
         "REVIEW {what}: mask {:?}, layer {:?}, {took:?}, parent grew {grew} KiB",
         mask.as_ref().map(|_| "drawn"),
@@ -265,6 +271,55 @@ fn limits(pid: u32) -> Vec<(String, String, String)> {
             )
         })
         .collect()
+}
+
+fn status_field(pid: u32, key: &str) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix(key))
+        .map(|v| v.trim().to_owned())
+}
+
+#[test]
+fn the_shipped_helper_draws_under_its_syscall_filter() {
+    let svg = mark();
+    let ours: u32 =
+        status_field(std::process::id(), "Seccomp_filters:").map_or(0, |v| v.parse().unwrap());
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let mut child = Command::new(BIN)
+        .args(["layer", "--mode", "4096x4096", "--transform", "0"])
+        .args(["--layer", "frame", "--value", "1", "--spec-len", "0"])
+        .args(["--svg-len", &svg.len().to_string(), "--deadline-ms", "5000"])
+        .stdin(reader)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    std::io::Write::write_all(&mut writer, &svg).unwrap();
+    drop(writer);
+    let mut seen = None;
+    while child.try_wait().unwrap().is_none() {
+        let Some(filters) = status_field(pid, "Seccomp_filters:") else {
+            continue;
+        };
+        let filters: u32 = filters.parse().unwrap();
+        if filters > ours {
+            let environ = std::fs::read(format!("/proc/{pid}/environ"));
+            seen = Some((filters, status_field(pid, "NoNewPrivs:"), environ));
+            break;
+        }
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+    let (filters, nnp, environ) = seen.expect("the helper ran under a new seccomp filter");
+    assert_eq!(filters, ours + 1);
+    assert_eq!(nnp.as_deref(), Some("1"));
+    if !rustix::process::getuid().is_root() {
+        let denied = environ.expect_err("a helper that is not dumpable hides its environ");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+    }
 }
 
 #[test]
@@ -438,6 +493,11 @@ fn child_draws_with_sigchld_ignored() {
         return;
     }
     let spin = fake_helper("spin-ignored", "while :; do :; done");
+    let need = request(&[], Layer::Logo).bytes().unwrap();
+    let noticed = fake_helper(
+        "noticed",
+        &format!("echo 'vigil-scene: notice: no Landlock' >&2; printf '%0{need}d' 0"),
+    );
     // SAFETY: SIG_IGN is a valid disposition, and this process runs this one
     // test alone, so no other code relies on SIGCHLD.
     #[allow(unsafe_code)]
@@ -460,6 +520,11 @@ fn child_draws_with_sigchld_ignored() {
         .draw(&request(&svg, Layer::Logo), &mut out)
         .unwrap();
     assert!(out == want);
+    let mut zeros = vec![0u8; need];
+    noticed
+        .draw(&request(&svg, Layer::Logo), &mut zeros)
+        .expect("a notice on stderr is not a failure");
+    assert!(zeros.iter().all(|&b| b == b'0'));
     let hostile = br#"<svg xmlns="http://www.w3.org/2000/svg"><image href="/etc/passwd"/></svg>"#;
     assert!(matches!(
         Helper::new(BIN, PATIENT).draw(&request(hostile, Layer::Logo), &mut out),
