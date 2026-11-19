@@ -12,6 +12,9 @@ use xkbcommon::xkb::compose;
 
 const REPEAT_DELAY: Duration = Duration::from_millis(500);
 const REPEAT_INTERVAL: Duration = Duration::from_millis(33);
+const RETURN: u32 = 0xff0d;
+const ESCAPE: u32 = 0xff1b;
+const ONE_SHOT: [u32; 2] = [RETURN, ESCAPE];
 
 #[derive(Debug)]
 pub struct InputError(pub String);
@@ -253,7 +256,8 @@ impl KeyboardState {
         }
 
         if pressed {
-            self.repeat = self.keymap.key_repeats(keycode).then_some(Repeat {
+            let one_shot = ONE_SHOT.contains(&self.state.key_get_one_sym(keycode).raw());
+            self.repeat = (!one_shot && self.keymap.key_repeats(keycode)).then_some(Repeat {
                 keycode,
                 deadline: now + REPEAT_DELAY,
             });
