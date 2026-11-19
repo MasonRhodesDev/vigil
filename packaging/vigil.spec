@@ -49,8 +49,8 @@ cat vendor-git-sources.toml >> "$cfg"
 
 %install
 # %%check runs after this and rebuilds target/release, not target/rpm, but
-# the library is checked before it can ship. Vendored sources sit in the
-# build tree, so only the target dir is forbidden.
+# the library is checked before it can ship. Debug info and vendored
+# sources name the build tree, so only the target dir is forbidden.
 packaging/check-ffi-helper-path target/rpm/libvigil_scene_ffi.so "$PWD/target"
 install -Dpm0755 target/rpm/vigil %{buildroot}%{_bindir}/vigil
 install -Dpm0755 target/rpm/vigil-lock %{buildroot}%{_bindir}/vigil-lock

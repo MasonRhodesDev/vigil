@@ -40,7 +40,9 @@ check() {
 package() {
   cd "$pkgname-$pkgver"
 
-  packaging/check-ffi-helper-path "$srcdir/ffi/libvigil_scene_ffi.so" "$srcdir"
+  # Debug info names the source tree, so only the target dir, where the
+  # test helper lives, is forbidden.
+  packaging/check-ffi-helper-path "$srcdir/ffi/libvigil_scene_ffi.so" "$PWD/target"
 
   install -Dm755 target/release/vigil "$pkgdir/usr/bin/vigil"
   install -Dm755 target/release/vigil-lock "$pkgdir/usr/bin/vigil-lock"
