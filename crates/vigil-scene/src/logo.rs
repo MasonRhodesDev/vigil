@@ -11,7 +11,7 @@ pub const MAX_EDGE: u32 = 4096;
 const MAX_RASTER_SIDE: u32 = 8192;
 const MAX_NODES: u32 = 10_000;
 const MAX_DEPTH: usize = 64;
-const MAX_REF_DEPTH: usize = 256;
+const MAX_REF_DEPTH: usize = 128;
 const MAX_EXPANDED: usize = 20_000;
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const DRAWN: &[&str] = &[
@@ -39,7 +39,7 @@ const DRAWN: &[&str] = &[
 ];
 
 pub enum Logo {
-    Svg(usvg::Tree),
+    Svg(Box<usvg::Tree>),
     Raster(image::RgbaImage),
 }
 
@@ -108,6 +108,11 @@ impl Logo {
         if text.contains("<!ENTITY") {
             return Err(Error::Refused("the SVG declares XML entities".into()));
         }
+        if nesting(text.as_bytes()) > MAX_DEPTH {
+            return Err(Error::Refused(format!(
+                "the SVG nests elements deeper than {MAX_DEPTH}"
+            )));
+        }
         let xml = roxmltree::ParsingOptions {
             allow_dtd: true,
             nodes_limit: MAX_NODES,
@@ -124,10 +129,13 @@ impl Logo {
             },
             ..usvg::Options::default()
         };
-        let tree = usvg::Tree::from_xmltree(&doc, &options)
-            .map_err(|e| Error::Invalid(format!("SVG: {e}")))?;
+        let tree = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            usvg::Tree::from_xmltree(&doc, &options)
+        }))
+        .map_err(|_| Error::Invalid("the SVG parser could not read this SVG".into()))?
+        .map_err(|e| Error::Invalid(format!("SVG: {e}")))?;
         refuse_dashes(tree.root())?;
-        Ok(Logo::Svg(tree))
+        Ok(Logo::Svg(Box::new(tree)))
     }
 
     pub fn raster(data: &[u8]) -> Result<Logo, Error> {
@@ -157,11 +165,11 @@ impl Logo {
                 let oy = (edge as f32 - size.height() * s) / 2.0;
                 let mut pixmap = resvg::tiny_skia::Pixmap::new(edge, edge)
                     .ok_or_else(|| Error::Invalid("empty logo box".into()))?;
-                resvg::render(
-                    tree,
-                    resvg::tiny_skia::Transform::from_row(s, 0.0, 0.0, s, ox, oy),
-                    &mut pixmap.as_mut(),
-                );
+                let fit = resvg::tiny_skia::Transform::from_row(s, 0.0, 0.0, s, ox, oy);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    resvg::render(tree, fit, &mut pixmap.as_mut());
+                }))
+                .map_err(|_| Error::Invalid("the renderer could not draw this SVG".into()))?;
                 let (pixels, _partial) = pixmap.data().as_chunks::<4>();
                 pixels.iter().map(|p| p[3]).collect::<Vec<u8>>()
             }
@@ -196,19 +204,7 @@ impl Logo {
 }
 
 fn screen(doc: &roxmltree::Document) -> Result<(), Error> {
-    let mut depths = HashMap::new();
     for n in doc.descendants().filter(roxmltree::Node::is_element) {
-        let depth = n
-            .parent()
-            .and_then(|p| depths.get(&p.id()).copied())
-            .unwrap_or(0)
-            + 1;
-        if depth > MAX_DEPTH {
-            return Err(Error::Refused(format!(
-                "the SVG nests elements deeper than {MAX_DEPTH}"
-            )));
-        }
-        depths.insert(n.id(), depth);
         let name = n.tag_name();
         if name.namespace() == Some(SVG_NS) && !DRAWN.contains(&name.name()) {
             return Err(Error::Refused(format!(
@@ -278,17 +274,62 @@ impl<'a, 'input> Expansion<'a, 'input> {
     }
 }
 
+// roxmltree recurses once per nesting level while it parses, so depth is
+// bounded on the raw text first. The scan never counts fewer levels than
+// the parser reaches before its first error.
+fn nesting(text: &[u8]) -> usize {
+    let skip_to = |from: usize, end: &[u8]| {
+        text[from..]
+            .windows(end.len())
+            .position(|w| w == end)
+            .map_or(text.len(), |p| from + p + end.len())
+    };
+    let (mut i, mut depth, mut deepest) = (0, 0usize, 0);
+    while i < text.len() {
+        if text[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &text[i..];
+        if rest.starts_with(b"<!--") {
+            i = skip_to(i, b"-->");
+        } else if rest.starts_with(b"<![CDATA[") {
+            i = skip_to(i, b"]]>");
+        } else if rest.starts_with(b"<?") {
+            i = skip_to(i, b"?>");
+        } else if rest.starts_with(b"<!") {
+            i = skip_to(i, b">");
+        } else if rest.starts_with(b"</") {
+            depth = depth.saturating_sub(1);
+            i = skip_to(i, b">");
+        } else {
+            let mut quote = None;
+            let mut j = i + 1;
+            while j < text.len() {
+                match (quote, text[j]) {
+                    (None, q @ (b'"' | b'\'')) => quote = Some(q),
+                    (Some(q), c) if c == q => quote = None,
+                    (None, b'>') => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if text.get(j.wrapping_sub(1)) != Some(&b'/') {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            i = j + 1;
+        }
+    }
+    deepest
+}
+
 fn references(value: &str) -> impl Iterator<Item = &str> {
     let href = value.strip_prefix('#').into_iter();
     let urls = value.split("url(").skip(1).filter_map(|rest| {
         let rest = rest.trim_start().trim_start_matches(['\'', '"']);
         let id = rest.strip_prefix('#')?;
-        Some(
-            id.split(|c: char| matches!(c, ')' | '\'' | '"'))
-                .next()
-                .unwrap_or(id)
-                .trim(),
-        )
+        Some(id.split([')', '\'', '"']).next().unwrap_or(id).trim())
     });
     href.chain(urls)
 }
@@ -305,10 +346,8 @@ fn refuse_dashes(group: &usvg::Group) -> Result<(), Error> {
     for node in group.children() {
         match node {
             usvg::Node::Group(g) => refuse_dashes(g)?,
-            usvg::Node::Path(p) => {
-                if p.stroke().is_some_and(|s| s.dasharray().is_some()) {
-                    return Err(Error::Refused("a dashed stroke".into()));
-                }
+            usvg::Node::Path(p) if p.stroke().is_some_and(|s| s.dasharray().is_some()) => {
+                return Err(Error::Refused("a dashed stroke".into()));
             }
             _ => {}
         }

@@ -253,9 +253,12 @@ fn render(argv: &[String]) -> Result<(), String> {
     std::thread::spawn(move || {
         let _ = tx.send(draw(&args, stage));
     });
-    let picture = rx
-        .recv_timeout(RENDER_LIMIT)
-        .map_err(|_| format!("gave up after {}s of drawing", RENDER_LIMIT.as_secs()))??;
+    let picture = rx.recv_timeout(RENDER_LIMIT).map_err(|e| match e {
+        mpsc::RecvTimeoutError::Timeout => {
+            format!("gave up after {}s of drawing", RENDER_LIMIT.as_secs())
+        }
+        mpsc::RecvTimeoutError::Disconnected => "the drawing failed".to_owned(),
+    })??;
     let fail = |e: Error| format!("{}: {e}", out.display());
     match picture {
         Picture::Frame { panel, xrgb } => {
