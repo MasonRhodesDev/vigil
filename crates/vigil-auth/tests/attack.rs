@@ -1,4 +1,6 @@
+use std::collections::hash_map::RandomState;
 use std::fs::File;
+use std::hash::BuildHasher;
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
@@ -10,6 +12,7 @@ use std::time::Instant;
 use greetd_ipc::codec::SyncCodec;
 use greetd_ipc::{AuthMessageType, ErrorType, Request, Response};
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use vigil_auth::{AuthMachine, Prompt};
 use vigil_core::{AuthUi, UiMessage};
@@ -773,13 +776,31 @@ fn case(conforming: bool) -> impl Strategy<Value = Case> {
         )
 }
 
-fn attack(greetd: &Greetd, name: &str, conforming: bool, cases: u32) -> bool {
-    let started = Instant::now();
-    let mut runner = TestRunner::new(Config {
+fn runner(cases: u32, _seed: u64) -> TestRunner {
+    TestRunner::new(Config {
         cases,
         failure_persistence: None,
         ..Config::default()
-    });
+    })
+}
+
+fn replays(seed: u64) -> bool {
+    let draw = || {
+        let mut runner = runner(1, seed);
+        (0..20)
+            .map(|_| format!("{:?}", case(false).new_tree(&mut runner).unwrap().current()))
+            .collect::<Vec<_>>()
+    };
+    let held = draw() == draw();
+    if !held {
+        println!("attack: seed {seed} draws different cases on each run");
+    }
+    held
+}
+
+fn attack(greetd: &Greetd, name: &str, conforming: bool, cases: u32, seed: u64) -> bool {
+    let started = Instant::now();
+    let mut runner = runner(cases, seed);
     let outcome = runner.run(&case(conforming), |case| {
         let trace = drive(greetd, &case);
         check(&case, &trace).map_err(|why| TestCaseError::fail(format!("{why}\n{trace:#?}")))
@@ -896,9 +917,29 @@ fn main() {
         .ok()
         .and_then(|cases| cases.parse().ok())
         .unwrap_or(1500);
-    let held = replay(&greetd)
-        & attack(&greetd, "a greetd that follows the protocol", true, cases)
-        & attack(&greetd, "a greetd that answers anything", false, cases);
+    let seed = match std::env::var("VIGIL_ATTACK_SEED") {
+        Ok(seed) => seed
+            .parse()
+            .unwrap_or_else(|_| panic!("VIGIL_ATTACK_SEED is not a u64: {seed}")),
+        Err(_) => RandomState::new().hash_one(()),
+    };
+    println!("attack: seed {seed}; replay with VIGIL_ATTACK_SEED={seed}");
+    let held = replays(seed)
+        & replay(&greetd)
+        & attack(
+            &greetd,
+            "a greetd that follows the protocol",
+            true,
+            cases,
+            seed,
+        )
+        & attack(
+            &greetd,
+            "a greetd that answers anything",
+            false,
+            cases,
+            seed,
+        );
     drop(greetd);
     std::process::exit(i32::from(!held));
 }
