@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use vigil_auth::{AuthMachine, Prompt};
 use vigil_config::{FirstQuestion, State};
 
@@ -7,7 +9,16 @@ use crate::autologin;
 // a remembered question is matched word for word against what PAM asks.
 const MAX_QUESTION_BYTES: usize = 512;
 
-pub fn seed(auth: &mut AuthMachine, state: &State) {
+pub fn seed(auth: &mut AuthMachine, state: &State, path: &Path) {
+    if !state.unprompted_user.is_empty() {
+        // Off disk while the unasked sign-in is open, so a greeter that dies
+        // in it cannot open the user unasked again; success writes it back.
+        State {
+            unprompted_user: String::new(),
+            ..state.clone()
+        }
+        .store(path);
+    }
     auth.set_unprompted(Some(state.unprompted_user.clone()).filter(|user| !user.is_empty()));
     auth.set_first_questions(
         state
@@ -101,7 +112,7 @@ mod tests {
             auth.set_session(vec!["session".into()], Vec::new());
             let stored = State::load(&greetd.state_file());
             if let Some(state) = &stored {
-                seed(&mut auth, state);
+                seed(&mut auth, state, &greetd.state_file());
             }
             Self {
                 auth,

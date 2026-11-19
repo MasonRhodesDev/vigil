@@ -2163,7 +2163,7 @@ fn run() -> Result<i32, String> {
         None => remembered_user.clone(),
     });
     if let Some(state) = &stored {
-        signin::seed(&mut auth, state);
+        signin::seed(&mut auth, state, &config.sessions.state_file);
     }
     auth.set_session(
         session_list[initial_session].cmd.clone(),

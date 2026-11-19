@@ -864,7 +864,18 @@ pub struct State {
     pub auto_started_at: Option<u64>,
     pub auto_streak: u32,
     pub unprompted_user: String,
+    #[serde(deserialize_with = "complete_entries")]
     pub first_question: Vec<FirstQuestion>,
+}
+
+fn complete_entries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<FirstQuestion>, D::Error> {
+    let entries = Vec::<toml::Value>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| entry.try_into().ok())
+        .collect())
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
