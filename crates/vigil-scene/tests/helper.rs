@@ -266,6 +266,7 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
     assert_eq!(limit("Max open files"), ("3", "3"));
     assert_eq!(limit("Max core file size"), ("0", "0"));
     assert_eq!(limit("Max processes"), ("0", "0"));
+    assert_eq!(limit("Max file size"), ("268439552", "268439552"));
     let mut fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -275,4 +276,195 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
     child.kill().unwrap();
     child.wait().unwrap();
     drop(writer);
+}
+
+fn fake_helper(name: &str, script: &str) -> Helper {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("vigil-scene-fake-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    Helper::new(path, Duration::from_millis(300))
+}
+
+#[test]
+fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
+    let svg = mark();
+    let req = request(&svg, Layer::Logo);
+    let need = req.bytes().unwrap();
+    let cases: [(&str, String, fn(&Error) -> bool); 6] = [
+        (
+            "spins",
+            "while :; do :; done".into(),
+            |e| matches!(e, Error::Refused(m) if m.contains("deadline")),
+        ),
+        (
+            "signal",
+            "kill -9 $$".into(),
+            |e| matches!(e, Error::Refused(m) if m.contains("signal 9")),
+        ),
+        ("short", "printf abc".into(), |e| {
+            matches!(e, Error::Invalid(_))
+        }),
+        ("long", format!("printf '%0{}d' 0", need + 1), |e| {
+            matches!(e, Error::Invalid(_))
+        }),
+        (
+            "unknown",
+            "echo odd >&2; exit 77".into(),
+            |e| matches!(e, Error::Helper(m) if m.contains("77") && m.contains("odd")),
+        ),
+        (
+            "refuses",
+            "echo 'vigil-scene: no' >&2; exit 12".into(),
+            |e| *e == Error::Refused("no".into()),
+        ),
+    ];
+    for (name, script, want) in cases {
+        let helper = fake_helper(name, &script);
+        let mut out = vec![0u8; need];
+        let start = Instant::now();
+        let got = helper.draw(&req, &mut out);
+        assert!(
+            start.elapsed() < Duration::from_millis(300) + SLACK,
+            "{name}"
+        );
+        assert!(got.as_ref().is_err_and(want), "{name}: {got:?}");
+        assert!(out.iter().all(|&b| b == 0), "{name}: nothing written");
+    }
+    let exact = fake_helper("exact", &format!("printf '%0{need}d' 0"));
+    let mut out = vec![0u8; need];
+    exact.draw(&req, &mut out).unwrap();
+    assert!(out.iter().all(|&b| b == b'0'));
+}
+
+#[test]
+fn child_draws_with_sigchld_ignored() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    // SAFETY: SIG_IGN is a valid disposition, and this process runs this one
+    // test alone, so no other code relies on SIGCHLD.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+    }
+    let svg = mark();
+    let want = Plate::new(
+        &Scene::default(),
+        &Logo::svg(&svg).unwrap(),
+        (1920, 1080),
+        0,
+    )
+    .unwrap()
+    .logo_sprite()
+    .unwrap()
+    .rgba;
+    let mut out = vec![0u8; want.len()];
+    Helper::new(BIN, PATIENT)
+        .draw(&request(&svg, Layer::Logo), &mut out)
+        .unwrap();
+    assert!(out == want);
+    let hostile = br#"<svg xmlns="http://www.w3.org/2000/svg"><image href="/etc/passwd"/></svg>"#;
+    assert!(matches!(
+        Helper::new(BIN, PATIENT).draw(&request(hostile, Layer::Logo), &mut out),
+        Err(Error::Refused(_))
+    ));
+    let spin = fake_helper("spin-ignored", "while :; do :; done");
+    let start = Instant::now();
+    assert!(spin.draw(&request(&svg, Layer::Logo), &mut out).is_err());
+    assert!(start.elapsed() < Duration::from_millis(300) + SLACK);
+    assert_eq!(children(), Vec::<String>::new());
+}
+
+#[test]
+fn a_host_that_ignores_sigchld_still_gets_its_pixels() {
+    in_fresh_process("child_draws_with_sigchld_ignored", "1");
+}
+
+#[test]
+fn the_helper_dies_with_the_thread_that_started_it() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    let mut child = std::thread::spawn(move || {
+        let child = Command::new(BIN)
+            .args([
+                "mask",
+                "--format",
+                "svg",
+                "--edge",
+                "64",
+                "--deadline-ms",
+                "60000",
+            ])
+            .stdin(reader)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let status = format!("/proc/{}/status", child.id());
+        let start = Instant::now();
+        while !std::fs::read_to_string(&status)
+            .unwrap()
+            .contains("NoNewPrivs:\t1")
+        {
+            assert!(start.elapsed() < Duration::from_secs(10), "never confined");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        child
+    })
+    .join()
+    .unwrap();
+    let status = child.wait().unwrap();
+    drop(writer);
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+}
+
+#[test]
+fn a_raster_logo_draws_the_same_through_the_helper() {
+    use image::ImageEncoder;
+    let img = image::RgbaImage::from_fn(300, 200, |x, y| {
+        image::Rgba([0, 0, 0, if (x / 20 + y / 20) % 2 == 0 { 255 } else { 0 }])
+    });
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(img.as_raw(), 300, 200, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    let want = Logo::raster(&png).unwrap().mask(64).unwrap();
+    let got = Helper::new(BIN, PATIENT)
+        .mask(&png, Format::Raster, 64)
+        .unwrap();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn a_fifo_or_a_huge_spec_never_stalls_the_caller() {
+    let dir = std::env::temp_dir().join(format!("vigil-scene-fifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("logo.svg");
+    let _ = std::fs::remove_file(&fifo);
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    let start = Instant::now();
+    assert!(matches!(
+        vigil_scene::read_logo(&fifo),
+        Err(Error::Refused(_))
+    ));
+    assert_eq!(Scene::load(&fifo), Scene::default());
+    assert!(start.elapsed() < Duration::from_secs(1));
+
+    let deep = "[".repeat(1 << 20);
+    let mut req = request(&[], Layer::Bar);
+    req.svg = None;
+    req.spec = Some(deep.as_bytes());
+    let start = Instant::now();
+    assert!(matches!(req.place(), Err(Error::Invalid(_))));
+    assert!(start.elapsed() < Duration::from_secs(1));
 }
