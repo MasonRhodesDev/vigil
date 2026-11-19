@@ -492,13 +492,13 @@ impl OutputWindow {
             _ => return self.send_key(keysym, utf8, pressed),
         };
         let key = self.focus_key(keysym, utf8.as_deref());
+        let (focus, effect) = self.focus.step(&card, key);
         if repeat
-            && self.focus.settle(&card).stop != Stop::Field
+            && effect != Effect::Forward
             && !matches!(key, focus::Key::Tab | focus::Key::BackTab)
         {
             return;
         }
-        let (focus, effect) = self.focus.step(&card, key);
         self.focus = focus;
         let c = &self.component;
         let action = |action| Value::String(focus::action_name(action).into());
