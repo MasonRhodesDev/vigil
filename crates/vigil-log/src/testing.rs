@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{PipeReader, Write};
 use std::os::fd::AsRawFd;
@@ -5,13 +6,14 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy)]
 pub enum Stderr {
     DevFull,
     ReaderlessPipe,
     StalledPipe,
 }
 
-pub fn exit_code(binary: &str, args: &[&str], stderr: Stderr) -> Option<i32> {
+pub fn exit_code(binary: &str, args: &[impl AsRef<OsStr>], stderr: Stderr) -> Option<i32> {
     let mut _unread: Option<PipeReader> = None;
     let target: Stdio = match stderr {
         Stderr::DevFull => OpenOptions::new()

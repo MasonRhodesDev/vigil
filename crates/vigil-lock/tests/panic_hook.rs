@@ -2,6 +2,7 @@
 
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::ExitStatusExt as _;
+use vigil_log::testing::{Stderr, exit_code};
 
 #[test]
 fn main_installs_the_panic_hook_before_reading_its_arguments() {
@@ -19,4 +20,16 @@ fn main_installs_the_panic_hook_before_reading_its_arguments() {
     );
     assert!(stderr.contains("panic at "), "{stderr}");
     assert!(!stderr.contains("hunter2"), "{stderr}");
+}
+
+#[test]
+fn a_panic_exits_101_even_when_stderr_is_broken() {
+    let arg = std::ffi::OsStr::from_bytes(b"hunter2\xff");
+    for stderr in [Stderr::DevFull, Stderr::ReaderlessPipe, Stderr::StalledPipe] {
+        assert_eq!(
+            exit_code(env!("CARGO_BIN_EXE_vigil-lock"), &[arg], stderr),
+            Some(101),
+            "{stderr:?}"
+        );
+    }
 }
