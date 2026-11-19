@@ -252,9 +252,12 @@ impl Plate {
             .map(|l| glow_mask(l.alpha(), edge, ge, sigma))
             .unwrap_or_default();
 
-        let (x0, y0) = (g.glow_x.max(0) as usize, g.glow_y.max(0) as usize);
-        let x1 = ((g.glow_x + ge as i64).max(0) as usize).min(sw);
-        let y1 = ((g.glow_y + ge as i64).max(0) as usize).min(sh);
+        let span = |from: i64, side: usize| {
+            let end = from.saturating_add(ge as i64);
+            let side = side as i64;
+            (from.clamp(0, side) as usize, end.clamp(0, side) as usize)
+        };
+        let ((x0, x1), (y0, y1)) = (span(g.glow_x, sw), span(g.glow_y, sh));
         let size = (x1.saturating_sub(x0), y1.saturating_sub(y0));
         let rect = logo
             .as_ref()
@@ -409,5 +412,23 @@ impl Plate {
             let c = if x < fill { a } else { t };
             [c[0], c[1], c[2], 0xff]
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ground_only_plate_survives_a_scene_built_by_hand() {
+        let spec = Scene {
+            centre_frac: 1e300,
+            logo_frac: 1e300,
+            glow_mult: u32::MAX,
+            ..Scene::default()
+        };
+        let plate = Plate::ground_only(&spec, (64, 48), 1);
+        assert_eq!(plate.frame(0.5).len(), 64 * 48 * 4);
+        let _ = plate.bar_sprite(0.5);
     }
 }
