@@ -208,6 +208,48 @@ fn every_review_input_returns_by_its_deadline_in_bounded_memory() {
     }
 }
 
+#[test]
+fn child_draws_the_ground_in_place() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    let mut req = request(&[], Layer::Frame);
+    req.svg = None;
+    req.mode = (4096, 4096);
+    let mut out = vec![1u8; req.bytes().unwrap()];
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let base = peak_rss_kib();
+    Helper::new("/nonexistent", PATIENT)
+        .draw(&req, &mut out)
+        .unwrap();
+    let grew = peak_rss_kib().saturating_sub(base);
+    let result = out.len() as u64 / 1024;
+    println!("GROUND result {result} KiB, peak grew {grew} KiB");
+    assert!(
+        grew < result / 8,
+        "the peak grew {grew} KiB for {result} KiB"
+    );
+    let bg = Scene::default().bg;
+    assert_eq!(out[..4], [bg[2], bg[1], bg[0], 0xff]);
+    out.fill(7);
+    req.layer = Layer::Logo;
+    assert!(
+        Helper::new("/nonexistent", PATIENT)
+            .draw(&req, &mut out)
+            .is_err()
+    );
+    assert!(out.iter().all(|&b| b == 7), "nothing written on an error");
+}
+
+#[test]
+fn the_ground_is_drawn_into_the_callers_buffer() {
+    let out = in_fresh_process("child_draws_the_ground_in_place", "1");
+    println!(
+        "{}",
+        out.lines().find(|l| l.contains("GROUND")).unwrap_or("")
+    );
+}
+
 fn limits(pid: u32) -> Vec<(String, String, String)> {
     std::fs::read_to_string(format!("/proc/{pid}/limits"))
         .unwrap()
