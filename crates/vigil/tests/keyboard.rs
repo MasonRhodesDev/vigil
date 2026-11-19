@@ -947,3 +947,28 @@ fn ctrl_tab_never_reaches_the_field() {
 fn alt_tab_never_reaches_the_field() {
     tab_under_a_modifier_never_reaches_the_field(ALT_L);
 }
+
+#[test]
+fn a_ctrl_still_down_when_the_keyboard_leaves_stops_holding_back_letters() {
+    let mut g = Greeter::new();
+    g.type_text("secret");
+    g.event(CONTROL_L, None, true);
+    g.window.release_keys();
+    g.type_text("x");
+    g.tap(RETURN);
+    assert_eq!(g.take(), [Sent::Respond("secretx".into())]);
+}
+
+#[test]
+fn an_enter_still_down_when_the_keyboard_leaves_does_not_eat_the_next_one() {
+    let mut g = Greeter::new();
+    g.window.show_prompt("Code:", false);
+    g.type_text("a");
+    g.event(RETURN, Some("\r"), true);
+    g.window.release_keys();
+    g.tap(RETURN);
+    assert_eq!(
+        g.take(),
+        [Sent::Respond("a".into()), Sent::Respond("".into())]
+    );
+}

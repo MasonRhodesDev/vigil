@@ -390,6 +390,8 @@ impl OutputWindow {
         self.set_property("panel-visible", Value::Bool(visible));
     }
 
+    pub fn release_keys(&mut self) {}
+
     pub fn set_power_visible(&mut self, visible: bool) {
         self.set_optional_property("power-visible", Value::Bool(visible));
         if !visible {
