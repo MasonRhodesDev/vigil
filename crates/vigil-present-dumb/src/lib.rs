@@ -7,6 +7,7 @@ use smithay::reexports::drm::control::{Device as ControlDevice, framebuffer};
 use smithay::reexports::rustix;
 use smithay::utils::{Rectangle, Transform};
 use vigil_core::{BufferDamage, Canvas, Damage, FrameTarget, PresentError, Presenter};
+use vigil_present_kms::{CursorPlane, backend, present_error};
 
 const BPP: u32 = 32;
 const DEPTH: u32 = 24;
@@ -51,38 +52,66 @@ struct Slot {
     mapping: Mapping,
 }
 
-pub struct DumbBufferPresenter {
-    surface: DrmSurface,
-    slots: [Slot; 2],
-    damage: BufferDamage,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flip {
+    Modeset,
+    Page,
+}
+
+#[derive(Default)]
+struct Pacing {
     back: usize,
     modeset_done: bool,
     staged: bool,
     flip_pending: bool,
+}
+
+impl Pacing {
+    fn shown(&self) -> usize {
+        self.back ^ 1
+    }
+
+    fn frame_flip(&self) -> Option<Flip> {
+        (self.staged && !self.flip_pending).then_some(if self.modeset_done {
+            Flip::Page
+        } else {
+            Flip::Modeset
+        })
+    }
+
+    fn cursor_flip(&self, cursor_dirty: bool) -> bool {
+        cursor_dirty && self.modeset_done && !self.flip_pending
+    }
+
+    fn frame_flipped(&mut self) {
+        self.staged = false;
+        self.modeset_done = true;
+        self.flip_pending = true;
+        self.back ^= 1;
+    }
+
+    fn cursor_flipped(&mut self) {
+        self.flip_pending = true;
+    }
+
+    fn vblank(&mut self) {
+        self.flip_pending = false;
+    }
+
+    fn invalidate(&mut self) {
+        self.modeset_done = false;
+        self.flip_pending = false;
+    }
+}
+
+pub struct DumbBufferPresenter {
+    surface: DrmSurface,
+    slots: [Slot; 2],
+    damage: BufferDamage,
+    cursor: Option<CursorPlane>,
+    pacing: Pacing,
     width: u32,
     height: u32,
-}
-
-fn backend(e: impl std::fmt::Display) -> PresentError {
-    PresentError::Backend(e.to_string())
-}
-
-fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
-    use smithay::backend::drm::DrmError;
-    match e {
-        DrmError::DeviceInactive => PresentError::DeviceLost,
-        DrmError::Access(ref a)
-            if matches!(
-                rustix::io::Errno::from_io_error(&a.source),
-                Some(
-                    rustix::io::Errno::NODEV | rustix::io::Errno::ACCESS | rustix::io::Errno::PERM
-                )
-            ) =>
-        {
-            PresentError::DeviceLost
-        }
-        e => backend(e),
-    }
 }
 
 impl DumbBufferPresenter {
@@ -111,17 +140,33 @@ impl DumbBufferPresenter {
             surface,
             damage: BufferDamage::new(slots.len()),
             slots,
-            back: 0,
-            modeset_done: false,
-            staged: false,
-            flip_pending: false,
+            cursor: None,
+            pacing: Pacing::default(),
             width,
             height,
         })
     }
 
+    pub fn claim_cursor(&mut self, scale: f32, transform: u8) -> Result<(), String> {
+        let scene = if transform % 2 == 1 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        let cursor = CursorPlane::claim(&self.surface, scale, transform, scene)?;
+        let shown = [
+            self.plane_state(self.slots[0].fb, None),
+            cursor.state_at(Some((0, 0))),
+        ];
+        self.surface
+            .test_state(shown, !self.pacing.modeset_done)
+            .map_err(|e| format!("the driver refused the cursor plane: {e}"))?;
+        self.cursor = Some(cursor);
+        Ok(())
+    }
+
     fn damage_clips(&self) -> Option<PlaneDamageClips> {
-        let shown = self.damage.behind(self.back ^ 1);
+        let shown = self.damage.behind(self.pacing.shown());
         if *shown == Damage::Full {
             return None;
         }
@@ -162,6 +207,39 @@ impl DumbBufferPresenter {
             }),
         }
     }
+
+    fn submit(
+        &mut self,
+        flip: Flip,
+        fb: framebuffer::Handle,
+        clips: Option<&PlaneDamageClips>,
+    ) -> Result<(), PresentError> {
+        let send = |surface: &DrmSurface, states: Vec<PlaneState<'_>>| match flip {
+            Flip::Page => surface.page_flip(states, true),
+            Flip::Modeset => surface.commit(states, true),
+        };
+        let mut states = vec![self.plane_state(fb, clips)];
+        states.extend(self.cursor.as_ref().map(CursorPlane::state));
+        let Err(error) = send(&self.surface, states) else {
+            if let Some(cursor) = self.cursor.as_mut() {
+                cursor.flushed();
+            }
+            return Ok(());
+        };
+        let Some(cursor) = self.cursor.take() else {
+            return Err(present_error(error));
+        };
+        let without = vec![self.plane_state(fb, clips), cursor.state_at(None)];
+        if send(&self.surface, without).is_err() {
+            self.cursor = Some(cursor);
+            return Err(present_error(error));
+        }
+        eprintln!(
+            "vigil: crtc {:?}: giving up the cursor plane, a flip with it failed: {error}",
+            self.surface.crtc()
+        );
+        Ok(())
+    }
 }
 
 impl Presenter for DumbBufferPresenter {
@@ -170,28 +248,53 @@ impl Presenter for DumbBufferPresenter {
     }
 
     fn invalidate(&mut self) {
-        self.modeset_done = false;
-        self.flip_pending = false;
+        self.pacing.invalidate();
         self.damage.invalidate();
+        if let Some(cursor) = self.cursor.as_mut() {
+            cursor.invalidate();
+        }
     }
 
     fn vblank(&mut self) {
-        self.flip_pending = false;
+        self.pacing.vblank();
     }
 
     fn flip_pending(&self) -> bool {
-        self.flip_pending
+        self.pacing.flip_pending
     }
 
     fn crtc_id(&self) -> Option<u32> {
         Some(self.surface.crtc().into())
     }
 
+    fn has_cursor(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn set_cursor(&mut self, pos: Option<(i32, i32)>) -> bool {
+        let Some(cursor) = self.cursor.as_mut() else {
+            return false;
+        };
+        cursor.set(pos);
+        true
+    }
+
+    fn flush_cursor(&mut self) -> Result<bool, PresentError> {
+        let dirty = self.cursor.as_ref().is_some_and(CursorPlane::is_dirty);
+        if !self.pacing.cursor_flip(dirty) {
+            return Ok(false);
+        }
+        let shown = self.slots[self.pacing.shown()].fb;
+        self.submit(Flip::Page, shown, None)?;
+        self.pacing.cursor_flipped();
+        Ok(true)
+    }
+
     fn with_frame(
         &mut self,
         draw: &mut dyn FnMut(Canvas<'_>) -> bool,
     ) -> Result<bool, PresentError> {
-        if self.flip_pending {
+        if self.pacing.flip_pending {
             return Ok(false);
         }
         if !self.stage_frame(draw)? {
@@ -204,9 +307,10 @@ impl Presenter for DumbBufferPresenter {
         &mut self,
         draw: &mut dyn FnMut(Canvas<'_>) -> bool,
     ) -> Result<bool, PresentError> {
-        let slot = &mut self.slots[self.back];
+        let back = self.pacing.back;
+        let slot = &mut self.slots[back];
         let stride = slot.buffer.pitch() as usize;
-        let mut frame = self.damage.begin(self.back);
+        let mut frame = self.damage.begin(back);
         let drew = draw(Canvas::Cpu(FrameTarget {
             buffer: slot.mapping.bytes(),
             width: self.width,
@@ -214,29 +318,81 @@ impl Presenter for DumbBufferPresenter {
             stride,
             damage: Some(&mut frame),
         }));
-        self.damage.finish(self.back, frame, drew);
-        self.staged = drew;
+        self.damage.finish(back, frame, drew);
+        self.pacing.staged = drew;
         Ok(drew)
     }
 
     fn commit_staged(&mut self) -> Result<bool, PresentError> {
-        if !self.staged || self.flip_pending {
+        let Some(flip) = self.pacing.frame_flip() else {
             return Ok(false);
-        }
-        let fb = self.slots[self.back].fb;
-        let clips = self.modeset_done.then(|| self.damage_clips()).flatten();
-        let state = self.plane_state(fb, clips.as_ref());
-        let result = if self.modeset_done {
-            self.surface.page_flip([state], true)
-        } else {
-            self.surface.commit([state], true)
         };
-        result.map_err(present_error)?;
-
-        self.staged = false;
-        self.modeset_done = true;
-        self.flip_pending = true;
-        self.back ^= 1;
+        let fb = self.slots[self.pacing.back].fb;
+        let clips = (flip == Flip::Page).then(|| self.damage_clips()).flatten();
+        self.submit(flip, fb, clips.as_ref())?;
+        self.pacing.frame_flipped();
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn staged() -> Pacing {
+        Pacing {
+            staged: true,
+            ..Pacing::default()
+        }
+    }
+
+    #[test]
+    fn the_first_frame_is_a_modeset_and_later_frames_are_page_flips() {
+        let mut pacing = staged();
+        assert_eq!(pacing.frame_flip(), Some(Flip::Modeset));
+        pacing.frame_flipped();
+        pacing.vblank();
+        pacing.staged = true;
+        assert_eq!(pacing.frame_flip(), Some(Flip::Page));
+    }
+
+    #[test]
+    fn nothing_is_submitted_until_the_pending_flip_completes() {
+        let mut pacing = staged();
+        pacing.frame_flipped();
+        pacing.staged = true;
+        assert_eq!(pacing.frame_flip(), None);
+        assert!(!pacing.cursor_flip(true));
+        pacing.vblank();
+        assert_eq!(pacing.frame_flip(), Some(Flip::Page));
+        assert!(pacing.cursor_flip(true));
+        pacing.cursor_flipped();
+        assert_eq!(pacing.frame_flip(), None);
+        assert!(!pacing.cursor_flip(true));
+    }
+
+    #[test]
+    fn a_cursor_flip_needs_a_frame_on_screen_and_reuses_it() {
+        let mut pacing = staged();
+        assert!(!pacing.cursor_flip(true), "nothing is on screen yet");
+        let first = pacing.back;
+        pacing.frame_flipped();
+        pacing.vblank();
+        assert!(pacing.cursor_flip(true));
+        assert!(!pacing.cursor_flip(false), "a clean cursor needs no flip");
+        assert_eq!(pacing.shown(), first);
+        pacing.cursor_flipped();
+        assert_eq!(pacing.shown(), first, "a cursor flip swaps no buffers");
+        assert_ne!(pacing.back, first);
+    }
+
+    #[test]
+    fn invalidate_clears_the_gate_and_asks_for_a_modeset() {
+        let mut pacing = staged();
+        pacing.frame_flipped();
+        pacing.invalidate();
+        assert!(!pacing.cursor_flip(true));
+        pacing.staged = true;
+        assert_eq!(pacing.frame_flip(), Some(Flip::Modeset));
     }
 }

@@ -5171,6 +5171,7 @@ version = "0.4.3"
 dependencies = [
  "smithay",
  "vigil-core",
+ "vigil-present-kms",
 ]
 
 [[package]]

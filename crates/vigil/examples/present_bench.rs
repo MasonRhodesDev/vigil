@@ -257,7 +257,7 @@ impl Pointer {
     }
 }
 
-fn run(output: &Output, presents: usize, map: Map, platform: &VigilPlatform) {
+fn run(output: &Output, presents: usize, map: Map, in_frame: bool, platform: &VigilPlatform) {
     let theme = Theme::load_or_default(None);
     let component = theme.instantiate().expect("instantiate");
     let adapter = platform.claim_last_adapter().expect("adapter");
@@ -273,7 +273,7 @@ fn run(output: &Output, presents: usize, map: Map, platform: &VigilPlatform) {
     .expect("window");
     let scene = window.scene_size();
     window.set_panel_visible(true);
-    window.set_cursor_visible(true);
+    window.set_cursor_visible(in_frame);
     window.set_clock("13:37");
     window.apply_kit_tokens(&slint_kit::embedded_fallback("dark"));
     window.set_users(&["user".into()]);
@@ -349,6 +349,7 @@ fn run(output: &Output, presents: usize, map: Map, platform: &VigilPlatform) {
 fn main() {
     let mut presents = 120;
     let mut map = ("persistent", Map::Persistent);
+    let mut cursor = "frame";
     let mut only = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -367,15 +368,25 @@ fn main() {
                     _ => panic!("--map needs per-frame, per-frame-populated or persistent"),
                 };
             }
+            "--cursor" => {
+                cursor = match args.next().as_deref() {
+                    Some("frame") => "frame",
+                    Some("plane") => "plane",
+                    _ => panic!("--cursor needs frame or plane"),
+                };
+            }
             "--output" => only = Some(args.next().expect("--output needs a name")),
             other => panic!("unknown argument {other}"),
         }
     }
-    println!("present_bench map={} presents={presents}", map.0);
+    println!(
+        "present_bench map={} cursor={cursor} presents={presents}",
+        map.0
+    );
     let platform = VigilPlatform::install().expect("platform");
     for output in &OUTPUTS {
         if only.as_deref().is_none_or(|name| name == output.name) {
-            run(output, presents, map.1, &platform);
+            run(output, presents, map.1, cursor == "frame", &platform);
         }
     }
 }

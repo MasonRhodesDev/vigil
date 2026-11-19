@@ -231,6 +231,10 @@ pub trait Presenter {
         false
     }
 
+    fn flush_cursor(&mut self) -> Result<bool, PresentError> {
+        Ok(false)
+    }
+
     fn vblank(&mut self) {}
 
     fn flip_pending(&self) -> bool {

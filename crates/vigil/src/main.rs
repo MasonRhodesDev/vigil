@@ -980,7 +980,7 @@ impl App {
         } else {
             None
         };
-        let hw_cursor = gl.is_some();
+        let is_gl = gl.is_some();
 
         let (mut window, presenter) = match gl {
             Some(built) => {
@@ -991,7 +991,7 @@ impl App {
                 built
             }
             None => {
-                let presenter: Box<dyn Presenter> = match early {
+                let mut presenter = match early {
                     Some(Early {
                         presenter,
                         splash,
@@ -999,15 +999,26 @@ impl App {
                         shown,
                     }) => {
                         splash_slot = Some((splash, tag, shown));
-                        Box::new(presenter)
+                        presenter
                     }
                     None => {
                         let surface = surface_slot
                             .take()
                             .ok_or("DRM surface consumed by a failed GL attempt")?;
-                        Box::new(DumbBufferPresenter::new(surface).map_err(|e| e.to_string())?)
+                        DumbBufferPresenter::new(surface).map_err(|e| e.to_string())?
                     }
                 };
+                match presenter.claim_cursor(scale, transform) {
+                    Ok(()) => eprintln!(
+                        "vigil: {}: rendering in software (hardware cursor)",
+                        info.connector
+                    ),
+                    Err(why) => eprintln!(
+                        "vigil: {}: rendering in software (cursor drawn in the frame: {why})",
+                        info.connector
+                    ),
+                }
+                let presenter: Box<dyn Presenter> = Box::new(presenter);
                 self.platform.set_next_output(id);
                 let component = self.theme.as_ref().ok_or("theme not loaded")?.instantiate();
                 self.platform.clear_next_output();
@@ -1029,6 +1040,7 @@ impl App {
                 (window, presenter)
             }
         };
+        let hw_cursor = presenter.has_cursor();
         let (scene_width, scene_height) = window.scene_size();
 
         window.set_clock(&self.last_clock.1);
@@ -1076,7 +1088,7 @@ impl App {
             None => (
                 None,
                 None,
-                (self.debug_tags && !hw_cursor).then(|| {
+                (self.debug_tags && !is_gl).then(|| {
                     splash::Tag::new(
                         &self.scene,
                         &info.connector,
@@ -1329,6 +1341,7 @@ impl App {
                 connector,
                 ..
             } = entry;
+            presenter.set_cursor(None);
             let (Some(sp), Some(cover)) = (splash.as_ref(), cover.as_mut()) else {
                 continue;
             };
@@ -1800,8 +1813,10 @@ impl App {
         let _ = dirty;
         for (i, entry) in self.entries.iter_mut().enumerate() {
             let Entry {
+                id,
                 presenter,
                 window,
+                hw_cursor,
                 present_failures,
                 budget,
                 connector,
@@ -1812,6 +1827,15 @@ impl App {
                 scratch,
                 ..
             } = entry;
+            if *hw_cursor && !presenter.has_cursor() {
+                *hw_cursor = false;
+                window.set_cursor_visible(Some(*id) == self.panel);
+            }
+            if *hw_cursor {
+                let shown = Some(*id) == self.panel && cover.is_none();
+                let (px, py) = window.pointer();
+                presenter.set_cursor(shown.then_some((px as i32, py as i32)));
+            }
             let mut fade: Option<f32> = None;
             if let (Some(c), Some(phase)) = (cover.as_mut(), phase) {
                 match phase {
@@ -1864,6 +1888,16 @@ impl App {
             let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
             let started = Instant::now();
             if !window.scene_needs_present() {
+                match presenter.flush_cursor() {
+                    Ok(_) => {}
+                    Err(PresentError::DeviceLost) => dead.push(i),
+                    Err(e) => {
+                        if *present_failures % PRESENT_LOG_EVERY == 0 {
+                            eprintln!("vigil: cursor flip: {e} (retrying)");
+                        }
+                        *present_failures = present_failures.saturating_add(1);
+                    }
+                }
                 continue;
             }
             self.metrics.record_buffer_acquire();
