@@ -33,7 +33,11 @@ struct Span {
 
 impl Span {
     fn sized(output: &Geometry<'_>, placed: Placed, x: f64, y: f64) -> Self {
-        let scale = 1.0;
+        let scale = if output.scale.is_finite() && output.scale > 0.0 {
+            output.scale
+        } else {
+            1.0
+        };
         Self {
             id: output.id,
             connector: output.connector.to_owned(),
@@ -106,30 +110,42 @@ pub struct Row {
 
 impl Row {
     pub fn place(outputs: &[Geometry<'_>]) -> Self {
-        let profiled = outputs.iter().any(|output| output.position.is_some());
-        let mut next = 0;
         let mut row = Row::default();
+        let mut auto: Vec<&Geometry<'_>> = Vec::new();
         for output in outputs {
-            let (x, y) = if profiled {
-                output.position.unwrap_or((0, 0))
-            } else {
-                (next, 0)
+            let Some((x, y)) = output.position else {
+                auto.push(output);
+                continue;
             };
-            next += output.scene.0 as i32;
-            let placed = if output.position.is_some() {
-                Placed::Profile
-            } else {
-                Placed::Auto
-            };
-            let span = Span::sized(output, placed, f64::from(x), f64::from(y));
-            for under in row.spans.iter().filter(|under| under.overlaps(&span)) {
+            let span = Span::sized(output, Placed::Profile, f64::from(x), f64::from(y));
+            let (cx, cy) = span.centre();
+            if let Some(cover) = row.spans.iter().find(|placed| placed.contains(cx, cy)) {
                 row.overlaps.push(Overlap {
                     connector: span.connector.clone(),
-                    under: under.connector.clone(),
+                    under: cover.connector.clone(),
+                    moved: true,
+                });
+                auto.push(output);
+                continue;
+            }
+            for placed in row.spans.iter().filter(|placed| placed.overlaps(&span)) {
+                row.overlaps.push(Overlap {
+                    connector: span.connector.clone(),
+                    under: placed.connector.clone(),
                     moved: false,
                 });
             }
             row.spans.push(span);
+        }
+        auto.sort_by(|a, b| a.connector.cmp(b.connector).then(a.id.cmp(&b.id)));
+        for output in auto {
+            let right = row
+                .spans
+                .iter()
+                .map(|span| span.x + span.width)
+                .fold(0.0, f64::max);
+            row.spans
+                .push(Span::sized(output, Placed::Auto, right.ceil(), 0.0));
         }
         row
     }

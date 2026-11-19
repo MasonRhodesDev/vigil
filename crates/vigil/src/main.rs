@@ -1116,11 +1116,9 @@ impl App {
                 .position(|entry| entry.connector == origin.name)
         {
             self.panel = index;
-            let (width, height) = self.entries[index].window.scene_size();
-            self.cursor = self.row.clamp(
-                f64::from(origin.position.0) + f64::from(width) / 2.0,
-                f64::from(origin.position.1) + f64::from(height) / 2.0,
-            );
+            if let Some(centre) = self.row.centre(self.entries[index].id) {
+                self.cursor = centre;
+            }
         }
         self.apply_panel();
     }
