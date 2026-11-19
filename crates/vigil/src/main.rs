@@ -1286,7 +1286,7 @@ impl App {
             state.user = user.to_owned();
             state.session = self.sessions[self.selected_session].name.clone();
         }
-        state.unprompted_user = autologin::unprompted_user(self.auth.user(), self.auth.asked());
+        state.unprompted_user = autologin::unprompted_user(self.auth.user(), self.auth.spoke());
         state.store(&self.state_file);
         self.begin_leaving();
     }

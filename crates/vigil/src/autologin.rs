@@ -60,9 +60,9 @@ pub fn record_pause(prev: &State, streak: u32) -> State {
     }
 }
 
-pub fn unprompted_user(user: Option<&str>, asked: bool) -> String {
+pub fn unprompted_user(user: Option<&str>, spoke: bool) -> String {
     match user {
-        Some(user) if !asked => user.to_owned(),
+        Some(user) if !spoke => user.to_owned(),
         _ => String::new(),
     }
 }
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_sign_in_that_asked_nothing_names_an_unprompted_user() {
+    fn only_a_sign_in_in_which_pam_said_nothing_names_an_unprompted_user() {
         assert_eq!(unprompted_user(Some("alice"), false), "alice");
         assert_eq!(unprompted_user(Some("alice"), true), "");
         assert_eq!(unprompted_user(None, false), "");

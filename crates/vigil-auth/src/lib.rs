@@ -71,6 +71,7 @@ pub struct AuthMachine {
     fixed_user: bool,
     typed: bool,
     asked: bool,
+    spoke: bool,
     unprompted: Option<String>,
     first_question: Option<(String, Prompt)>,
     stage: String,
@@ -96,6 +97,7 @@ impl AuthMachine {
             fixed_user: false,
             typed: false,
             asked: false,
+            spoke: false,
             unprompted: None,
             first_question: None,
             stage: String::new(),
@@ -120,8 +122,8 @@ impl AuthMachine {
         self.unprompted.as_deref()
     }
 
-    pub fn asked(&self) -> bool {
-        self.asked
+    pub fn spoke(&self) -> bool {
+        self.spoke
     }
 
     pub fn user(&self) -> Option<&str> {
@@ -252,6 +254,7 @@ impl AuthMachine {
         };
         eprintln!("vigil: auth open user={}", self.logged_user());
         self.asked = false;
+        self.spoke = false;
         let response = self.transact(&Request::CreateSession { username: user }, ui)?;
         self.process_response(response, answer, ui)
     }
@@ -321,6 +324,17 @@ impl AuthMachine {
         }
     }
 
+    fn heard(&mut self) {
+        self.spoke = true;
+        if self.unprompted.is_some() && self.unprompted == self.user {
+            eprintln!(
+                "vigil: auth: PAM spoke to user={}; no longer opening unasked",
+                self.logged_user()
+            );
+            self.unprompted = None;
+        }
+    }
+
     fn fail(&mut self, ui: &mut dyn AuthUi, description: &str) {
         let text = self.show_error(ui, description);
         let _ = self.transact(&Request::CancelSession, ui);
@@ -348,13 +362,7 @@ impl AuthMachine {
                     if !std::mem::replace(&mut self.asked, true) {
                         self.first_question = self.user.clone().map(|user| (user, prompt.clone()));
                     }
-                    if self.unprompted.is_some() && self.unprompted == self.user {
-                        eprintln!(
-                            "vigil: auth: user={} was asked a question; no longer opening unasked",
-                            self.logged_user()
-                        );
-                        self.unprompted = None;
-                    }
+                    self.heard();
                     if let Some(answer) = answer.take().filter(|_| prompt.secret == offered.secret)
                     {
                         response = self.transact(
@@ -374,6 +382,7 @@ impl AuthMachine {
                     auth_message_type,
                     auth_message,
                 } => {
+                    self.heard();
                     match auth_message_type {
                         AuthMessageType::Info => ui.show_info(&auth_message),
                         AuthMessageType::Error => ui.show_error(&auth_message),
@@ -1414,7 +1423,7 @@ mod tests {
         let _ = machine.begin(Some("alice"), &mut ui);
         assert_eq!(sent(&requests), ["create alice", "start"]);
         assert!(machine.is_complete());
-        assert!(!machine.asked());
+        assert!(!machine.spoke());
     }
 
     #[test]
@@ -1480,7 +1489,7 @@ mod tests {
             Some(&&UiCall::Prompt("Password:".into(), true))
         );
         assert_eq!(machine.unprompted(), None);
-        assert!(machine.asked());
+        assert!(machine.spoke());
         let _ = machine.handle(UiMessage::Cancel, &mut ui);
         let _ = machine.select_user(Some("alice"), &mut ui);
         drop(machine);
@@ -1513,7 +1522,7 @@ mod tests {
             "a stack that speaks may go on to ask, so it is not opened unasked again"
         );
         assert!(
-            machine.asked(),
+            machine.spoke(),
             "a sign-in during which PAM said anything is not recorded as unprompted"
         );
     }
