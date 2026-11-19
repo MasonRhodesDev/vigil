@@ -437,6 +437,7 @@ struct Locker {
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
     auth: AuthTrack,
+    refusal: Refusal,
     conversation_losses: u32,
     login: Option<LoginSession>,
     login_rx: mpsc::Receiver<LoginEvent>,
@@ -478,11 +479,76 @@ fn forwarded_channel<T: Send + 'static>(
     (source_tx, app_rx)
 }
 
-// The field keeps a retry typed while the attempt was checked. The failure
-// hides it, and wiping it would turn the rest of the retry into a wrong password.
-fn show_failure(window: &mut OutputWindow, message: &str) {
-    window.show_error(message);
-    window.set_busy(false);
+struct LockUi<'a> {
+    entries: &'a mut [Entry],
+    snapshot: &'a mut UiSnapshot,
+}
+
+impl AuthUi for LockUi<'_> {
+    fn show_prompt(&mut self, text: &str, secret: bool) {
+        self.snapshot.on_prompt(text, secret);
+        for e in self.entries.iter_mut() {
+            e.window.show_prompt(text, secret);
+        }
+    }
+    fn reset_input(&mut self) {
+        for e in self.entries.iter_mut() {
+            e.window.reset_input();
+        }
+    }
+    fn show_info(&mut self, text: &str) {
+        self.snapshot.info = text.to_owned();
+        for e in self.entries.iter_mut() {
+            e.window.show_info(text);
+        }
+    }
+    fn show_error(&mut self, text: &str) {
+        self.snapshot.error = text.to_owned();
+        for e in self.entries.iter_mut() {
+            e.window.show_error(text);
+        }
+    }
+    fn set_busy(&mut self, busy: bool) {
+        self.snapshot.busy = busy;
+        for e in self.entries.iter_mut() {
+            e.window.set_busy(busy);
+        }
+    }
+}
+
+// The lock asks again as soon as an attempt fails, and a new question clears
+// the message line. As at the greeter, the refusal is shown again over that
+// question, and it stays until the user answers.
+#[derive(Default)]
+struct Refusal(Option<String>);
+
+impl Refusal {
+    // The field keeps a retry typed while the attempt was checked. The failure
+    // hides it, and wiping it would turn the rest of the retry into a wrong password.
+    fn show(&mut self, message: &str, ui: &mut dyn AuthUi) {
+        self.0 = Some(message.to_owned());
+        ui.show_error(message);
+        ui.set_busy(false);
+    }
+
+    fn relay(&self, event: AuthEvent, ui: &mut dyn AuthUi) -> Option<Result<(), AuthError>> {
+        match event {
+            AuthEvent::Prompt { text, secret } => {
+                ui.show_prompt(&text, secret);
+                if let Some(message) = &self.0 {
+                    ui.show_error(message);
+                }
+            }
+            AuthEvent::Info(text) => ui.show_info(&text),
+            AuthEvent::Error(text) => ui.show_error(&text),
+            AuthEvent::Done(result) => return Some(result),
+        }
+        None
+    }
+
+    fn answered(&mut self) {
+        self.0 = None;
+    }
 }
 
 #[cfg(test)]
@@ -574,6 +640,7 @@ impl Locker {
             caps_lock: false,
             queue: Rc::default(),
             auth: AuthTrack::new(),
+            refusal: Refusal::default(),
             conversation_losses: 0,
             login: LoginSession::connect(),
             login_rx,
@@ -648,23 +715,13 @@ impl Locker {
 
     fn pump_auth(&mut self) {
         for event in self.auth.drain() {
-            match event {
-                AuthEvent::Prompt { text, secret } => {
-                    self.snapshot.on_prompt(&text, secret);
-                    self.each_window(|w| w.show_prompt(&text, secret));
-                }
-                AuthEvent::Info(text) => {
-                    self.snapshot.info = text.clone();
-                    self.each_window(|w| w.show_info(&text));
-                }
-                AuthEvent::Error(text) => {
-                    self.snapshot.error = text.clone();
-                    self.each_window(|w| w.show_error(&text));
-                }
-                AuthEvent::Done(result) => {
-                    self.finish_attempt(result);
-                    return;
-                }
+            let mut ui = LockUi {
+                entries: &mut self.entries,
+                snapshot: &mut self.snapshot,
+            };
+            if let Some(result) = self.refusal.relay(event, &mut ui) {
+                self.finish_attempt(result);
+                return;
             }
         }
     }
@@ -708,9 +765,11 @@ impl Locker {
     }
 
     fn show_failure(&mut self, message: String) {
-        self.snapshot.error = message.clone();
-        self.snapshot.busy = false;
-        self.each_window(|window| show_failure(window, &message));
+        let mut ui = LockUi {
+            entries: &mut self.entries,
+            snapshot: &mut self.snapshot,
+        };
+        self.refusal.show(&message, &mut ui);
     }
 
     fn pump_ui(&mut self) {
@@ -720,8 +779,12 @@ impl Locker {
             match msg {
                 UiMessage::Respond(text) => {
                     if self.auth.respond(text) {
-                        self.snapshot.busy = true;
-                        self.each_window(|w| w.set_busy(true));
+                        self.refusal.answered();
+                        LockUi {
+                            entries: &mut self.entries,
+                            snapshot: &mut self.snapshot,
+                        }
+                        .set_busy(true);
                         self.conversation_losses = 0;
                     }
                 }
@@ -2229,7 +2292,7 @@ mod tests {
         key(&mut window, 0xffe9, None, true);
         tap(&mut window, 0xffc5, None);
         key(&mut window, 0xffe9, None, false);
-        show_failure(&mut window, "Authentication failure");
+        Refusal::default().show("Authentication failure", &mut window);
         window.show_prompt("Password", true);
         "aa".chars().for_each(|_| tap(&mut window, 0x61, Some("a")));
         assert!(
@@ -2250,6 +2313,143 @@ mod tests {
             [&Secret::from("aaaa"), &Secret::from("aaaa")],
             "the retry typed during the check is kept"
         );
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Shown {
+        Prompt(String),
+        Info(String),
+        Error(String),
+        Busy(bool),
+        Reset,
+    }
+
+    #[derive(Default)]
+    struct RecordingUi(Vec<Shown>);
+
+    impl AuthUi for RecordingUi {
+        fn show_prompt(&mut self, text: &str, _: bool) {
+            self.0.push(Shown::Prompt(text.into()));
+        }
+        fn reset_input(&mut self) {
+            self.0.push(Shown::Reset);
+        }
+        fn show_info(&mut self, text: &str) {
+            self.0.push(Shown::Info(text.into()));
+        }
+        fn show_error(&mut self, text: &str) {
+            self.0.push(Shown::Error(text.into()));
+        }
+        fn set_busy(&mut self, busy: bool) {
+            self.0.push(Shown::Busy(busy));
+        }
+    }
+
+    fn question(text: &str) -> AuthEvent {
+        AuthEvent::Prompt {
+            text: text.into(),
+            secret: true,
+        }
+    }
+
+    #[test]
+    fn a_refusal_stays_shown_over_the_question_that_restarts_the_attempt() {
+        let mut refusal = Refusal::default();
+        let mut ui = RecordingUi::default();
+        refusal.show("Incorrect password", &mut ui);
+        refusal.relay(AuthEvent::Info("2 tries left".into()), &mut ui);
+        refusal.relay(question("Password:"), &mut ui);
+        assert_eq!(
+            ui.0.last(),
+            Some(&Shown::Error("Incorrect password".into())),
+            "the re-ask hid the refusal: {:?}",
+            ui.0
+        );
+
+        refusal.relay(question("Password:"), &mut ui);
+        assert_eq!(
+            ui.0.last(),
+            Some(&Shown::Error("Incorrect password".into())),
+            "a reopened conversation hid a refusal the user has not answered: {:?}",
+            ui.0
+        );
+
+        refusal.answered();
+        ui.0.clear();
+        refusal.relay(question("Verification code:"), &mut ui);
+        assert_eq!(
+            ui.0,
+            [Shown::Prompt("Verification code:".into())],
+            "the refusal outlived the answer that followed it"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_drawn_after_the_re_ask_and_on_an_output_that_joins_later() {
+        const W: u32 = 1280;
+        const H: u32 = 800;
+        let platform = VigilPlatform::install().unwrap();
+        let window = || {
+            let component = Theme::load_or_default(None).instantiate().unwrap();
+            let adapter = platform.claim_last_adapter().unwrap();
+            let mut window = OutputWindow::new(OutputId(1), W, H, 1.0, adapter, component).unwrap();
+            window.set_panel_visible(true);
+            window
+        };
+        let frame = |window: &mut OutputWindow| {
+            std::thread::sleep(Duration::from_millis(400));
+            vigil_ui::advance_timers();
+            let mut buf = vec![0u8; (W * H * 4) as usize];
+            window.request_present();
+            window.render_if_needed(FrameTarget {
+                buffer: &mut buf,
+                width: W,
+                height: H,
+                stride: (W * 4) as usize,
+                damage: None,
+            });
+            buf
+        };
+        let row = |buf: &[u8], y: usize| buf[y * W as usize * 4..(y + 1) * W as usize * 4].to_vec();
+        let mut entries = vec![Entry {
+            id: OutputId(1),
+            connector: "TEST-1".into(),
+            description: String::new(),
+            window: window(),
+        }];
+        let mut snapshot = UiSnapshot::default();
+        let mut refusal = Refusal::default();
+        let mut ui = LockUi {
+            entries: &mut entries,
+            snapshot: &mut snapshot,
+        };
+        ui.show_prompt("Password", true);
+        let hint = frame(&mut ui.entries[0].window);
+        refusal.show("Incorrect password", &mut ui);
+        let refused = frame(&mut ui.entries[0].window);
+        let line: Vec<usize> = (0..H as usize)
+            .filter(|&y| row(&hint, y) != row(&refused, y))
+            .collect();
+        assert!(!line.is_empty(), "the refusal line is found");
+
+        refusal.relay(question("Password"), &mut ui);
+        let reasked = frame(&mut ui.entries[0].window);
+        for &y in &line {
+            assert!(
+                row(&reasked, y) == row(&refused, y),
+                "the re-ask replaced the refusal at row {y}"
+            );
+        }
+
+        let mut joined = window();
+        snapshot.apply(&mut joined);
+        let joined = frame(&mut joined);
+        for &y in &line {
+            assert!(
+                row(&joined, y) == row(&refused, y),
+                "an output that joined after the re-ask lost the refusal at row {y}"
+            );
+        }
     }
 
     #[test]
