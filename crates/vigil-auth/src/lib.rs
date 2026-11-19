@@ -741,6 +741,37 @@ mod tests {
         assert_eq!(shown(&ui), [&UiCall::Prompt("Password".into(), true)]);
     }
 
+    // Minimised from fuzz/artifacts/greetd_response: ee ff ff ff.
+    #[test]
+    fn a_reply_that_claims_four_gibibytes_is_refused_without_waiting_for_it() {
+        let Some(server) = FakeServer::spawn(|stream| {
+            assert_create(request(stream), "alice");
+            stream.write_all(&0xffff_ffee_u32.to_ne_bytes()).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(4)))
+                .unwrap();
+            let _ = stream.read(&mut [0]);
+        }) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let (done, outcome) = std::sync::mpsc::channel();
+        let greeter = thread::spawn(move || {
+            let mut ui = RecordingUi::default();
+            machine.select_user(Some("alice"), &mut ui).unwrap();
+            let result = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+            let _ = done.send(result.map_err(|error| error.to_string()));
+        });
+        let result = outcome
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the greeter froze waiting for a reply no greetd sends");
+        assert!(
+            result.unwrap_err().contains("exceeds"),
+            "an oversized reply must be refused by its size"
+        );
+        greeter.join().unwrap();
+    }
+
     #[test]
     fn pam_codes_become_short_messages() {
         assert_eq!(
