@@ -64,6 +64,14 @@ greetd command and never restarts greetd (that tears down a live
 session). Point hypridle / your lock keybind at `vigil-lock`. An example
 `vigil.toml` ships at `/usr/share/vigil/vigil.toml.example`.
 
+The splash logo is drawn by a confined helper process, `vigil-scene`, which
+the package installs at `/usr/lib/vigil/vigil-scene`. vigil and the scene
+library's C ABI look for it only there, never on `PATH`. A build that runs
+from a checkout, or a distro that installs it elsewhere, sets
+`VIGIL_SCENE_HELPER` to the helper's path when it builds vigil, for example
+`VIGIL_SCENE_HELPER=$PWD/target/release/vigil-scene cargo build --release`.
+Without the helper the splash draws the ground and no logo.
+
 For safe UI development inside a running session, use `vigil-sim login`,
 `vigil-sim lock`, or `vigil-sim warning`. The simulator has no PAM, logind,
 greetd, DRM, power, or session-lock dependencies; its hamburger drawer selects

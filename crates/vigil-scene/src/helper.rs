@@ -1,16 +1,17 @@
 use std::fs::File;
 use std::io::{Seek, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::Errno;
 use rustix::process::{
-    Pid, PidfdFlags, Resource, Rlimit, Signal, getrlimit, pidfd_open,
+    Pid, PidfdFlags, Resource, Rlimit, Signal, getrlimit, pidfd_open, pidfd_send_signal,
     set_parent_process_death_signal, setrlimit,
 };
 
@@ -147,34 +148,58 @@ impl Helper {
             .stderr(stderr.try_clone().map_err(io)?)
             .spawn()
             .map_err(|e| Error::Helper(format!("cannot run {}: {e}", self.path.display())))?;
-        let exited = wait(&child, by);
-        if !matches!(exited, Ok(true)) {
+        // A host that ignores SIGCHLD has the kernel reap the helper as it
+        // exits, which loses its status and can beat pidfd_open.
+        let watch = |e: Errno| Error::Helper(format!("cannot watch the helper: {e}"));
+        let exited = match pidfd_open(Pid::from_child(&child), PidfdFlags::empty()) {
+            Err(Errno::SRCH) => Ok(true),
+            Err(e) => Err(watch(e)),
+            Ok(pidfd) => {
+                let exited = wait(&pidfd, by);
+                if !matches!(exited, Ok(true)) {
+                    let _ = pidfd_send_signal(&pidfd, Signal::KILL);
+                }
+                exited
+            }
+        };
+        if exited.is_err() {
             let _ = child.kill();
         }
-        let status = child.wait().map_err(io)?;
+        let status = match child.wait() {
+            Ok(status) => Some(status),
+            Err(e) if e.raw_os_error() == Some(Errno::CHILD.raw_os_error()) => None,
+            Err(e) => return Err(io(e)),
+        };
         if !exited? {
             return Err(Error::Refused(format!(
                 "the helper was stopped at its {} ms deadline",
                 self.deadline.as_millis()
             )));
         }
-        match status.code() {
-            Some(0) => {
-                let len = stdout.metadata().map_err(io)?.len();
-                if len != out.len() as u64 {
-                    return Err(Error::Invalid(format!(
-                        "the helper wrote {len} bytes, not {}",
-                        out.len()
-                    )));
-                }
-                stdout.read_exact_at(out, 0).map_err(io)
+        match status.map(|s| (s.code(), s.signal())) {
+            Some((Some(0), _)) => {}
+            Some((Some(code), _)) => return Err(Error::from_exit(code, message(&stderr))),
+            Some((None, signal)) => {
+                return Err(Error::Refused(format!(
+                    "the helper was killed by signal {}",
+                    signal.unwrap_or(0)
+                )));
             }
-            Some(code) => Err(Error::from_exit(code, message(&stderr))),
-            None => Err(Error::Refused(format!(
-                "the helper was killed by signal {}",
-                status.signal().unwrap_or(0)
-            ))),
+            None => {
+                let why = message(&stderr);
+                if !why.is_empty() {
+                    return Err(Error::Refused(why));
+                }
+            }
         }
+        let len = stdout.metadata().map_err(io)?.len();
+        if len != out.len() as u64 {
+            return Err(Error::Invalid(format!(
+                "the helper wrote {len} bytes, not {}",
+                out.len()
+            )));
+        }
+        stdout.read_exact_at(out, 0).map_err(io)
     }
 }
 
@@ -188,9 +213,7 @@ fn memfd(name: &str) -> Result<File, Error> {
         .map_err(|e| Error::Io(format!("memfd: {e}")))
 }
 
-fn wait(child: &Child, by: Instant) -> Result<bool, Error> {
-    let watch = |e: Errno| Error::Helper(format!("cannot watch the helper: {e}"));
-    let pidfd = pidfd_open(Pid::from_child(child), PidfdFlags::empty()).map_err(watch)?;
+fn wait(pidfd: &OwnedFd, by: Instant) -> Result<bool, Error> {
     loop {
         let left = by.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -198,10 +221,10 @@ fn wait(child: &Child, by: Instant) -> Result<bool, Error> {
         }
         let left = Timespec::try_from(left)
             .map_err(|_| Error::Helper("the deadline is out of range".into()))?;
-        match poll(&mut [PollFd::new(&pidfd, PollFlags::IN)], Some(&left)) {
+        match poll(&mut [PollFd::new(pidfd, PollFlags::IN)], Some(&left)) {
             Ok(0) | Err(Errno::INTR) => {}
             Ok(_) => return Ok(true),
-            Err(e) => return Err(watch(e)),
+            Err(e) => return Err(Error::Helper(format!("cannot watch the helper: {e}"))),
         }
     }
 }
