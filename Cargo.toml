@@ -9,6 +9,34 @@ license = "GPL-3.0-only"
 publish = false
 repository = "https://github.com/MasonRhodesDev/vigil"
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+missing_safety_doc = "deny"
+multiple_unsafe_ops_per_block = "deny"
+mem_forget = "deny"
+as_ptr_cast_mut = "deny"
+cast_ptr_alignment = "deny"
+ptr_as_ptr = "deny"
+ptr_cast_constness = "deny"
+borrow_as_ptr = "deny"
+transmute_ptr_to_ptr = "deny"
+transmute_undefined_repr = "deny"
+transmutes_expressible_as_ptr_casts = "deny"
+uninit_vec = "deny"
+uninit_assumed_init = "deny"
+mem_replace_with_uninit = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
 [workspace.dependencies]
 vigil-core = { path = "crates/vigil-core" }
 vigil-config = { path = "crates/vigil-config" }

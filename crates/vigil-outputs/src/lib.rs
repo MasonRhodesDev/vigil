@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::OnceLock;

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 use std::env;
 use std::os::unix::net::UnixStream;

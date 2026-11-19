@@ -38,6 +38,7 @@ impl Platform for GlPlatform {
     }
 }
 
+#[allow(unsafe_code)]
 fn main() {
     let node = std::env::var("VIGIL_GL_NODE").unwrap_or_else(|_| "/dev/dri/card0".into());
     let context = Rc::new(GlContext::open(std::path::Path::new(&node)).expect("gl context"));
@@ -64,6 +65,7 @@ fn main() {
     instance.show().expect("show");
     window.render().expect("render");
 
+    // SAFETY: window.render() above swapped this surface exactly once.
     let bo = unsafe { gbm.lock_front_buffer() }.expect("lock front buffer");
     let row = bo
         .map(0, H / 2, W, 1, |mapped| {
@@ -88,6 +90,7 @@ fn main() {
     println!("LARGE TEXT OK");
 }
 
+#[allow(unsafe_code)]
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -95,6 +98,8 @@ fn spin_on<F: std::future::Future>(future: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: every vtable entry ignores the null data pointer, and clone hands
+    // back the same no-op waker.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);

@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -660,7 +662,11 @@ impl AuthUi for OutputWindow {
 #[repr(transparent)]
 struct Xrgb8888(u32);
 
+// SAFETY: a transparent u32, so all zero bytes is a valid value.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Zeroable for Xrgb8888 {}
+// SAFETY: a transparent Copy u32, so it has no padding and every bit pattern is valid.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Pod for Xrgb8888 {}
 
 impl TargetPixel for Xrgb8888 {
@@ -681,7 +687,11 @@ impl TargetPixel for Xrgb8888 {
 #[repr(transparent)]
 struct Argb8888(u32);
 
+// SAFETY: a transparent u32, so all zero bytes is a valid value.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Zeroable for Argb8888 {}
+// SAFETY: a transparent Copy u32, so it has no padding and every bit pattern is valid.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Pod for Argb8888 {}
 
 impl TargetPixel for Argb8888 {

@@ -39,3 +39,6 @@ greetd_ipc.workspace = true
 [features]
 default = ["gl"]
 gl = ["dep:vigil-gl", "dep:vigil-present-gl"]
+
+[lints]
+workspace = true

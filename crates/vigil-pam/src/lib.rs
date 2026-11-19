@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

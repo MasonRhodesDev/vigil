@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -119,8 +121,11 @@ impl InputSystem {
     }
 }
 
+#[allow(unsafe_code)]
 impl std::os::fd::AsFd for InputSystem {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: the fd belongs to the libinput context `self` owns, so it
+        // stays open for the borrow of `self`.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }

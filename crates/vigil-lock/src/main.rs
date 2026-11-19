@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -578,6 +580,7 @@ impl Locker {
         });
     }
 
+    #[allow(unsafe_code)]
     fn signal_locked(&mut self) {
         eprintln!("vigil-lock: session locked");
         let joiners = {
@@ -591,6 +594,8 @@ impl Locker {
         if let Some(fd) = self.ready_fd.take() {
             use std::io::Write;
             use std::os::fd::FromRawFd;
+            // SAFETY: the fd came open from the parent through --ready-fd, nothing
+            // else in this process owns it, and take() makes this the one conversion.
             let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
             let _ = ready.write_all(b"1");
         }
@@ -750,11 +755,14 @@ impl Locker {
         self.each_window(|w| apply_kit_tokens_from_disk(w, mode));
     }
 
+    #[allow(unsafe_code)]
     fn detach_auth(&mut self) {
         self.auth.detach();
         self.unlocked = true;
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(5));
+            // SAFETY: _exit takes no pointers and ends the process without
+            // running destructors, which an unlocked daemon no longer needs.
             unsafe { libc::_exit(0) };
         });
     }
@@ -1104,23 +1112,36 @@ impl LockSession for Locker {
     }
 }
 
+#[allow(unsafe_code)]
 fn clock_text(format: &str) -> String {
     let Ok(fmt) = std::ffi::CString::new(format) else {
         return String::new();
     };
-    unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&now, &mut tm).is_null() {
-            return String::new();
-        }
-        let mut buf = vec![0_u8; 256];
-        let written = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), fmt.as_ptr(), &tm);
-        buf.truncate(written);
-        String::from_utf8(buf).unwrap_or_default()
+    // SAFETY: time accepts a null output pointer.
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    // SAFETY: tm is integers and a nullable tm_zone pointer, all valid when zero.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are live locals of the right types, and localtime_r
+    // is the reentrant form.
+    if unsafe { libc::localtime_r(&raw const now, &raw mut tm) }.is_null() {
+        return String::new();
     }
+    let mut buf = vec![0_u8; 256];
+    // SAFETY: strftime writes at most buf.len() bytes into buf, fmt is NUL
+    // terminated, and localtime_r filled tm.
+    let written = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            fmt.as_ptr(),
+            &raw const tm,
+        )
+    };
+    buf.truncate(written);
+    String::from_utf8(buf).unwrap_or_default()
 }
 
+#[allow(unsafe_code)]
 fn detach_and_wait_for_lock() -> ! {
     use std::io::Read;
     use std::os::fd::OwnedFd;
@@ -1137,15 +1158,17 @@ fn detach_and_wait_for_lock() -> ! {
             .args(["--ready-fd", "1"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(OwnedFd::from(child_end)));
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
+        let detach = || {
+            // SAFETY: setsid takes no arguments and moves only this child.
+            if unsafe { libc::setsid() } == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        // SAFETY: the hook runs between fork and exec, allocates nothing, and
+        // calls only setsid and errno reads, which are async-signal-safe.
+        unsafe { command.pre_exec(detach) };
         let mut child = command.spawn().map_err(|e| format!("spawn locker: {e}"))?;
         drop(command);
         let mut byte = [0u8; 1];
@@ -1284,9 +1307,12 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
     Ok((LockIpcSocket { path }, state))
 }
 
+#[allow(unsafe_code)]
 fn signal_ready_fd(ready_fd: Option<i32>) {
     if let Some(fd) = ready_fd {
         use std::os::fd::FromRawFd;
+        // SAFETY: the fd came open from the parent through --ready-fd, nothing
+        // else in this process owns it, and the Option is consumed here.
         let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
         let _ = ready.write_all(b"1");
     }

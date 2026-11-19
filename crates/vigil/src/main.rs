@@ -1,5 +1,8 @@
+#![deny(unsafe_code)]
+
 mod autologin;
 mod budget;
+#[allow(unsafe_code)]
 mod hold;
 mod keys;
 mod layout;

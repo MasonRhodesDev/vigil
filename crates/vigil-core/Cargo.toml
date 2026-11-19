@@ -9,3 +9,6 @@ repository.workspace = true
 
 [dependencies]
 monitor-profiles.workspace = true
+
+[lints]
+workspace = true

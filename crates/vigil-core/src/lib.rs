@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod damage;
 
 pub use damage::{BufferDamage, Damage, FrameDamage, Rect, next_frame_serial};

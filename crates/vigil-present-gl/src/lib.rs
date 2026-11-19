@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::rc::Rc;
 
 use smithay::backend::allocator::gbm::GbmBuffer;
@@ -171,6 +173,7 @@ impl Presenter for GbmPresenter {
         true
     }
 
+    #[allow(unsafe_code)]
     fn with_frame(
         &mut self,
         draw: &mut dyn FnMut(Canvas<'_>) -> bool,
@@ -202,6 +205,8 @@ impl Presenter for GbmPresenter {
             return Ok(true);
         }
 
+        // SAFETY: `drew` means femtovg rendered and swapped this surface once,
+        // and flip_pending blocks a second lock until the flip returns the buffer.
         let bo = unsafe { self.gbm.lock_front_buffer() }.map_err(backend)?;
         let buffer = GbmBuffer::from_bo(bo, true);
         let fb = framebuffer_from_bo(&self.drm, &buffer, false).map_err(backend)?;
