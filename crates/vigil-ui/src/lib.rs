@@ -817,6 +817,17 @@ impl OutputWindow {
                 .set_global_property("Theme", name, color.into());
         }
         self.set_optional_property("accent-color", tokens.get("primary").into());
+        let tone = |name| match self.component.get_global_property("Theme", name) {
+            Ok(Value::Brush(brush)) => Some(brush.color()),
+            _ => None,
+        };
+        if let (Some(fg), Some(bg)) = (tone("fg"), tone("page-bg")) {
+            let _ = self.component.set_global_property(
+                "FocusTones",
+                "fallback",
+                Value::Bool(contrast(fg, bg) < 9.0),
+            );
+        }
         self.touch();
     }
 
@@ -929,6 +940,22 @@ impl TargetPixel for Argb8888 {
     fn background() -> Self {
         Self(0)
     }
+}
+
+fn contrast(a: Color, b: Color) -> f64 {
+    let luminance = |color: Color| {
+        let linear = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.red()) + 0.7152 * linear(color.green()) + 0.0722 * linear(color.blue())
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 fn pointer_button(button: u32) -> PointerEventButton {

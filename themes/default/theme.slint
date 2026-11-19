@@ -4,6 +4,13 @@ import { KitTitle, KitMuted, KitLabel } from "ui/typography.slint";
 
 export { Theme }
 
+// vigil sets fallback when a kit puts Theme.fg and Theme.page-bg under 9:1.
+export global FocusTones {
+    in-out property <bool> fallback;
+    out property <color> line: self.fallback ? #ffffff : Theme.fg;
+    out property <color> edge: self.fallback ? #000000 : Theme.page-bg;
+}
+
 component FocusRing {
     in property <length> radius;
     width: 100%;
@@ -16,7 +23,7 @@ component FocusRing {
         height: root.height + 10px;
         border-radius: root.radius + 5px;
         border-width: 1px;
-        border-color: Theme.page-bg;
+        border-color: FocusTones.edge;
 
         Rectangle {
             x: 1px;
@@ -25,7 +32,7 @@ component FocusRing {
             height: parent.height - 2px;
             border-radius: root.radius + 4px;
             border-width: 2px;
-            border-color: Theme.fg;
+            border-color: FocusTones.line;
         }
         Rectangle {
             x: 3px;
@@ -34,7 +41,7 @@ component FocusRing {
             height: parent.height - 6px;
             border-radius: root.radius + 2px;
             border-width: 1px;
-            border-color: Theme.page-bg;
+            border-color: FocusTones.edge;
         }
     }
 }
