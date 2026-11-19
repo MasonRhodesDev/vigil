@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use vigil_scene::{Error, Logo, MAX_EDGE};
+use vigil_scene::{Error, Logo, MAX_EDGE, Plate, Scene};
 
 const OPEN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">"#;
 const CHILD: &str = "VIGIL_SCENE_BUDGET_CHILD";
@@ -205,5 +205,28 @@ fn the_largest_accepted_inputs_draw_quickly_in_bounded_memory() {
         println!("{what}: {n} accepted, drawn at {MAX_EDGE} in {took:?}, peak {kib} KiB");
         assert!(took < Duration::from_secs(4), "{what} x{n}: {took:?}");
         assert!(kib < 512 * 1024, "{what} x{n}: peak {kib} KiB");
+    }
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "timed; run with --release")]
+fn the_reviews_glow_specs_draw_quickly() {
+    let mark =
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mark.svg"))
+            .unwrap();
+    let logo = Logo::svg(&mark).unwrap();
+    for spec in [
+        r#"{"version":2,"geometry":{"glow_blur_div":1,"glow_mult":2}}"#,
+        r#"{"version":2,"geometry":{"glow_blur_div":1,"glow_mult":2,"logo_frac":0.9}}"#,
+        r#"{"version":2,"geometry":{"logo_frac":0.9}}"#,
+    ] {
+        let scene = Scene::parse(spec).unwrap();
+        let start = Instant::now();
+        let plate = Plate::new(&scene, &logo, (4096, 2160), 0).unwrap();
+        let frame = plate.frame(0.42);
+        let took = start.elapsed();
+        println!("{spec}: {took:?}");
+        assert_eq!(frame.len(), 4096 * 2160 * 4);
+        assert!(took < Duration::from_secs(2), "{spec}: {took:?}");
     }
 }

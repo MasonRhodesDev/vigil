@@ -257,3 +257,95 @@ fn c_program_gets_the_same_pixels_through_the_header() {
     let plate = Plate::new(&Scene::default(), &logo, (2160, 3840), 1).unwrap();
     assert!(std::fs::read(&pixels).unwrap() == plate.logo_sprite().unwrap().rgba);
 }
+
+const LAYERS: [u32; 4] = [
+    VIGIL_SCENE_LAYER_FRAME,
+    VIGIL_SCENE_LAYER_LOGO,
+    VIGIL_SCENE_LAYER_GLOW,
+    VIGIL_SCENE_LAYER_BAR,
+];
+
+fn with_spec(svg: &[u8], spec: &[u8], layer: u32) -> i32 {
+    let mut req = request(svg, layer);
+    req.spec_json = spec.as_ptr();
+    req.spec_len = spec.len();
+    render(&req, &mut []).0
+}
+
+#[test]
+fn the_reviews_scene_specs_are_refused_not_drawn() {
+    let svg = mark();
+    for centre in ["1e18", "1e300", "-1e300"] {
+        let spec = format!(r#"{{"version":2,"geometry":{{"centre_frac_of_h":{centre}}}}}"#);
+        for layer in LAYERS {
+            assert_eq!(
+                with_spec(&svg, spec.as_bytes(), layer),
+                VIGIL_SCENE_ERR_REFUSED,
+                "centre {centre}, layer {layer}"
+            );
+        }
+    }
+    let bar = br#"{"version":2,"ref_short_side":16384,"geometry":{"logo_frac":0.01,"bar_w_frac":1,"bar_h_frac":1}}"#;
+    assert_eq!(
+        with_spec(&svg, bar, VIGIL_SCENE_LAYER_BAR),
+        VIGIL_SCENE_ERR_TOO_LARGE
+    );
+    for spec in [
+        r#"{"version":2,"geometry":{"logo_frac":0}}"#,
+        r#"{"version":2,"geometry":{"gap_frac":-1}}"#,
+        r#"{"version":2,"geometry":{"glow_mult":0}}"#,
+        r#"{"version":2,"motion":{"in_s":1e300}}"#,
+        r#"{"version":2,"ref_short_side":16385}"#,
+    ] {
+        assert_eq!(
+            with_spec(&svg, spec.as_bytes(), VIGIL_SCENE_LAYER_FRAME),
+            VIGIL_SCENE_ERR_REFUSED,
+            "{spec}"
+        );
+    }
+}
+
+#[test]
+fn a_size_query_places_what_a_render_draws() {
+    let svg = mark();
+    for transform in 0..4 {
+        for layer in LAYERS {
+            let mut req = request(&svg, layer);
+            req.transform = transform;
+            req.value = 0.5;
+            let (rc, query) = render(&req, &mut []);
+            assert_eq!(rc, VIGIL_SCENE_OK);
+            let mut out = vec![0u8; query.stride * query.height as usize];
+            let (rc, drawn) = render(&req, &mut out);
+            assert_eq!(rc, VIGIL_SCENE_OK);
+            assert_eq!(query, drawn, "layer {layer}, transform {transform}");
+        }
+    }
+}
+
+#[test]
+fn a_size_query_does_not_draw() {
+    let svg = mark();
+    let mut small = request(&svg, VIGIL_SCENE_LAYER_FRAME);
+    small.mode_width = 640;
+    small.mode_height = 480;
+    let (rc, at) = render(&small, &mut []);
+    assert_eq!(rc, VIGIL_SCENE_OK);
+    let mut out = vec![0u8; at.stride * at.height as usize];
+    let start = std::time::Instant::now();
+    assert_eq!(render(&small, &mut out).0, VIGIL_SCENE_OK);
+    let drawing_small = start.elapsed();
+
+    let mut huge = request(&svg, VIGIL_SCENE_LAYER_FRAME);
+    huge.mode_width = 8192;
+    huge.mode_height = 8192;
+    let start = std::time::Instant::now();
+    let (rc, at) = render(&huge, &mut []);
+    let querying_huge = start.elapsed();
+    assert_eq!(rc, VIGIL_SCENE_OK);
+    assert_eq!((at.width, at.height, at.stride), (8192, 8192, 8192 * 4));
+    assert!(
+        querying_huge < drawing_small,
+        "a size query for 8192x8192 took {querying_huge:?}, drawing 640x480 took {drawing_small:?}"
+    );
+}
