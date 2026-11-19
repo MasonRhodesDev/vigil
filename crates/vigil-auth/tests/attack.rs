@@ -920,7 +920,6 @@ fn replay(greetd: &Greetd) -> bool {
 }
 
 fn main() {
-    vigil_secret::exit_on_panic();
     if std::env::var_os(JOURNAL).is_none() {
         supervise();
     }
