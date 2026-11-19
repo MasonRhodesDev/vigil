@@ -100,16 +100,21 @@ pub fn exit_on_panic() {
 }
 
 /// For a process about to install a seccomp filter that allows little beyond write(2) and
-/// exit. From here on, a panic writes its place to stderr in one write(2) and exits with
-/// `status`, because `say!` makes calls such a filter kills. SIGSEGV and SIGBUS get their
-/// default action, so a fault ends the process by its own signal rather than in std's handler,
-/// whose sigaction the filter also kills. A stack overflow then dies of SIGSEGV unannounced.
-pub fn crash_plainly(status: u8) -> std::io::Result<()> {
+/// exit. SIGSEGV and SIGBUS get their default action, so a fault ends the process by its own
+/// signal rather than in std's handler, whose sigaction the filter kills. A stack overflow then
+/// dies of SIGSEGV unannounced. Call it before the filter goes on.
+pub fn die_of_faults() -> std::io::Result<()> {
     for signal in [libc::SIGSEGV, libc::SIGBUS] {
         default_action(signal)?;
     }
-    PLAIN_EXIT.store(status.into(), std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// For a process whose seccomp filter is on. From here on, a panic writes its place to stderr
+/// in one write(2) and exits with `status`, because `say!` makes calls such a filter kills.
+/// Call it only once the filter is on, so a panic while installing it still exits 101.
+pub fn crash_plainly(status: u8) {
+    PLAIN_EXIT.store(status.into(), std::sync::atomic::Ordering::Relaxed);
 }
 
 fn report_plainly(at: Option<&std::panic::Location<'_>>) {
@@ -218,7 +223,7 @@ mod tests {
     #[test]
     fn a_plain_panic_exits_with_its_status_and_names_only_the_place() {
         if in_child() {
-            crash_plainly(12).unwrap();
+            crash_plainly(12);
             let _ = std::thread::spawn(|| panic!("hunter2")).join();
             std::process::exit(0);
         }

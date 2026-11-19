@@ -81,6 +81,9 @@ fn crash_as_helper() -> ! {
     vigil_secret::exit_on_panic();
     let mut act = String::new();
     std::io::stdin().read_to_string(&mut act).unwrap();
+    if act == "unsynced" {
+        hold_another_filter();
+    }
     confine(Duration::from_secs(5), 0).unwrap();
     lock_down().unwrap();
     match act.as_str() {
@@ -92,9 +95,38 @@ fn crash_as_helper() -> ! {
             let _ = unsafe { std::ptr::read_volatile(std::ptr::without_provenance::<u8>(8)) };
         }
         "open" => drop(std::fs::File::open("/proc/self/status")),
+        "overflow" => drop(std::hint::black_box(deeper(0))),
         _ => {}
     }
     std::process::exit(0);
+}
+
+fn deeper(n: u64) -> u64 {
+    let frame = std::hint::black_box([n as u8; 4096]);
+    if n == u64::MAX {
+        return 0;
+    }
+    deeper(n + 1) + u64::from(frame[0])
+}
+
+// A thread with a seccomp filter of its own cannot be synchronised, so the
+// filter lock_down installs on all threads fails before it exists.
+fn hold_another_filter() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let allow = seccompiler::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        };
+        tx.send(seccompiler::apply_filter(&[allow]).is_ok())
+            .unwrap();
+        loop {
+            std::thread::park();
+        }
+    });
+    assert!(rx.recv().unwrap(), "a thread holds its own filter");
 }
 
 fn crash_through_helper(act: &str) -> Error {
@@ -123,6 +155,10 @@ fn main() {
     let drawn = probe(true, "draw");
     assert!(drawn.success(), "a frame drawn in the sandbox: {drawn:?}");
     vigil_log::out!("draw: a frame is drawn and the process exits 0 inside the sandbox");
+    match crash_through_helper("overflow") {
+        Error::Refused(m) => assert!(m.contains("signal 11"), "{m}"),
+        other => panic!("a stack overflow in the sandbox: {other:?}"),
+    }
     match crash_through_helper("panic") {
         Error::Refused(m) => assert!(m.contains("panic at"), "{m}"),
         other => panic!("a panic in the sandbox: {other:?}"),
@@ -131,9 +167,15 @@ fn main() {
         Error::Refused(m) => assert!(m.contains("signal 11"), "{m}"),
         other => panic!("a fault in the sandbox: {other:?}"),
     }
+    match crash_through_helper("unsynced") {
+        Error::Helper(m) => assert!(m.contains("101"), "{m}"),
+        other => panic!("a panic before the filter: {other:?}"),
+    }
     match crash_through_helper("open") {
         Error::Helper(m) => assert!(m.contains("system call"), "{m}"),
         other => panic!("a forbidden call in the sandbox: {other:?}"),
     }
-    vigil_log::out!("crashes: a panic or a fault is a refusal, a forbidden call a helper fault");
+    vigil_log::out!(
+        "crashes: a stack overflow, a panic or a fault is a refusal; a panic before the filter or a forbidden call is a helper fault"
+    );
 }

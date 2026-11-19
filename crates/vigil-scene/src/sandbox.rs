@@ -72,17 +72,20 @@ pub fn confine(deadline: Duration, output: u64) -> Result<Option<String>, Error>
 /// kills the process at any system call outside what drawing, writing the
 /// result and dying need: it cannot open a file, reach a socket, signal or
 /// trace another process, or map executable memory. Landlock, applied by
-/// `confine`, is the second layer. A panic or a fault after this is the
-/// input's doing, so it ends the process as a refusal or by its own signal,
-/// never by SIGSYS, which says the allowlist has a gap.
+/// `confine`, is the second layer. A panic or a fault once the filter is on
+/// is the input's doing, so it ends the process as a refusal or by its own
+/// signal, never by SIGSYS, which says the allowlist has a gap. A panic
+/// before then is the helper's own fault and exits 101.
 pub fn lock_down() -> Result<(), Error> {
-    vigil_secret::crash_plainly(Error::Refused(String::new()).exit_code())
-        .map_err(|e| Error::Helper(format!("readying the helper to crash plainly: {e}")))?;
+    vigil_secret::die_of_faults()
+        .map_err(|e| Error::Helper(format!("readying the helper to die of faults: {e}")))?;
     set_dumpable_behavior(DumpableBehavior::NotDumpable)
         .map_err(|e| Error::Helper(format!("making the helper undumpable: {e}")))?;
     let filter = allowlist().map_err(|e| Error::Helper(format!("building the filter: {e}")))?;
     seccompiler::apply_filter_all_threads(&filter)
-        .map_err(|e| Error::Helper(format!("installing the filter: {e}")))
+        .map_err(|e| Error::Helper(format!("installing the filter: {e}")))?;
+    vigil_secret::crash_plainly(Error::Refused(String::new()).exit_code());
+    Ok(())
 }
 
 // The ruleset is a descriptor, so it is made before RLIMIT_NOFILE leaves
