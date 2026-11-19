@@ -261,6 +261,39 @@ fn cdylib() -> PathBuf {
         .expect("cargo names the cdylib it built")
 }
 
+fn fit_to_package(library: &Path, build: &Path) -> bool {
+    Command::new(root().join("packaging/check-ffi-helper-path"))
+        .arg(library)
+        .arg(build)
+        .env_remove("VIGIL_SCENE_HELPER")
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn the_package_check_refuses_the_library_the_tests_built() {
+    let build = helper().parent().unwrap();
+    let tested = cdylib();
+    assert!(
+        !fit_to_package(&tested, build),
+        "{} runs a helper under {}",
+        tested.display(),
+        build.display()
+    );
+    let dir = std::env::temp_dir().join(format!("vigil-scene-pkg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shipped = dir.join("shipped.so");
+    std::fs::write(&shipped, b"\x7fELF\0/usr/lib/vigil/vigil-scene\0").unwrap();
+    assert!(fit_to_package(&shipped, build));
+    let both = dir.join("both.so");
+    let mut text = b"/usr/lib/vigil/vigil-scene\0".to_vec();
+    text.extend_from_slice(build.join("vigil-scene").as_os_str().as_encoded_bytes());
+    std::fs::write(&both, text).unwrap();
+    assert!(!fit_to_package(&both, build));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn c_program_gets_the_same_pixels_through_the_header() {
     let lib = cdylib();
