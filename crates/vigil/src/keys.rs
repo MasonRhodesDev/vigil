@@ -390,6 +390,33 @@ mod tests {
     }
 
     #[test]
+    fn control_z_after_escape_never_answers_with_the_cleared_password() {
+        let Some(greetd) = Greetd::scripted(
+            "escape-undo",
+            vec![secret(), Response::Success, Response::Success],
+        ) else {
+            return;
+        };
+        let mut rig = Rig::new(&greetd);
+        rig.auth
+            .begin(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        let mut drive = text("secret");
+        drive.extend(tap(ESCAPE, None));
+        drive.push(press(CONTROL_L));
+        drive.extend(tap('z' as u32, Some("\u{1a}")));
+        drive.push(release(CONTROL_L));
+        drive.extend(tap(RETURN, None));
+        for event in drive {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        drop(rig);
+        assert_eq!(greetd.finish(), ["create alice"]);
+    }
+
+    #[test]
     fn modifiers_held_across_a_vt_switch_do_not_stick() {
         let Some(greetd) = Greetd::scripted(
             "vt-modifiers",

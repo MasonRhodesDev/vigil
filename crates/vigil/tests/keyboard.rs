@@ -539,3 +539,79 @@ fn holding_an_arrow_steps_a_picker_once() {
         "key repeat never cycles users, each of which may open a sign-in"
     );
 }
+
+#[test]
+fn control_z_after_a_submit_neither_panics_nor_restores_the_password() {
+    let mut g = Greeter::new();
+    g.type_text("a");
+    g.tap(RETURN);
+    g.chord(CONTROL_L, 'z' as u32, Some("\u{1a}"));
+    g.tap(RETURN);
+    assert_eq!(
+        g.take(),
+        [Sent::Respond("a".into()), Sent::Respond("".into())]
+    );
+}
+
+#[test]
+fn no_control_chord_edits_history_or_types_into_a_cleared_field() {
+    let mut g = Greeter::new();
+    for letter in 'a'..='z' {
+        for shift in [false, true] {
+            let keysym = if shift {
+                letter.to_ascii_uppercase()
+            } else {
+                letter
+            } as u32;
+            let control = char::from(letter as u8 - b'a' + 1).to_string();
+            let bare = char::from_u32(keysym).unwrap().to_string();
+            for utf8 in [control.as_str(), bare.as_str()] {
+                g.type_text("pw");
+                g.tap(RETURN);
+                if shift {
+                    g.event(SHIFT_L, None, true);
+                }
+                g.chord(CONTROL_L, keysym, Some(utf8));
+                if shift {
+                    g.event(SHIFT_L, None, false);
+                }
+                g.type_text("x");
+                g.tap(RETURN);
+                assert_eq!(
+                    g.take(),
+                    [Sent::Respond("pw".into()), Sent::Respond("x".into())],
+                    "Ctrl+{}{letter} sent as {utf8:?}",
+                    if shift { "Shift+" } else { "" }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_composed_character_types_once() {
+    const MULTI_KEY: u32 = 0xff20;
+    let mut g = Greeter::new();
+    g.event(MULTI_KEY, None, true);
+    g.event(MULTI_KEY, None, false);
+    g.event('a' as u32, None, true);
+    g.event('a' as u32, None, false);
+    g.event('\'' as u32, Some("á"), true);
+    g.event('\'' as u32, None, false);
+    g.tap(RETURN);
+    assert_eq!(g.take(), [Sent::Respond("á".into())]);
+}
+
+#[test]
+fn control_z_never_brings_back_a_deleted_password() {
+    const BACKSPACE: u32 = 0xff08;
+    let mut g = Greeter::new();
+    g.type_text("secret");
+    for _ in 0..6 {
+        g.tap(BACKSPACE);
+    }
+    g.chord(CONTROL_L, 'z' as u32, Some("\u{1a}"));
+    g.chord(ALT_L, F8, None);
+    g.tap(RETURN);
+    assert_eq!(g.take(), [Sent::Respond("".into())]);
+}
