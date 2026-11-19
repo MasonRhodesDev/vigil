@@ -3,7 +3,8 @@ use std::pin::pin;
 use std::sync::mpsc::Sender;
 use vigil_core::{AppearanceEvent, ColorScheme, LoginEvent, accent_from_portal};
 use zbus::export::futures_core::Stream;
-use zbus::{Connection, MessageStream, OwnedObjectPath, OwnedVariant, Proxy, block_on};
+use zbus::proxy::SignalStream;
+use zbus::{Connection, Message, OwnedObjectPath, OwnedVariant, Proxy, block_on};
 
 const DEST: &str = "org.freedesktop.login1";
 const MANAGER_PATH: &str = "/org/freedesktop/login1";
@@ -61,83 +62,98 @@ impl LoginSession {
     }
 
     pub fn spawn_signals(&self, tx: Sender<LoginEvent>) {
-        let path = self.path.clone();
-        std::thread::spawn(move || {
-            block_on(async move {
-                let rule = zbus::MatchRule::builder()
-                    .msg_type(zbus::message::Type::Signal)
-                    .sender(DEST)
-                    .interface(SESSION_IFACE)
-                    .build();
-                let session_rule = match rule {
-                    Ok(rule) => rule,
-                    Err(e) => {
-                        eprintln!("vigil-lock: logind match rule: {e}");
-                        return;
-                    }
-                };
-                let stream = match signal_stream(Connection::system(), session_rule, 8).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        eprintln!("vigil-lock: logind signals: {e}");
-                        return;
-                    }
-                };
-                let mut stream = pin!(stream);
-                while let Some(message) = next_message(stream.as_mut()).await {
-                    let Ok(message) = message else { continue };
-                    let header = message.header();
-                    if header.path().map(|p| p.as_str()) != Some(path.as_str()) {
-                        continue;
-                    }
-                    let event = match header.member().map(|m| m.as_str()) {
-                        Some("Lock") => LoginEvent::Lock,
-                        Some("Unlock") => LoginEvent::Unlock,
-                        _ => continue,
-                    };
-                    if tx.send(event).is_err() {
-                        return;
-                    }
-                }
-            });
+        Source {
+            bus: Bus::System,
+            name: DEST,
+            path: self.path.to_string(),
+            interface: SESSION_IFACE,
+            member: None,
+        }
+        .forward(tx, |message| match message.header().member()?.as_str() {
+            "Lock" => Some(LoginEvent::Lock),
+            "Unlock" => Some(LoginEvent::Unlock),
+            _ => None,
         });
     }
 
     pub fn spawn_sleep_signals(&self, tx: Sender<LoginEvent>) {
+        Source {
+            bus: Bus::System,
+            name: DEST,
+            path: MANAGER_PATH.to_string(),
+            interface: MANAGER_IFACE,
+            member: Some("PrepareForSleep"),
+        }
+        .forward(tx, |message| {
+            message
+                .body()
+                .deserialize::<bool>()
+                .ok()
+                .map(LoginEvent::PrepareForSleep)
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Bus {
+    System,
+    Session,
+}
+
+impl Bus {
+    async fn connect(self) -> zbus::Result<Connection> {
+        match self {
+            Self::System => Connection::system().await,
+            Self::Session => Connection::session().await,
+        }
+    }
+}
+
+struct Source {
+    bus: Bus,
+    name: &'static str,
+    path: String,
+    interface: &'static str,
+    member: Option<&'static str>,
+}
+
+impl Source {
+    // A Proxy stream yields only messages from the current unique owner of `name`. A MatchRule
+    // naming a well-known sender matches every sender, so a forged unicast signal would pass.
+    async fn signals(&self) -> zbus::Result<SignalStream<'static>> {
+        let conn = self.bus.connect().await?;
+        let proxy = Proxy::new(&conn, self.name, self.path.as_str(), self.interface).await?;
+        match self.member {
+            Some(member) => proxy.receive_signal(member).await,
+            None => proxy.receive_all_signals().await,
+        }
+    }
+
+    fn forward<T: Send + 'static>(
+        self,
+        tx: Sender<T>,
+        decode: impl Fn(&Message) -> Option<T> + Send + 'static,
+    ) {
         std::thread::spawn(move || {
             block_on(async move {
-                let rule = zbus::MatchRule::builder()
-                    .msg_type(zbus::message::Type::Signal)
-                    .sender(DEST)
-                    .interface(MANAGER_IFACE)
-                    .member("PrepareForSleep")
-                    .build();
-                let Ok(rule) = rule else { return };
-                let Ok(stream) = signal_stream(Connection::system(), rule, 4).await else {
-                    return;
+                let signals = match self.signals().await {
+                    Ok(signals) => signals,
+                    Err(e) => {
+                        eprintln!("vigil: {} signals from {}: {e}", self.interface, self.name);
+                        return;
+                    }
                 };
-                let mut stream = pin!(stream);
-                while let Some(message) = next_message(stream.as_mut()).await {
-                    let Ok(message) = message else { continue };
-                    let Ok(sleeping) = message.body().deserialize::<bool>() else {
-                        continue;
-                    };
-                    if tx.send(LoginEvent::PrepareForSleep(sleeping)).is_err() {
+                let mut signals = pin!(signals);
+                while let Some(message) = next_message(signals.as_mut()).await {
+                    if let Some(event) = decode(&message)
+                        && tx.send(event).is_err()
+                    {
                         return;
                     }
                 }
             });
         });
     }
-}
-
-async fn signal_stream(
-    connect: impl std::future::Future<Output = zbus::Result<Connection>>,
-    rule: zbus::MatchRule<'static>,
-    max: usize,
-) -> zbus::Result<MessageStream> {
-    let conn = connect.await?;
-    MessageStream::for_match_rule(rule, &conn, std::num::NonZeroUsize::new(max)).await
 }
 
 async fn next_message<S: Stream + Unpin>(mut stream: std::pin::Pin<&mut S>) -> Option<S::Item> {
@@ -190,46 +206,30 @@ impl AppearanceWatcher {
     }
 
     pub fn spawn_signals(&self, tx: Sender<AppearanceEvent>) {
-        std::thread::spawn(move || {
-            block_on(async move {
-                let rule = zbus::MatchRule::builder()
-                    .msg_type(zbus::message::Type::Signal)
-                    .sender(PORTAL_DEST)
-                    .interface(PORTAL_IFACE)
-                    .member("SettingChanged")
-                    .build();
-                let Ok(rule) = rule else { return };
-                let Ok(stream) = signal_stream(Connection::session(), rule, 8).await else {
-                    return;
-                };
-                let mut stream = pin!(stream);
-                while let Some(message) = next_message(stream.as_mut()).await {
-                    let Ok(message) = message else { continue };
-                    let Ok((namespace, key, value)) = message
-                        .body()
-                        .deserialize::<(String, String, OwnedVariant)>()
-                    else {
-                        continue;
-                    };
-                    if namespace != APPEARANCE_NS {
-                        continue;
-                    }
-                    let event = match key.as_str() {
-                        "color-scheme" => u32::try_from(portal_inner(value))
-                            .ok()
-                            .map(|raw| AppearanceEvent::Scheme(ColorScheme::from_portal(raw))),
-                        "accent-color" => <(f64, f64, f64)>::try_from(portal_inner(value))
-                            .ok()
-                            .map(|rgb| AppearanceEvent::Accent(accent_from_portal(rgb))),
-                        _ => None,
-                    };
-                    if let Some(event) = event
-                        && tx.send(event).is_err()
-                    {
-                        return;
-                    }
-                }
-            });
+        Source {
+            bus: Bus::Session,
+            name: PORTAL_DEST,
+            path: PORTAL_PATH.to_string(),
+            interface: PORTAL_IFACE,
+            member: Some("SettingChanged"),
+        }
+        .forward(tx, |message| {
+            let (namespace, key, value) = message
+                .body()
+                .deserialize::<(String, String, OwnedVariant)>()
+                .ok()?;
+            if namespace != APPEARANCE_NS {
+                return None;
+            }
+            match key.as_str() {
+                "color-scheme" => u32::try_from(portal_inner(value))
+                    .ok()
+                    .map(|raw| AppearanceEvent::Scheme(ColorScheme::from_portal(raw))),
+                "accent-color" => <(f64, f64, f64)>::try_from(portal_inner(value))
+                    .ok()
+                    .map(|rgb| AppearanceEvent::Accent(accent_from_portal(rgb))),
+                _ => None,
+            }
         });
     }
 }
@@ -238,7 +238,6 @@ impl AppearanceWatcher {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     #[test]
     fn logind_session_resolves_read_only() {
@@ -277,42 +276,5 @@ mod tests {
         while rx.try_recv().is_ok() {}
         let (tx, _rx) = mpsc::channel();
         watcher.spawn_signals(tx);
-    }
-
-    #[test]
-    fn worker_thread_receives_signal_from_other_connection() {
-        let Ok(sender) = block_on(Connection::session()) else {
-            eprintln!("skipped: no session bus");
-            return;
-        };
-        let (tx, rx) = mpsc::channel::<String>();
-        let (ready_tx, ready_rx) = mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            block_on(async move {
-                let rule = zbus::MatchRule::builder()
-                    .msg_type(zbus::message::Type::Signal)
-                    .interface("org.vigil.LoginTest")
-                    .member("Ping")
-                    .build()
-                    .unwrap();
-                let stream = signal_stream(Connection::session(), rule, 4).await.unwrap();
-                ready_tx.send(()).unwrap();
-                let mut stream = pin!(stream);
-                if let Some(Ok(m)) = next_message(stream.as_mut()).await {
-                    let body: String = m.body().deserialize().unwrap();
-                    tx.send(body).unwrap();
-                }
-            });
-        });
-        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        block_on(sender.emit_signal(
-            None::<&str>,
-            "/org/vigil/LoginTest",
-            "org.vigil.LoginTest",
-            "Ping",
-            &("pong".to_string(),),
-        ))
-        .unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), "pong");
     }
 }
