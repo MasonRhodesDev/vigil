@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use image::ImageEncoder;
 use vigil_scene::{Error, Logo, MAX_LOGO_BYTES};
 
 const OPEN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 100 100">"#;
@@ -383,4 +384,40 @@ fn raster_logos_keep_their_own_larger_cap() {
     assert!(std::fs::metadata(&path).unwrap().len() > MAX_LOGO_BYTES);
     let mask = Logo::load(&path).unwrap().mask(64).unwrap();
     assert!(mask.alpha().iter().filter(|&&a| a == 255).count() > 1500);
+}
+
+#[test]
+fn a_raster_is_bounded_by_its_pixel_count_before_decoding() {
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new_with_quality(
+        &mut png,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::NoFilter,
+    )
+    .write_image(
+        &vec![0u8; 8192 * 8192],
+        8192,
+        8192,
+        image::ExtendedColorType::L8,
+    )
+    .unwrap();
+    assert!((png.len() as u64) < vigil_scene::MAX_RASTER_BYTES);
+    let start = Instant::now();
+    assert!(matches!(Logo::raster(&png), Err(Error::TooLarge(_))));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            &vec![255u8; 2048 * 2048],
+            2048,
+            2048,
+            image::ExtendedColorType::L8,
+        )
+        .unwrap();
+    assert_eq!(Logo::raster(&png).unwrap().mask(64).unwrap().edge(), 64);
 }
