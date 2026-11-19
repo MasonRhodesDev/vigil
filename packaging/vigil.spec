@@ -152,6 +152,8 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 - crates/vigil-config is relicensed MIT (the workspace binaries stay
   GPL-3.0-only) so the MIT configurator can share the one parse-only crate;
   it links no GPL code.
+- crates/vigil-log is MIT too, so vigil-config can log through it; it links
+  only libc.
 * Thu Sep 04 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.6-1
 - A correct password is no longer intermittently rejected. Every PAM
   worker shared one event channel with no attempt identity, so a
