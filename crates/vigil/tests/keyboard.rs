@@ -16,6 +16,7 @@ const SPACE: u32 = 0x20;
 const F8: u32 = 0xffc5;
 const SHIFT_L: u32 = 0xffe1;
 const CONTROL_L: u32 = 0xffe3;
+const CONTROL_R: u32 = 0xffe4;
 const ALT_L: u32 = 0xffe9;
 
 const W: u32 = 1280;
@@ -892,5 +893,38 @@ fn a_retry_typed_during_the_check_survives_the_failure_hidden() {
     assert_eq!(
         g.take(),
         [Sent::Respond("aaaa".into()), Sent::Respond("aaaa".into())]
+    );
+}
+
+#[test]
+fn tab_with_both_ctrl_keys_down_never_replaces_the_field() {
+    let mut g = Greeter::new();
+    g.type_text("secret");
+    g.event(CONTROL_L, None, true);
+    g.event(CONTROL_R, None, true);
+    g.event(CONTROL_R, None, false);
+    g.event(TAB, Some("\t"), true);
+    g.event(TAB, Some("\t"), false);
+    g.event(CONTROL_L, None, false);
+    g.type_text("x");
+    g.tap(RETURN);
+    assert_eq!(g.take(), [Sent::Respond("secretx".into())]);
+}
+
+#[test]
+fn ctrl_a_with_one_of_two_ctrl_keys_released_types_no_letter() {
+    let mut g = Greeter::new();
+    g.type_text("secret");
+    g.event(CONTROL_L, None, true);
+    g.event(CONTROL_R, None, true);
+    g.event(CONTROL_R, None, false);
+    g.event('a' as u32, Some("a"), true);
+    g.event('a' as u32, Some("a"), false);
+    g.event(CONTROL_L, None, false);
+    g.tap(RETURN);
+    assert_eq!(
+        g.take(),
+        [Sent::Respond("secret".into())],
+        "Ctrl+A selects, so no letter reaches the password"
     );
 }
