@@ -48,9 +48,11 @@ can be run alone.
 | A locked session: signals, memory starvation, input flood, unlock race, compositor death | `tests/nested/attack.sh` |
 
 `VIGIL_ATTACK_CASES` sets how many sequences the `AuthMachine` attack
-generates per greetd model (default 1500). A failure prints the
-shortest sequence that breaks an invariant; add it to `pinned()` in
-`crates/vigil-auth/tests/attack.rs` before fixing it.
+generates per greetd model (default 1500). Each run draws a new seed and
+prints it first. `VIGIL_ATTACK_SEED=<seed>` with the same case count
+draws the same sequences again, so a red CI run replays locally. A
+failure prints the shortest sequence that breaks an invariant; add it to
+`pinned()` in `crates/vigil-auth/tests/attack.rs` before fixing it.
 
 `fuzz/run.sh [seconds] [target...]` needs `cargo install cargo-fuzz
 --locked` and a toolchain that accepts `-Z` flags: a rustup nightly, or

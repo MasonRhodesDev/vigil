@@ -13,7 +13,7 @@ use greetd_ipc::codec::SyncCodec;
 use greetd_ipc::{AuthMessageType, ErrorType, Request, Response};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
-use proptest::test_runner::{Config, TestCaseError, TestRunner};
+use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
 use vigil_auth::{AuthMachine, Prompt};
 use vigil_core::{AuthUi, UiMessage};
 
@@ -776,12 +776,17 @@ fn case(conforming: bool) -> impl Strategy<Value = Case> {
         )
 }
 
-fn runner(cases: u32, _seed: u64) -> TestRunner {
-    TestRunner::new(Config {
-        cases,
-        failure_persistence: None,
-        ..Config::default()
-    })
+fn runner(cases: u32, seed: u64) -> TestRunner {
+    let mut bytes = [0; 32];
+    bytes[..8].copy_from_slice(&seed.to_le_bytes());
+    TestRunner::new_with_rng(
+        Config {
+            cases,
+            failure_persistence: None,
+            ..Config::default()
+        },
+        TestRng::from_seed(RngAlgorithm::ChaCha, &bytes),
+    )
 }
 
 fn replays(seed: u64) -> bool {
@@ -814,7 +819,7 @@ fn attack(greetd: &Greetd, name: &str, conforming: bool, cases: u32, seed: u64) 
             true
         }
         Err(failure) => {
-            println!("attack: {name}: FAILED\n{failure}");
+            println!("attack: {name}: FAILED with VIGIL_ATTACK_SEED={seed}\n{failure}");
             false
         }
     }
