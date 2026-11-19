@@ -1671,6 +1671,33 @@ mod tests {
     }
 
     #[test]
+    fn an_unasked_sign_in_that_is_refused_is_not_opened_unasked_again() {
+        let Some((server, requests)) = scripted(vec![
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "cancel"]);
+        assert_eq!(machine.unprompted(), None);
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        drop(machine);
+        drop(server);
+        assert_eq!(
+            sent(&requests),
+            ["create alice", "cancel"],
+            "choosing the user again waits for a submit"
+        );
+    }
+
+    #[test]
     fn a_message_alone_ends_the_expectation_of_an_unasked_sign_in() {
         let Some((server, requests)) = scripted(vec![
             auth_message(AuthMessageType::Info, "Place your finger on the reader"),
