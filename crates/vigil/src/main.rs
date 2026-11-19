@@ -1,5 +1,6 @@
 mod autologin;
 mod hold;
+mod keys;
 mod layout;
 mod scene;
 mod sessions;
@@ -594,6 +595,24 @@ fn splash_bringup(
     out
 }
 
+impl keys::KeySink for App {
+    fn change_vt(&mut self, vt: i32) {
+        if let Err(e) = self.session.change_vt(vt) {
+            eprintln!("vigil: change vt {vt}: {e}");
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.queue.borrow_mut().push_back(UiMessage::Cancel);
+    }
+
+    fn forward(&mut self, event: InputEvent) {
+        if let Some(e) = self.panel_entry() {
+            e.window.dispatch(event);
+        }
+    }
+}
+
 impl App {
     fn wait_timeout(&self) -> Option<Duration> {
         let slint = match self
@@ -1142,31 +1161,12 @@ impl App {
     }
 
     fn route(&mut self, events: Vec<InputEvent>) {
-        const VT_FIRST: u32 = 0x1008_FE01;
-        const VT_LAST: u32 = 0x1008_FE0C;
-        const ESCAPE: u32 = 0xff1b;
         if self.leaving.is_some() {
             return;
         }
         for event in events {
             match event {
-                InputEvent::Key {
-                    keysym, pressed, ..
-                } => {
-                    if pressed && (VT_FIRST..=VT_LAST).contains(&keysym) {
-                        let vt = (keysym - VT_FIRST + 1) as i32;
-                        if let Err(e) = self.session.change_vt(vt) {
-                            eprintln!("vigil: change vt {vt}: {e}");
-                        }
-                        continue;
-                    }
-                    if pressed && keysym == ESCAPE {
-                        self.queue.borrow_mut().push_back(UiMessage::Cancel);
-                    }
-                    if let Some(e) = self.panel_entry() {
-                        e.window.dispatch(event);
-                    }
-                }
+                InputEvent::Key { .. } => keys::route(self, event),
                 InputEvent::PointerMotion { dx, dy } => {
                     self.move_cursor(self.cursor.0 + dx, self.cursor.1 + dy);
                 }
