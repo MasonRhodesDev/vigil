@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
-rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "process", "stdio"] }
 libc.workspace = true
 vigil-log.workspace = true
 
