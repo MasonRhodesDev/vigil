@@ -779,3 +779,46 @@ fn a_double_click_on_power_never_acts_in_landscape() {
 fn a_double_click_on_power_never_acts_in_portrait() {
     a_double_click_on_power_never_acts(H, W);
 }
+
+fn frame(window: &mut OutputWindow) -> Vec<u8> {
+    let mut buf = vec![0u8; (W * H * 4) as usize];
+    vigil_ui::advance_timers();
+    window.request_present();
+    window.render_if_needed(FrameTarget {
+        buffer: &mut buf,
+        width: W,
+        height: H,
+        stride: (W * 4) as usize,
+        damage: None,
+    });
+    buf
+}
+
+fn ring_contrast(g: &mut Greeter) -> f64 {
+    let before = frame(&mut g.window);
+    g.tap(TAB);
+    let after = frame(&mut g.window);
+    g.tap(ESCAPE);
+    let (mut light, mut dark) = (0.0f64, 1.0f64);
+    for (old, new) in before.chunks(4).zip(after.chunks(4)) {
+        if old != new {
+            let l = luminance(slint::Color::from_rgb_u8(new[2], new[1], new[0]));
+            light = light.max(l);
+            dark = dark.min(l);
+        }
+    }
+    (light + 0.05) / (dark.min(light) + 0.05)
+}
+
+#[test]
+fn a_kit_that_flattens_fg_and_page_bg_still_gets_a_9_to_1_ring() {
+    let mut g = Greeter::new();
+    let ratio = ring_contrast(&mut g);
+    assert!(ratio >= 9.0, "the built-in ring's tones are {ratio:.2}:1");
+    g.window.apply_kit_tokens(&slint_kit::TokenSet {
+        mode: "dark".into(),
+        colors: Default::default(),
+    });
+    let ratio = ring_contrast(&mut g);
+    assert!(ratio >= 9.0, "under the kit the ring's tones are {ratio:.2}:1");
+}
