@@ -1582,6 +1582,21 @@ mod tests {
         );
     }
 
+    fn panic_probe(stderr: std::process::Stdio) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_panic_on_any_thread_ends_the_lock_at_once_without_a_core",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("VIGIL_LOCK_PANIC_PROBE", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .output()
+            .unwrap()
+    }
+
     #[test]
     fn a_panic_on_any_thread_ends_the_lock_at_once_without_a_core() {
         use std::os::unix::process::ExitStatusExt;
@@ -1594,16 +1609,7 @@ mod tests {
             .join();
             std::process::exit(0);
         }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tests::a_panic_on_any_thread_ends_the_lock_at_once_without_a_core",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env("VIGIL_LOCK_PANIC_PROBE", "1")
-            .output()
-            .unwrap();
+        let output = panic_probe(std::process::Stdio::piped());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.signal(), None, "no signal, so no core dump");
         assert_eq!(
@@ -1615,6 +1621,22 @@ mod tests {
         assert!(
             !stderr.contains("hunter") && !stderr.contains('\u{e9}'),
             "the report names no text the panic was holding: {stderr}"
+        );
+    }
+
+    #[test]
+    fn a_panic_with_stderr_unwritable_still_exits_without_a_core() {
+        use std::os::unix::process::ExitStatusExt;
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let status = panic_probe(full.into()).status;
+        assert_eq!(status.signal(), None, "no abort, so no core dump");
+        assert_eq!(
+            status.code(),
+            Some(101),
+            "the report failing changes nothing"
         );
     }
 
