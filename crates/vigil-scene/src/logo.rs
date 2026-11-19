@@ -14,7 +14,6 @@ const MAX_NODES: u32 = 10_000;
 const MAX_DEPTH: usize = 64;
 const MAX_REF_DEPTH: usize = 128;
 const MAX_EXPANDED: usize = 20_000;
-const REACH: f32 = 16.0;
 const MAX_NUMBER: f64 = 1e6;
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const DRAWN: &[&str] = &[
@@ -134,8 +133,7 @@ impl Logo {
         }))
         .map_err(|_| Error::Invalid("the SVG parser could not read this SVG".into()))?
         .map_err(|e| Error::Invalid(format!("SVG: {e}")))?;
-        let size = tree.size();
-        screen_tree(tree.root(), REACH * size.width().max(size.height()))?;
+        crate::cost::check(&tree, fit(&tree, MAX_EDGE), MAX_EDGE)?;
         Ok(Logo::Svg(Box::new(tree)))
     }
 
@@ -160,15 +158,10 @@ impl Logo {
         }
         let mut alpha = match self {
             Logo::Svg(tree) => {
-                let size = tree.size();
-                let s = edge as f32 / size.width().max(size.height());
-                let ox = (edge as f32 - size.width() * s) / 2.0;
-                let oy = (edge as f32 - size.height() * s) / 2.0;
                 let mut pixmap = resvg::tiny_skia::Pixmap::new(edge, edge)
                     .ok_or_else(|| Error::Invalid("empty logo box".into()))?;
-                let fit = resvg::tiny_skia::Transform::from_row(s, 0.0, 0.0, s, ox, oy);
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    resvg::render(tree, fit, &mut pixmap.as_mut());
+                    resvg::render(tree, fit(tree, edge), &mut pixmap.as_mut());
                 }))
                 .map_err(|_| Error::Invalid("the renderer could not draw this SVG".into()))?;
                 let (pixels, _partial) = pixmap.data().as_chunks::<4>();
@@ -409,36 +402,12 @@ fn nesting(text: &[u8]) -> usize {
     deepest
 }
 
-fn screen_tree(group: &usvg::Group, reach: f32) -> Result<(), Error> {
-    let nested = group
-        .clip_path()
-        .map(|c| c.root())
-        .into_iter()
-        .chain(group.mask().map(|m| m.root()));
-    for g in nested {
-        screen_tree(g, reach)?;
-    }
-    for node in group.children() {
-        match node {
-            usvg::Node::Group(g) => screen_tree(g, reach)?,
-            usvg::Node::Path(p) => {
-                if p.stroke().is_some_and(|s| s.dasharray().is_some()) {
-                    return Err(Error::Refused("a dashed stroke".into()));
-                }
-                let b = p.abs_stroke_bounding_box();
-                if [b.left(), b.top(), b.right(), b.bottom()]
-                    .iter()
-                    .any(|v| !v.is_finite() || v.abs() > reach)
-                {
-                    return Err(Error::Refused(
-                        "a shape reaches far outside the logo's box".into(),
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
+fn fit(tree: &usvg::Tree, edge: u32) -> usvg::Transform {
+    let size = tree.size();
+    let s = edge as f32 / size.width().max(size.height());
+    let ox = (edge as f32 - size.width() * s) / 2.0;
+    let oy = (edge as f32 - size.height() * s) / 2.0;
+    usvg::Transform::from_row(s, 0.0, 0.0, s, ox, oy)
 }
 
 fn drop_specks(alpha: &mut [u8], w: usize, h: usize, keep: f64) {

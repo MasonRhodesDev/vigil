@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod cost;
 mod glow;
 mod logo;
 mod plate;
