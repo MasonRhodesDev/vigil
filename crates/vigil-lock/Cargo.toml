@@ -25,6 +25,7 @@ vigil-pam = { path = "../vigil-pam" }
 vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }
 libc.workspace = true
+rustix = { version = "1.1", default-features = false, features = ["std", "stdio"] }
 
 [dev-dependencies]
 image.workspace = true

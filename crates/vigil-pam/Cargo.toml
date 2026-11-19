@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 vigil-core.workspace = true
+vigil-secret.workspace = true
 pam-client.workspace = true
 
 [lints]

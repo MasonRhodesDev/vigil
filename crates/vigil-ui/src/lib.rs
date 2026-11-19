@@ -23,7 +23,8 @@ use slint_idle_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use slint_interpreter::{ComponentInstance, Value};
 use slint_kit::TokenSet;
 use vigil_core::{
-    AuthUi, BackgroundFit, Damage, FrameTarget, InputEvent, OutputId, PowerAction, Rect, UiMessage,
+    AuthUi, BackgroundFit, Damage, FrameTarget, InputEvent, KeyText, OutputId, PowerAction, Rect,
+    UiMessage,
 };
 use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 
@@ -727,7 +728,7 @@ fn pointer_button(button: u32) -> PointerEventButton {
     }
 }
 
-fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
+fn key_text(keysym: u32, utf8: Option<KeyText>) -> Option<slint::SharedString> {
     let key = match keysym {
         0xff0d => Key::Return,
         0xff08 => Key::Backspace,
@@ -742,8 +743,10 @@ fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
         0xff57 => Key::End,
         _ => {
             return utf8
-                .filter(|text| !text.is_empty() && !text.chars().all(char::is_control))
-                .map(Into::into);
+                .filter(|text| {
+                    !text.as_str().is_empty() && !text.as_str().chars().all(char::is_control)
+                })
+                .map(|text| text.as_str().into());
         }
     };
     Some(key.into())

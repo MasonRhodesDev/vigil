@@ -41,7 +41,7 @@ mod tests {
 
     use greetd_ipc::{AuthMessageType, Response};
     use vigil_auth::AuthMachine;
-    use vigil_core::{OutputId, UiMessage};
+    use vigil_core::{KeyText, OutputId, UiMessage};
     use vigil_theme::Theme;
     use vigil_ui::{OutputWindow, VigilPlatform};
 
@@ -53,7 +53,7 @@ mod tests {
     fn tap(keysym: u32, utf8: Option<&str>) -> [InputEvent; 2] {
         [true, false].map(|pressed| InputEvent::Key {
             keysym,
-            utf8: utf8.map(str::to_owned),
+            utf8: utf8.map(KeyText::from),
             pressed,
         })
     }

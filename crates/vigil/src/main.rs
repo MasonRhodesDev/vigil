@@ -2455,6 +2455,7 @@ fn run() -> Result<i32, String> {
 }
 
 fn main() {
+    vigil_secret::abort_on_worker_panic();
     if let Err(e) = vigil_secret::deny_memory_dumps() {
         eprintln!("vigil: could not keep memory out of core dumps: {e}");
     }

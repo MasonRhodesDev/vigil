@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use serde::Deserialize;
 use softbuffer::{Context, Surface};
-use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
+use vigil_core::{AuthUi, FrameTarget, InputEvent, KeyText, OutputId};
 use vigil_flow::{FlowCmd, FlowEvent, FlowPhase, LockFlow, Now};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
@@ -1166,12 +1166,12 @@ fn blend_warning_frame(
         .collect()
 }
 
-fn key_event(key: &Key) -> (u32, Option<String>) {
+fn key_event(key: &Key) -> (u32, Option<KeyText>) {
     match key {
         Key::Character(text) => {
             let text = text.to_string();
             let keysym = text.chars().next().map_or(0, u32::from);
-            (keysym, Some(text))
+            (keysym, Some(text.into()))
         }
         Key::Named(NamedKey::Enter) => (0xff0d, Some("\r".into())),
         Key::Named(NamedKey::Tab) => (0xff09, Some("\t".into())),

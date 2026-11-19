@@ -5129,6 +5129,7 @@ dependencies = [
  "image",
  "libc",
  "monitor-profiles",
+ "rustix 1.1.6",
  "singleton-guard",
  "slint-idle-runtime",
  "span-lines",
@@ -5169,6 +5170,7 @@ version = "0.4.3"
 dependencies = [
  "pam-client",
  "vigil-core",
+ "vigil-secret",
 ]
 
 [[package]]

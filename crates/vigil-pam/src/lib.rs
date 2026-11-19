@@ -50,7 +50,10 @@ impl<E: Fn(AuthEvent)> Bridge<E> {
             reason = "credential adapter: pam-client takes the answer as a CString it copies and drops unwiped"
         )]
         let plain = response.expose();
-        CString::new(plain).map_err(|_| fail())
+        CString::new(plain).map_err(|refused| {
+            vigil_secret::Zeroize::zeroize(&mut refused.into_vec());
+            fail()
+        })
     }
 }
 
@@ -177,6 +180,18 @@ mod tests {
                 secret: true
             }
         );
+    }
+
+    #[test]
+    fn an_answer_holding_nul_fails_the_conversation() {
+        let (tx, rx) = mpsc::channel();
+        let mut bridge = Bridge::new(|_| {}, rx);
+        tx.send("hun\0ter2".into()).unwrap();
+        let err = bridge
+            .prompt_echo_off(&CString::new("Password:").unwrap())
+            .unwrap_err();
+        assert_eq!(err, ErrorCode::CONV_ERR);
+        assert!(bridge.broken.load(Ordering::SeqCst));
     }
 
     #[test]

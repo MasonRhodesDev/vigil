@@ -78,3 +78,6 @@ font8x8 = "0.3"
 
 [profile.release]
 overflow-checks = true
+
+[profile.release.package."*"]
+overflow-checks = false

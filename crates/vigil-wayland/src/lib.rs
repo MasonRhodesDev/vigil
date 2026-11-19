@@ -61,7 +61,7 @@ use wayland_protocols::wp::viewporter::client::{
 };
 
 use vigil_config::Lock;
-use vigil_core::{FrameTarget, InputEvent, OutputId, OutputInfo};
+use vigil_core::{FrameTarget, InputEvent, KeyText, OutputId, OutputInfo};
 pub use vigil_flow::LockOutcome;
 use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now, Signal};
 
@@ -1523,7 +1523,7 @@ impl<S: LockSession> KeyboardHandler for App<S> {
     ) {
         self.deliver_input(InputEvent::Key {
             keysym: event.keysym.raw(),
-            utf8: event.utf8,
+            utf8: event.utf8.map(KeyText::from),
             pressed: true,
         });
     }
@@ -1537,7 +1537,7 @@ impl<S: LockSession> KeyboardHandler for App<S> {
     ) {
         self.deliver_input(InputEvent::Key {
             keysym: event.keysym.raw(),
-            utf8: event.utf8,
+            utf8: event.utf8.map(KeyText::from),
             pressed: true,
         });
     }
