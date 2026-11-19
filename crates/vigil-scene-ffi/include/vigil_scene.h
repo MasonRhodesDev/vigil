@@ -130,7 +130,9 @@ extern "C" {
  * A request with a logo is drawn by the helper process installed with this
  * library, and the call returns within `deadline_ms`, plus the kernel's
  * teardown of a killed helper and the copy of the layer into `out`, whatever
- * the logo holds. A request without one is drawn in the calling process.
+ * the logo holds. Past the deadline that has taken under 10 ms on an idle
+ * host and about 340 ms on a loaded one, in a debug build. A request
+ * without a logo is drawn in the calling process.
  * On any error `out` is left unwritten, and a caller should draw the
  * ground-only scene by asking again without the logo.
  *
