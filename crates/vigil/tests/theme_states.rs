@@ -265,7 +265,7 @@ fn native_background_partial_repaint_matches_full() {
         .into();
 
     scene.window.set_panel_visible(true);
-    scene.window.set_user_name("mason");
+    scene.window.set_user_name("alice");
     scene.window.set_clock("12:34");
     scene.window.show_prompt("Password:", true);
     assert!(

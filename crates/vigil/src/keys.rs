@@ -37,19 +37,16 @@ pub fn route(sink: &mut impl KeySink, event: InputEvent) {
 mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::PathBuf;
     use std::rc::Rc;
-    use std::sync::{Arc, Mutex};
 
-    use greetd_ipc::codec::SyncCodec;
-    use greetd_ipc::{AuthMessageType, Request, Response};
+    use greetd_ipc::{AuthMessageType, Response};
     use vigil_auth::AuthMachine;
     use vigil_core::{OutputId, UiMessage};
     use vigil_theme::Theme;
     use vigil_ui::{OutputWindow, VigilPlatform};
 
     use super::*;
+    use crate::scripted_greetd::Greetd;
 
     const RETURN: u32 = 0xff0d;
 
@@ -110,70 +107,6 @@ mod tests {
         assert!(sink.forwarded.is_empty());
     }
 
-    struct Greetd {
-        dir: PathBuf,
-        requests: Arc<Mutex<Vec<String>>>,
-        thread: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl Greetd {
-        fn scripted(name: &str, replies: Vec<Response>) -> Option<Self> {
-            let dir =
-                std::env::temp_dir().join(format!("vigil-keys-{}-{name}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let listener = UnixListener::bind(dir.join("greetd.sock")).and_then(|listener| {
-                let probe = UnixStream::connect(dir.join("greetd.sock"))?;
-                listener.accept()?;
-                drop(probe);
-                Ok(listener)
-            });
-            let listener = match listener {
-                Ok(listener) => listener,
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    std::fs::remove_dir_all(&dir).unwrap();
-                    return None;
-                }
-                Err(error) => panic!("open the scripted greetd socket: {error}"),
-            };
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let seen = requests.clone();
-            let thread = std::thread::spawn(move || {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    return;
-                };
-                for reply in replies {
-                    let Ok(request) = Request::read_from(&mut stream) else {
-                        return;
-                    };
-                    seen.lock().unwrap().push(match request {
-                        Request::CreateSession { username } => format!("create {username}"),
-                        Request::PostAuthMessageResponse { response } => {
-                            format!("answer {}", response.as_deref().unwrap_or("<none>"))
-                        }
-                        Request::StartSession { .. } => "start".into(),
-                        Request::CancelSession => "cancel".into(),
-                    });
-                    if reply.write_to(&mut stream).is_err() {
-                        return;
-                    }
-                }
-            });
-            Some(Self {
-                dir,
-                requests,
-                thread: Some(thread),
-            })
-        }
-
-        fn finish(mut self) -> Vec<String> {
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-            let _ = std::fs::remove_dir_all(&self.dir);
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
     struct Rig {
         window: OutputWindow,
         queue: Rc<RefCell<VecDeque<UiMessage>>>,
@@ -193,8 +126,7 @@ mod tests {
             let queue = Rc::new(RefCell::new(VecDeque::new()));
             let sink = queue.clone();
             window.on_ui_message(Rc::new(move |message| sink.borrow_mut().push_back(message)));
-            let socket = greetd.dir.join("greetd.sock");
-            let mut auth = AuthMachine::connect(socket.to_str()).expect("connect");
+            let mut auth = AuthMachine::connect(greetd.socket().to_str()).expect("connect");
             auth.set_session(vec!["session".into()], Vec::new());
             Self {
                 window,
@@ -267,13 +199,7 @@ mod tests {
     fn escape_clears_a_fixed_users_password_field() {
         let Some(greetd) = Greetd::scripted(
             "fixed-escape",
-            vec![
-                secret(),
-                Response::Success,
-                secret(),
-                Response::Success,
-                Response::Success,
-            ],
+            vec![secret(), Response::Success, Response::Success],
         ) else {
             return;
         };
@@ -297,29 +223,14 @@ mod tests {
         rig.tick();
 
         drop(rig);
-        assert_eq!(
-            greetd.finish(),
-            [
-                "create alice",
-                "cancel",
-                "create alice",
-                "answer pw",
-                "start"
-            ]
-        );
+        assert_eq!(greetd.finish(), ["create alice", "answer pw", "start"]);
     }
 
     #[test]
     fn escape_a_name_and_a_password_in_one_batch_sign_that_user_in() {
         let Some(greetd) = Greetd::scripted(
             "escape",
-            vec![
-                secret(),
-                Response::Success,
-                secret(),
-                Response::Success,
-                Response::Success,
-            ],
+            vec![secret(), Response::Success, Response::Success],
         ) else {
             return;
         };
@@ -344,10 +255,7 @@ mod tests {
 
         let complete = rig.auth.is_complete();
         drop(rig);
-        assert_eq!(
-            greetd.finish(),
-            ["create alice", "cancel", "create bob", "answer pw", "start"]
-        );
+        assert_eq!(greetd.finish(), ["create bob", "answer pw", "start"]);
         assert!(complete);
     }
 }

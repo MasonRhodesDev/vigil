@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::os::unix::net::UnixStream;
 
@@ -47,13 +48,53 @@ fn show_greetd_error(ui: &mut dyn AuthUi, description: &str) -> String {
 enum State {
     Idle,
     AwaitingUser,
+    AwaitingCommit,
     AwaitingPrompt,
-    AwaitingRetry,
     Complete,
 }
 
 pub const USERNAME_PROMPT: &str = "Username";
-pub const RETRY_PROMPT: &str = "Press Enter to try again";
+pub const PASSWORD_PROMPT: &str = "Password";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    pub text: String,
+    pub secret: bool,
+}
+
+impl Prompt {
+    fn password() -> Self {
+        Self {
+            text: PASSWORD_PROMPT.into(),
+            secret: true,
+        }
+    }
+
+    // The PAM worker's locale is unknown here, so behind vigil's own
+    // "Password" label only libpam's untranslated default is recognised.
+    pub fn is_plain_password(&self) -> bool {
+        let label = self
+            .text
+            .trim_end_matches(|c: char| c == ':' || c.is_whitespace());
+        self.secret && label == PASSWORD_PROMPT
+    }
+
+    fn is_the_question_under(&self, field: &Prompt) -> bool {
+        self == field || (*field == Prompt::password() && self.is_plain_password())
+    }
+
+    fn shown(&self) -> String {
+        self.text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect()
+    }
+}
+
+struct Submitted {
+    text: String,
+    field: Prompt,
+}
 
 pub struct AuthMachine {
     stream: UnixStream,
@@ -63,8 +104,11 @@ pub struct AuthMachine {
     user: Option<String>,
     default_user: Option<String>,
     fixed_user: bool,
-    answered: bool,
     typed: bool,
+    asked: bool,
+    spoke: bool,
+    unprompted: Option<String>,
+    first_questions: BTreeMap<String, Prompt>,
     stage: String,
     stage_key: String,
 }
@@ -86,8 +130,11 @@ impl AuthMachine {
             user: None,
             default_user: None,
             fixed_user: false,
-            answered: false,
             typed: false,
+            asked: false,
+            spoke: false,
+            unprompted: None,
+            first_questions: BTreeMap::new(),
             stage: String::new(),
             stage_key: String::new(),
         })
@@ -100,6 +147,30 @@ impl AuthMachine {
 
     pub fn set_default_user(&mut self, user: Option<String>) {
         self.default_user = user;
+    }
+
+    pub fn set_unprompted(&mut self, user: Option<String>) {
+        self.unprompted = user;
+    }
+
+    pub fn unprompted(&self) -> Option<&str> {
+        self.unprompted.as_deref()
+    }
+
+    pub fn spoke(&self) -> bool {
+        self.spoke
+    }
+
+    pub fn set_first_questions(&mut self, questions: BTreeMap<String, Prompt>) {
+        self.first_questions = questions;
+    }
+
+    pub fn first_question(&self) -> Option<&Prompt> {
+        self.first_questions.get(self.user.as_deref()?)
+    }
+
+    pub fn typed_user(&self) -> bool {
+        self.typed
     }
 
     pub fn user(&self) -> Option<&str> {
@@ -126,18 +197,21 @@ impl AuthMachine {
         }
     }
 
-    fn log_stage(&mut self, user: &str, prompt: &str, secret: bool) {
-        let kind = if secret { "secret" } else { "visible" };
-        let key = format!("user={user} prompt={prompt:?} {kind}");
+    fn log_stage(&mut self, prompt: &Prompt, local: bool) {
+        let kind = if prompt.secret { "secret" } else { "visible" };
+        let origin = if local { " local" } else { "" };
+        let user = self.logged_user().to_owned();
+        let key = format!("user={user} prompt={:?} {kind}{origin}", prompt.text);
         if key == self.stage_key {
             return;
         }
-        let shown = if self.typed && prompt != RETRY_PROMPT && prompt != USERNAME_PROMPT {
+        let own = prompt.text == USERNAME_PROMPT || prompt.text == PASSWORD_PROMPT;
+        let shown = if self.typed && !own {
             "<hidden>".to_owned()
         } else {
-            format!("{prompt:?}")
+            format!("{:?}", prompt.text)
         };
-        self.stage = format!("user={user} prompt={shown} {kind}");
+        self.stage = format!("user={user} prompt={shown} {kind}{origin}");
         self.stage_key = key;
         eprintln!("vigil: auth stage {}", self.stage);
     }
@@ -149,17 +223,8 @@ impl AuthMachine {
     }
 
     pub fn begin(&mut self, user: Option<&str>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
-        match user {
-            Some(user) => {
-                self.fixed_user = true;
-                self.start(user, ui)
-            }
-            None => {
-                self.fixed_user = false;
-                self.prompt_username(ui);
-                Ok(())
-            }
-        }
+        self.fixed_user = user.is_some();
+        self.choose(user, false, ui)
     }
 
     pub fn select_user(
@@ -171,119 +236,126 @@ impl AuthMachine {
             return Err(AuthError("session has already started".into()));
         }
         self.fixed_user = false;
-        if self.state == State::AwaitingPrompt {
-            self.cancel(ui)?;
+        self.close(ui)?;
+        self.choose(user, false, ui)
+    }
+
+    fn choose(
+        &mut self,
+        user: Option<&str>,
+        typed: bool,
+        ui: &mut dyn AuthUi,
+    ) -> Result<(), AuthError> {
+        let Some(user) = user else {
+            self.prompt_username(ui);
+            return Ok(());
+        };
+        self.user = Some(user.to_owned());
+        self.typed = typed;
+        if self.unprompted.as_deref() == Some(user) {
+            eprintln!("vigil: auth unasked user={}", self.logged_user());
+            ui.reset_input();
+            return self.open(None, ui);
         }
-        match user {
-            Some(user) => self.start(user, ui),
-            None => {
-                self.user = None;
-                self.prompt_username(ui);
-                Ok(())
-            }
-        }
+        self.offer(ui);
+        Ok(())
     }
 
     fn prompt_username(&mut self, ui: &mut dyn AuthUi) {
+        self.user = None;
         self.typed = false;
         ui.reset_input();
         ui.show_prompt(USERNAME_PROMPT, false);
         self.state = State::AwaitingUser;
-        self.log_stage("<none>", USERNAME_PROMPT, false);
+        let prompt = Prompt {
+            text: USERNAME_PROMPT.into(),
+            secret: false,
+        };
+        self.log_stage(&prompt, true);
     }
 
-    fn await_retry(&mut self, ui: &mut dyn AuthUi, error: &str) {
+    fn offered(&self) -> Prompt {
+        self.first_question()
+            .cloned()
+            .unwrap_or_else(Prompt::password)
+    }
+
+    fn offer(&mut self, ui: &mut dyn AuthUi) {
+        let prompt = self.offered();
         ui.reset_input();
-        ui.show_prompt(RETRY_PROMPT, true);
-        ui.show_error(error);
-        self.state = State::AwaitingRetry;
-        let user = self.logged_user().to_owned();
-        self.log_stage(&user, RETRY_PROMPT, true);
+        ui.show_prompt(&prompt.shown(), prompt.secret);
+        self.state = State::AwaitingCommit;
+        self.log_stage(&prompt, true);
     }
 
-    fn restart(&mut self, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
-        match self.user.clone() {
-            Some(user) => self.create(&user, self.typed, ui),
-            None => {
-                self.prompt_username(ui);
-                Ok(())
-            }
-        }
-    }
-
-    pub fn start(&mut self, user: &str, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
-        self.create(user, false, ui)
-    }
-
-    fn create(&mut self, user: &str, typed: bool, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
-        if self.state == State::Complete {
-            return Err(AuthError("session has already started".into()));
-        }
-        ui.reset_input();
-        if self.state == State::AwaitingPrompt {
-            self.cancel(ui)?;
-        }
-        self.user = Some(user.to_owned());
-        self.typed = typed;
-        self.answered = false;
-
-        let response = self.transact(
-            &Request::CreateSession {
-                username: user.to_owned(),
-            },
-            ui,
-        )?;
-        self.process_response(response, ui)
+    // greetd can end a conversation that has asked a question only with an
+    // answer or with a failure PAM counts, so none is opened before a submit.
+    fn open(&mut self, submitted: Option<Submitted>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+        let Some(user) = self.user.clone() else {
+            self.prompt_username(ui);
+            return Ok(());
+        };
+        eprintln!("vigil: auth open user={}", self.logged_user());
+        self.asked = false;
+        self.spoke = false;
+        let response = self.transact(&Request::CreateSession { username: user }, ui)?;
+        self.process_response(response, submitted, ui)
     }
 
     pub fn handle(&mut self, msg: UiMessage, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         match msg {
-            UiMessage::Respond(username) if self.state == State::AwaitingUser => {
-                let username = username.trim();
-                if username.is_empty() {
-                    if let Some(default) = self.default_user.clone() {
-                        return self.start(&default, ui);
+            UiMessage::Respond(text) => match self.state {
+                State::AwaitingUser => {
+                    let name = text.trim();
+                    if name.is_empty() {
+                        let default = self.default_user.clone();
+                        self.choose(default.as_deref(), false, ui)
+                    } else {
+                        let typed = self.default_user.as_deref() != Some(name);
+                        self.choose(Some(name), typed, ui)
                     }
-                    self.prompt_username(ui);
-                    return Ok(());
                 }
-                let typed = self.default_user.as_deref() != Some(username);
-                self.create(username, typed, ui)
-            }
-            UiMessage::Respond(response) if self.state == State::AwaitingPrompt => {
-                self.answered = true;
-                let response = self.transact(
-                    &Request::PostAuthMessageResponse {
-                        response: Some(response),
-                    },
-                    ui,
-                )?;
-                self.process_response(response, ui)
-            }
-            UiMessage::Respond(_) if self.state == State::AwaitingRetry => self.restart(ui),
+                State::AwaitingCommit => {
+                    let field = self.offered();
+                    self.open((!text.is_empty()).then_some(Submitted { text, field }), ui)
+                }
+                State::AwaitingPrompt => {
+                    let response = self.transact(
+                        &Request::PostAuthMessageResponse {
+                            response: Some(text),
+                        },
+                        ui,
+                    )?;
+                    self.process_response(response, None, ui)
+                }
+                State::Idle | State::Complete => {
+                    Err(AuthError("no authentication prompt is pending".into()))
+                }
+            },
             UiMessage::Cancel if matches!(self.state, State::AwaitingUser | State::Complete) => {
                 Ok(())
             }
             UiMessage::Cancel => {
-                if self.state == State::AwaitingPrompt {
-                    self.cancel(ui)?;
-                }
+                self.close(ui)?;
                 if self.fixed_user {
                     eprintln!("vigil: auth cancel -> restart user={}", self.logged_user());
-                    self.restart(ui)
+                    self.offer(ui);
                 } else {
                     eprintln!("vigil: auth cancel -> username");
                     self.prompt_username(ui);
-                    Ok(())
                 }
+                Ok(())
             }
-            UiMessage::Respond(_) => Err(AuthError("no authentication prompt is pending".into())),
             UiMessage::SelectSession(_) | UiMessage::SelectUser(_) => Ok(()),
             UiMessage::Power(_) => Err(AuthError("power actions are not authentication".into())),
         }
     }
 
-    fn cancel(&mut self, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+    fn close(&mut self, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+        if self.state != State::AwaitingPrompt {
+            return Ok(());
+        }
+        eprintln!("vigil: auth close user={} unanswered", self.logged_user());
         let response = self.transact(&Request::CancelSession, ui)?;
         self.state = State::Idle;
         match response {
@@ -298,32 +370,80 @@ impl AuthMachine {
         }
     }
 
+    fn heard(&mut self) {
+        self.spoke = true;
+        self.stop_opening_unasked("PAM spoke to");
+    }
+
+    fn stop_opening_unasked(&mut self, why: &str) {
+        if self.unprompted.is_some() && self.unprompted == self.user {
+            eprintln!(
+                "vigil: auth: {why} user={}; no longer opening unasked",
+                self.logged_user()
+            );
+            self.unprompted = None;
+        }
+    }
+
+    fn fail(&mut self, ui: &mut dyn AuthUi, description: &str) {
+        self.stop_opening_unasked("sign-in failed for");
+        let text = self.show_error(ui, description);
+        let _ = self.transact(&Request::CancelSession, ui);
+        self.offer(ui);
+        ui.show_error(&text);
+    }
+
     fn process_response(
         &mut self,
         mut response: Response,
+        mut submitted: Option<Submitted>,
         ui: &mut dyn AuthUi,
     ) -> Result<(), AuthError> {
-        let mut pending_error: Option<String> = None;
         loop {
             match response {
                 Response::AuthMessage {
                     auth_message_type: kind @ (AuthMessageType::Visible | AuthMessageType::Secret),
                     auth_message,
                 } => {
-                    let secret = matches!(kind, AuthMessageType::Secret);
-                    ui.show_prompt(&auth_message, secret);
-                    if let Some(error) = pending_error.take() {
-                        ui.show_error(&error);
+                    let prompt = Prompt {
+                        text: auth_message,
+                        secret: matches!(kind, AuthMessageType::Secret),
+                    };
+                    if !std::mem::replace(&mut self.asked, true)
+                        && let Some(user) = self.user.clone()
+                    {
+                        self.first_questions.insert(user, prompt.clone());
                     }
+                    self.heard();
+                    match submitted.take() {
+                        Some(submitted) if prompt.is_the_question_under(&submitted.field) => {
+                            response = self.transact(
+                                &Request::PostAuthMessageResponse {
+                                    response: Some(submitted.text),
+                                },
+                                ui,
+                            )?;
+                            continue;
+                        }
+                        Some(_) => {
+                            eprintln!(
+                                "vigil: auth withheld user={}; the first question is not the one the field showed",
+                                self.logged_user()
+                            );
+                            ui.reset_input();
+                        }
+                        None => {}
+                    }
+                    ui.show_prompt(&prompt.text, prompt.secret);
                     self.state = State::AwaitingPrompt;
-                    let user = self.logged_user().to_owned();
-                    self.log_stage(&user, &auth_message, secret);
+                    self.log_stage(&prompt, false);
                     return Ok(());
                 }
                 Response::AuthMessage {
                     auth_message_type,
                     auth_message,
                 } => {
+                    self.heard();
                     match auth_message_type {
                         AuthMessageType::Info => ui.show_info(&auth_message),
                         AuthMessageType::Error => ui.show_error(&auth_message),
@@ -351,9 +471,7 @@ impl AuthMachine {
                             return Ok(());
                         }
                         Response::Error { description, .. } => {
-                            let text = self.show_error(ui, &description);
-                            let _ = self.transact(&Request::CancelSession, ui);
-                            self.await_retry(ui, &text);
+                            self.fail(ui, &description);
                             return Ok(());
                         }
                         Response::AuthMessage { .. } => {
@@ -365,15 +483,8 @@ impl AuthMachine {
                     }
                 }
                 Response::Error { description, .. } => {
-                    let text = self.show_error(ui, &description);
-                    let _ = self.transact(&Request::CancelSession, ui);
-                    let Some(user) = self.user.clone().filter(|_| self.answered) else {
-                        self.await_retry(ui, &text);
-                        return Ok(());
-                    };
-                    self.answered = false;
-                    pending_error = Some(text);
-                    response = self.transact(&Request::CreateSession { username: user }, ui)?;
+                    self.fail(ui, &description);
+                    return Ok(());
                 }
             }
         }
@@ -410,6 +521,7 @@ mod tests {
         Info(String),
         Error(String),
         Busy(bool),
+        Reset,
     }
 
     #[derive(Default)]
@@ -427,6 +539,9 @@ mod tests {
         }
         fn set_busy(&mut self, busy: bool) {
             self.0.push(UiCall::Busy(busy));
+        }
+        fn reset_input(&mut self) {
+            self.0.push(UiCall::Reset);
         }
     }
 
@@ -588,7 +703,17 @@ mod tests {
 
     fn shown(ui: &RecordingUi) -> Vec<&UiCall> {
         ui.0.iter()
-            .filter(|call| !matches!(call, UiCall::Busy(_)))
+            .filter(|call| !matches!(call, UiCall::Busy(_) | UiCall::Reset))
+            .collect()
+    }
+
+    fn fields(ui: &RecordingUi) -> Vec<String> {
+        ui.0.iter()
+            .filter_map(|call| match call {
+                UiCall::Reset => Some("reset".to_owned()),
+                UiCall::Prompt(text, _) => Some(text.clone()),
+                _ => None,
+            })
             .collect()
     }
 
@@ -606,23 +731,12 @@ mod tests {
         };
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
-        machine.start("alice", &mut ui).unwrap();
+        machine.select_user(Some("alice"), &mut ui).unwrap();
         machine
             .handle(UiMessage::Respond("hunter2".into()), &mut ui)
             .unwrap();
         assert!(machine.is_complete());
-        assert_eq!(
-            ui.0,
-            [
-                UiCall::Busy(true),
-                UiCall::Busy(false),
-                UiCall::Prompt("Password:".into(), true),
-                UiCall::Busy(true),
-                UiCall::Busy(false),
-                UiCall::Busy(true),
-                UiCall::Busy(false),
-            ]
-        );
+        assert_eq!(shown(&ui), [&UiCall::Prompt("Password".into(), true)]);
     }
 
     #[test]
@@ -656,6 +770,66 @@ mod tests {
     }
 
     #[test]
+    fn escape_before_any_submit_sends_greetd_nothing() {
+        let Some((server, requests)) = scripted(vec![secret_prompt(), Response::Success]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Cancel, &mut ui);
+        assert!(machine.awaiting_username());
+        drop(machine);
+        drop(server);
+        assert_eq!(sent(&requests), [""; 0]);
+    }
+
+    #[test]
+    fn a_greeter_that_stops_before_any_submit_sends_greetd_nothing() {
+        let Some((server, requests)) = scripted(vec![secret_prompt(), Response::Success]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        drop(machine);
+        drop(server);
+        assert_eq!(sent(&requests), [""; 0]);
+    }
+
+    #[test]
+    fn a_wrong_password_is_one_attempt_and_opens_nothing_after_it() {
+        let Some((server, requests)) = scripted(vec![
+            secret_prompt(),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+            secret_prompt(),
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("wrong".into()), &mut ui);
+        assert_eq!(
+            shown(&ui)[2..],
+            [
+                &UiCall::Prompt("Password:".into(), true),
+                &UiCall::Error("Incorrect password".into())
+            ]
+        );
+        let _ = machine.handle(UiMessage::Cancel, &mut ui);
+        drop(machine);
+        drop(server);
+        assert_eq!(
+            sent(&requests),
+            ["create alice", "answer wrong", "cancel"],
+            "one conversation, one answer, and the cancel that clears the failed session"
+        );
+    }
+
+    #[test]
     fn auth_error_then_retry() {
         let Some(server) = FakeServer::spawn(|stream| {
             assert_create(request(stream), "alice");
@@ -681,7 +855,7 @@ mod tests {
         };
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
-        machine.start("alice", &mut ui).unwrap();
+        machine.select_user(Some("alice"), &mut ui).unwrap();
         machine
             .handle(UiMessage::Respond("wrong".into()), &mut ui)
             .unwrap();
@@ -699,39 +873,369 @@ mod tests {
     }
 
     #[test]
-    fn handles_multiple_prompts() {
-        let Some(server) = FakeServer::spawn(|stream| {
-            assert_create(request(stream), "alice");
-            respond(stream, auth_message(AuthMessageType::Visible, "Login:"));
-            assert_answer(request(stream), Some("alice@example.com"));
-            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
-            assert_answer(request(stream), Some("secret"));
-            respond(stream, Response::Success);
-            assert_start(request(stream));
-            respond(stream, Response::Success);
-        }) else {
+    fn enter_with_nothing_typed_asks_pam_without_answering() {
+        let Some((server, requests)) =
+            scripted(vec![secret_prompt(), Response::Success, Response::Success])
+        else {
             return;
         };
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
-        machine.start("alice", &mut ui).unwrap();
-        machine
-            .handle(UiMessage::Respond("alice@example.com".into()), &mut ui)
-            .unwrap();
-        machine
-            .handle(UiMessage::Respond("secret".into()), &mut ui)
-            .unwrap();
-        let prompts: Vec<_> =
-            ui.0.iter()
-                .filter(|call| matches!(call, UiCall::Prompt(..)))
-                .collect();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice"]);
         assert_eq!(
-            prompts,
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Password:".into(), true))
+        );
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer hunter2", "start"]);
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn handles_multiple_prompts() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Visible, "Login:"),
+            secret_prompt(),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("alice@example.com".into()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("secret".into()), &mut ui);
+        assert_eq!(
+            sent(&requests),
             [
+                "create alice",
+                "answer alice@example.com",
+                "answer secret",
+                "start"
+            ]
+        );
+        assert_eq!(
+            shown(&ui),
+            [
+                &UiCall::Prompt("Password".into(), true),
                 &UiCall::Prompt("Login:".into(), false),
                 &UiCall::Prompt("Password:".into(), true)
             ]
         );
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn a_first_question_of_another_kind_is_shown_instead_of_answered() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Visible, "Code:"),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+            auth_message(AuthMessageType::Visible, "Code:"),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("my password".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice"]);
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Code:".into(), false))
+        );
+        let _ = machine.handle(UiMessage::Respond("111111".into()), &mut ui);
+        assert_eq!(
+            shown(&ui)[shown(&ui).len() - 2..],
+            [
+                &UiCall::Prompt("Code:".into(), false),
+                &UiCall::Error("Incorrect password".into())
+            ],
+            "the next attempt is offered under the question PAM asks first"
+        );
+        let _ = machine.handle(UiMessage::Respond("222222".into()), &mut ui);
+        assert_eq!(
+            sent(&requests),
+            [
+                "create alice",
+                "answer 111111",
+                "cancel",
+                "create alice",
+                "answer 222222",
+                "start"
+            ]
+        );
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn a_hidden_first_question_that_is_not_the_password_gets_no_typed_text() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Security token PIN: "),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(
+            sent(&requests),
+            ["create alice"],
+            "a password typed under the Password field is not a token PIN"
+        );
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Security token PIN: ".into(), true))
+        );
+    }
+
+    #[test]
+    fn a_localized_password_question_is_shown_before_it_is_answered() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Mot de passe : "),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice"]);
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Mot de passe : ".into(), true))
+        );
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer hunter2", "start"]);
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn typed_text_that_is_withheld_is_cleared_from_the_field() {
+        let Some((server, _requests)) = scripted(vec![auth_message(
+            AuthMessageType::Secret,
+            "Security token PIN: ",
+        )]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(
+            fields(&ui),
+            ["reset", "Password", "reset", "Security token PIN: "]
+        );
+    }
+
+    #[test]
+    fn a_learned_question_is_answered_only_when_pam_asks_it_again_word_for_word() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Security token PIN: "),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+            auth_message(AuthMessageType::Secret, "Security token PIN: "),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+            auth_message(AuthMessageType::Secret, "Recovery key: "),
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("111111".into()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("222222".into()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("333333".into()), &mut ui);
+        assert_eq!(
+            sent(&requests),
+            [
+                "create alice",
+                "answer 111111",
+                "cancel",
+                "create alice",
+                "answer 222222",
+                "cancel",
+                "create alice"
+            ]
+        );
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Recovery key: ".into(), true))
+        );
+    }
+
+    #[test]
+    fn the_password_field_answers_only_the_plain_password_question() {
+        let asked = |kind, text: &str| {
+            let (server, requests) = scripted(vec![
+                auth_message(kind, text),
+                Response::Success,
+                Response::Success,
+            ])?;
+            let mut machine = machine(&server);
+            let mut ui = RecordingUi::default();
+            let _ = machine.select_user(Some("alice"), &mut ui);
+            let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+            Some(sent(&requests))
+        };
+        let answered = ["create alice", "answer hunter2", "start"];
+        for text in ["Password: ", "Password:", "Password"] {
+            let Some(sent) = asked(AuthMessageType::Secret, text) else {
+                return;
+            };
+            assert_eq!(sent, answered, "{text:?}");
+        }
+        for (kind, text) in [
+            (AuthMessageType::Secret, "Password for alice: "),
+            (AuthMessageType::Secret, "New password: "),
+            (AuthMessageType::Visible, "Password: "),
+        ] {
+            let Some(sent) = asked(kind, text) else {
+                return;
+            };
+            assert_eq!(sent, ["create alice"], "{text:?}");
+        }
+    }
+
+    fn pin_question() -> Prompt {
+        Prompt {
+            text: "Security token PIN: ".into(),
+            secret: true,
+        }
+    }
+
+    #[test]
+    fn a_remembered_first_question_is_offered_and_answered_on_the_first_try() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Security token PIN: "),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_first_questions(BTreeMap::from([("alice".into(), pin_question())]));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(
+            shown(&ui),
+            [&UiCall::Prompt("Security token PIN: ".into(), true)]
+        );
+        assert_eq!(sent(&requests), [""; 0]);
+        let _ = machine.handle(UiMessage::Respond("123456".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer 123456", "start"]);
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn a_remembered_question_belongs_to_one_user() {
+        let Some((server, requests)) = scripted(vec![auth_message(
+            AuthMessageType::Secret,
+            "Security token PIN: ",
+        )]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_first_questions(BTreeMap::from([("alice".into(), pin_question())]));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        assert_eq!(shown(&ui), [&UiCall::Prompt("Password".into(), true)]);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create bob"]);
+    }
+
+    #[test]
+    fn a_localized_password_question_is_answered_on_the_first_try_of_the_next_start() {
+        let Some((first, _requests)) = scripted(vec![auth_message(
+            AuthMessageType::Secret,
+            "Mot de passe : ",
+        )]) else {
+            return;
+        };
+        let mut before = machine(&first);
+        let mut ui = RecordingUi::default();
+        let _ = before.select_user(Some("alice"), &mut ui);
+        let _ = before.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        let learned = before.first_question().cloned().unwrap();
+        assert!(!learned.is_plain_password());
+
+        let Some((second, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Mot de passe : "),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut after = machine(&second);
+        after.set_first_questions(BTreeMap::from([("alice".into(), learned)]));
+        let mut ui = RecordingUi::default();
+        let _ = after.select_user(Some("alice"), &mut ui);
+        assert_eq!(
+            shown(&ui),
+            [&UiCall::Prompt("Mot de passe : ".into(), true)]
+        );
+        let _ = after.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer hunter2", "start"]);
+        assert!(after.is_complete());
+    }
+
+    #[test]
+    fn a_remembered_question_pam_no_longer_asks_is_replaced_not_answered() {
+        let Some((server, requests)) = scripted(vec![secret_prompt()]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_first_questions(BTreeMap::from([("alice".into(), pin_question())]));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("123456".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice"]);
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Password:".into(), true))
+        );
+        assert!(machine.first_question().unwrap().is_plain_password());
+    }
+
+    #[test]
+    fn a_remembered_question_is_displayed_without_control_characters() {
+        let raw = "Code for\n\u{1b}[31malice:\t";
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Visible, raw),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_first_questions(BTreeMap::from([(
+            "alice".into(),
+            Prompt {
+                text: raw.into(),
+                secret: false,
+            },
+        )]));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(
+            shown(&ui),
+            [&UiCall::Prompt("Code for  [31malice: ".into(), false)]
+        );
+        let _ = machine.handle(UiMessage::Respond("111111".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer 111111", "start"]);
     }
 
     #[test]
@@ -758,47 +1262,35 @@ mod tests {
         };
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
-        machine.start("alice", &mut ui).unwrap();
+        machine.select_user(Some("alice"), &mut ui).unwrap();
         machine
             .handle(UiMessage::Respond("secret".into()), &mut ui)
             .unwrap();
-        let messages: Vec<_> =
-            ui.0.iter()
-                .filter(|call| !matches!(call, UiCall::Busy(_)))
-                .collect();
+        assert!(machine.is_complete());
         assert_eq!(
-            messages,
+            shown(&ui),
             [
+                &UiCall::Prompt("Password".into(), true),
                 &UiCall::Info("Touch your key".into()),
-                &UiCall::Error("Key timed out".into()),
-                &UiCall::Prompt("Password:".into(), true)
+                &UiCall::Error("Key timed out".into())
             ]
         );
     }
 
     #[test]
     fn selectable_user_skips_username_and_manual_entry_restores_it() {
-        let Some(server) = FakeServer::spawn(|stream| {
-            assert_create(request(stream), "alice");
-            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
-            assert_cancel(request(stream));
-            respond(stream, Response::Success);
-            assert_create(request(stream), "bob");
-            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
-            assert_cancel(request(stream));
-            respond(stream, Response::Success);
-        }) else {
+        let Some((server, requests)) = scripted(vec![secret_prompt(), Response::Success]) else {
             return;
         };
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
 
         machine.select_user(Some("alice"), &mut ui).unwrap();
-        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password:".into(), true)));
+        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password".into(), true)));
         assert_eq!(machine.user(), Some("alice"));
 
         machine.select_user(Some("bob"), &mut ui).unwrap();
-        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password:".into(), true)));
+        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password".into(), true)));
         assert_eq!(machine.user(), Some("bob"));
 
         machine.select_user(None, &mut ui).unwrap();
@@ -807,6 +1299,9 @@ mod tests {
             Some(&UiCall::Prompt(USERNAME_PROMPT.into(), false))
         );
         assert_eq!(machine.user(), None);
+        drop(machine);
+        drop(server);
+        assert_eq!(sent(&requests), [""; 0]);
     }
 
     #[test]
@@ -825,8 +1320,8 @@ mod tests {
         let mut ui = RecordingUi::default();
         machine.begin(None, &mut ui).unwrap();
         assert_eq!(
-            ui.0.first(),
-            Some(&UiCall::Prompt(USERNAME_PROMPT.into(), false))
+            shown(&ui).first(),
+            Some(&&UiCall::Prompt(USERNAME_PROMPT.into(), false))
         );
         machine
             .handle(UiMessage::Respond("  ".into()), &mut ui)
@@ -846,10 +1341,7 @@ mod tests {
 
     #[test]
     fn empty_username_submits_default() {
-        let Some(server) = FakeServer::spawn(|stream| {
-            assert_create(request(stream), "alice");
-            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
-        }) else {
+        let Some((server, requests)) = scripted(vec![secret_prompt(), Response::Success]) else {
             return;
         };
         let mut machine = machine(&server);
@@ -859,20 +1351,16 @@ mod tests {
         machine
             .handle(UiMessage::Respond("   ".into()), &mut ui)
             .unwrap();
-        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password:".into(), true)));
+        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password".into(), true)));
         assert_eq!(machine.user(), Some("alice"));
+        drop(machine);
+        drop(server);
+        assert_eq!(sent(&requests), [""; 0]);
     }
 
     #[test]
     fn cancel_returns_to_username_stage() {
-        let Some(server) = FakeServer::spawn(|stream| {
-            assert_create(request(stream), "alice");
-            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
-            assert_cancel(request(stream));
-            respond(stream, Response::Success);
-            assert_create(request(stream), "bob");
-            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
-        }) else {
+        let Some((server, requests)) = scripted(vec![secret_prompt(), Response::Success]) else {
             return;
         };
         let mut machine = machine(&server);
@@ -889,56 +1377,55 @@ mod tests {
         machine
             .handle(UiMessage::Respond("bob".into()), &mut ui)
             .unwrap();
-        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password:".into(), true)));
+        assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Password".into(), true)));
+        drop(machine);
+        drop(server);
+        assert_eq!(sent(&requests), [""; 0]);
     }
 
     #[test]
     fn cancels_mid_prompt_and_can_restart() {
-        let Some(server) = FakeServer::spawn(|stream| {
-            assert_create(request(stream), "alice");
-            respond(stream, auth_message(AuthMessageType::Secret, "Password:"));
-            assert!(matches!(request(stream), Request::CancelSession));
-            respond(stream, Response::Success);
-            assert_create(request(stream), "bob");
-            respond(stream, auth_message(AuthMessageType::Visible, "Code:"));
-        }) else {
+        let Some((server, requests)) = scripted(vec![
+            secret_prompt(),
+            Response::Success,
+            auth_message(AuthMessageType::Visible, "Code:"),
+        ]) else {
             return;
         };
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
-        machine.start("alice", &mut ui).unwrap();
-        machine.handle(UiMessage::Cancel, &mut ui).unwrap();
-        machine.start("bob", &mut ui).unwrap();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Cancel, &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "cancel"]);
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
         assert!(!machine.is_complete());
+        assert_eq!(sent(&requests), ["create alice", "cancel", "create bob"]);
         assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Code:".into(), false)));
     }
 
     #[test]
-    fn a_fixed_user_cancel_starts_that_users_session_again() {
-        let Some((server, requests)) = scripted(vec![
-            secret_prompt(),
-            Response::Success,
-            secret_prompt(),
-            Response::Success,
-            Response::Success,
-        ]) else {
+    fn a_fixed_user_cancel_offers_that_user_again() {
+        let Some((server, requests)) =
+            scripted(vec![secret_prompt(), Response::Success, Response::Success])
+        else {
             return;
         };
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         machine.begin(Some("alice"), &mut ui).unwrap();
         let _ = machine.handle(UiMessage::Cancel, &mut ui);
-        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert!(!machine.awaiting_username());
         assert_eq!(
-            sent(&requests),
+            shown(&ui),
             [
-                "create alice",
-                "cancel",
-                "create alice",
-                "answer hunter2",
-                "start"
+                &UiCall::Prompt("Password".into(), true),
+                &UiCall::Prompt("Password".into(), true)
             ]
         );
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer hunter2", "start"]);
         assert!(machine.is_complete());
     }
 
@@ -955,11 +1442,12 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
         assert_eq!(sent(&requests), ["create alice", "cancel"]);
         assert_eq!(
-            shown(&ui)[1..],
+            shown(&ui)[2..],
             [
-                &UiCall::Prompt(RETRY_PROMPT.into(), true),
+                &UiCall::Prompt("Password".into(), true),
                 &UiCall::Error("Incorrect password".into())
             ]
         );
@@ -979,47 +1467,12 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
         assert_eq!(sent(&requests), ["create alice", "answer <none>", "cancel"]);
     }
 
     #[test]
-    fn a_wrong_answer_reopens_the_session_once() {
-        let mut replies = vec![
-            secret_prompt(),
-            refusal("pam_authenticate: AUTH_ERR"),
-            Response::Success,
-        ];
-        for _ in 0..4 {
-            replies.push(refusal("pam_authenticate: MAXTRIES"));
-            replies.push(Response::Success);
-        }
-        let Some((server, requests)) = scripted(replies) else {
-            return;
-        };
-        let mut machine = machine(&server);
-        let mut ui = RecordingUi::default();
-        let _ = machine.select_user(Some("alice"), &mut ui);
-        let _ = machine.handle(UiMessage::Respond("wrong".into()), &mut ui);
-        assert_eq!(
-            sent(&requests),
-            [
-                "create alice",
-                "answer wrong",
-                "cancel",
-                "create alice",
-                "cancel"
-            ]
-        );
-        assert_eq!(
-            shown(&ui).last(),
-            Some(&&UiCall::Error(
-                "Too many failed attempts. Try again later.".into()
-            ))
-        );
-    }
-
-    #[test]
-    fn enter_retries_a_refused_session_without_sending_what_was_typed() {
+    fn text_typed_for_a_session_refused_before_any_question_is_never_sent() {
         let Some((server, requests)) = scripted(vec![
             refusal("pam_authenticate: AUTH_ERR"),
             Response::Success,
@@ -1033,12 +1486,25 @@ mod tests {
         let mut ui = RecordingUi::default();
         let _ = machine.begin(Some("alice"), &mut ui);
         let _ = machine.handle(UiMessage::Respond("typed blind".into()), &mut ui);
-        assert_eq!(sent(&requests), ["create alice", "cancel", "create alice"]);
+        assert_eq!(sent(&requests), ["create alice", "cancel"]);
         assert_eq!(
-            shown(&ui).last(),
-            Some(&&UiCall::Prompt("Password:".into(), true))
+            shown(&ui)[2..],
+            [
+                &UiCall::Prompt("Password".into(), true),
+                &UiCall::Error("Incorrect password".into())
+            ]
         );
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(
+            sent(&requests),
+            [
+                "create alice",
+                "cancel",
+                "create alice",
+                "answer hunter2",
+                "start"
+            ]
+        );
         assert!(machine.is_complete());
     }
 
@@ -1054,16 +1520,16 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
         assert!(!machine.awaiting_username());
         let _ = machine.handle(UiMessage::Cancel, &mut ui);
         assert!(machine.awaiting_username());
-        assert_eq!(sent(&requests), ["create alice", "cancel"]);
         assert_eq!(
             shown(&ui).last(),
             Some(&&UiCall::Prompt(USERNAME_PROMPT.into(), false))
         );
         let _ = machine.handle(UiMessage::Respond("bob".into()), &mut ui);
-        assert_eq!(sent(&requests), ["create alice", "cancel", "create bob"]);
+        assert_eq!(sent(&requests), ["create alice", "cancel"]);
     }
 
     #[test]
@@ -1077,6 +1543,8 @@ mod tests {
             },
             Response::Success,
             secret_prompt(),
+            Response::Success,
+            Response::Success,
         ]) else {
             return;
         };
@@ -1088,11 +1556,15 @@ mod tests {
             shown(&ui)[1..],
             [
                 &UiCall::Error("no such session".into()),
-                &UiCall::Prompt(RETRY_PROMPT.into(), true),
+                &UiCall::Prompt("Password:".into(), true),
                 &UiCall::Error("no such session".into())
             ]
         );
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        assert_eq!(
+            sent(&requests),
+            ["create alice", "answer hunter2", "start", "cancel"]
+        );
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
         assert_eq!(
             sent(&requests),
             [
@@ -1100,13 +1572,12 @@ mod tests {
                 "answer hunter2",
                 "start",
                 "cancel",
-                "create alice"
+                "create alice",
+                "answer hunter2",
+                "start"
             ]
         );
-        assert_eq!(
-            shown(&ui).last(),
-            Some(&&UiCall::Prompt("Password:".into(), true))
-        );
+        assert!(machine.is_complete());
     }
 
     #[test]
@@ -1121,14 +1592,64 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
         let _ = machine.handle(UiMessage::Cancel, &mut ui);
         assert!(machine.awaiting_username());
         let _ = machine.handle(UiMessage::Respond("bob".into()), &mut ui);
-        assert_eq!(sent(&requests), ["create alice", "cancel", "create bob"]);
+        assert_eq!(sent(&requests), ["create alice", "cancel"]);
         assert_eq!(
             shown(&ui).last(),
-            Some(&&UiCall::Prompt("Password:".into(), true))
+            Some(&&UiCall::Prompt("Password".into(), true))
         );
+    }
+
+    #[test]
+    fn a_local_field_is_cleared_each_time_it_is_offered() {
+        let Some((server, _requests)) = scripted(vec![
+            secret_prompt(),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.begin(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Cancel, &mut ui);
+        let _ = machine.handle(UiMessage::Respond("wrong".into()), &mut ui);
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        let _ = machine.select_user(None, &mut ui);
+        assert_eq!(
+            fields(&ui),
+            [
+                "reset",
+                "Password",
+                "reset",
+                "Password",
+                "reset",
+                "Password:",
+                "reset",
+                "Password",
+                "reset",
+                "Username"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_question_from_pam_leaves_the_field_as_it_is() {
+        let Some((server, _requests)) = scripted(vec![
+            secret_prompt(),
+            auth_message(AuthMessageType::Visible, "Code:"),
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(fields(&ui), ["reset", "Password", "Password:", "Code:"]);
     }
 
     #[test]
@@ -1139,33 +1660,48 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(
+            machine.stage(),
+            "user=alice prompt=\"Password\" secret local"
+        );
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
         assert_eq!(machine.stage(), "user=alice prompt=\"Password:\" secret");
         let _ = machine.handle(UiMessage::Cancel, &mut ui);
-        assert_eq!(machine.stage(), "user=<none> prompt=\"Username\" visible");
+        assert_eq!(
+            machine.stage(),
+            "user=<none> prompt=\"Username\" visible local"
+        );
     }
 
     #[test]
     fn a_prompt_that_echoes_a_typed_name_never_reaches_the_stage_line() {
-        let Some((server, _requests)) = scripted(vec![auth_message(
-            AuthMessageType::Secret,
-            "hunter2's password:",
-        )]) else {
+        let Some((server, _requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "hunter2's password:"),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+        ]) else {
             return;
         };
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.begin(None, &mut ui);
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
         assert!(!machine.stage().contains("hunter2"), "{}", machine.stage());
         assert_eq!(machine.stage(), "user=<typed> prompt=<hidden> secret");
+        let _ = machine.handle(UiMessage::Respond("wrong".into()), &mut ui);
+        assert!(!machine.stage().contains("hunter2"), "{}", machine.stage());
+        assert_eq!(machine.stage(), "user=<typed> prompt=<hidden> secret local");
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Error("Incorrect password".into()))
+        );
     }
 
     #[test]
     fn a_typed_name_never_reaches_the_stage_line() {
         let Some((server, requests)) = scripted(vec![
             secret_prompt(),
-            refusal("pam_authenticate: AUTH_ERR"),
-            Response::Success,
             refusal("pam_authenticate: AUTH_ERR"),
             Response::Success,
         ]) else {
@@ -1176,12 +1712,12 @@ mod tests {
         let mut ui = RecordingUi::default();
         let _ = machine.begin(None, &mut ui);
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
-        assert_eq!(machine.stage(), "user=<typed> prompt=<hidden> secret");
-        let _ = machine.handle(UiMessage::Respond("again".into()), &mut ui);
         assert_eq!(
             machine.stage(),
-            format!("user=<typed> prompt={RETRY_PROMPT:?} secret")
+            "user=<typed> prompt=\"Password\" secret local"
         );
+        let _ = machine.handle(UiMessage::Respond("again".into()), &mut ui);
+        assert_eq!(machine.stage(), "user=<typed> prompt=<hidden> secret local");
         assert_eq!(sent(&requests)[0], "create hunter2");
     }
 
@@ -1195,6 +1731,151 @@ mod tests {
         let mut ui = RecordingUi::default();
         let _ = machine.begin(None, &mut ui);
         let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
-        assert_eq!(machine.stage(), "user=alice prompt=\"Password:\" secret");
+        assert_eq!(
+            machine.stage(),
+            "user=alice prompt=\"Password\" secret local"
+        );
+    }
+
+    #[test]
+    fn a_user_whose_last_sign_in_asked_nothing_is_signed_in_unasked() {
+        let Some((server, requests)) = scripted(vec![Response::Success, Response::Success]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.begin(Some("alice"), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "start"]);
+        assert!(machine.is_complete());
+        assert!(!machine.spoke());
+    }
+
+    #[test]
+    fn enter_at_the_name_stage_signs_the_unprompted_default_user_in() {
+        let Some((server, requests)) = scripted(vec![Response::Success, Response::Success]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_default_user(Some("alice".into()));
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.begin(None, &mut ui);
+        assert_eq!(sent(&requests), [""; 0]);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "start"]);
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn a_question_put_to_the_unprompted_user_starts_with_an_empty_field() {
+        let Some((server, _requests)) = scripted(vec![secret_prompt()]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(fields(&ui), ["reset", "Password", "reset", "Password:"]);
+    }
+
+    #[test]
+    fn only_the_unprompted_user_is_opened_unasked() {
+        let Some((server, requests)) = scripted(vec![Response::Success, Response::Success]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Password".into(), true))
+        );
+        drop(machine);
+        drop(server);
+        assert_eq!(sent(&requests), [""; 0]);
+    }
+
+    #[test]
+    fn a_question_withdraws_the_expectation_of_an_unasked_sign_in() {
+        let Some((server, requests)) =
+            scripted(vec![secret_prompt(), Response::Success, secret_prompt()])
+        else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Password:".into(), true))
+        );
+        assert_eq!(machine.unprompted(), None);
+        assert!(machine.spoke());
+        let _ = machine.handle(UiMessage::Cancel, &mut ui);
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        drop(machine);
+        drop(server);
+        assert_eq!(
+            sent(&requests),
+            ["create alice", "cancel"],
+            "the second selection waits for a submit"
+        );
+    }
+
+    #[test]
+    fn an_unasked_sign_in_that_is_refused_is_not_opened_unasked_again() {
+        let Some((server, requests)) = scripted(vec![
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "cancel"]);
+        assert_eq!(machine.unprompted(), None);
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        drop(machine);
+        drop(server);
+        assert_eq!(
+            sent(&requests),
+            ["create alice", "cancel"],
+            "choosing the user again waits for a submit"
+        );
+    }
+
+    #[test]
+    fn a_message_alone_ends_the_expectation_of_an_unasked_sign_in() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Info, "Place your finger on the reader"),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.begin(Some("alice"), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer <none>", "start"]);
+        assert!(machine.is_complete());
+        assert_eq!(
+            machine.unprompted(),
+            None,
+            "a stack that speaks may go on to ask, so it is not opened unasked again"
+        );
+        assert!(
+            machine.spoke(),
+            "a sign-in during which PAM said anything is not recorded as unprompted"
+        );
     }
 }

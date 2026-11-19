@@ -118,7 +118,7 @@ dump_live("2-after-unplug.ppm")
 
 typestr("demo")
 sendkey("ret")
-wait_in_log(["create_session"], 15, "username submit after unplug")
+wait_in_log(["auth stage user=<typed>", "auth open user="], 15, "submit after unplug")
 time.sleep(1)
 dump_live("3-password-after-unplug.ppm")
 

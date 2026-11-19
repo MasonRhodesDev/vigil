@@ -863,6 +863,43 @@ pub struct State {
     pub session: String,
     pub auto_started_at: Option<u64>,
     pub auto_streak: u32,
+    pub unprompted_user: String,
+    #[serde(deserialize_with = "complete_entries")]
+    pub first_question: Vec<FirstQuestion>,
+}
+
+fn complete_entries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<FirstQuestion>, D::Error> {
+    let entries = Vec::<toml::Value>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| entry.try_into().ok())
+        .collect())
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct FirstQuestion {
+    pub user: String,
+    pub text: String,
+    pub secret: bool,
+}
+
+fn quoted(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 impl State {
@@ -884,25 +921,39 @@ impl State {
         }
     }
 
-    pub fn store(&self, path: &Path) {
-        let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    pub fn store(&self, path: &Path) -> bool {
         let mut body = format!(
-            "user = \"{}\"\nsession = \"{}\"\nauto_streak = {}\n",
-            escape(&self.user),
-            escape(&self.session),
+            "user = {}\nsession = {}\nauto_streak = {}\n",
+            quoted(&self.user),
+            quoted(&self.session),
             self.auto_streak
         );
         if let Some(at) = self.auto_started_at {
             body.push_str(&format!("auto_started_at = {at}\n"));
         }
+        if !self.unprompted_user.is_empty() {
+            body.push_str(&format!(
+                "unprompted_user = {}\n",
+                quoted(&self.unprompted_user)
+            ));
+        }
+        for question in &self.first_question {
+            body.push_str(&format!(
+                "\n[[first_question]]\nuser = {}\ntext = {}\nsecret = {}\n",
+                quoted(&question.user),
+                quoted(&question.text),
+                question.secret
+            ));
+        }
         let tmp = path.with_extension("tmp");
         let result = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
-        if let Err(e) = result {
+        if let Err(e) = &result {
             eprintln!(
                 "vigil-config: cannot store state at {}: {e}",
                 path.display()
             );
         }
+        result.is_ok()
     }
 }
 
@@ -1476,7 +1527,7 @@ easing = \"linear\"
 scale = 2.0
 
 [profiles]
-dir = \"/home/mason/.config/monitor-profiles\"
+dir = \"/etc/vigil/monitor-profiles\"
 ",
         );
         assert_eq!(ignored, Vec::new());
@@ -1492,7 +1543,7 @@ dir = \"/home/mason/.config/monitor-profiles\"
         );
         assert_eq!(
             config.profiles.dir,
-            Some(PathBuf::from("/home/mason/.config/monitor-profiles"))
+            Some(PathBuf::from("/etc/vigil/monitor-profiles"))
         );
         assert_eq!(
             config.look.background,
@@ -1844,6 +1895,38 @@ not_a_key = 1
             session: "Test DE".into(),
             auto_started_at: Some(1_700_000_000),
             auto_streak: 2,
+            unprompted_user: "al\"ice".into(),
+            first_question: Vec::new(),
+        };
+        state.store(&tmp);
+        assert_eq!(State::load(&tmp), Some(state));
+        std::fs::remove_file(tmp).unwrap();
+    }
+
+    #[test]
+    fn state_round_trip_keeps_first_questions_character_for_character() {
+        let tmp =
+            std::env::temp_dir().join(format!("vigil-state-questions-{}.toml", std::process::id()));
+        let question = |user: &str, text: &str, secret| FirstQuestion {
+            user: user.into(),
+            text: text.into(),
+            secret,
+        };
+        let state = State {
+            user: "alice".into(),
+            session: "Test DE".into(),
+            auto_started_at: Some(1_700_000_000),
+            auto_streak: 1,
+            unprompted_user: "carol".into(),
+            first_question: vec![
+                question("alice", "Security token PIN: ", true),
+                question(
+                    "b\"ob",
+                    "Code for\n\tC:\\ \"b\u{1b}[31mob\u{7f}\u{85}\":\r\n",
+                    false,
+                ),
+                question("dave", "Mot de passe\u{a0}: 密码", true),
+            ],
         };
         state.store(&tmp);
         assert_eq!(State::load(&tmp), Some(state));
@@ -1859,6 +1942,33 @@ not_a_key = 1
         assert_eq!(state.user, "alice");
         assert_eq!(state.auto_started_at, None);
         assert_eq!(state.auto_streak, 0);
+        assert_eq!(state.unprompted_user, "");
+        assert_eq!(state.first_question, Vec::new());
+        std::fs::remove_file(tmp).unwrap();
+    }
+
+    #[test]
+    fn a_bad_first_question_entry_is_skipped_and_the_rest_of_the_state_kept() {
+        let tmp =
+            std::env::temp_dir().join(format!("vigil-state-badq-{}.toml", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "user = \"alice\"\nunprompted_user = \"alice\"\n\n\
+             [[first_question]]\nuser = \"bob\"\ntext = \"PIN: \"\n\n\
+             [[first_question]]\nuser = \"carol\"\ntext = \"PIN: \"\nsecret = true\n",
+        )
+        .unwrap();
+        let state = State::load(&tmp).unwrap();
+        assert_eq!(state.user, "alice");
+        assert_eq!(state.unprompted_user, "alice");
+        assert_eq!(
+            state.first_question,
+            vec![FirstQuestion {
+                user: "carol".into(),
+                text: "PIN: ".into(),
+                secret: true,
+            }]
+        );
         std::fs::remove_file(tmp).unwrap();
     }
 

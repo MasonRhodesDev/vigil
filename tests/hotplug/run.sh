@@ -6,10 +6,10 @@ case $WORK in /tmp/*) echo "workdir must not be under /tmp (guest tmpfs)"; exit 
 mkdir -p "$WORK"
 QMP=$WORK/qmp.sock
 rm -f "$QMP"
-VIGIL_REPO=$REPO VIGIL_E2E_DIR=$WORK vng --run --disable-microvm --user root -m 1G --cpus 2 \
+VIGIL_REPO=$REPO VIGIL_E2E_DIR=$WORK vng --run ${VIGIL_VM_KERNEL:-} --disable-microvm --user root -m 1G --cpus 2 \
     --rwdir="$WORK" \
     --qemu-opts="-device virtio-gpu-pci,id=gpu0 -device bochs-display,id=gpu1 -device usb-ehci -device usb-tablet -qmp unix:$QMP,server=on,wait=off" \
-    -e "VIGIL_REPO=$REPO VIGIL_E2E_DIR=$WORK VIGIL_E2E_CONFIG=${VIGIL_E2E_CONFIG:-} $REPO/tests/e2e/guest.sh" &
+    -e "VIGIL_REPO=$REPO VIGIL_E2E_DIR=$WORK VIGIL_E2E_CONFIG=${VIGIL_E2E_CONFIG:-} VIGIL_E2E_BIN=${VIGIL_E2E_BIN:-} $REPO/tests/e2e/guest.sh" &
 VM=$!
 for i in $(seq 120); do grep -q "vigil: output" "$WORK/vigil.log" 2>/dev/null && break; sleep 1; done
 grep -q "vigil: output" "$WORK/vigil.log" 2>/dev/null || { echo "vigil never came up; see $WORK/vigil.log"; exit 1; }

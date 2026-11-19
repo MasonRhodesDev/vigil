@@ -336,13 +336,13 @@ impl Simulator {
             .expect("create simulated output");
         scene.set_cursor_visible(false);
         scene.set_clock("13:37");
-        scene.set_user_name("mason");
+        scene.set_user_name("alice");
         vigil_ui::apply_kit_tokens_from_disk(&mut scene, "dark");
         match self.mode {
             Mode::Login => {
                 scene.set_panel_visible(true);
                 scene.set_power_visible(true);
-                scene.set_users(&["mason".into(), "Manual entry".into()]);
+                scene.set_users(&["alice".into(), "Manual entry".into()]);
                 scene.set_user_index(0);
                 scene.set_sessions(&["Hyprland".into(), "Test session".into()]);
                 scene.set_session_index(0);
@@ -352,7 +352,7 @@ impl Simulator {
                 scene.set_background((*self.lock_wallpaper).clone(), WIDTH, HEIGHT);
                 scene.set_panel_visible(true);
                 scene.set_power_visible(true);
-                scene.set_users(&["mason".into()]);
+                scene.set_users(&["alice".into()]);
                 scene.set_sessions(&[]);
                 scene.show_prompt("Password:", true);
                 scene.set_status_banner("SIMULATED LOCK — host session unaffected");
