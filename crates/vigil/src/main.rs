@@ -1,4 +1,5 @@
 mod autologin;
+mod budget;
 mod hold;
 mod keys;
 mod layout;
@@ -215,6 +216,7 @@ struct Entry {
     window: OutputWindow,
     hw_cursor: bool,
     present_failures: u32,
+    budget: budget::FrameBudget,
     splash: Option<splash::Splash>,
     cover: Option<splash::Cover>,
     tag: Option<splash::Tag>,
@@ -1097,6 +1099,7 @@ impl App {
             scale: f64::from(scale),
             hw_cursor,
             present_failures: 0,
+            budget: budget::FrameBudget::new(info.refresh_mhz),
             presenter,
             window,
             splash,
@@ -1798,6 +1801,8 @@ impl App {
                 presenter,
                 window,
                 present_failures,
+                budget,
+                connector,
                 splash,
                 cover,
                 tag,
@@ -1855,6 +1860,7 @@ impl App {
                 }
             }
             let debug_frames = std::env::var_os("VIGIL_DEBUG_FRAMES").is_some();
+            let started = Instant::now();
             if !window.scene_needs_present() {
                 continue;
             }
@@ -1913,6 +1919,9 @@ impl App {
                         *shown_once = true;
                         self.metrics.record_render();
                         self.metrics.record_commit();
+                        if let Some(line) = budget.record(started.elapsed(), Instant::now()) {
+                            eprintln!("vigil: {connector}: {line}");
+                        }
                     }
                     self.present_retry.remove(&entry.id);
                     *present_failures = 0
