@@ -17,12 +17,10 @@
 
 /**
  * The logo or the scene is refused: drawing it would pass the limits on
- * time, memory or features, it crashed the helper's parser, or it timed out
- * `VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL` times. The same request is refused
- * again on every call, so a caller should remember it, keyed by a hash of
- * the logo and the spec, and draw the ground-only scene instead. Remember it
- * for the life of the process only: a refusal for timeouts may come from a
- * loaded host.
+ * time, memory or features, or it crashed the helper's parser. The same
+ * request is refused again on every call, so a caller may remember it,
+ * keyed by a hash of the logo and the spec, and draw the ground-only scene
+ * instead.
  */
 #define VIGIL_SCENE_ERR_REFUSED -3
 
@@ -45,6 +43,17 @@
  * scene now and try the logo once more with `VIGIL_SCENE_MAX_DEADLINE_MS`.
  */
 #define VIGIL_SCENE_ERR_TIMEOUT -8
+
+/**
+ * The logo and spec timed out at a deadline of
+ * `VIGIL_SCENE_STRIKING_DEADLINE_MS` or more
+ * `VIGIL_SCENE_TIMEOUTS_BEFORE_TOO_SLOW` times at this size, so the library
+ * skips them there for about an hour without running the helper. It may
+ * come from a loaded host, so a caller must not remember it: draw the
+ * ground-only scene and ask again later, and the library answers this at
+ * once until the hour is up.
+ */
+#define VIGIL_SCENE_ERR_TOO_SLOW -9
 
 /**
  * The whole frame, XRGB8888: bytes B, G, R, 0xff per pixel.
@@ -77,12 +86,19 @@
 #define VIGIL_SCENE_MAX_DEADLINE_MS 5000
 
 /**
- * After this many `VIGIL_SCENE_ERR_TIMEOUT`s for one logo and spec, the
- * library returns `VIGIL_SCENE_ERR_REFUSED` for them, without running the
- * helper, until the process exits. Timeouts of calls that overlap count
- * once, and a drawing of that logo and spec clears the count.
+ * A timeout counts toward `VIGIL_SCENE_ERR_TOO_SLOW` only at a deadline of
+ * this or more. One at a shorter deadline says only that it was short.
  */
-#define VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL 3
+#define VIGIL_SCENE_STRIKING_DEADLINE_MS 4500
+
+/**
+ * After this many counted timeouts for one logo and spec at one size class,
+ * each within ten minutes of the one before, the library returns
+ * `VIGIL_SCENE_ERR_TOO_SLOW` for them there. The size class is the log2 of
+ * the mode's area. Timeouts of calls that overlap count once, and a drawing
+ * of that logo and spec at that size class clears the count.
+ */
+#define VIGIL_SCENE_TIMEOUTS_BEFORE_TOO_SLOW 2
 
 /**
  * What to draw. `svg` and `spec_json` are each null with a length of 0, or
@@ -143,12 +159,13 @@ extern "C" {
  * main thread. Pass a modest `deadline_ms` first, 500: a 4K frame takes
  * about 55 ms in a release build. On `VIGIL_SCENE_ERR_TIMEOUT`, draw the
  * ground-only scene and retry once with `VIGIL_SCENE_MAX_DEADLINE_MS`, so a
- * loaded host still gets the logo. The library refuses a logo that keeps
- * timing out (`VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL`), so a spinning logo
- * costs a few deadlines per process. Remember `VIGIL_SCENE_ERR_REFUSED` per
- * logo, so a refused logo costs one call at most, but never
- * `VIGIL_SCENE_ERR_TIMEOUT` or `VIGIL_SCENE_ERR_HELPER`, which say nothing
- * about the logo.
+ * loaded host still gets the logo. A logo that keeps timing out at that
+ * deadline is `VIGIL_SCENE_ERR_TOO_SLOW` for about an hour, so a spinning
+ * logo costs two long deadlines an hour per size. Remember
+ * `VIGIL_SCENE_ERR_REFUSED` per logo, so a refused logo costs one call at
+ * most, but never `VIGIL_SCENE_ERR_TIMEOUT`, `VIGIL_SCENE_ERR_TOO_SLOW` or
+ * `VIGIL_SCENE_ERR_HELPER`: the first two may come from a loaded host and
+ * the last says nothing about the logo.
  *
  * # Safety
  *

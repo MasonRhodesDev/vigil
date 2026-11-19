@@ -24,7 +24,7 @@ pub use sandbox::{NOTICE, confine, lock_down};
 pub use spec::{
     DEFAULT_SPEC, Geometry, MAX_SPEC_BYTES, Scene, TagGeometry, ease, emit_spec, parse_color,
 };
-pub use timeouts::TIMEOUTS_BEFORE_REFUSAL;
+pub use timeouts::{STRIKING_DEADLINE, TIMEOUTS_BEFORE_TOO_SLOW, TOO_SLOW_LASTS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -36,6 +36,11 @@ pub enum Error {
     /// The helper was stopped at its deadline. A slow host can cause it, so
     /// unlike a refusal it says nothing about the logo.
     Timeout(String),
+    /// The logo timed out at a striking deadline `TIMEOUTS_BEFORE_TOO_SLOW`
+    /// times at this size class, so the library skips it without running the
+    /// helper until `TOO_SLOW_LASTS` passes. A loaded host can cause it, so
+    /// unlike a refusal it expires.
+    TooSlow(String),
 }
 
 // The helper reports which error it hit by its exit status.
@@ -48,6 +53,7 @@ impl Error {
             Error::TooLarge(_) => 13,
             Error::Helper(_) => 14,
             Error::Timeout(_) => 15,
+            Error::TooSlow(_) => 16,
         }
     }
 
@@ -70,7 +76,8 @@ impl std::fmt::Display for Error {
             | Error::Refused(m)
             | Error::TooLarge(m)
             | Error::Helper(m)
-            | Error::Timeout(m) => f.write_str(m),
+            | Error::Timeout(m)
+            | Error::TooSlow(m) => f.write_str(m),
         }
     }
 }

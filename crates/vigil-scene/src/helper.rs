@@ -18,9 +18,12 @@ use crate::{Error, Format, MAX_EDGE, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Mask, NOTIC
 /// Where packages install the helper. A crate that calls it takes the path
 /// from `installed_helper!`, so a build can move it.
 pub const INSTALLED_HELPER: &str = "/usr/lib/vigil/vigil-scene";
-/// The version of the helper protocol and of its drawing. The library
-/// passes it as `--abi`, and a helper built from other code refuses to run.
-pub const HELPER_ABI: &str = env!("CARGO_PKG_VERSION");
+/// The version of the helper protocol: its command line and its output. The
+/// library passes it as `--abi`, and a helper of another version refuses to
+/// run and names both. Bump it on any change to the arguments the library
+/// sends or to what the helper writes back; a test pins the argument names
+/// to this number.
+pub const HELPER_ABI: u32 = 2;
 pub const DEFAULT_DEADLINE: Duration = Duration::from_millis(1500);
 pub const MAX_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -46,8 +49,9 @@ macro_rules! installed_helper {
 /// byte, and a deadline after which it is killed and reaped. Whatever the
 /// logo does, a call returns within the deadline, plus the kernel's teardown
 /// of a killed helper and the copy of the result, and the caller's memory
-/// grows by the result alone. A logo and spec that time out
-/// `TIMEOUTS_BEFORE_REFUSAL` times are refused from then on.
+/// grows by the result alone. A logo and spec that time out at a striking
+/// deadline `TIMEOUTS_BEFORE_TOO_SLOW` times at one size class are
+/// `Error::TooSlow` there for `TOO_SLOW_LASTS`.
 #[derive(Debug, Clone)]
 pub struct Helper {
     path: PathBuf,
@@ -76,7 +80,7 @@ impl Helper {
         }
         let mut alpha = vec![0u8; edge as usize * edge as usize];
         self.run(
-            timeouts::key(&[format.name().as_bytes(), logo]),
+            timeouts::Key::new(&[format.name().as_bytes(), logo], u64::from(edge).pow(2)),
             &[
                 "mask",
                 "--format",
@@ -113,7 +117,10 @@ impl Helper {
         }
         let (mode, transform) = (format!("{}x{}", req.mode.0, req.mode.1), req.transform);
         self.run(
-            timeouts::key(&[Format::Svg.name().as_bytes(), svg, spec]),
+            timeouts::Key::new(
+                &[Format::Svg.name().as_bytes(), svg, spec],
+                u64::from(req.mode.0) * u64::from(req.mode.1),
+            ),
             &[
                 "layer",
                 "--mode",
@@ -134,11 +141,17 @@ impl Helper {
         )
     }
 
-    fn run(&self, key: u64, args: &[&str], input: &[&[u8]], out: &mut [u8]) -> Result<(), Error> {
-        timeouts::refused(key)?;
-        let started = Instant::now();
-        let got = self.run_once(started + self.deadline, args, input, out);
-        timeouts::settle(key, started, got)
+    fn run(
+        &self,
+        key: timeouts::Key,
+        args: &[&str],
+        input: &[&[u8]],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        timeouts::check(key)?;
+        let started = timeouts::now();
+        let got = self.run_once(Instant::now() + self.deadline, args, input, out);
+        timeouts::settle(key, self.deadline, started, got)
     }
 
     fn run_once(
@@ -158,7 +171,7 @@ impl Helper {
             .args(args)
             .args(["--deadline-ms", &self.deadline.as_millis().to_string()])
             .args(["--out-len", &out.len().to_string()])
-            .args(["--abi", HELPER_ABI])
+            .args(["--abi", &HELPER_ABI.to_string()])
             .env_clear()
             .current_dir("/")
             .stdin(stdin)
@@ -206,6 +219,13 @@ impl Helper {
                 return Err(Error::Helper(
                     "the helper's sandbox stopped it at a forbidden system call".into(),
                 ));
+            }
+            // The OOM killer sends SIGKILL, and the helper is single-threaded,
+            // so its CPU limit fires only after the wall deadline would have.
+            Some((None, Some(signal @ (libc::SIGKILL | libc::SIGXCPU)))) => {
+                return Err(Error::Helper(format!(
+                    "the helper was killed by signal {signal}, which says nothing about the logo"
+                )));
             }
             Some((None, signal)) => {
                 return Err(Error::Refused(format!(

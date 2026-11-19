@@ -437,7 +437,7 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
         };
         let args = Args::parse(argv, allowed).map_err(Error::Helper)?;
         let abi = args.need("abi").map_err(Error::Helper)?;
-        if abi != HELPER_ABI {
+        if abi != HELPER_ABI.to_string() {
             return Err(Error::Helper(format!(
                 "this helper is version {HELPER_ABI}, the library {abi}"
             )));
