@@ -2085,6 +2085,47 @@ mod tests {
     }
 
     #[test]
+    fn only_an_unlock_before_the_lock_is_held_is_journaled_as_unconfirmed() {
+        const CHILD: &str = "VIGIL_LOCK_TEST_UNCONFIRMED";
+        let cases = [
+            (Hold::Pending, LockOutcome::Unlocked),
+            (Hold::Held, LockOutcome::Unlocked),
+            (Hold::Pending, LockOutcome::Cancelled),
+        ];
+        if std::env::var_os(CHILD).is_some() {
+            for (hold, outcome) in cases {
+                eprintln!("case {hold:?} {outcome:?}");
+                let ipc = Mutex::new(LockIpcState {
+                    hold,
+                    ..LockIpcState::default()
+                });
+                follow_flow(&ipc, &FlowCmd::Exit(outcome));
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::only_an_unlock_before_the_lock_is_held_is_journaled_as_unconfirmed",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(
+            stderr.lines().collect::<Vec<_>>(),
+            [
+                "case Pending Unlocked",
+                "vigil-lock: lock ended before it was confirmed: logind unlocked it",
+                "case Held Unlocked",
+                "case Pending Cancelled",
+            ]
+        );
+    }
+
+    #[test]
     fn a_join_after_a_signal_is_told_the_held_lock_stays() {
         let path = ipc_path("terminated");
         let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
