@@ -48,6 +48,8 @@ mod tests {
     use super::*;
     use crate::scripted_greetd::Greetd;
 
+    mod exposure;
+
     const RETURN: u32 = 0xff0d;
 
     fn tap(keysym: u32, utf8: Option<&str>) -> [InputEvent; 2] {

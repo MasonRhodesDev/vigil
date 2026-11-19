@@ -57,6 +57,15 @@ impl<E: Fn(AuthEvent)> Bridge<E> {
     }
 }
 
+// The conversation libpam calls, for tests that call it as a hostile module would.
+#[doc(hidden)]
+pub fn conversation(
+    emit: impl Fn(AuthEvent),
+    responses: mpsc::Receiver<Secret>,
+) -> impl ConversationHandler {
+    Bridge::new(emit, responses)
+}
+
 impl<E: Fn(AuthEvent)> ConversationHandler for Bridge<E> {
     fn prompt_echo_on(&mut self, msg: &CStr) -> Result<CString, ErrorCode> {
         self.ask(msg, false)
@@ -265,6 +274,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "leaves a parked thread behind by design")]
     fn drop_never_waits_on_a_wedged_worker() {
         let (tx, _rx) = mpsc::channel();
         let attempt = PamAttempt {

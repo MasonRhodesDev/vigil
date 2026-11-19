@@ -569,7 +569,7 @@ impl Locker {
 
     fn start_attempt(&mut self) {
         debug_assert!(
-            self.lock_ipc.lock().expect("lock IPC poisoned").locked,
+            self.lock_ipc.lock().expect("lock IPC poisoned").hold == Hold::Held,
             "PAM conversation must not start before the compositor grants the lock"
         );
         let waker = self.event_waker.clone();
@@ -584,17 +584,8 @@ impl Locker {
         });
     }
 
-    #[allow(unsafe_code)]
     fn signal_locked(&mut self) {
         vigil_log::say!("vigil-lock: session locked");
-        let joiners = {
-            let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
-            ipc.locked = true;
-            std::mem::take(&mut ipc.joiners)
-        };
-        for mut joiner in joiners {
-            let _ = joiner.write_all(b"locked\n");
-        }
         signal_ready_fd(self.ready_fd.take());
     }
 
@@ -1016,6 +1007,9 @@ impl LockSession for Locker {
     }
 
     fn flow_command(&mut self, cmd: &FlowCmd) {
+        if follow_flow(&self.lock_ipc, cmd) {
+            self.signal_locked();
+        }
         match cmd {
             FlowCmd::ShowPanel(true) => self.apply_panel(),
             FlowCmd::ShowPanel(false) => self.each_window(|window| {
@@ -1057,7 +1051,6 @@ impl LockSession for Locker {
                     login.set_locked_hint(*on);
                 }
             }
-            FlowCmd::SignalReady => self.signal_locked(),
             _ => {}
         }
     }
@@ -1213,12 +1206,51 @@ struct LockIpcSocket {
     path: PathBuf,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    #[default]
+    Pending,
+    Held,
+    Releasing,
+}
+
 #[derive(Default)]
 struct LockIpcState {
-    locked: bool,
+    hold: Hold,
     commit_requested: bool,
     joiners: Vec<UnixStream>,
     waker: Option<WakeHandle>,
+}
+
+fn follow_flow(ipc: &Mutex<LockIpcState>, cmd: &FlowCmd) -> bool {
+    let joiners = {
+        let mut state = ipc.lock().expect("lock IPC poisoned");
+        match cmd {
+            FlowCmd::SignalReady => {
+                state.hold = Hold::Held;
+                std::mem::take(&mut state.joiners)
+            }
+            FlowCmd::DetachAuth => {
+                state.hold = Hold::Releasing;
+                return false;
+            }
+            // A signal leaves a held lock to the compositor, so it stays held.
+            FlowCmd::Exit(outcome) if !matches!(outcome, LockOutcome::Terminated(_)) => {
+                if state.hold == Hold::Pending && *outcome == LockOutcome::Unlocked {
+                    vigil_log::say!(
+                        "vigil-lock: lock ended before it was confirmed: logind unlocked it"
+                    );
+                }
+                state.hold = Hold::Releasing;
+                return false;
+            }
+            _ => return false,
+        }
+    };
+    for mut joiner in joiners {
+        let _ = joiner.write_all(b"locked\n");
+    }
+    true
 }
 
 impl Drop for LockIpcSocket {
@@ -1305,15 +1337,21 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
             let mut command = [0_u8; 7];
             if stream.read_exact(&mut command).is_ok() && command == *b"commit\n" {
                 let mut state = server_state.lock().expect("warning IPC poisoned");
-                if state.locked {
-                    let _ = stream.write_all(b"locked\n");
-                } else {
-                    vigil_log::say!("vigil-lock: warning join requested immediate lock");
-                    state.commit_requested = true;
-                    state.joiners.push(stream);
-                    if let Some(waker) = state.waker.clone() {
-                        waker.wake();
+                match state.hold {
+                    Hold::Held => {
+                        let _ = stream.write_all(b"locked\n");
                     }
+                    Hold::Pending => {
+                        vigil_log::say!("vigil-lock: warning join requested immediate lock");
+                        state.commit_requested = true;
+                        state.joiners.push(stream);
+                        if let Some(waker) = state.waker.clone() {
+                            waker.wake();
+                        }
+                    }
+                    // Never answered. This client's exit closes the stream,
+                    // and the joiner then takes the singleton and locks afresh.
+                    Hold::Releasing => state.joiners.push(stream),
                 }
             }
         }
@@ -1943,13 +1981,177 @@ mod tests {
         let joiners = {
             let mut state = state.lock().unwrap();
             assert!(state.commit_requested);
-            state.locked = true;
+            state.hold = Hold::Held;
             std::mem::take(&mut state.joiners)
         };
         for mut stream in joiners {
             stream.write_all(b"locked\n").unwrap();
         }
         assert!(join.join().unwrap());
+        drop(guard);
+    }
+
+    #[test]
+    fn a_join_during_the_unlock_is_not_told_the_session_is_locked() {
+        let path = std::env::temp_dir().join(format!(
+            "vigil-lock-ipc-releasing-test-{}.sock",
+            std::process::id()
+        ));
+        let (guard, state) = start_lock_ipc_at(path.clone()).unwrap();
+        state.lock().unwrap().hold = Hold::Releasing;
+        let join = std::thread::spawn(move || join_lock_at(&path));
+
+        for _ in 0..200 {
+            if !state.lock().unwrap().joiners.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let parked = std::mem::take(&mut state.lock().unwrap().joiners);
+        assert_eq!(parked.len(), 1, "the joiner was answered or never arrived");
+        assert!(!state.lock().unwrap().commit_requested);
+        drop(parked);
+        assert!(
+            !matches!(join.join().unwrap(), Ok(true)),
+            "a client that is unlocking confirmed the lock to a joiner"
+        );
+        drop(guard);
+    }
+
+    fn step(
+        ipc: &Mutex<LockIpcState>,
+        flow: &mut vigil_flow::LockFlow,
+        ms: u64,
+        event: FlowEvent,
+    ) -> bool {
+        flow.step(vigil_flow::Now::at(Duration::from_millis(ms)), event)
+            .iter()
+            .fold(false, |confirmed, cmd| follow_flow(ipc, cmd) | confirmed)
+    }
+
+    fn locked_flow(ipc: &Mutex<LockIpcState>) -> vigil_flow::LockFlow {
+        let (mut flow, _) = vigil_flow::LockFlow::new(
+            vigil_flow::Now::at(Duration::ZERO),
+            &vigil_config::Lock::default(),
+            Some(0),
+        );
+        step(ipc, &mut flow, 400, FlowEvent::Tick);
+        assert!(step(ipc, &mut flow, 410, FlowEvent::LockConfirmed));
+        flow
+    }
+
+    fn join_until_exit(path: PathBuf, ipc: &Mutex<LockIpcState>) -> Result<bool, String> {
+        let join = std::thread::spawn(move || join_lock_at(&path));
+        for _ in 0..200 {
+            if join.is_finished() || !ipc.lock().unwrap().joiners.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(std::mem::take(&mut ipc.lock().unwrap().joiners));
+        join.join().unwrap()
+    }
+
+    fn ipc_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("vigil-lock-ipc-{name}-{}.sock", std::process::id()))
+    }
+
+    #[test]
+    fn a_join_before_a_confirm_that_unlocks_is_not_told_the_session_is_locked() {
+        let path = ipc_path("latched");
+        let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
+        let (mut flow, _) = vigil_flow::LockFlow::new(
+            vigil_flow::Now::at(Duration::ZERO),
+            &vigil_config::Lock::default(),
+            Some(0),
+        );
+        step(&ipc, &mut flow, 100, FlowEvent::LogindUnlock);
+        step(&ipc, &mut flow, 400, FlowEvent::Tick);
+        let join = std::thread::spawn(move || join_lock_at(&path));
+        for _ in 0..200 {
+            if !ipc.lock().unwrap().joiners.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !step(&ipc, &mut flow, 410, FlowEvent::LockConfirmed),
+            "readiness was signalled for a lock that unlocks at once"
+        );
+        drop(std::mem::take(&mut ipc.lock().unwrap().joiners));
+        assert!(
+            !matches!(join.join().unwrap(), Ok(true)),
+            "a joiner was told locked by a client that unlocks at once"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn a_join_after_the_compositor_drops_the_lock_is_not_told_the_session_is_locked() {
+        let path = ipc_path("invalidated");
+        let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
+        let mut flow = locked_flow(&ipc);
+        step(&ipc, &mut flow, 500, FlowEvent::LockInvalidated);
+        assert!(
+            !matches!(join_until_exit(path, &ipc), Ok(true)),
+            "a client whose lock the compositor dropped told a joiner locked"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn only_an_unlock_before_the_lock_is_held_is_journaled_as_unconfirmed() {
+        const CHILD: &str = "VIGIL_LOCK_TEST_UNCONFIRMED";
+        let cases = [
+            (Hold::Pending, LockOutcome::Unlocked),
+            (Hold::Held, LockOutcome::Unlocked),
+            (Hold::Pending, LockOutcome::Cancelled),
+        ];
+        if std::env::var_os(CHILD).is_some() {
+            for (hold, outcome) in cases {
+                vigil_log::say!("case {hold:?} {outcome:?}");
+                let ipc = Mutex::new(LockIpcState {
+                    hold,
+                    ..LockIpcState::default()
+                });
+                follow_flow(&ipc, &FlowCmd::Exit(outcome));
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::only_an_unlock_before_the_lock_is_held_is_journaled_as_unconfirmed",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(
+            stderr.lines().collect::<Vec<_>>(),
+            [
+                "case Pending Unlocked",
+                "vigil-lock: lock ended before it was confirmed: logind unlocked it",
+                "case Held Unlocked",
+                "case Pending Cancelled",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_join_after_a_signal_is_told_the_held_lock_stays() {
+        let path = ipc_path("terminated");
+        let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
+        let mut flow = locked_flow(&ipc);
+        step(
+            &ipc,
+            &mut flow,
+            500,
+            FlowEvent::Terminate(vigil_flow::Signal::Terminate),
+        );
+        assert_eq!(join_until_exit(path, &ipc), Ok(true));
         drop(guard);
     }
 

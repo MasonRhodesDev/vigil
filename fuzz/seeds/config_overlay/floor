@@ -1,0 +1,13 @@
+[lock]
+grace_secs = 5
+[lock.warning]
+duration_ms = 3000
+ÿ[lock]
+grace_secs = 9999
+[lock.warning]
+duration_ms = 0
+frost_alpha = 0.5
+[look]
+theme = "/x.slint"
+[users]
+hide = ["root"]

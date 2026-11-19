@@ -305,6 +305,48 @@ impl KeyboardState {
     }
 }
 
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    use super::*;
+
+    pub struct Keyboard {
+        state: KeyboardState,
+        now: Instant,
+    }
+
+    impl Keyboard {
+        pub fn new(settings: &KeymapSettings, compose_locale: &str) -> Option<Self> {
+            let mut state = KeyboardState::new(settings).ok()?;
+            state.compose = compose_state(compose_locale);
+            Some(Self {
+                state,
+                now: Instant::now(),
+            })
+        }
+
+        pub fn reset(&mut self) {
+            self.state.state = xkb::State::new(&self.state.keymap);
+            if let Some(compose) = &mut self.state.compose {
+                compose.reset();
+            }
+            self.state.repeat = None;
+        }
+
+        pub fn key(&mut self, evdev_keycode: u16, pressed: bool) -> Option<InputEvent> {
+            self.state.key(u32::from(evdev_keycode), pressed, self.now)
+        }
+
+        pub fn wait(&mut self, time: Duration) -> Vec<InputEvent> {
+            self.now += time;
+            self.state.tick_repeat(self.now)
+        }
+
+        pub fn caps_lock(&self) -> bool {
+            self.state.caps_lock()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

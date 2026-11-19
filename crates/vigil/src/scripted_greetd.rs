@@ -25,6 +25,10 @@ impl Greetd {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 std::fs::remove_dir_all(&dir).unwrap();
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "unix sockets are refused, so this test would pass without running: {error}"
+                );
                 return None;
             }
             Err(error) => panic!("open the scripted greetd socket: {error}"),

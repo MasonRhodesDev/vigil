@@ -1,0 +1,9 @@
+export component Theme inherits Window {
+    in property <string> prompt-text;
+    in property <bool> prompt-is-secret;
+    callback submit(string);
+    input := TextInput {
+        input-type: root.prompt-is-secret ? InputType.password : InputType.text;
+        accepted => { root.submit(self.text); }
+    }
+}
