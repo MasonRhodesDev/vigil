@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 vigil-core.workspace = true
 vigil-gl = { path = "../vigil-gl" }
+vigil-present-kms = { path = "../vigil-present-kms" }
 smithay = { workspace = true, features = ["backend_drm", "backend_gbm", "backend_egl"] }
 gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 

@@ -19,6 +19,7 @@ impl Scene {
             width: W,
             height: H,
             stride: (W * 4) as usize,
+            damage: None,
         })
     }
 
@@ -286,6 +287,7 @@ fn native_background_partial_repaint_matches_full() {
             width: W,
             height: H,
             stride: (W * 4) as usize,
+            damage: None,
         }));
         buf
     };
@@ -316,6 +318,7 @@ fn native_background_partial_repaint_matches_full() {
                 width: W,
                 height: H,
                 stride: (W * 4) as usize,
+                damage: None,
             }),
             "{name}: change must draw"
         );

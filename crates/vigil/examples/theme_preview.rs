@@ -88,6 +88,7 @@ fn main() {
         width: pw,
         height: ph,
         stride: (pw * 4) as usize,
+        damage: None,
     });
     println!("drew: {drew}");
 

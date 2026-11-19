@@ -448,6 +448,7 @@ impl Simulator {
             width: WIDTH,
             height: HEIGHT,
             stride: (WIDTH * 4) as usize,
+            damage: None,
         });
         if !drew
             && self.started.elapsed().as_millis() > 100
@@ -1295,6 +1296,7 @@ fn render_scenario_frame(simulator: &mut Simulator) -> Result<(), String> {
         width: WIDTH,
         height: HEIGHT,
         stride: (WIDTH * 4) as usize,
+        damage: None,
     });
     Ok(())
 }

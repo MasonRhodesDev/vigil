@@ -2,71 +2,15 @@ use std::rc::Rc;
 
 use smithay::backend::allocator::gbm::GbmBuffer;
 use smithay::backend::drm::gbm::{GbmFramebuffer, framebuffer_from_bo};
-use smithay::backend::drm::{DrmDeviceFd, DrmSurface, PlaneClaim, PlaneConfig, PlaneState};
-use smithay::reexports::drm::buffer::{Buffer as _, DrmFourcc};
-use smithay::reexports::drm::control::{
-    Device as ControlDevice, dumbbuffer::DumbBuffer, framebuffer, plane,
-};
-use smithay::utils::{Rectangle, Transform};
-use vigil_core::{Canvas, PresentError, Presenter, scene_to_panel};
+use smithay::backend::drm::{DrmDeviceFd, DrmSurface, PlaneConfig, PlaneState};
+use smithay::utils::Rectangle;
+use vigil_core::{Canvas, PresentError, Presenter};
 use vigil_gl::{GbmWindow, GlContext, GlSurface};
-
-fn backend(e: impl std::fmt::Display) -> PresentError {
-    PresentError::Backend(e.to_string())
-}
-
-fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
-    use smithay::backend::drm::DrmError;
-    use smithay::reexports::rustix;
-    match e {
-        DrmError::DeviceInactive => PresentError::DeviceLost,
-        DrmError::Access(ref a)
-            if matches!(
-                rustix::io::Errno::from_io_error(&a.source),
-                Some(
-                    rustix::io::Errno::NODEV | rustix::io::Errno::ACCESS | rustix::io::Errno::PERM
-                )
-            ) =>
-        {
-            PresentError::DeviceLost
-        }
-        e => backend(e),
-    }
-}
-
-fn plane_transform(transform: u8) -> Transform {
-    match transform % 4 {
-        1 => Transform::_90,
-        2 => Transform::_180,
-        3 => Transform::_270,
-        _ => Transform::Normal,
-    }
-}
-
-fn cursor_dst(transform: u8, scene: (u32, u32), plane: (u32, u32), pos: (i32, i32)) -> (i32, i32) {
-    let (sw, sh) = (scene.0 as usize, scene.1 as usize);
-    let (sx, sy) = (
-        (pos.0.max(0) as usize).min(sw - 1),
-        (pos.1.max(0) as usize).min(sh - 1),
-    );
-    let p = scene_to_panel(transform, sw, sh, sx, sy);
-    let h = scene_to_panel(transform, plane.0 as usize, plane.1 as usize, 0, 0);
-    (p.0 as i32 - h.0 as i32, p.1 as i32 - h.1 as i32)
-}
+use vigil_present_kms::{CursorPlane, backend, plane_transform, present_error};
 
 struct Frame {
     fb: GbmFramebuffer,
     _buffer: GbmBuffer,
-}
-
-struct CursorPlane {
-    plane: plane::Handle,
-    _claim: PlaneClaim,
-    _buffer: DumbBuffer,
-    fb: framebuffer::Handle,
-    size: (u32, u32),
-    pos: Option<(i32, i32)>,
-    dirty: bool,
 }
 
 pub struct GbmPresenter {
@@ -103,7 +47,7 @@ impl GbmPresenter {
         };
         let gl = GlSurface::new(context, width, height).map_err(backend)?;
         let gbm = gl.window();
-        let cursor = Self::cursor_plane(&surface, cursor_scale, transform);
+        let cursor = CursorPlane::claim(&surface, cursor_scale, transform, (width, height)).ok();
         Ok((
             Self {
                 surface,
@@ -124,14 +68,7 @@ impl GbmPresenter {
     }
 
     pub fn probe_cursor(surface: &DrmSurface, transform: u8) -> bool {
-        let Some(info) = Self::find_cursor_plane(surface) else {
-            return false;
-        };
-        if transform.is_multiple_of(2) {
-            return true;
-        }
-        let (pw, ph) = Self::cursor_plane_size(info);
-        pw == ph
+        CursorPlane::probe(surface, transform).is_ok()
     }
 
     pub fn test_transform(
@@ -180,85 +117,6 @@ impl GbmPresenter {
             .map_err(|e| format!("rotation refused: {e}"))
     }
 
-    fn find_cursor_plane(surface: &DrmSurface) -> Option<&smithay::backend::drm::PlaneInfo> {
-        surface
-            .planes()
-            .cursor
-            .iter()
-            .find(|p| p.formats.iter().any(|f| f.code == DrmFourcc::Argb8888))
-    }
-
-    fn cursor_plane_size(info: &smithay::backend::drm::PlaneInfo) -> (u32, u32) {
-        info.size_hints
-            .as_deref()
-            .and_then(<[_]>::first)
-            .map_or((64, 64), |s| (u32::from(s.w), u32::from(s.h)))
-    }
-
-    fn cursor_plane(surface: &DrmSurface, scale: f32, transform: u8) -> Option<CursorPlane> {
-        let info = Self::find_cursor_plane(surface)?;
-        let (pw, ph) = Self::cursor_plane_size(info);
-        if transform % 2 == 1 && pw != ph {
-            return None;
-        }
-        let max_scale = (pw as f32 / vigil_core::CURSOR[0].len() as f32)
-            .min(ph as f32 / vigil_core::CURSOR.len() as f32);
-        let (argb, cw, ch) = vigil_core::cursor_argb(scale.min(max_scale));
-        let claim = surface.claim_plane(info.handle)?;
-        let mut buffer = surface
-            .create_dumb_buffer((pw, ph), DrmFourcc::Argb8888, 32)
-            .ok()?;
-        {
-            let pitch = buffer.pitch() as usize;
-            let mut mapping = surface.map_dumb_buffer(&mut buffer).ok()?;
-            let bytes = mapping.as_mut();
-            bytes.fill(0);
-            for y in 0..ch as usize {
-                for x in 0..cw as usize {
-                    let src = (y * cw as usize + x) * 4;
-                    let (qx, qy) = scene_to_panel(transform, pw as usize, ph as usize, x, y);
-                    bytes[qy * pitch + qx * 4..qy * pitch + qx * 4 + 4]
-                        .copy_from_slice(&argb[src..src + 4]);
-                }
-            }
-        }
-        let fb = surface.add_framebuffer(&buffer, 32, 32).ok()?;
-        Some(CursorPlane {
-            plane: info.handle,
-            _claim: claim,
-            _buffer: buffer,
-            fb,
-            size: (pw, ph),
-            pos: None,
-            dirty: false,
-        })
-    }
-
-    pub fn has_cursor(&self) -> bool {
-        self.cursor.is_some()
-    }
-
-    fn cursor_state(&self) -> Option<PlaneState<'_>> {
-        let cursor = self.cursor.as_ref()?;
-        Some(PlaneState {
-            handle: cursor.plane,
-            config: cursor.pos.map(|pos| PlaneConfig {
-                src: Rectangle::from_size(
-                    (f64::from(cursor.size.0), f64::from(cursor.size.1)).into(),
-                ),
-                dst: Rectangle::new(
-                    cursor_dst(self.transform, (self.width, self.height), cursor.size, pos).into(),
-                    (cursor.size.0 as i32, cursor.size.1 as i32).into(),
-                ),
-                transform: Transform::Normal,
-                alpha: 1.0,
-                damage_clips: None,
-                fb: cursor.fb,
-                fence: None,
-            }),
-        })
-    }
-
     fn plane_state(
         &self,
         fb: smithay::reexports::drm::control::framebuffer::Handle,
@@ -289,7 +147,7 @@ impl Presenter for GbmPresenter {
         self.modeset_done = false;
         self.flip_pending = false;
         if let Some(cursor) = self.cursor.as_mut() {
-            cursor.dirty = true;
+            cursor.invalidate();
         }
     }
 
@@ -301,14 +159,15 @@ impl Presenter for GbmPresenter {
         Some(self.surface.crtc().into())
     }
 
+    fn has_cursor(&self) -> bool {
+        self.cursor.is_some()
+    }
+
     fn set_cursor(&mut self, pos: Option<(i32, i32)>) -> bool {
         let Some(cursor) = self.cursor.as_mut() else {
             return false;
         };
-        if cursor.pos != pos {
-            cursor.pos = pos;
-            cursor.dirty = true;
-        }
+        cursor.set(pos);
         true
     }
 
@@ -324,7 +183,7 @@ impl Presenter for GbmPresenter {
             height: self.height,
         });
         if !drew {
-            let cursor_dirty = self.cursor.as_ref().is_some_and(|c| c.dirty);
+            let cursor_dirty = self.cursor.as_ref().is_some_and(CursorPlane::is_dirty);
             let Some(current) = self.current.as_ref() else {
                 return Ok(false);
             };
@@ -332,12 +191,12 @@ impl Presenter for GbmPresenter {
                 return Ok(false);
             }
             let mut states = vec![self.plane_state(*current.fb.as_ref())];
-            states.extend(self.cursor_state());
+            states.extend(self.cursor.as_ref().map(CursorPlane::state));
             self.surface
                 .page_flip(states, true)
                 .map_err(present_error)?;
             if let Some(cursor) = self.cursor.as_mut() {
-                cursor.dirty = false;
+                cursor.flushed();
             }
             self.flip_pending = true;
             return Ok(true);
@@ -348,7 +207,7 @@ impl Presenter for GbmPresenter {
         let fb = framebuffer_from_bo(&self.drm, &buffer, false).map_err(backend)?;
 
         let mut states = vec![self.plane_state(*fb.as_ref())];
-        states.extend(self.cursor_state());
+        states.extend(self.cursor.as_ref().map(CursorPlane::state));
         let result = if self.modeset_done {
             self.surface.page_flip(states, true)
         } else {
@@ -358,7 +217,7 @@ impl Presenter for GbmPresenter {
         self.modeset_done = true;
         self.flip_pending = true;
         if let Some(cursor) = self.cursor.as_mut() {
-            cursor.dirty = false;
+            cursor.flushed();
         }
 
         self.previous = self.current.take();
@@ -367,33 +226,5 @@ impl Presenter for GbmPresenter {
             _buffer: buffer,
         });
         Ok(true)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plane_transform_matches_drm_quarter_turns() {
-        assert_eq!(plane_transform(0), Transform::Normal);
-        assert_eq!(plane_transform(1), Transform::_90);
-        assert_eq!(plane_transform(2), Transform::_180);
-        assert_eq!(plane_transform(3), Transform::_270);
-        assert_eq!(plane_transform(5), Transform::_90);
-    }
-
-    #[test]
-    fn cursor_dst_matches_software_blit() {
-        assert_eq!(cursor_dst(0, (4, 6), (2, 2), (1, 2)), (1, 2));
-        assert_eq!(cursor_dst(1, (4, 6), (2, 2), (1, 2)), (2, 1));
-        assert_eq!(cursor_dst(3, (4, 6), (2, 2), (1, 2)), (2, 1));
-        assert_eq!(cursor_dst(2, (4, 6), (2, 2), (1, 2)), (1, 2));
-    }
-
-    #[test]
-    fn cursor_bitmap_rotates_within_square_buffer() {
-        assert_eq!(vigil_core::scene_to_panel(1, 2, 2, 0, 0), (0, 1));
-        assert_eq!(vigil_core::scene_to_panel(3, 2, 2, 0, 0), (1, 0));
     }
 }
