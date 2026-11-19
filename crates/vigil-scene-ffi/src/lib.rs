@@ -8,7 +8,9 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use vigil_scene::{Error, Logo, MAX_LOGO_BYTES, Plate, Scene, Sprite, check_output};
+use vigil_scene::{
+    Error, Logo, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Plate, Scene, Sprite, check_output,
+};
 
 pub const VIGIL_SCENE_OK: i32 = 0;
 pub const VIGIL_SCENE_ERR_ARGUMENT: i32 = -1;
@@ -26,8 +28,6 @@ pub const VIGIL_SCENE_LAYER_LOGO: u32 = 1;
 pub const VIGIL_SCENE_LAYER_GLOW: u32 = 2;
 /// The progress bar at `value`, RGBA, opaque.
 pub const VIGIL_SCENE_LAYER_BAR: u32 = 3;
-
-const MAX_SPEC_BYTES: usize = 1 << 20;
 
 /// What to draw. `svg` and `spec_json` are each null with a length of 0, or
 /// point to that many bytes. Without `spec_json` the built-in scene is used.
@@ -102,7 +102,6 @@ fn parse(raw: &VigilSceneRequest) -> Result<(u8, Layer, f64), i32> {
 }
 
 fn draw(req: &Request<'_>) -> Result<(VigilScenePlacement, Vec<u8>), i32> {
-    check_output(req.mode).map_err(|e| code(&e))?;
     let spec = match req.spec {
         Some(bytes) => std::str::from_utf8(bytes)
             .ok()
@@ -110,6 +109,7 @@ fn draw(req: &Request<'_>) -> Result<(VigilScenePlacement, Vec<u8>), i32> {
             .ok_or(VIGIL_SCENE_ERR_INVALID)?,
         None => Scene::default(),
     };
+    check_output(&spec, req.mode, req.transform).map_err(|e| code(&e))?;
     let scene = if req.transform % 2 == 1 {
         (req.mode.1, req.mode.0)
     } else {
@@ -211,7 +211,7 @@ pub unsafe extern "C" fn vigil_scene_render(
         Err(code) => return code,
     };
     // SAFETY: as for svg, for spec_json and spec_len.
-    let spec = match unsafe { bytes(raw.spec_json, raw.spec_len, MAX_SPEC_BYTES) } {
+    let spec = match unsafe { bytes(raw.spec_json, raw.spec_len, MAX_SPEC_BYTES as usize) } {
         Ok(spec) => spec,
         Err(code) => return code,
     };

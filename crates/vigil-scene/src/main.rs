@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use image::ImageEncoder;
 use vigil_scene::{
-    Error, Logo, MAX_EDGE, MAX_SIDE, Plate, Scene, Sprite, check_output, emit_spec, read_bounded,
+    Error, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE, MAX_SPEC_BYTES, Plate, Scene, Sprite,
+    check_output, emit_spec, read_bounded,
 };
 
 const USAGE: &str = "usage:
@@ -112,16 +113,15 @@ fn mode(text: &str) -> Result<(u32, u32), String> {
         v.parse::<u32>()
             .map_err(|_| format!("--mode {text} is not WxH"))
     };
-    let panel = (parse(w)?, parse(h)?);
-    check_output(panel).map_err(|e| e.to_string())?;
-    Ok(panel)
+    Ok((parse(w)?, parse(h)?))
 }
 
 fn scene_spec(args: &Args) -> Result<(Scene, Option<String>), String> {
     let source = args
         .get("scene")
         .map(|p| {
-            let bytes = read_bounded(Path::new(p)).map_err(|e| format!("--scene {p}: {e}"))?;
+            let bytes = read_bounded(Path::new(p), MAX_SPEC_BYTES)
+                .map_err(|e| format!("--scene {p}: {e}"))?;
             String::from_utf8(bytes).map_err(|_| format!("--scene {p}: not UTF-8"))
         })
         .transpose()?;
@@ -141,7 +141,7 @@ fn scene_spec(args: &Args) -> Result<(Scene, Option<String>), String> {
 fn logo(args: &Args) -> Result<Option<Logo>, String> {
     args.get("logo")
         .map(|p| {
-            read_bounded(Path::new(p))
+            read_bounded(Path::new(p), MAX_LOGO_BYTES)
                 .and_then(|data| Logo::svg(&data))
                 .map_err(|e| format!("--logo {p}: {e}"))
         })
@@ -161,6 +161,7 @@ fn draw(args: &Args, stage: Stage) -> Result<Picture, String> {
         if transform > 3 {
             return Err(format!("--transform {transform} is outside 0..3"));
         }
+        check_output(&spec, panel, transform).map_err(|e| e.to_string())?;
         let scene = if transform % 2 == 1 {
             (panel.1, panel.0)
         } else {

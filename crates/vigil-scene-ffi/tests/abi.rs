@@ -36,7 +36,7 @@ fn render(req: &VigilSceneRequest, out: &mut [u8]) -> (i32, VigilScenePlacement)
         (out.as_mut_ptr(), out.len())
     };
     // SAFETY: req, out and at are live, aligned and disjoint for the call.
-    let rc = unsafe { vigil_scene_render(req, ptr, len, &mut at) };
+    let rc = unsafe { vigil_scene_render(req, ptr, len, &raw mut at) };
     (rc, at)
 }
 
@@ -94,15 +94,15 @@ fn bad_arguments_are_refused_before_any_drawing() {
     let svg = mark();
     let mut at = VigilScenePlacement::default();
     // SAFETY: a null request is the case under test; nothing is dereferenced.
-    let rc = unsafe { vigil_scene_render(ptr::null(), ptr::null_mut(), 0, &mut at) };
+    let rc = unsafe { vigil_scene_render(ptr::null(), ptr::null_mut(), 0, &raw mut at) };
     assert_eq!(rc, VIGIL_SCENE_ERR_ARGUMENT);
     let req = request(&svg, VIGIL_SCENE_LAYER_LOGO);
     // SAFETY: a null placement is the case under test.
-    let rc = unsafe { vigil_scene_render(&req, ptr::null_mut(), 0, ptr::null_mut()) };
+    let rc = unsafe { vigil_scene_render(&raw const req, ptr::null_mut(), 0, ptr::null_mut()) };
     assert_eq!(rc, VIGIL_SCENE_ERR_ARGUMENT);
     let mut one = [0u8; 1];
     // SAFETY: a non-null out with a length of 0 is the case under test.
-    let rc = unsafe { vigil_scene_render(&req, one.as_mut_ptr(), 0, &mut at) };
+    let rc = unsafe { vigil_scene_render(&raw const req, one.as_mut_ptr(), 0, &raw mut at) };
     assert_eq!(rc, VIGIL_SCENE_ERR_ARGUMENT);
 
     type Edit = fn(&mut VigilSceneRequest);
@@ -161,6 +161,13 @@ fn bad_arguments_are_refused_before_any_drawing() {
     req.spec_json = spec.as_ptr();
     req.spec_len = spec.len();
     assert_eq!(render(&req, &mut []).0, VIGIL_SCENE_ERR_INVALID);
+
+    let mut req = request(&[], VIGIL_SCENE_LAYER_BAR);
+    req.svg = ptr::null();
+    let spec = br#"{"version":2,"ref_short_side":4000000000}"#;
+    req.spec_json = spec.as_ptr();
+    req.spec_len = spec.len();
+    assert_eq!(render(&req, &mut []).0, VIGIL_SCENE_ERR_TOO_LARGE);
 
     let req = request(&svg, VIGIL_SCENE_LAYER_LOGO);
     let mut short = vec![0u8; 10];

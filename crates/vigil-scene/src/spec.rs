@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::Error;
 
 pub const DEFAULT_SPEC: &str = include_str!("../../../tests/fixtures/scene.json");
+pub const MAX_SPEC_BYTES: u64 = 1 << 20;
 
 pub(crate) fn rnd(x: f64) -> i64 {
     (x + 0.5).floor() as i64

@@ -65,6 +65,52 @@ fn reference_fan_out_is_refused() {
 }
 
 #[test]
+fn fan_out_cannot_hide_behind_decoys_or_whitespace() {
+    let fan = |decoy: &str, href: &dyn Fn(usize) -> String| {
+        let mut body = String::from(r#"<defs><rect id="l0" width="1" height="1"/>"#);
+        for level in 1..10 {
+            body += &format!(r#"<g id="l{level}">"#);
+            for _ in 0..10 {
+                body += &format!(r#"<use href="{}"/>"#, href(level - 1));
+            }
+            body += "</g>";
+            body += &decoy.replace("ID", &format!("l{level}"));
+        }
+        body + &format!(r#"</defs><use href="{}"/>"#, href(9))
+    };
+    let plain = |l: usize| format!("#l{l}");
+    let spaced = |l: usize| format!(" #l{l}");
+    for (what, body) in [
+        (
+            "svg decoy",
+            fan(r#"<rect id="ID" width="1" height="1"/>"#, &plain),
+        ),
+        (
+            "foreign decoy",
+            fan(r#"<x:decoy xmlns:x="urn:x" id="ID"/>"#, &plain),
+        ),
+        ("leading space", fan("", &spaced)),
+    ] {
+        let why = refused(&svg(&body));
+        assert!(
+            why.contains("expands") || why.contains("id"),
+            "{what}: {why}"
+        );
+    }
+}
+
+#[test]
+fn style_sheets_may_paint_with_gradients_but_not_fan_out() {
+    let gradient = r##"<defs><style>.a{fill:url(#g)}</style><linearGradient id="g"><stop offset="0" stop-color="#fff"/></linearGradient></defs><rect class="a" width="100" height="100"/>"##;
+    assert_eq!(coverage(&svg(gradient), 8), 64);
+    let mut clips = String::from(r#"<style>rect { clip-path: url(#c) }</style><clipPath id="c">"#);
+    clips += &r#"<circle r="1"/>"#.repeat(200);
+    clips += "</clipPath>";
+    clips += &r#"<rect width="9" height="9"/>"#.repeat(200);
+    assert!(refused(&svg(&clips)).contains("expands"));
+}
+
+#[test]
 fn reference_loops_are_refused() {
     assert!(refused(&svg(r##"<g id="a"><use href="#a"/></g>"##)).contains("loop"));
     assert!(
@@ -108,7 +154,6 @@ fn nothing_outside_the_svg_is_read() {
         r#"<marker id="m"/>"#.into(),
         r#"<text>logo</text>"#.into(),
         r#"<script>alert(1)</script>"#.into(),
-        r#"<style>rect { clip-path: url(#c) }</style>"#.into(),
     ] {
         refused(&svg(&body));
     }
@@ -125,6 +170,32 @@ fn dashed_strokes_are_refused() {
 }
 
 #[test]
+fn shapes_far_outside_the_box_are_refused() {
+    for body in [
+        r##"<ellipse cx="50" cy="50" rx="01e38" ry="20" stroke="#000"/>"##,
+        r#"<rect width="2000000" height="9"/>"#,
+        r#"<rect width="9" height="9" style="stroke-width:1e9"/>"#,
+        r#"<g transform="rotate(30 50 50)"><polygon points="1-1e38,10 90,10 50,90"/></g>"#,
+        r#"<path d="M-1e38 -1e38 L1e38 1e38 L-1e38 1e38 Z"/>"#,
+        r##"<path d="M0 0 L100 100" stroke="#000" stroke-width="1e30"/>"##,
+        r#"<rect width="100" height="100" transform="scale(1e6)"/>"#,
+        r#"<clipPath id="c"><rect x="-1e9" width="9" height="9"/></clipPath><rect width="9" height="9" clip-path="url(#c)"/>"#,
+    ] {
+        let why = refused(&svg(body));
+        assert!(
+            why.contains("far outside") || why.contains("beyond"),
+            "{body}: {why}"
+        );
+    }
+    assert!(
+        coverage(
+            &svg(r#"<rect x="-500" y="-500" width="1100" height="1100"/>"#),
+            8
+        ) == 64
+    );
+}
+
+#[test]
 fn extreme_numbers_render_in_bounded_time() {
     for body in [
         r#"<path d="M-1e38 -1e38 L1e38 1e38 L-1e38 1e38 Z"/>"#,
@@ -132,7 +203,6 @@ fn extreme_numbers_render_in_bounded_time() {
         r#"<circle cx="50" cy="50" r="1e-30"/>"#,
         r#"<rect width="100" height="100" transform="scale(1e-30)"/>"#,
         r#"<rect width="100" height="100" transform="rotate(1e30)"/>"#,
-        r#"<g transform="rotate(30 50 50)"><polygon points="1-1e38,10 90,10 50,90"/></g>"#,
     ] {
         let start = Instant::now();
         if let Ok(logo) = Logo::svg(svg(body).as_bytes()) {
@@ -291,4 +361,26 @@ fn mutated_svgs_fail_cleanly_and_quickly() {
         "{cases} cases took {:?}, slowest {slowest:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn raster_logos_keep_their_own_larger_cap() {
+    let mut rng = XorShift(7);
+    let noisy = image::RgbaImage::from_fn(640, 640, |x, y| {
+        let inside = (x as i64 - 320).pow(2) + (y as i64 - 320).pow(2) < 250 * 250;
+        let n = rng.next();
+        image::Rgba([
+            n as u8,
+            (n >> 8) as u8,
+            (n >> 16) as u8,
+            if inside { 255 } else { 0 },
+        ])
+    });
+    let dir = std::env::temp_dir().join(format!("vigil-scene-raster-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("logo.png");
+    noisy.save(&path).unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() > MAX_LOGO_BYTES);
+    let mask = Logo::load(&path).unwrap().mask(64).unwrap();
+    assert!(mask.alpha().iter().filter(|&&a| a == 255).count() > 1500);
 }

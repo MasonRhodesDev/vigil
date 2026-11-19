@@ -1,12 +1,12 @@
 use crate::glow::glow_mask;
 use crate::spec::{Geometry, Scene, rnd};
-use crate::{Error, Logo, Mask};
+use crate::{Error, Logo, MAX_EDGE, Mask};
 
 pub const MAX_SIDE: u32 = 16384;
 pub const MAX_PIXELS: u64 = 8192 * 8192;
-pub const MAX_GLOW: u32 = 8192;
+pub const MAX_GLOW: u32 = 4096;
 
-pub fn check_output(panel: (u32, u32)) -> Result<(), Error> {
+pub fn check_output(spec: &Scene, panel: (u32, u32), transform: u8) -> Result<(), Error> {
     let (w, h) = panel;
     if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
         return Err(Error::TooLarge(format!(
@@ -16,6 +16,14 @@ pub fn check_output(panel: (u32, u32)) -> Result<(), Error> {
     if u64::from(w) * u64::from(h) > MAX_PIXELS {
         return Err(Error::TooLarge(format!(
             "an output of {w}x{h} is over {MAX_PIXELS} pixels"
+        )));
+    }
+    let scene = if transform % 2 == 1 { (h, w) } else { (w, h) };
+    let g = spec.geometry(scene.0, scene.1);
+    if g.logo > MAX_EDGE || g.glow > MAX_GLOW || g.bar_w > MAX_SIDE || g.bar_h > MAX_SIDE {
+        return Err(Error::TooLarge(format!(
+            "the scene asks for a {} px logo, a {} px glow and a {}x{} bar",
+            g.logo, g.glow, g.bar_w, g.bar_h
         )));
     }
     Ok(())

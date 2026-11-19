@@ -7,12 +7,15 @@ use resvg::usvg::{self, roxmltree};
 use crate::Error;
 
 pub const MAX_LOGO_BYTES: u64 = 512 * 1024;
-pub const MAX_EDGE: u32 = 4096;
+pub const MAX_EDGE: u32 = 2048;
+pub const MAX_RASTER_BYTES: u64 = 16 << 20;
 const MAX_RASTER_SIDE: u32 = 8192;
 const MAX_NODES: u32 = 10_000;
 const MAX_DEPTH: usize = 64;
 const MAX_REF_DEPTH: usize = 128;
 const MAX_EXPANDED: usize = 20_000;
+const REACH: f32 = 16.0;
+const MAX_NUMBER: f64 = 1e6;
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const DRAWN: &[&str] = &[
     "svg",
@@ -66,34 +69,31 @@ impl Mask {
     }
 }
 
-pub fn read_bounded(path: &Path) -> Result<Vec<u8>, Error> {
+pub fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, Error> {
     let file = std::fs::File::open(path).map_err(|e| Error::Io(e.to_string()))?;
     let meta = file.metadata().map_err(|e| Error::Io(e.to_string()))?;
     if !meta.is_file() {
         return Err(Error::Refused("not a regular file".into()));
     }
     let mut data = Vec::new();
-    file.take(MAX_LOGO_BYTES + 1)
+    file.take(cap + 1)
         .read_to_end(&mut data)
         .map_err(|e| Error::Io(e.to_string()))?;
-    if data.len() as u64 > MAX_LOGO_BYTES {
-        return Err(Error::TooLarge(format!(
-            "logo is over {MAX_LOGO_BYTES} bytes"
-        )));
+    if data.len() as u64 > cap {
+        return Err(Error::TooLarge(format!("over {cap} bytes")));
     }
     Ok(data)
 }
 
 impl Logo {
     pub fn load(path: &Path) -> Result<Logo, Error> {
-        let data = read_bounded(path)?;
         if path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
         {
-            Logo::svg(&data)
+            Logo::svg(&read_bounded(path, MAX_LOGO_BYTES)?)
         } else {
-            Logo::raster(&data)
+            Logo::raster(&read_bounded(path, MAX_RASTER_BYTES)?)
         }
     }
 
@@ -134,7 +134,8 @@ impl Logo {
         }))
         .map_err(|_| Error::Invalid("the SVG parser could not read this SVG".into()))?
         .map_err(|e| Error::Invalid(format!("SVG: {e}")))?;
-        refuse_dashes(tree.root())?;
+        let size = tree.size();
+        screen_tree(tree.root(), REACH * size.width().max(size.height()))?;
         Ok(Logo::Svg(Box::new(tree)))
     }
 
@@ -205,6 +206,22 @@ impl Logo {
 
 fn screen(doc: &roxmltree::Document) -> Result<(), Error> {
     for n in doc.descendants().filter(roxmltree::Node::is_element) {
+        let values = n
+            .attributes()
+            .filter(|a| a.namespace().is_none() && !matches!(a.name(), "id" | "class" | "href"))
+            .map(|a| a.value())
+            .chain(
+                n.has_tag_name((SVG_NS, "style"))
+                    .then(|| n.text())
+                    .flatten(),
+            );
+        for value in values {
+            if largest_number(value) > MAX_NUMBER {
+                return Err(Error::Refused(format!(
+                    "a number beyond {MAX_NUMBER} has no place in a logo"
+                )));
+            }
+        }
         let name = n.tag_name();
         if name.namespace() == Some(SVG_NS) && !DRAWN.contains(&name.name()) {
             return Err(Error::Refused(format!(
@@ -212,13 +229,23 @@ fn screen(doc: &roxmltree::Document) -> Result<(), Error> {
                 name.name()
             )));
         }
-        if name.name() == "style" && n.text().is_some_and(|t| t.contains("url(")) {
-            return Err(Error::Refused(
-                "a <style> sheet that references other elements".into(),
-            ));
+    }
+    let mut expansion = Expansion::new(doc)?;
+    let mut total = expansion.size(doc.root_element(), 0)?;
+    let elements = doc
+        .descendants()
+        .filter(roxmltree::Node::is_element)
+        .count();
+    let sheets = doc
+        .descendants()
+        .filter(|n| n.has_tag_name((SVG_NS, "style")))
+        .filter_map(|n| n.text());
+    for sheet in sheets {
+        for target in expansion.targets(sheet) {
+            total += expansion.size(target, 0)?.saturating_mul(elements);
+            expansion.check(total)?;
         }
     }
-    Expansion::new(doc).size(doc.root_element(), 0)?;
     Ok(())
 }
 
@@ -229,16 +256,42 @@ struct Expansion<'a, 'input> {
 }
 
 impl<'a, 'input> Expansion<'a, 'input> {
-    fn new(doc: &'a roxmltree::Document<'input>) -> Self {
-        let ids = doc
-            .descendants()
-            .filter_map(|n| n.attribute("id").map(|id| (id, n)))
-            .collect();
-        Self {
+    fn new(doc: &'a roxmltree::Document<'input>) -> Result<Self, Error> {
+        let mut ids = HashMap::new();
+        for n in doc.descendants() {
+            if let Some(id) = n.attribute("id")
+                && ids.insert(id, n).is_some()
+            {
+                return Err(Error::Refused(format!("the SVG uses the id {id:?} twice")));
+            }
+        }
+        Ok(Self {
             ids,
             sizes: HashMap::new(),
             open: HashSet::new(),
+        })
+    }
+
+    fn targets(&self, value: &str) -> Vec<roxmltree::Node<'a, 'input>> {
+        value
+            .split('#')
+            .skip(1)
+            .filter_map(|rest| {
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || "()'\",;".contains(c))
+                    .unwrap_or(rest.len());
+                self.ids.get(&rest[..end]).copied()
+            })
+            .collect()
+    }
+
+    fn check(&self, total: usize) -> Result<(), Error> {
+        if total > MAX_EXPANDED {
+            return Err(Error::Refused(format!(
+                "the SVG expands to more than {MAX_EXPANDED} elements"
+            )));
         }
+        Ok(())
     }
 
     fn size(&mut self, node: roxmltree::Node<'a, 'input>, depth: usize) -> Result<usize, Error> {
@@ -253,8 +306,7 @@ impl<'a, 'input> Expansion<'a, 'input> {
         let mut total = 1usize;
         let targets: Vec<_> = node
             .attributes()
-            .flat_map(|a| references(a.value()))
-            .filter_map(|id| self.ids.get(id).copied())
+            .flat_map(|a| self.targets(a.value()))
             .collect();
         for next in node
             .children()
@@ -262,16 +314,49 @@ impl<'a, 'input> Expansion<'a, 'input> {
             .chain(targets)
         {
             total += self.size(next, depth + 1)?;
-            if total > MAX_EXPANDED {
-                return Err(Error::Refused(format!(
-                    "the SVG expands to more than {MAX_EXPANDED} elements"
-                )));
-            }
+            self.check(total)?;
         }
         self.open.remove(&node.id());
         self.sizes.insert(node.id(), total);
         Ok(total)
     }
+}
+
+fn largest_number(text: &str) -> f64 {
+    let b = text.as_bytes();
+    let mut largest = 0.0f64;
+    let mut i = 0;
+    while i < b.len() {
+        let starts = (b[i].is_ascii_digit() || b[i] == b'.')
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b"_#".contains(&b[i - 1])));
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let from = i;
+        while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+            i += 1;
+        }
+        if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+            let mut j = i + 1;
+            if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+                j += 1;
+            }
+            if j < b.len() && b[j].is_ascii_digit() {
+                i = j;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+        }
+        if !text[from..i].bytes().any(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(v) = text[from..i].parse::<f64>() {
+            largest = largest.max(v.abs());
+        }
+    }
+    largest
 }
 
 // roxmltree recurses once per nesting level while it parses, so depth is
@@ -324,30 +409,31 @@ fn nesting(text: &[u8]) -> usize {
     deepest
 }
 
-fn references(value: &str) -> impl Iterator<Item = &str> {
-    let href = value.strip_prefix('#').into_iter();
-    let urls = value.split("url(").skip(1).filter_map(|rest| {
-        let rest = rest.trim_start().trim_start_matches(['\'', '"']);
-        let id = rest.strip_prefix('#')?;
-        Some(id.split([')', '\'', '"']).next().unwrap_or(id).trim())
-    });
-    href.chain(urls)
-}
-
-fn refuse_dashes(group: &usvg::Group) -> Result<(), Error> {
+fn screen_tree(group: &usvg::Group, reach: f32) -> Result<(), Error> {
     let nested = group
         .clip_path()
         .map(|c| c.root())
         .into_iter()
         .chain(group.mask().map(|m| m.root()));
     for g in nested {
-        refuse_dashes(g)?;
+        screen_tree(g, reach)?;
     }
     for node in group.children() {
         match node {
-            usvg::Node::Group(g) => refuse_dashes(g)?,
-            usvg::Node::Path(p) if p.stroke().is_some_and(|s| s.dasharray().is_some()) => {
-                return Err(Error::Refused("a dashed stroke".into()));
+            usvg::Node::Group(g) => screen_tree(g, reach)?,
+            usvg::Node::Path(p) => {
+                if p.stroke().is_some_and(|s| s.dasharray().is_some()) {
+                    return Err(Error::Refused("a dashed stroke".into()));
+                }
+                let b = p.abs_stroke_bounding_box();
+                if [b.left(), b.top(), b.right(), b.bottom()]
+                    .iter()
+                    .any(|v| !v.is_finite() || v.abs() > reach)
+                {
+                    return Err(Error::Refused(
+                        "a shape reaches far outside the logo's box".into(),
+                    ));
+                }
             }
             _ => {}
         }
