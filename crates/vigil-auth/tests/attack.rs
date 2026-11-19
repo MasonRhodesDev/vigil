@@ -816,6 +816,24 @@ fn pinned() -> Vec<(&'static str, Case)> {
             "refused\nvigil: [t+0ms] auth: start_session accepted",
         ),
         (
+            "a later question writes the line an earlier refusal quoted",
+            Case {
+                conforming: true,
+                default_user: None,
+                unprompted: None,
+                remembered: Vec::new(),
+                ops: vec![Op::Begin(Some(0)), Op::Enter, Op::Enter],
+                replies: vec![
+                    Reply::Refuse(
+                        "refused\nvigil: auth stage user=alice prompt=\"Password\" secret".into(),
+                    ),
+                    Reply::Message(Kind::Secret, "Password".into()),
+                ],
+                starts: Vec::new(),
+                refuse_cancels: false,
+            },
+        ),
+        (
             "a failed unasked open leaves the previous user's field on screen",
             Case {
                 conforming: false,
