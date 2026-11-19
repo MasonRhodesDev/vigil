@@ -511,3 +511,31 @@ fn the_focus_ring_tones_are_far_enough_apart_to_show_on_any_background() {
         "fg on page-bg is {ratio:.2}:1; at 9:1 or more any neighbour is 3:1 from one tone"
     );
 }
+
+#[test]
+fn a_modifier_held_when_the_panel_leaves_does_not_stick() {
+    let mut g = Greeter::new();
+    g.event(CONTROL_L, None, true);
+    g.window.set_panel_visible(false);
+    g.window.set_panel_visible(true);
+    g.window.show_prompt("Password:", true);
+    g.type_text("pw");
+    g.tap(RETURN);
+    assert_eq!(g.take(), [Sent::Respond("pw".into())]);
+}
+
+#[test]
+fn holding_an_arrow_steps_a_picker_once() {
+    let mut g = Greeter::with_pickers();
+    g.chord(SHIFT_L, ISO_LEFT_TAB, Some("\t"));
+    for _ in 0..5 {
+        g.event(RIGHT, None, true);
+    }
+    g.event(RIGHT, None, false);
+    g.tap(RIGHT);
+    assert_eq!(
+        g.take(),
+        [Sent::User(1), Sent::User(2)],
+        "key repeat never cycles users, each of which may open a sign-in"
+    );
+}
