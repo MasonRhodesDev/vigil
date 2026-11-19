@@ -13,7 +13,7 @@ use seccompiler::{
     SeccompRule,
 };
 
-use crate::helper::MESSAGE;
+use crate::helper::MAX_MESSAGE;
 use crate::{Error, MAX_PIXELS};
 
 const MEMORY: u64 = 1 << 30;
@@ -40,7 +40,7 @@ pub fn confine(deadline: Duration, output: u64) -> Result<Option<String>, Error>
         (Resource::Cpu, cpu),
         (Resource::As, MEMORY),
         (Resource::Nofile, 3),
-        (Resource::Fsize, output.min(MAX_PIXELS * 4) + MESSAGE),
+        (Resource::Fsize, output.min(MAX_PIXELS * 4) + MAX_MESSAGE),
         (Resource::Core, 0),
         (Resource::Nproc, 0),
     ] {

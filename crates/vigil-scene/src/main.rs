@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use image::ImageEncoder;
 use vigil_scene::{
-    Error, Format, HELPER_ABI, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_PIXELS, MAX_SIDE,
-    MAX_SPEC_BYTES, NOTICE, Plate, Request, Scene, Sprite, confine, emit_spec, lock_down,
-    read_bounded,
+    Error, Format, HELPER_ABI, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_MESSAGE,
+    MAX_PIXELS, MAX_SIDE, MAX_SPEC_BYTES, NOTICE, Plate, Request, Scene, Sprite, confine,
+    emit_spec, lock_down, read_bounded,
 };
 
 const USAGE: &str = "usage:
@@ -342,6 +342,16 @@ fn record(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+const NOTICE_ROOM: usize = 256;
+
+// A refusal can quote the logo at any length, and a write past the file size
+// limit, which leaves MAX_MESSAGE beyond the output, would end the helper by
+// SIGXFSZ instead. A notice and an error together stay within it.
+fn say_within(line: &str, room: usize) {
+    let line = &line[..line.floor_char_boundary(room - 1)];
+    let _ = record(rustix::stdio::stderr(), format!("{line}\n").as_bytes());
+}
+
 // Reads all of stdin, then locks the process down before any of it is
 // parsed.
 fn input_up_to(cap: u64) -> Result<Vec<u8>, Error> {
@@ -444,10 +454,7 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
                 Error::Helper(format!("--out-len up to {} is required", MAX_PIXELS * 4))
             })?;
         if let Some(notice) = confine(Duration::from_millis(deadline), out_len)? {
-            let _ = record(
-                rustix::stdio::stderr(),
-                format!("{NOTICE}{notice}\n").as_bytes(),
-            );
+            say_within(&format!("{NOTICE}{notice}"), NOTICE_ROOM);
         }
         let pixels = match job {
             "mask" => mask_job(&args)?,
@@ -464,9 +471,9 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            let _ = record(
-                rustix::stdio::stderr(),
-                format!("vigil-scene: {e}\n").as_bytes(),
+            say_within(
+                &format!("vigil-scene: {e}"),
+                MAX_MESSAGE as usize - NOTICE_ROOM,
             );
             ExitCode::from(e.exit_code())
         }

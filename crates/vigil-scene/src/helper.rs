@@ -24,7 +24,9 @@ pub const HELPER_ABI: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_DEADLINE: Duration = Duration::from_millis(1500);
 pub const MAX_DEADLINE: Duration = Duration::from_secs(5);
 
-pub(crate) const MESSAGE: u64 = 4096;
+/// The most the library reads of what the helper writes to stderr, and the
+/// most the helper's file size limit leaves room for beyond its output.
+pub const MAX_MESSAGE: u64 = 4096;
 
 /// The helper's installed path, fixed when the calling crate is built: the
 /// `VIGIL_SCENE_HELPER` build variable, else `INSTALLED_HELPER`. It is never
@@ -261,7 +263,7 @@ fn wait(pidfd: &OwnedFd, by: Instant) -> Result<bool, Error> {
 }
 
 fn stderr_text(stderr: &File) -> String {
-    let len = stderr.metadata().map_or(0, |m| m.len()).min(MESSAGE);
+    let len = stderr.metadata().map_or(0, |m| m.len()).min(MAX_MESSAGE);
     let mut buf = vec![0u8; len as usize];
     let read = stderr.read_at(&mut buf, 0).unwrap_or(0);
     String::from_utf8_lossy(&buf[..read]).into_owned()
