@@ -30,7 +30,7 @@ fn main() {
 
     let context = Rc::new(GlContext::open(std::path::Path::new(&node)).expect("gl context"));
     let surface = GlSurface::new(context, W, H).expect("gbm window surface");
-    println!("egl window surface over gbm: ok");
+    vigil_log::out!("egl window surface over gbm: ok");
     let gbm = surface.window();
 
     let window = GlWindow::with_surface(surface, PhysicalSize::new(W, H)).expect("window");
@@ -45,7 +45,7 @@ fn main() {
     let source = include_str!("../../../themes/default/theme.slint");
     let result = spin_on(compiler.build_from_source(source.into(), Default::default()));
     for diagnostic in result.diagnostics() {
-        eprintln!("theme: {diagnostic}");
+        vigil_log::say!("theme: {diagnostic}");
     }
     let definition = result.component("DefaultTheme").expect("DefaultTheme");
     let instance = definition.create().expect("instantiate");
@@ -61,11 +61,11 @@ fn main() {
     instance.show().expect("show");
 
     window.render().expect("render");
-    println!("rendered the default theme through femtovg: ok");
+    vigil_log::out!("rendered the default theme through femtovg: ok");
 
     // SAFETY: window.render() above swapped this surface exactly once.
     let bo = unsafe { gbm.lock_front_buffer() }.expect("lock front buffer");
-    println!(
+    vigil_log::out!(
         "front buffer: {}x{} stride={} format={:?}",
         bo.width(),
         bo.height(),
@@ -75,7 +75,7 @@ fn main() {
     assert_eq!(bo.width(), W, "front buffer is the wrong size");
     gbm.release_buffer(bo);
 
-    println!("SCANOUT PATH OK (everything but the CRTC commit)");
+    vigil_log::out!("SCANOUT PATH OK (everything but the CRTC commit)");
 }
 
 #[allow(unsafe_code)]

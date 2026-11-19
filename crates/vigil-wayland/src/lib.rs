@@ -482,7 +482,7 @@ impl<S: LockSession> App<S> {
                 }
                 FlowCmd::ReleaseSessionLock => self.send_unlock(),
                 FlowCmd::DestroyRevealOverlays => self.drop_overlays(SurfaceRole::is_reveal),
-                FlowCmd::Journal(note) => eprintln!("vigil-lock: {note}"),
+                FlowCmd::Journal(note) => vigil_log::say!("vigil-lock: {note}"),
                 FlowCmd::PhaseChanged { from, to } => {
                     let phase = self.phase_span.as_ref().and_then(tracing::Span::id);
                     tracing::event!(
@@ -778,7 +778,7 @@ impl<S: LockSession> App<S> {
         self.wake.wake();
         let elapsed = configure_started.elapsed();
         if elapsed >= Duration::from_millis(8) {
-            eprintln!("vigil-lock: output {:?} configure: {:?}", id, elapsed);
+            vigil_log::say!("vigil-lock: output {:?} configure: {:?}", id, elapsed);
         }
     }
 
@@ -844,7 +844,7 @@ impl<S: LockSession> App<S> {
         let is_reveal = self.entries[idx].role.is_reveal();
         let role = self.entries[idx].role.name();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
-            eprintln!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
+            vigil_log::say!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
             self.schedule_present_retry(id);
             return;
         };
@@ -868,7 +868,7 @@ impl<S: LockSession> App<S> {
         };
         let Ok((buffer, canvas)) = pool.create_buffer(w as i32, h as i32, stride as i32, format)
         else {
-            eprintln!("vigil-lock: output {id:?}: shm buffer {w}x{h} failed");
+            vigil_log::say!("vigil-lock: output {id:?}: shm buffer {w}x{h} failed");
             self.schedule_present_retry(id);
             return;
         };
@@ -916,7 +916,9 @@ impl<S: LockSession> App<S> {
             self.metrics.record_render();
         }
         if !drew {
-            eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
+            vigil_log::say!(
+                "vigil-lock: output {id:?}: first present empty; committing black {w}x{h}"
+            );
         }
         if let Some((frost, wallpaper)) = overlay_progress {
             let opacity = if self.entries[idx].role.is_reveal() {
@@ -937,9 +939,10 @@ impl<S: LockSession> App<S> {
         let commit_elapsed = commit_started.elapsed();
         if render_elapsed >= Duration::from_millis(8) || commit_elapsed >= Duration::from_millis(8)
         {
-            eprintln!(
+            vigil_log::say!(
                 "vigil-lock: output {id:?} present: render {:?}, commit {:?}",
-                render_elapsed, commit_elapsed
+                render_elapsed,
+                commit_elapsed
             );
         }
         drop(frame_span);
@@ -1228,7 +1231,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
     let qh: QueueHandle<App<S>> = event_queue.handle();
     let mut event_loop: EventLoop<App<S>> = EventLoop::try_new().map_err(err)?;
     if let Err(error) = arm_termination(&event_loop.handle()) {
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: {error}; a signal will still end the process, without closing its trace"
         );
     }
@@ -1248,7 +1251,9 @@ fn run_with_lock_body<S: LockSession + 'static>(
         Err(error) if warning_enabled => return Err(err(error)),
         Err(error) => {
             if policy.transition.ramps_in() || policy.transition.reveals() {
-                eprintln!("vigil-lock: layer-shell unavailable ({error}); locking immediately");
+                vigil_log::say!(
+                    "vigil-lock: layer-shell unavailable ({error}); locking immediately"
+                );
             }
             policy.transition = vigil_config::LockTransition::immediate();
             None
@@ -1315,7 +1320,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
         phase_span,
         protocol_events: Vec::new(),
     };
-    eprintln!(
+    vigil_log::say!(
         "vigil-lock: frost opacity lever: {}",
         if app.hyprland_surfaces.is_some() {
             "hyprland-surface-v1 (blur strength follows)"
@@ -1395,7 +1400,7 @@ fn report_idle_cost(
     let end = metrics.snapshot();
     let secs = started.elapsed().as_secs_f64().max(0.001);
     let per_min = |a: u64, b: u64| (b.saturating_sub(a) as f64) * 60.0 / secs;
-    eprintln!(
+    vigil_log::say!(
         "vigil-lock: idle cost over {:.0}s: {:.0} wakes/min, {:.0} renders/min, \
          {:.0} commits/min, {:.0} buffer acquires/min",
         secs,
@@ -1456,7 +1461,7 @@ impl<S: LockSession> LayerShellHandler for App<S> {
             self.entries.remove(idx);
             return;
         }
-        eprintln!("vigil-lock: warning surface {id:?} closed");
+        vigil_log::say!("vigil-lock: warning surface {id:?} closed");
         self.entries.remove(idx);
         self.raise(FlowEvent::OverlayClosed);
     }
@@ -1492,7 +1497,7 @@ impl<S: LockSession> BackgroundEffectHandler for App<S> {
             .background_effects
             .capabilities()
             .is_some_and(|capabilities| capabilities.contains(Capability::Blur));
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: compositor background blur {}",
             if blur {
                 "available"
@@ -1741,7 +1746,7 @@ impl<S: LockSession> OutputHandler for App<S> {
             .find(|entry| entry.output == output)
             .map(|entry| entry.id)
         {
-            eprintln!("vigil-lock: output {:?} gone", id);
+            vigil_log::say!("vigil-lock: output {:?} gone", id);
             for entry in self.entries.iter().filter(|entry| entry.output == output) {
                 if let Some(fractional) = &entry.fractional {
                     fractional.destroy();

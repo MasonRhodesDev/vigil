@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 vigil-core.workspace = true
 greetd_ipc.workspace = true
 serde_json.workspace = true

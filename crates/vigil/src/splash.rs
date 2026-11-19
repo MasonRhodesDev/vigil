@@ -259,7 +259,7 @@ impl Splash {
             Some(path) => match mask(path, g.logo) {
                 Ok(m) => Some(m),
                 Err(e) => {
-                    eprintln!("vigil: splash logo {}: {e}", path.display());
+                    vigil_log::say!("vigil: splash logo {}: {e}", path.display());
                     None
                 }
             },

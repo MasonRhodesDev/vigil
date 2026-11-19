@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 slint-idle-runtime.workspace = true
 vigil-core.workspace = true
 vigil-secret.workspace = true
@@ -34,6 +35,7 @@ image.workspace = true
 resvg = { version = "0.47", default-features = false }
 
 [dev-dependencies]
+vigil-log = { workspace = true, features = ["testing"] }
 image.workspace = true
 greetd_ipc.workspace = true
 

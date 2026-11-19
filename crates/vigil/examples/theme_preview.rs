@@ -25,7 +25,7 @@ fn main() {
             .expect("window");
     let (pw, ph) = (W, H);
 
-    window.on_ui_message(std::rc::Rc::new(|m| println!("ui-message: {m:?}")));
+    window.on_ui_message(std::rc::Rc::new(|m| vigil_log::out!("ui-message: {m:?}")));
     window.set_panel_visible(true);
     window.set_cursor_visible(true);
     window.set_clock("13:37");
@@ -91,12 +91,12 @@ fn main() {
         stride: (pw * 4) as usize,
         damage: None,
     });
-    println!("drew: {drew}");
+    vigil_log::out!("drew: {drew}");
 
     let mut rgb = Vec::with_capacity((W * H * 3) as usize);
     for px in buf.as_chunks::<4>().0 {
         rgb.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     image::save_buffer(&out, &rgb, pw, ph, image::ColorType::Rgb8).expect("png");
-    println!("wrote {out}");
+    vigil_log::out!("wrote {out}");
 }

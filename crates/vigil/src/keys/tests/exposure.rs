@@ -184,9 +184,9 @@ fn what_a_submitted_password_leaves_in_process_memory() {
     let submitted = scan(&needle);
     drop(rig);
     let dropped = scan(&needle);
-    println!("exposure: in the field   {typed:?}");
-    println!("exposure: after submit   {submitted:?}");
-    println!("exposure: greeter dropped {dropped:?}");
+    vigil_log::out!("exposure: in the field   {typed:?}");
+    vigil_log::out!("exposure: after submit   {submitted:?}");
+    vigil_log::out!("exposure: greeter dropped {dropped:?}");
 
     assert!(
         typed.heap + typed.anonymous > 0,

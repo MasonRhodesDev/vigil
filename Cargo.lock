@@ -5125,6 +5125,7 @@ dependencies = [
  "vigil-core",
  "vigil-gl",
  "vigil-input",
+ "vigil-log",
  "vigil-login",
  "vigil-outputs",
  "vigil-present-dumb",
@@ -5143,6 +5144,7 @@ dependencies = [
  "proptest",
  "serde_json",
  "vigil-core",
+ "vigil-log",
  "vigil-secret",
 ]
 
@@ -5152,6 +5154,7 @@ version = "0.4.3"
 dependencies = [
  "serde",
  "toml 0.9.12+spec-1.1.0",
+ "vigil-log",
  "xdg-paths",
 ]
 
@@ -5184,6 +5187,7 @@ dependencies = [
  "slint-interpreter",
  "smithay",
  "vigil-core",
+ "vigil-log",
 ]
 
 [[package]]
@@ -5193,6 +5197,7 @@ dependencies = [
  "input 0.9.1",
  "smithay",
  "vigil-core",
+ "vigil-log",
  "xkbcommon 0.9.0",
 ]
 
@@ -5212,6 +5217,7 @@ dependencies = [
  "vigil-config",
  "vigil-core",
  "vigil-flow",
+ "vigil-log",
  "vigil-login",
  "vigil-pam",
  "vigil-secret",
@@ -5223,10 +5229,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vigil-log"
+version = "0.4.3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "vigil-login"
 version = "0.4.3"
 dependencies = [
  "vigil-core",
+ "vigil-log",
  "zbus 6.0.0",
 ]
 
@@ -5237,6 +5251,7 @@ dependencies = [
  "smithay",
  "smithay-drm-extras",
  "vigil-core",
+ "vigil-log",
 ]
 
 [[package]]
@@ -5246,6 +5261,7 @@ dependencies = [
  "libc",
  "pam-client",
  "vigil-core",
+ "vigil-log",
  "vigil-secret",
 ]
 
@@ -5255,6 +5271,7 @@ version = "0.4.3"
 dependencies = [
  "smithay",
  "vigil-core",
+ "vigil-log",
  "vigil-present-kms",
 ]
 
@@ -5268,6 +5285,7 @@ dependencies = [
  "smithay",
  "vigil-core",
  "vigil-gl",
+ "vigil-log",
  "vigil-present-kms",
  "vigil-theme",
  "vigil-ui",
@@ -5288,6 +5306,7 @@ dependencies = [
  "libc",
  "rustix 1.1.6",
  "serde",
+ "vigil-log",
  "zeroize",
 ]
 
@@ -5313,6 +5332,7 @@ dependencies = [
  "vigil-config",
  "vigil-core",
  "vigil-flow",
+ "vigil-log",
  "vigil-secret",
  "vigil-theme",
  "vigil-ui",
@@ -5327,6 +5347,7 @@ dependencies = [
  "slint-interpreter",
  "slint-kit",
  "vigil-core",
+ "vigil-log",
 ]
 
 [[package]]
@@ -5341,6 +5362,7 @@ dependencies = [
  "slint-kit",
  "vigil-config",
  "vigil-core",
+ "vigil-log",
 ]
 
 [[package]]
@@ -5363,6 +5385,7 @@ dependencies = [
  "vigil-config",
  "vigil-core",
  "vigil-flow",
+ "vigil-log",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",

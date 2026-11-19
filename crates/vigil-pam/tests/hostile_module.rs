@@ -64,7 +64,7 @@ fn load() -> Option<Module<impl ConversationHandler>> {
             field: Some(field),
         }),
         Err(error) if std::env::var_os("CI").is_none() => {
-            eprintln!("SKIP: libpam would not start here ({error})");
+            vigil_log::say!("SKIP: libpam would not start here ({error})");
             None
         }
         Err(error) => panic!("pam_start: {error}"),

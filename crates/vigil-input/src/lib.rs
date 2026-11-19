@@ -183,7 +183,7 @@ fn compose_state(locale: &str) -> Option<compose::State> {
     ) {
         Ok(table) => Some(compose::State::new(&table, compose::STATE_NO_FLAGS)),
         Err(()) => {
-            eprintln!("vigil-input: no compose table for locale {locale}; compose disabled");
+            vigil_log::say!("vigil-input: no compose table for locale {locale}; compose disabled");
             None
         }
     }
@@ -202,7 +202,7 @@ impl KeyboardState {
         let keymap = compile_keymap(&context, settings)
             .or_else(|| {
                 if *settings != KeymapSettings::default() {
-                    eprintln!(
+                    vigil_log::say!(
                         "vigil-input: keymap {settings:?} did not compile; using system default"
                     );
                     compile_keymap(&context, &KeymapSettings::default())

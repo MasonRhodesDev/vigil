@@ -68,6 +68,7 @@ jobs:
       - run: cargo build -p vigil-lock
       - run: cargo build -p vigil-wayland --example lock_probe
       - run: ./tests/nested/run.sh
+      - run: ./tests/nested/log-safety.sh
       - run: ./tests/nested/attack.sh
 
   sanitizers:
