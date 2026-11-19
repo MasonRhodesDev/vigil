@@ -123,9 +123,9 @@ Without the helper the splash draws the ground and no logo.
 
 A logo from config is untrusted, so the helper sandboxes itself. Before it
 reads a byte it caps its CPU time, memory, descriptors, output and children,
-and can never gain privileges. Once it holds all its input, and before it
-parses any, it stops being dumpable, denies itself every file and network
-access with Landlock where the kernel has it, and installs a seccomp filter
+denies itself every file and network access with Landlock where the kernel
+has it, and can never gain privileges. Once it holds all its input, and
+before it parses any, it stops being dumpable and installs a seccomp filter
 that kills it at any system call outside allocating, writing its result and
 exiting. A bug in the SVG or image parsers then reaches no file, socket or
 other process. The allowlist and how it was derived are in
