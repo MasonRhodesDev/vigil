@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::os::unix::net::UnixStream;
 
@@ -56,9 +57,9 @@ pub const USERNAME_PROMPT: &str = "Username";
 pub const PASSWORD_PROMPT: &str = "Password";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Prompt {
-    text: String,
-    secret: bool,
+pub struct Prompt {
+    pub text: String,
+    pub secret: bool,
 }
 
 impl Prompt {
@@ -71,13 +72,22 @@ impl Prompt {
 
     // The PAM worker's locale is unknown here, so behind vigil's own
     // "Password" label only libpam's untranslated default is recognised.
-    fn is_the_question_under(&self, field: &Prompt) -> bool {
+    pub fn is_plain_password(&self) -> bool {
         let label = self
             .text
             .trim_end_matches(|c: char| c == ':' || c.is_whitespace());
-        self.secret == field.secret
-            && (self.text == field.text
-                || (field.text == PASSWORD_PROMPT && label == PASSWORD_PROMPT))
+        self.secret && label == PASSWORD_PROMPT
+    }
+
+    fn is_the_question_under(&self, field: &Prompt) -> bool {
+        self == field || (*field == Prompt::password() && self.is_plain_password())
+    }
+
+    fn shown(&self) -> String {
+        self.text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect()
     }
 }
 
@@ -98,7 +108,7 @@ pub struct AuthMachine {
     asked: bool,
     spoke: bool,
     unprompted: Option<String>,
-    first_question: Option<(String, Prompt)>,
+    first_questions: BTreeMap<String, Prompt>,
     stage: String,
     stage_key: String,
 }
@@ -124,7 +134,7 @@ impl AuthMachine {
             asked: false,
             spoke: false,
             unprompted: None,
-            first_question: None,
+            first_questions: BTreeMap::new(),
             stage: String::new(),
             stage_key: String::new(),
         })
@@ -149,6 +159,18 @@ impl AuthMachine {
 
     pub fn spoke(&self) -> bool {
         self.spoke
+    }
+
+    pub fn set_first_questions(&mut self, questions: BTreeMap<String, Prompt>) {
+        self.first_questions = questions;
+    }
+
+    pub fn first_question(&self) -> Option<&Prompt> {
+        self.first_questions.get(self.user.as_deref()?)
+    }
+
+    pub fn typed_user(&self) -> bool {
+        self.typed
     }
 
     pub fn user(&self) -> Option<&str> {
@@ -253,16 +275,15 @@ impl AuthMachine {
     }
 
     fn offered(&self) -> Prompt {
-        match (&self.first_question, &self.user) {
-            (Some((user, prompt)), Some(current)) if user == current => prompt.clone(),
-            _ => Prompt::password(),
-        }
+        self.first_question()
+            .cloned()
+            .unwrap_or_else(Prompt::password)
     }
 
     fn offer(&mut self, ui: &mut dyn AuthUi) {
         let prompt = self.offered();
         ui.reset_input();
-        ui.show_prompt(&prompt.text, prompt.secret);
+        ui.show_prompt(&prompt.shown(), prompt.secret);
         self.state = State::AwaitingCommit;
         self.log_stage(&prompt, true);
     }
@@ -388,8 +409,10 @@ impl AuthMachine {
                         text: auth_message,
                         secret: matches!(kind, AuthMessageType::Secret),
                     };
-                    if !std::mem::replace(&mut self.asked, true) {
-                        self.first_question = self.user.clone().map(|user| (user, prompt.clone()));
+                    if !std::mem::replace(&mut self.asked, true)
+                        && let Some(user) = self.user.clone()
+                    {
+                        self.first_questions.insert(user, prompt.clone());
                     }
                     self.heard();
                     match typed.take() {
@@ -1085,6 +1108,134 @@ mod tests {
             };
             assert_eq!(sent, ["create alice"], "{text:?}");
         }
+    }
+
+    fn pin_question() -> Prompt {
+        Prompt {
+            text: "Security token PIN: ".into(),
+            secret: true,
+        }
+    }
+
+    #[test]
+    fn a_remembered_first_question_is_offered_and_answered_on_the_first_try() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Security token PIN: "),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_first_questions(BTreeMap::from([("alice".into(), pin_question())]));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(
+            shown(&ui),
+            [&UiCall::Prompt("Security token PIN: ".into(), true)]
+        );
+        assert_eq!(sent(&requests), [""; 0]);
+        let _ = machine.handle(UiMessage::Respond("123456".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer 123456", "start"]);
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn a_remembered_question_belongs_to_one_user() {
+        let Some((server, requests)) = scripted(vec![auth_message(
+            AuthMessageType::Secret,
+            "Security token PIN: ",
+        )]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_first_questions(BTreeMap::from([("alice".into(), pin_question())]));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        assert_eq!(shown(&ui), [&UiCall::Prompt("Password".into(), true)]);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create bob"]);
+    }
+
+    #[test]
+    fn a_localized_password_question_is_answered_on_the_first_try_of_the_next_start() {
+        let Some((first, _requests)) = scripted(vec![auth_message(
+            AuthMessageType::Secret,
+            "Mot de passe : ",
+        )]) else {
+            return;
+        };
+        let mut before = machine(&first);
+        let mut ui = RecordingUi::default();
+        let _ = before.select_user(Some("alice"), &mut ui);
+        let _ = before.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        let learned = before.first_question().cloned().unwrap();
+        assert!(!learned.is_plain_password());
+
+        let Some((second, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Mot de passe : "),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut after = machine(&second);
+        after.set_first_questions(BTreeMap::from([("alice".into(), learned)]));
+        let mut ui = RecordingUi::default();
+        let _ = after.select_user(Some("alice"), &mut ui);
+        assert_eq!(
+            shown(&ui),
+            [&UiCall::Prompt("Mot de passe : ".into(), true)]
+        );
+        let _ = after.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer hunter2", "start"]);
+        assert!(after.is_complete());
+    }
+
+    #[test]
+    fn a_remembered_question_pam_no_longer_asks_is_replaced_not_answered() {
+        let Some((server, requests)) = scripted(vec![secret_prompt()]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_first_questions(BTreeMap::from([("alice".into(), pin_question())]));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("123456".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice"]);
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Password:".into(), true))
+        );
+        assert!(machine.first_question().unwrap().is_plain_password());
+    }
+
+    #[test]
+    fn a_remembered_question_is_displayed_without_control_characters() {
+        let raw = "Code for\n\u{1b}[31malice:\t";
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Visible, raw),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_first_questions(BTreeMap::from([(
+            "alice".into(),
+            Prompt {
+                text: raw.into(),
+                secret: false,
+            },
+        )]));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(
+            shown(&ui),
+            [&UiCall::Prompt("Code for  [31malice: ".into(), false)]
+        );
+        let _ = machine.handle(UiMessage::Respond("111111".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer 111111", "start"]);
     }
 
     #[test]
