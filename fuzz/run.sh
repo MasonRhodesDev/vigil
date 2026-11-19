@@ -18,8 +18,12 @@ else
     cargo=cargo
 fi
 
-# shellcheck disable=SC2046
-[ $# -gt 0 ] || set -- $($cargo fuzz list)
+if [ $# -eq 0 ]; then
+    targets=$($cargo fuzz list) || { echo "fuzz: cargo fuzz list failed" >&2; exit 1; }
+    [ -n "$targets" ] || { echo "fuzz: cargo fuzz list found no targets" >&2; exit 1; }
+    # shellcheck disable=SC2086
+    set -- $targets
+fi
 for target; do
     echo "fuzz: $target for ${seconds}s"
     mkdir -p "corpus/$target"
