@@ -1914,6 +1914,58 @@ mod tests {
     }
 
     #[test]
+    fn a_panic_rendering_the_wallpaper_still_locks_without_one() {
+        if std::env::var_os("VIGIL_LOCK_WALLPAPER_PROBE").is_some() {
+            exit_on_panic();
+            let path = std::env::temp_dir().join(format!(
+                "vigil-lock-wallpaper-panic-{}.png",
+                std::process::id()
+            ));
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255]))
+                .save(&path)
+                .unwrap();
+            let (tx, rx) = mpsc::channel();
+            let (wake_tx, wake_rx) = mpsc::channel();
+            let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = wake_tx.send(());
+            });
+            let key = BackgroundKey {
+                path: path.clone(),
+                fit: BackgroundFit::Fill,
+                width: 16,
+                height: 16,
+            };
+            BackgroundWorker::new(tx).render_prepared(OutputId(1), key, None, Some(waker));
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            let woken = wake_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            let _ = std::fs::remove_file(path);
+            let delivered = result.is_ok_and(|result| result.pixels.is_err());
+            std::process::exit(if delivered && woken { 0 } else { 3 });
+        }
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_panic_rendering_the_wallpaper_still_locks_without_one",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("VIGIL_LOCK_WALLPAPER_PROBE", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(full)
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the panic costs the wallpaper and the lock goes on without it"
+        );
+    }
+
+    #[test]
     fn warning_join_waits_for_locked_acknowledgement() {
         let path = std::env::temp_dir().join(format!(
             "vigil-warning-ipc-test-{}-{}.sock",
