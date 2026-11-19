@@ -869,3 +869,28 @@ fn a_pam_info_message_stays_shown_while_navigating() {
 fn a_pam_error_stays_shown_while_navigating() {
     a_pam_message_stays_shown_while_navigating(|w| w.show_error("Authentication failure"));
 }
+
+#[test]
+fn a_retry_typed_during_the_check_survives_the_failure_hidden() {
+    let mut g = Greeter::new();
+    let mut buf = vec![0u8; (W * H * 4) as usize];
+    g.type_text("aaaa");
+    let masked = settled_row(&mut g, &mut buf);
+    g.tap(RETURN);
+    g.window.set_busy(true);
+    g.type_text("aa");
+    g.chord(ALT_L, F8, None);
+    g.window.set_busy(false);
+    g.window.show_error("Authentication failure");
+    g.type_text("aa");
+    assert_eq!(
+        masked,
+        settled_row(&mut g, &mut buf),
+        "hidden after the failure"
+    );
+    g.tap(RETURN);
+    assert_eq!(
+        g.take(),
+        [Sent::Respond("aaaa".into()), Sent::Respond("aaaa".into())]
+    );
+}

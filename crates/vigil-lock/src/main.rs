@@ -1040,7 +1040,6 @@ impl LockSession for Locker {
                 self.snapshot.busy = false;
                 let message = message.clone();
                 self.each_window(move |window| {
-                    window.reset_input();
                     window.show_error(&message);
                     window.set_busy(false);
                 });
@@ -1050,7 +1049,6 @@ impl LockSession for Locker {
                 self.snapshot.error = message.clone();
                 self.snapshot.busy = false;
                 self.each_window(move |window| {
-                    window.reset_input();
                     window.show_error(&message);
                     window.set_busy(false);
                 });
