@@ -18,6 +18,8 @@ use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRu
 use vigil_auth::{AuthMachine, Prompt};
 use vigil_core::{AuthUi, Secret, UiMessage};
 
+mod token;
+
 const USERS: [&str; 3] = ["alice", "bob", "carol"];
 const MARK: &str = "Zq7typed";
 const ECHO: &str = "{user}";
@@ -1042,7 +1044,9 @@ fn main() {
             false,
             cases,
             seed,
-        );
+        )
+        & token::replay()
+        & token::attack(cases, seed);
     drop(greetd);
     std::process::exit(i32::from(!held));
 }

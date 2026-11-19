@@ -55,6 +55,8 @@ packaging/check-ffi-helper-path target/rpm/libvigil_scene_ffi.so "$PWD/target"
 install -Dpm0755 target/rpm/vigil %{buildroot}%{_bindir}/vigil
 install -Dpm0755 target/rpm/vigil-lock %{buildroot}%{_bindir}/vigil-lock
 install -Dpm0755 target/rpm/vigil-sim %{buildroot}%{_bindir}/vigil-sim
+install -Dpm0755 target/rpm/vigil-unlock %{buildroot}%{_bindir}/vigil-unlock
+install -Dpm0644 dist/vigil-unlock.8 %{buildroot}%{_mandir}/man8/vigil-unlock.8
 
 install -Dpm0755 target/rpm/vigil-scene %{buildroot}%{_prefix}/lib/vigil/vigil-scene
 install -Dpm0755 dist/setup-greetd %{buildroot}%{_prefix}/lib/vigil/setup-greetd
@@ -84,6 +86,8 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %{_bindir}/vigil
 %{_bindir}/vigil-lock
 %{_bindir}/vigil-sim
+%{_bindir}/vigil-unlock
+%{_mandir}/man8/vigil-unlock.8*
 %{_prefix}/lib/vigil/vigil-scene
 %{_prefix}/lib/vigil/setup-greetd
 %{_tmpfilesdir}/vigil.conf

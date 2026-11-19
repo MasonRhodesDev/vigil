@@ -5184,10 +5184,12 @@ version = "0.5.0"
 dependencies = [
  "greetd_ipc",
  "proptest",
+ "rustix 1.1.6",
  "serde_json",
  "vigil-core",
  "vigil-log",
  "vigil-secret",
+ "vigil-unlock-token",
 ]
 
 [[package]]
@@ -5265,6 +5267,7 @@ dependencies = [
  "vigil-secret",
  "vigil-theme",
  "vigil-ui",
+ "vigil-unlock-token",
  "vigil-warning",
  "vigil-wayland",
  "zbus 6.0.0",
@@ -5437,6 +5440,24 @@ dependencies = [
  "vigil-config",
  "vigil-core",
  "vigil-log",
+]
+
+[[package]]
+name = "vigil-unlock"
+version = "0.4.3"
+dependencies = [
+ "rustix 1.1.6",
+ "vigil-log",
+ "vigil-secret",
+ "vigil-unlock-token",
+ "zbus 6.0.0",
+]
+
+[[package]]
+name = "vigil-unlock-token"
+version = "0.4.3"
+dependencies = [
+ "rustix 1.1.6",
 ]
 
 [[package]]
