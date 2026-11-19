@@ -472,8 +472,16 @@ fn fake_script(name: &str, script: &str) -> PathBuf {
     path
 }
 
+const BRIEF: Duration = Duration::from_millis(300);
+
 fn fake_helper(name: &str, script: &str) -> Helper {
-    Helper::new(fake_script(name, script), Duration::from_millis(300))
+    Helper::new(fake_script(name, script), PATIENT)
+}
+
+// Starting sh alone can take longer than BRIEF on a loaded host, so only a
+// helper that never ends gets so short a deadline.
+fn spinner(name: &str) -> Helper {
+    Helper::new(fake_script(name, "while :; do :; done"), BRIEF)
 }
 
 #[test]
@@ -511,12 +519,18 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
     let need = req.bytes().unwrap();
     type Expect = fn(&Error) -> bool;
     let crash = |e: &Error| matches!(e, Error::Refused(m) if m.contains("signal"));
-    let cases: [(&str, String, Expect); 12] = [
-        (
-            "spins",
-            "while :; do :; done".into(),
-            |e| matches!(e, Error::Timeout(m) if m.contains("deadline")),
-        ),
+    let spin = spinner("spins");
+    let mut out = vec![0u8; need];
+    let start = Instant::now();
+    let got = spin.draw(&req, &mut out);
+    let took = start.elapsed();
+    assert!(took < BRIEF + SLACK, "spins: returned after {took:?}");
+    assert!(
+        matches!(&got, Err(Error::Timeout(m)) if m.contains("deadline")),
+        "spins: {got:?}"
+    );
+    assert!(out.iter().all(|&b| b == 0), "spins: nothing written");
+    let cases: [(&str, String, Expect); 11] = [
         (
             "signal",
             "kill -9 $$".into(),
@@ -552,12 +566,7 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
     for (name, script, want) in cases {
         let helper = fake_helper(name, &script);
         let mut out = vec![0u8; need];
-        let start = Instant::now();
         let got = helper.draw(&req, &mut out);
-        assert!(
-            start.elapsed() < Duration::from_millis(300) + SLACK,
-            "{name}"
-        );
         assert!(got.as_ref().is_err_and(want), "{name}: {got:?}");
         assert!(out.iter().all(|&b| b == 0), "{name}: nothing written");
     }
@@ -572,7 +581,7 @@ fn child_draws_with_sigchld_ignored() {
     if std::env::var_os(CHILD).is_none() {
         return;
     }
-    let spin = fake_helper("spin-ignored", "while :; do :; done");
+    let spin = spinner("spin-ignored");
     let need = request(&[], Layer::Logo).bytes().unwrap();
     let noticed = fake_helper(
         "noticed",
@@ -612,7 +621,7 @@ fn child_draws_with_sigchld_ignored() {
     ));
     let start = Instant::now();
     assert!(spin.draw(&request(&svg, Layer::Logo), &mut out).is_err());
-    assert!(start.elapsed() < Duration::from_millis(300) + SLACK);
+    assert!(start.elapsed() < BRIEF + SLACK);
     assert_eq!(children(), Vec::<String>::new());
 }
 
