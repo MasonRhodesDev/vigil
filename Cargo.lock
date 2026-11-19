@@ -5038,6 +5038,7 @@ dependencies = [
  "bytemuck",
  "calloop 0.14.4",
  "font8x8",
+ "greetd_ipc",
  "image",
  "libc",
  "monitor-profiles",
