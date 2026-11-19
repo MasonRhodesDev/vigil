@@ -5,3 +5,13 @@ disallowed-macros = [
     { path = "std::print", reason = "use vigil_log::out!, which never panics on a broken stdout" },
     { path = "std::dbg", reason = "dbg! panics on a broken stderr; use vigil_log::say!" },
 ]
+disallowed-methods = [
+    { path = "std::io::stderr", reason = "use vigil_log::say! or vigil_log::emit, which never panic or block on a broken stderr" },
+    { path = "std::io::stdout", reason = "use vigil_log::out!, which never panics on a broken stdout" },
+]
+disallowed-types = [
+    { path = "std::io::Stderr", reason = "use vigil_log::say! or vigil_log::emit, which never panic or block on a broken stderr" },
+    { path = "std::io::StderrLock", reason = "use vigil_log::say! or vigil_log::emit, which never panic or block on a broken stderr" },
+    { path = "std::io::Stdout", reason = "use vigil_log::out!, which never panics on a broken stdout" },
+    { path = "std::io::StdoutLock", reason = "use vigil_log::out!, which never panics on a broken stdout" },
+]
