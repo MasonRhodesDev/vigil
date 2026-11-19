@@ -34,7 +34,7 @@ pub fn route(sink: &mut impl KeySink, event: InputEvent) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -48,9 +48,9 @@ mod tests {
     use super::*;
     use crate::scripted_greetd::Greetd;
 
-    const RETURN: u32 = 0xff0d;
+    pub(crate) const RETURN: u32 = 0xff0d;
 
-    fn tap(keysym: u32, utf8: Option<&str>) -> [InputEvent; 2] {
+    pub(crate) fn tap(keysym: u32, utf8: Option<&str>) -> [InputEvent; 2] {
         [true, false].map(|pressed| InputEvent::Key {
             keysym,
             utf8: utf8.map(str::to_owned),
@@ -58,7 +58,7 @@ mod tests {
         })
     }
 
-    fn text(text: &str) -> Vec<InputEvent> {
+    pub(crate) fn text(text: &str) -> Vec<InputEvent> {
         text.chars()
             .flat_map(|ch| tap(ch as u32, Some(&ch.to_string())))
             .collect()
@@ -107,14 +107,14 @@ mod tests {
         assert!(sink.forwarded.is_empty());
     }
 
-    struct Rig {
-        window: OutputWindow,
+    pub(crate) struct Rig {
+        pub(crate) window: OutputWindow,
         queue: Rc<RefCell<VecDeque<UiMessage>>>,
-        auth: AuthMachine,
+        pub(crate) auth: AuthMachine,
     }
 
     impl Rig {
-        fn new(greetd: &Greetd) -> Self {
+        pub(crate) fn new(greetd: &Greetd) -> Self {
             let platform = VigilPlatform::install().expect("platform");
             let component = Theme::load_or_default(None)
                 .instantiate()
@@ -135,7 +135,7 @@ mod tests {
             }
         }
 
-        fn tick(&mut self) {
+        pub(crate) fn tick(&mut self) {
             loop {
                 let message = self.queue.borrow_mut().pop_front();
                 let Some(message) = message else { break };
@@ -157,7 +157,7 @@ mod tests {
         }
     }
 
-    fn secret() -> Response {
+    pub(crate) fn secret() -> Response {
         Response::AuthMessage {
             auth_message_type: AuthMessageType::Secret,
             auth_message: "Password:".into(),
