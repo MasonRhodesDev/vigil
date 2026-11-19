@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -21,7 +23,8 @@ use slint_idle_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use slint_interpreter::{ComponentInstance, Value};
 use slint_kit::TokenSet;
 use vigil_core::{
-    AuthUi, BackgroundFit, Damage, FrameTarget, InputEvent, OutputId, PowerAction, Rect, UiMessage,
+    AuthUi, BackgroundFit, Damage, FrameTarget, InputEvent, KeyText, OutputId, PowerAction, Rect,
+    UiMessage,
 };
 use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 
@@ -502,7 +505,7 @@ impl OutputWindow {
         }
     }
 
-    fn key(&mut self, keysym: u32, utf8: Option<String>, pressed: bool) {
+    fn key(&mut self, keysym: u32, utf8: Option<KeyText>, pressed: bool) {
         if let Some(at) = vigil_core::MODIFIER_KEYSYMS
             .iter()
             .position(|k| *k == keysym)
@@ -538,7 +541,7 @@ impl OutputWindow {
             Some(card) if pressed => card,
             _ => return self.send_key(keysym, utf8, pressed),
         };
-        let key = self.focus_key(keysym, utf8.as_deref());
+        let key = self.focus_key(keysym, utf8.as_ref().map(KeyText::as_str));
         let (focus, effect) = self.focus.step(&card, key);
         if repeat
             && effect != Effect::Forward
@@ -574,7 +577,7 @@ impl OutputWindow {
         self.publish_focus();
     }
 
-    fn send_key(&self, keysym: u32, utf8: Option<String>, pressed: bool) {
+    fn send_key(&self, keysym: u32, utf8: Option<KeyText>, pressed: bool) {
         let text = if self.modifiers().1 {
             control_text(keysym)
         } else {
@@ -717,7 +720,7 @@ impl OutputWindow {
                 let _ = component.set_property("reveal", Value::Bool(false));
             }
             if let Some(Value::String(text)) = args.first() {
-                s(UiMessage::Respond(text.to_string()));
+                s(UiMessage::Respond(text.as_str().into()));
             }
             Value::Void
         });
@@ -911,7 +914,11 @@ impl AuthUi for OutputWindow {
 #[repr(transparent)]
 struct Xrgb8888(u32);
 
+// SAFETY: a transparent u32, so all zero bytes is a valid value.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Zeroable for Xrgb8888 {}
+// SAFETY: a transparent Copy u32, so it has no padding and every bit pattern is valid.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Pod for Xrgb8888 {}
 
 impl TargetPixel for Xrgb8888 {
@@ -932,7 +939,11 @@ impl TargetPixel for Xrgb8888 {
 #[repr(transparent)]
 struct Argb8888(u32);
 
+// SAFETY: a transparent u32, so all zero bytes is a valid value.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Zeroable for Argb8888 {}
+// SAFETY: a transparent Copy u32, so it has no padding and every bit pattern is valid.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Pod for Argb8888 {}
 
 impl TargetPixel for Argb8888 {
@@ -990,7 +1001,7 @@ fn printable(text: &str) -> bool {
     !text.is_empty() && !text.chars().all(char::is_control)
 }
 
-fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
+fn key_text(keysym: u32, utf8: Option<KeyText>) -> Option<slint::SharedString> {
     let key = match keysym {
         0xffe1 | 0xffe2 => Key::Shift,
         0xffe3 | 0xffe4 => Key::Control,
@@ -1007,7 +1018,11 @@ fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
         0xffff => Key::Delete,
         0xff50 => Key::Home,
         0xff57 => Key::End,
-        _ => return utf8.filter(|text| printable(text)).map(Into::into),
+        _ => {
+            return utf8
+                .filter(|text| printable(text.as_str()))
+                .map(|text| text.as_str().into());
+        }
     };
     Some(key.into())
 }
@@ -1061,7 +1076,7 @@ fn parse_fit(value: Option<&str>, context: &str) -> Option<BackgroundFit> {
     let value = value?;
     let parsed = BackgroundFit::parse(value);
     if parsed.is_none() {
-        eprintln!("vigil-ui: config: unknown fit `{value}` ({context})");
+        vigil_log::say!("vigil-ui: config: unknown fit `{value}` ({context})");
     }
     parsed
 }
@@ -1400,7 +1415,7 @@ impl RenderBackend for SoftwareBackend {
 
     fn render(&mut self, view: &SceneView, canvas: CoreCanvas<'_>) -> bool {
         let CoreCanvas::Cpu(target) = canvas else {
-            eprintln!("vigil-ui: software backend given a GL canvas");
+            vigil_log::say!("vigil-ui: software backend given a GL canvas");
             return false;
         };
         let (scene_w, scene_h) = view.scene_size;
@@ -1411,7 +1426,7 @@ impl RenderBackend for SoftwareBackend {
             || target.buffer.len() < target.stride.saturating_mul(target.height as usize)
         {
             if debug {
-                eprintln!(
+                vigil_log::say!(
                     "vigil-ui: target mismatch: got {}x{} stride {} len {}, want {}x{}",
                     target.width,
                     target.height,

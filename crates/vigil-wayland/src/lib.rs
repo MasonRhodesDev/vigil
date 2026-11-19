@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read as _;
@@ -59,7 +61,7 @@ use wayland_protocols::wp::viewporter::client::{
 };
 
 use vigil_config::Lock;
-use vigil_core::{FrameTarget, InputEvent, OutputId, OutputInfo};
+use vigil_core::{FrameTarget, InputEvent, KeyText, OutputId, OutputInfo};
 pub use vigil_flow::LockOutcome;
 use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now, Signal};
 
@@ -393,6 +395,15 @@ fn keyboard_left<S: LockSession>(held: &mut vigil_core::HeldKeys, session: &mut 
     session.keyboard_left();
 }
 
+fn exit_session<S: LockSession>(
+    session: &mut S,
+    slot: &mut Option<LockOutcome>,
+    outcome: LockOutcome,
+) {
+    *slot = Some(outcome);
+    session.flow_command(&FlowCmd::Exit(outcome));
+}
+
 fn soonest_retry(
     retries: &BTreeMap<OutputId, (std::time::Instant, u32)>,
     live: impl Fn(OutputId) -> bool,
@@ -481,7 +492,7 @@ impl<S: LockSession> App<S> {
                 }
                 FlowCmd::ReleaseSessionLock => self.send_unlock(),
                 FlowCmd::DestroyRevealOverlays => self.drop_overlays(SurfaceRole::is_reveal),
-                FlowCmd::Journal(note) => eprintln!("vigil-lock: {note}"),
+                FlowCmd::Journal(note) => vigil_log::say!("vigil-lock: {note}"),
                 FlowCmd::PhaseChanged { from, to } => {
                     let phase = self.phase_span.as_ref().and_then(tracing::Span::id);
                     tracing::event!(
@@ -499,7 +510,9 @@ impl<S: LockSession> App<S> {
                         phase = %to
                     ));
                 }
-                FlowCmd::Exit(outcome) => self.outcome = Some(outcome),
+                FlowCmd::Exit(outcome) => {
+                    exit_session(&mut self.session, &mut self.outcome, outcome)
+                }
                 ref session_cmd @ (FlowCmd::ShowPanel(_)
                 | FlowCmd::DispatchInput(_)
                 | FlowCmd::StartAuth
@@ -775,7 +788,7 @@ impl<S: LockSession> App<S> {
         self.wake.wake();
         let elapsed = configure_started.elapsed();
         if elapsed >= Duration::from_millis(8) {
-            eprintln!("vigil-lock: output {:?} configure: {:?}", id, elapsed);
+            vigil_log::say!("vigil-lock: output {:?} configure: {:?}", id, elapsed);
         }
     }
 
@@ -841,7 +854,7 @@ impl<S: LockSession> App<S> {
         let is_reveal = self.entries[idx].role.is_reveal();
         let role = self.entries[idx].role.name();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
-            eprintln!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
+            vigil_log::say!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
             self.schedule_present_retry(id);
             return;
         };
@@ -865,7 +878,7 @@ impl<S: LockSession> App<S> {
         };
         let Ok((buffer, canvas)) = pool.create_buffer(w as i32, h as i32, stride as i32, format)
         else {
-            eprintln!("vigil-lock: output {id:?}: shm buffer {w}x{h} failed");
+            vigil_log::say!("vigil-lock: output {id:?}: shm buffer {w}x{h} failed");
             self.schedule_present_retry(id);
             return;
         };
@@ -913,7 +926,9 @@ impl<S: LockSession> App<S> {
             self.metrics.record_render();
         }
         if !drew {
-            eprintln!("vigil-lock: output {id:?}: first present empty; committing black {w}x{h}");
+            vigil_log::say!(
+                "vigil-lock: output {id:?}: first present empty; committing black {w}x{h}"
+            );
         }
         if let Some((frost, wallpaper)) = overlay_progress {
             let opacity = if self.entries[idx].role.is_reveal() {
@@ -934,9 +949,10 @@ impl<S: LockSession> App<S> {
         let commit_elapsed = commit_started.elapsed();
         if render_elapsed >= Duration::from_millis(8) || commit_elapsed >= Duration::from_millis(8)
         {
-            eprintln!(
+            vigil_log::say!(
                 "vigil-lock: output {id:?} present: render {:?}, commit {:?}",
-                render_elapsed, commit_elapsed
+                render_elapsed,
+                commit_elapsed
             );
         }
         drop(frame_span);
@@ -1097,29 +1113,36 @@ impl<S: LockSession> App<S> {
 
 static TERMINATION_PIPE: AtomicI32 = AtomicI32::new(-1);
 
+#[allow(unsafe_code)]
 extern "C" fn on_termination_signal(signal: libc::c_int) {
     let fd = TERMINATION_PIPE.load(Ordering::Relaxed);
     if fd < 0 {
         return;
     }
     let byte = signal as u8;
+    // SAFETY: write is async-signal-safe, the fd is the pipe write end that
+    // arm_termination leaks for the life of the process, and `byte` is one live byte.
     unsafe {
-        libc::write(fd, (&byte as *const u8).cast(), 1);
+        libc::write(fd, (&raw const byte).cast(), 1);
     }
 }
 
+#[allow(unsafe_code)]
 fn arm_termination<'l, S: LockSession + 'static>(
     handle: &LoopHandle<'l, App<S>>,
 ) -> Result<(), LockError> {
     let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 writes exactly two fds into the two-element array.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
         return Err(err(format!(
             "termination pipe: {}",
             std::io::Error::last_os_error()
         )));
     }
-    let (read_end, write_end) =
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: pipe2 succeeded, so fds[0] is a fresh open fd nothing else owns.
+    let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: pipe2 succeeded, so fds[1] is a fresh open fd nothing else owns.
+    let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     if TERMINATION_PIPE
         .compare_exchange(
             -1,
@@ -1131,20 +1154,23 @@ fn arm_termination<'l, S: LockSession + 'static>(
     {
         return Err(err("termination handling armed twice in one process"));
     }
-    std::mem::forget(write_end);
+    let _ = std::os::fd::IntoRawFd::into_raw_fd(write_end);
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            let handler: extern "C" fn(libc::c_int) = on_termination_signal;
-            action.sa_sigaction = handler as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
-                return Err(err(format!(
-                    "sigaction({signal}): {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
+        // SAFETY: sigaction is plain integers, a mask and a handler slot, all
+        // valid when zero.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        let handler: extern "C" fn(libc::c_int) = on_termination_signal;
+        action.sa_sigaction = handler as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: the mask is a live field of a local sigaction.
+        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+        // SAFETY: the handler only loads an atomic and calls write, both
+        // async-signal-safe, and the old-action pointer may be null.
+        if unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) } != 0 {
+            return Err(err(format!(
+                "sigaction({signal}): {}",
+                std::io::Error::last_os_error()
+            )));
         }
     }
     handle
@@ -1215,7 +1241,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
     let qh: QueueHandle<App<S>> = event_queue.handle();
     let mut event_loop: EventLoop<App<S>> = EventLoop::try_new().map_err(err)?;
     if let Err(error) = arm_termination(&event_loop.handle()) {
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: {error}; a signal will still end the process, without closing its trace"
         );
     }
@@ -1235,7 +1261,9 @@ fn run_with_lock_body<S: LockSession + 'static>(
         Err(error) if warning_enabled => return Err(err(error)),
         Err(error) => {
             if policy.transition.ramps_in() || policy.transition.reveals() {
-                eprintln!("vigil-lock: layer-shell unavailable ({error}); locking immediately");
+                vigil_log::say!(
+                    "vigil-lock: layer-shell unavailable ({error}); locking immediately"
+                );
             }
             policy.transition = vigil_config::LockTransition::immediate();
             None
@@ -1303,7 +1331,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
         phase_span,
         protocol_events: Vec::new(),
     };
-    eprintln!(
+    vigil_log::say!(
         "vigil-lock: frost opacity lever: {}",
         if app.hyprland_surfaces.is_some() {
             "hyprland-surface-v1 (blur strength follows)"
@@ -1362,6 +1390,10 @@ fn run_with_lock_body<S: LockSession + 'static>(
     if matches!(app.outcome, Some(LockOutcome::Terminated(_)))
         && let Some(lock) = app.lock.take()
     {
+        #[expect(
+            clippy::mem_forget,
+            reason = "the lock's Drop sends destroy; a terminated locker leaves the session locked"
+        )]
         std::mem::forget(lock);
     }
     match (&app.error, app.outcome) {
@@ -1379,7 +1411,7 @@ fn report_idle_cost(
     let end = metrics.snapshot();
     let secs = started.elapsed().as_secs_f64().max(0.001);
     let per_min = |a: u64, b: u64| (b.saturating_sub(a) as f64) * 60.0 / secs;
-    eprintln!(
+    vigil_log::say!(
         "vigil-lock: idle cost over {:.0}s: {:.0} wakes/min, {:.0} renders/min, \
          {:.0} commits/min, {:.0} buffer acquires/min",
         secs,
@@ -1440,7 +1472,7 @@ impl<S: LockSession> LayerShellHandler for App<S> {
             self.entries.remove(idx);
             return;
         }
-        eprintln!("vigil-lock: warning surface {id:?} closed");
+        vigil_log::say!("vigil-lock: warning surface {id:?} closed");
         self.entries.remove(idx);
         self.raise(FlowEvent::OverlayClosed);
     }
@@ -1476,7 +1508,7 @@ impl<S: LockSession> BackgroundEffectHandler for App<S> {
             .background_effects
             .capabilities()
             .is_some_and(|capabilities| capabilities.contains(Capability::Blur));
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: compositor background blur {}",
             if blur {
                 "available"
@@ -1517,11 +1549,12 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: u32,
         event: KeyEvent,
     ) {
+        let utf8 = event.utf8.map(KeyText::from);
         self.held_keys
-            .press(event.raw_code, event.keysym.raw(), event.utf8.clone());
+            .press(event.raw_code, event.keysym.raw(), utf8.clone());
         self.deliver_input(InputEvent::Key {
             keysym: event.keysym.raw(),
-            utf8: event.utf8,
+            utf8,
             pressed: true,
         });
     }
@@ -1737,7 +1770,7 @@ impl<S: LockSession> OutputHandler for App<S> {
             .find(|entry| entry.output == output)
             .map(|entry| entry.id)
         {
-            eprintln!("vigil-lock: output {:?} gone", id);
+            vigil_log::say!("vigil-lock: output {:?} gone", id);
             for entry in self.entries.iter().filter(|entry| entry.output == output) {
                 if let Some(fractional) = &entry.fractional {
                     fractional.destroy();
@@ -1881,6 +1914,56 @@ mod tests {
         assert_eq!(
             super::soonest_retry(&retries, |id| id == super::OutputId(1), now),
             Some(Duration::from_millis(800))
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingSession {
+        commands: Vec<vigil_flow::FlowCmd>,
+    }
+
+    impl super::LockSession for RecordingSession {
+        fn output_ready(&mut self, _: super::OutputId, _: &super::OutputInfo) {}
+        fn output_resized(&mut self, _: super::OutputId, _: &super::OutputInfo) {}
+        fn force_copy_out(&mut self, _: super::OutputId) {}
+        fn output_gone(&mut self, _: super::OutputId) {}
+        fn focus_output(&mut self, _: super::OutputId) {}
+        fn caps_lock(&mut self, _: bool) {}
+        fn flow_command(&mut self, cmd: &vigil_flow::FlowCmd) {
+            self.commands.push(cmd.clone());
+        }
+        fn tick(&mut self) {}
+        fn render(&mut self, _: super::OutputId, _: super::FrameTarget<'_>) -> bool {
+            false
+        }
+        fn wait_decision(&self) -> super::WaitDecision {
+            super::WaitDecision::Indefinite
+        }
+    }
+
+    #[test]
+    fn an_invalidated_lock_tells_the_session_it_exited() {
+        use vigil_flow::{FlowCmd, FlowEvent, LockFlow, LockOutcome, Now};
+        let lock = vigil_config::Lock::default();
+        let (mut flow, _) = LockFlow::new(Now::at(Duration::ZERO), &lock, Some(0));
+        let cmds = flow.step(
+            Now::at(Duration::from_millis(100)),
+            FlowEvent::LockInvalidated,
+        );
+        let mut session = RecordingSession::default();
+        let mut outcome = None;
+        for cmd in cmds {
+            if let FlowCmd::Exit(exit) = cmd {
+                super::exit_session(&mut session, &mut outcome, exit);
+            }
+        }
+        assert_eq!(outcome, Some(LockOutcome::Invalidated));
+        assert!(
+            session
+                .commands
+                .contains(&FlowCmd::Exit(LockOutcome::Invalidated)),
+            "the session must hear the exit so it stops confirming joins: {:?}",
+            session.commands
         );
     }
 

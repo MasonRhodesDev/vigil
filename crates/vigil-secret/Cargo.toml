@@ -1,0 +1,27 @@
+[package]
+name = "vigil-secret"
+description = "Credential handling: a zeroizing secret type and process hardening"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+libc.workspace = true
+vigil-log.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+
+[features]
+lint-canary = []
+
+[[example]]
+name = "lint_canary"
+required-features = ["lint-canary"]
+
+[lints]
+workspace = true

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -110,12 +112,12 @@ impl Splash {
             Ok(text) => match toml::from_str(&text) {
                 Ok(splash) => splash,
                 Err(e) => {
-                    eprintln!("vigil: splash config {}: {e}", path.display());
+                    vigil_log::say!("vigil: splash config {}: {e}", path.display());
                     Splash::default()
                 }
             },
             Err(e) => {
-                eprintln!("vigil: splash config {}: {e}", path.display());
+                vigil_log::say!("vigil: splash config {}: {e}", path.display());
                 Splash::default()
             }
         }
@@ -494,12 +496,12 @@ impl Config {
     pub fn load_layered(path: Option<&Path>) -> Config {
         let (config, ignored) = Config::load_layered_reporting(path);
         for notice in ignored.iter().take(MAX_REPORTED_REFUSALS) {
-            eprintln!("vigil-config: {notice}");
+            vigil_log::say!("vigil-config: {notice}");
         }
         if let Some(rest) = ignored.len().checked_sub(MAX_REPORTED_REFUSALS)
             && rest > 0
         {
-            eprintln!("vigil-config: user config: and {rest} more ignored keys");
+            vigil_log::say!("vigil-config: user config: and {rest} more ignored keys");
         }
         config
     }
@@ -834,7 +836,7 @@ fn load_layered_from(system: &Path, user: Option<&Path>) -> (Config, Vec<Ignored
         Ok(Some(source)) => source,
         Ok(None) => return (config, Vec::new()),
         Err(reason) => {
-            eprintln!(
+            vigil_log::say!(
                 "vigil-config: {}: overlay refused: {reason}",
                 user.display()
             );
@@ -847,7 +849,7 @@ fn load_layered_from(system: &Path, user: Option<&Path>) -> (Config, Vec<Ignored
             (config, ignored)
         }
         Err(err) => {
-            eprintln!(
+            vigil_log::say!(
                 "vigil-config: {}: {err}; ignoring the user overlay",
                 user.display()
             );
@@ -908,14 +910,14 @@ impl State {
             Ok(source) => source,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
-                eprintln!("vigil-config: {}: {e}", path.display());
+                vigil_log::say!("vigil-config: {}: {e}", path.display());
                 return None;
             }
         };
         match toml::from_str(&source) {
             Ok(state) => Some(state),
             Err(e) => {
-                eprintln!("vigil-config: {}: {e}", path.display());
+                vigil_log::say!("vigil-config: {}: {e}", path.display());
                 None
             }
         }
@@ -948,7 +950,7 @@ impl State {
         let tmp = path.with_extension("tmp");
         let result = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
         if let Err(e) = &result {
-            eprintln!(
+            vigil_log::say!(
                 "vigil-config: cannot store state at {}: {e}",
                 path.display()
             );
@@ -962,13 +964,13 @@ fn load_file(path: &Path) -> Option<Config> {
         Ok(source) => match parse(&source) {
             Ok(config) => Some(config),
             Err(err) => {
-                eprintln!("vigil-config: {}: {err}; using defaults", path.display());
+                vigil_log::say!("vigil-config: {}: {err}; using defaults", path.display());
                 Some(Config::default())
             }
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
-            eprintln!("vigil-config: {}: {err}; using defaults", path.display());
+            vigil_log::say!("vigil-config: {}: {err}; using defaults", path.display());
             Some(Config::default())
         }
     }

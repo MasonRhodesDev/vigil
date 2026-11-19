@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::ptr::NonNull;
 
 use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneDamageClips, PlaneState};
@@ -17,8 +19,11 @@ struct Mapping {
     len: usize,
 }
 
-// The mapped bytes are owned and reached only through `&mut self`, as with a `Box<[u8]>`.
+// SAFETY: the mapped bytes are owned and reached only through `&mut self`, as with a `Box<[u8]>`.
+#[allow(unsafe_code)]
 unsafe impl Send for Mapping {}
+// SAFETY: `&Mapping` exposes no access to the bytes, so sharing it shares nothing.
+#[allow(unsafe_code)]
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
@@ -30,18 +35,27 @@ impl Mapping {
             ptr: NonNull::from(&mut *bytes).cast(),
             len: bytes.len(),
         };
-        // drm-rs unmaps when its guard drops; this type owns the unmap instead.
+        #[expect(
+            clippy::mem_forget,
+            reason = "drm-rs unmaps when its guard drops; this type owns the unmap instead"
+        )]
         std::mem::forget(mapped);
         Ok(mapping)
     }
 
+    #[allow(unsafe_code)]
     fn bytes(&mut self) -> &mut [u8] {
+        // SAFETY: ptr and len describe a live read-write mapping this value
+        // owns until Drop, and `&mut self` makes this the only view of it.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
+#[allow(unsafe_code)]
 impl Drop for Mapping {
     fn drop(&mut self) {
+        // SAFETY: ptr and len are exactly the mapping drm-rs created, no slice
+        // from `bytes` outlives `&mut self`, and Drop runs once.
         let _ = unsafe { rustix::mm::munmap(self.ptr.as_ptr().cast(), self.len) };
     }
 }
@@ -234,7 +248,7 @@ impl DumbBufferPresenter {
             self.cursor = Some(cursor);
             return Err(present_error(error));
         }
-        eprintln!(
+        vigil_log::say!(
             "vigil: crtc {:?}: giving up the cursor plane, a flip with it failed: {error}",
             self.surface.crtc()
         );

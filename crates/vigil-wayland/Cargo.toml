@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 libc.workspace = true
 slint-idle-runtime.workspace = true
 tracing.workspace = true
@@ -20,3 +21,6 @@ wayland-client.workspace = true
 wayland-protocols.workspace = true
 wayland-scanner.workspace = true
 wayland-backend.workspace = true
+
+[lints]
+workspace = true

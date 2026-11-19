@@ -11,3 +11,6 @@ repository.workspace = true
 vigil-core.workspace = true
 vigil-config.workspace = true
 vigil-warning = { path = "../vigil-warning" }
+
+[lints]
+workspace = true

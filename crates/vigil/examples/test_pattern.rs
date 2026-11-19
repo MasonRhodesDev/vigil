@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -28,9 +29,12 @@ fn main() {
     let mut presenters = Vec::new();
     for event in events {
         if let OutputEvent::Added(id, info) = event {
-            println!(
+            vigil_log::out!(
                 "output {}: {}x{}@{}mHz",
-                info.connector, info.width, info.height, info.refresh_mhz
+                info.connector,
+                info.width,
+                info.height,
+                info.refresh_mhz
             );
             let surface = outputs.create_surface(id).expect("surface");
             presenters.push(DumbBufferPresenter::new(surface).expect("presenter"));
@@ -48,7 +52,7 @@ fn main() {
         })
         .expect("frame 1");
     }
-    println!(
+    vigil_log::out!(
         "frame 1 committed (modeset) on {} output(s)",
         presenters.len()
     );
@@ -64,10 +68,10 @@ fn main() {
         })
         .expect("frame 2");
     }
-    println!("frame 2 flipped");
+    vigil_log::out!("frame 2 flipped");
     std::thread::sleep(std::time::Duration::from_secs(hold_secs));
 
-    println!("PASS test_pattern");
+    vigil_log::out!("PASS test_pattern");
 }
 
 fn gradient(t: vigil_core::FrameTarget<'_>, phase: u32) {
@@ -87,6 +91,6 @@ fn libc_o_cloexec() -> i32 {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: test_pattern </dev/dri/cardN> [hold-seconds]");
+    vigil_log::say!("usage: test_pattern </dev/dri/cardN> [hold-seconds]");
     std::process::exit(2);
 }

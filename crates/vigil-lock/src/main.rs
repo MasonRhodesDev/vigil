@@ -1,5 +1,8 @@
+#![deny(unsafe_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -10,7 +13,7 @@ use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHan
 use vigil_config::{Config, LockTransition};
 use vigil_core::{
     AppearanceEvent, AuthError, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget,
-    LoginEvent, OutputId, OutputInfo, UiMessage,
+    LoginEvent, OutputId, OutputInfo, Secret, UiMessage,
 };
 use vigil_flow::{FlowCmd, FlowEvent};
 use vigil_login::{AppearanceWatcher, LoginSession};
@@ -26,7 +29,7 @@ struct Cli {
     background: Option<PathBuf>,
     bg_mode: Option<BackgroundFit>,
     grace: Option<u64>,
-    ready_fd: Option<i32>,
+    ready_fd: Option<OwnedFd>,
     wait: bool,
     warning_ms: Option<u64>,
     immediate: bool,
@@ -84,7 +87,10 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
             }
             "--ready-fd" => {
                 let v = value("--ready-fd")?;
-                cli.ready_fd = Some(v.parse().map_err(|_| format!("bad --ready-fd {v}"))?);
+                if cli.ready_fd.is_some() {
+                    return Err("--ready-fd given twice".into());
+                }
+                cli.ready_fd = Some(adopt_ready_fd(&v)?);
             }
             "--wait" | "--daemonize" => cli.wait = true,
             "--warn" => {
@@ -111,13 +117,13 @@ fn apply_cli_to_config(cli: &Cli, config: &mut Config) {
         config.lock.transition = LockTransition::immediate();
     }
     if config.lock.warning.clamp() {
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: lock.warning.wallpaper_hold_max_ms clamped to {} ms",
             vigil_config::LockWarning::MAX_WALLPAPER_HOLD_MS
         );
     }
     if config.lock.transition.clamp() {
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: lock.transition ramps clamped to {} ms",
             LockTransition::MAX_RAMP_MS
         );
@@ -208,7 +214,7 @@ impl BackgroundWorker {
         let rendered = self.rendered.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let (pixels, cache_hit) = cosmetic(|| {
+            let (pixels, cache_hit) = vigil_secret::cosmetic(|| {
                 let cell = rendered
                     .lock()
                     .expect("background render cache poisoned")
@@ -231,7 +237,7 @@ impl BackgroundWorker {
                                         }
                                     }
                                 });
-                            eprintln!(
+                            vigil_log::say!(
                                 "vigil-lock: prepared background read {}: {:?}",
                                 prepared.asset.display(),
                                 read_started.elapsed()
@@ -247,7 +253,7 @@ impl BackgroundWorker {
                         let source = source_cell.get_or_init(|| {
                             let decode_started = Instant::now();
                             let result = vigil_ui::load_background(&key.path).map(Arc::new);
-                            eprintln!(
+                            vigil_log::say!(
                                 "vigil-lock: background decode {}: {:?}",
                                 key.path.display(),
                                 decode_started.elapsed()
@@ -259,7 +265,7 @@ impl BackgroundWorker {
                             let result =
                                 vigil_ui::render_background(source, key.fit, key.width, key.height)
                                     .map(|rgba| BackgroundData::Rgba(Arc::new(rgba)));
-                            eprintln!(
+                            vigil_log::say!(
                                 "vigil-lock: background resize {}x{}: {:?}",
                                 key.width,
                                 key.height,
@@ -287,13 +293,13 @@ impl BackgroundWorker {
 }
 
 trait AuthAttempt {
-    fn respond(&self, text: String);
+    fn respond(&self, text: Secret);
     fn cancel(&mut self);
     fn detach(&mut self);
 }
 
 impl AuthAttempt for PamAttempt {
-    fn respond(&self, text: String) {
+    fn respond(&self, text: Secret) {
         PamAttempt::respond(self, text);
     }
     fn cancel(&mut self) {
@@ -336,7 +342,7 @@ impl<A: AuthAttempt> AuthTrack<A> {
         self.live = None;
     }
 
-    fn respond(&self, text: String) -> bool {
+    fn respond(&self, text: Secret) -> bool {
         match &self.live {
             Some(live) if !(live.secret && text.is_empty()) => {
                 live.attempt.respond(text);
@@ -441,7 +447,7 @@ struct Locker {
     scheme: ColorScheme,
     unlocked: bool,
     last_clock: (Instant, String),
-    ready_fd: Option<i32>,
+    ready_fd: Option<OwnedFd>,
     pending: Vec<FlowEvent>,
     wallpaper_ready: bool,
     snapshot: UiSnapshot,
@@ -510,7 +516,7 @@ impl Locker {
             .map(monitor_profiles::load_dir)
             .map(|(profiles, diagnostics)| {
                 for diagnostic in diagnostics {
-                    eprintln!("vigil-lock: monitor profile: {diagnostic:?}");
+                    vigil_log::say!("vigil-lock: monitor profile: {diagnostic:?}");
                 }
                 profiles
             })
@@ -518,7 +524,7 @@ impl Locker {
         let (background_tx, background_rx) = mpsc::channel();
         let appearance_bundle = appearance_profiles::PreparedBundle::load_published(&user)
             .unwrap_or_else(|error| {
-                eprintln!("vigil-lock: prepared appearance bundle: {error}");
+                vigil_log::say!("vigil-lock: prepared appearance bundle: {error}");
                 None
             });
         let locker = Self {
@@ -537,7 +543,7 @@ impl Locker {
             },
             appearance_registry: appearance_profiles::Registry::load_current_user().unwrap_or_else(
                 |e| {
-                    eprintln!("vigil-lock: appearance registry: {e}");
+                    vigil_log::say!("vigil-lock: appearance registry: {e}");
                     Default::default()
                 },
             ),
@@ -586,7 +592,7 @@ impl Locker {
 
     fn start_attempt(&mut self) {
         debug_assert!(
-            self.lock_ipc.lock().expect("lock IPC poisoned").locked,
+            self.lock_ipc.lock().expect("lock IPC poisoned").hold == Hold::Held,
             "PAM conversation must not start before the compositor grants the lock"
         );
         let waker = self.event_waker.clone();
@@ -602,21 +608,8 @@ impl Locker {
     }
 
     fn signal_locked(&mut self) {
-        eprintln!("vigil-lock: session locked");
-        let joiners = {
-            let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
-            ipc.locked = true;
-            std::mem::take(&mut ipc.joiners)
-        };
-        for mut joiner in joiners {
-            let _ = joiner.write_all(b"locked\n");
-        }
-        if let Some(fd) = self.ready_fd.take() {
-            use std::io::Write;
-            use std::os::fd::FromRawFd;
-            let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
-            let _ = ready.write_all(b"1");
-        }
+        vigil_log::say!("vigil-lock: session locked");
+        signal_ready_fd(self.ready_fd.take());
     }
 
     fn apply_panel(&mut self) {
@@ -673,17 +666,17 @@ impl Locker {
                 self.pending.push(FlowEvent::AuthErr(message));
             }
             DoneOutcome::LockedOut { message, remaining } => {
-                eprintln!("vigil-lock: account is faillocked ({message})");
+                vigil_log::say!("vigil-lock: account is faillocked ({message})");
                 self.auth.retire();
                 self.pending.push(FlowEvent::AuthLocked { remaining });
             }
             DoneOutcome::ReopenQuietly(message) => {
-                eprintln!("vigil-lock: PAM conversation lost ({message}); reopening");
+                vigil_log::say!("vigil-lock: PAM conversation lost ({message}); reopening");
                 self.auth.retire();
                 self.pending.push(FlowEvent::AuthConversationLost);
             }
             DoneOutcome::Surface(message) => {
-                eprintln!(
+                vigil_log::say!(
                     "vigil-lock: {} conversation failures in a row; surfacing the last ({message})",
                     self.conversation_losses
                 );
@@ -778,11 +771,14 @@ impl Locker {
         self.each_window(|w| apply_kit_tokens_from_disk(w, mode));
     }
 
+    #[allow(unsafe_code)]
     fn detach_auth(&mut self) {
         self.auth.detach();
         self.unlocked = true;
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(5));
+            // SAFETY: _exit takes no pointers and ends the process without
+            // running destructors, which an unlocked daemon no longer needs.
             unsafe { libc::_exit(0) };
         });
     }
@@ -794,9 +790,11 @@ impl Locker {
                 continue;
             };
             if entry.window.scene_size() != (result.key.width, result.key.height) {
-                eprintln!(
+                vigil_log::say!(
                     "vigil-lock: discarding stale background for {} ({}x{})",
-                    entry.connector, result.key.width, result.key.height
+                    entry.connector,
+                    result.key.width,
+                    result.key.height
                 );
                 continue;
             }
@@ -805,7 +803,7 @@ impl Locker {
                     entry
                         .window
                         .set_background_pixels(&rgba, result.key.width, result.key.height);
-                    eprintln!(
+                    vigil_log::say!(
                         "vigil-lock: background ready for {} in {:?}{}",
                         entry.connector,
                         result.elapsed,
@@ -818,20 +816,20 @@ impl Locker {
                         result.key.width,
                         result.key.height,
                     ) {
-                        eprintln!(
+                        vigil_log::say!(
                             "vigil-lock: native background unsupported for {}; using fallback",
                             entry.connector
                         );
                         continue;
                     }
-                    eprintln!(
+                    vigil_log::say!(
                         "vigil-lock: native background ready for {} in {:?}{}",
                         entry.connector,
                         result.elapsed,
                         if result.cache_hit { " (cache hit)" } else { "" }
                     );
                 }
-                Err(error) => eprintln!("vigil-lock: background: {error}"),
+                Err(error) => vigil_log::say!("vigil-lock: background: {error}"),
             }
         }
     }
@@ -860,19 +858,19 @@ impl LockSession for Locker {
         let component = match component {
             Ok(component) => component,
             Err(e) => {
-                eprintln!("vigil-lock: skipping output {id:?}: {e}");
+                vigil_log::say!("vigil-lock: skipping output {id:?}: {e}");
                 return;
             }
         };
         let Some(adapter) = self.platform.claim_last_adapter() else {
-            eprintln!("vigil-lock: skipping output {id:?}: no adapter captured");
+            vigil_log::say!("vigil-lock: skipping output {id:?}: no adapter captured");
             return;
         };
         let mut window =
             match OutputWindow::new(id, info.width, info.height, info.scale, adapter, component) {
                 Ok(window) => window,
                 Err(e) => {
-                    eprintln!("vigil-lock: skipping output {id:?}: {e}");
+                    vigil_log::say!("vigil-lock: skipping output {id:?}: {e}");
                     return;
                 }
             };
@@ -896,9 +894,12 @@ impl LockSession for Locker {
         let native_background_supported = window.supports_native_background();
         let queue = self.queue.clone();
         window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: output {} {}x{}@{:.2}",
-            info.connector, info.width, info.height, info.scale
+            info.connector,
+            info.width,
+            info.height,
+            info.scale
         );
         self.entries.push(Entry {
             id,
@@ -908,7 +909,7 @@ impl LockSession for Locker {
         });
         self.focus_profile_origin();
         self.apply_panel();
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: scene ready for {} in {:?}",
             info.connector,
             scene_started.elapsed()
@@ -983,7 +984,7 @@ impl LockSession for Locker {
 
     fn output_gone(&mut self, id: OutputId) {
         if let Some(e) = self.entries.iter().find(|e| e.id == id) {
-            eprintln!("vigil-lock: output {} gone", e.connector);
+            vigil_log::say!("vigil-lock: output {} gone", e.connector);
         }
         self.entries.retain(|e| e.id != id);
         if self.panel >= self.entries.len() {
@@ -1035,6 +1036,9 @@ impl LockSession for Locker {
     }
 
     fn flow_command(&mut self, cmd: &FlowCmd) {
+        if follow_flow(&self.lock_ipc, cmd) {
+            self.signal_locked();
+        }
         match cmd {
             FlowCmd::ShowPanel(true) => self.apply_panel(),
             FlowCmd::ShowPanel(false) => self.each_window(|window| {
@@ -1062,7 +1066,6 @@ impl LockSession for Locker {
                     login.set_locked_hint(*on);
                 }
             }
-            FlowCmd::SignalReady => self.signal_locked(),
             _ => {}
         }
     }
@@ -1123,24 +1126,37 @@ impl LockSession for Locker {
     }
 }
 
+#[allow(unsafe_code)]
 fn clock_text(format: &str) -> String {
     let Ok(fmt) = std::ffi::CString::new(format) else {
         return String::new();
     };
-    unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&now, &mut tm).is_null() {
-            return String::new();
-        }
-        let mut buf = vec![0_u8; 256];
-        let written = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), fmt.as_ptr(), &tm);
-        buf.truncate(written);
-        String::from_utf8(buf).unwrap_or_default()
+    // SAFETY: time accepts a null output pointer.
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    // SAFETY: tm is integers and a nullable tm_zone pointer, all valid when zero.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are live locals of the right types, and localtime_r
+    // is the reentrant form.
+    if unsafe { libc::localtime_r(&raw const now, &raw mut tm) }.is_null() {
+        return String::new();
     }
+    let mut buf = vec![0_u8; 256];
+    // SAFETY: strftime writes at most buf.len() bytes into buf, fmt is NUL
+    // terminated, and localtime_r filled tm.
+    let written = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            fmt.as_ptr(),
+            &raw const tm,
+        )
+    };
+    buf.truncate(written);
+    String::from_utf8(buf).unwrap_or_default()
 }
 
-fn detach_and_wait_for_lock() -> ! {
+#[allow(unsafe_code)]
+fn detach_and_wait_for_lock(ready_fd: Option<OwnedFd>) -> ! {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -1156,20 +1172,25 @@ fn detach_and_wait_for_lock() -> ! {
             .args(["--ready-fd", "1"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(OwnedFd::from(child_end)));
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
+        let detach = || {
+            // SAFETY: setsid takes no arguments and moves only this child.
+            if unsafe { libc::setsid() } == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        // SAFETY: the hook runs between fork and exec, allocates nothing, and
+        // calls only setsid and errno reads, which are async-signal-safe.
+        unsafe { command.pre_exec(detach) };
         let mut child = command.spawn().map_err(|e| format!("spawn locker: {e}"))?;
         drop(command);
         let mut byte = [0u8; 1];
         match parent_end.read_exact(&mut byte) {
-            Ok(()) => Ok(0),
+            Ok(()) => {
+                signal_ready_fd(ready_fd);
+                Ok(0)
+            }
             Err(_) => {
                 let status = child.wait().map_err(|e| format!("wait locker: {e}"))?;
                 Ok(status.code().unwrap_or(1).max(1))
@@ -1179,28 +1200,76 @@ fn detach_and_wait_for_lock() -> ! {
     match result {
         Ok(code) => span_lines::exit(code),
         Err(e) => {
-            eprintln!("vigil-lock: wait: {e}");
+            vigil_log::say!("vigil-lock: wait: {e}");
             span_lines::exit(1);
         }
     }
 }
 
 fn daemon_child_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
-    args.into_iter()
-        .filter(|arg| arg != "--wait" && arg != "--daemonize")
-        .collect()
+    let mut kept = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--wait" | "--daemonize" => {}
+            "--ready-fd" => {
+                args.next();
+            }
+            _ => kept.push(arg),
+        }
+    }
+    kept
 }
 
 struct LockIpcSocket {
     path: PathBuf,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    #[default]
+    Pending,
+    Held,
+    Releasing,
+}
+
 #[derive(Default)]
 struct LockIpcState {
-    locked: bool,
+    hold: Hold,
     commit_requested: bool,
     joiners: Vec<UnixStream>,
     waker: Option<WakeHandle>,
+}
+
+fn follow_flow(ipc: &Mutex<LockIpcState>, cmd: &FlowCmd) -> bool {
+    let joiners = {
+        let mut state = ipc.lock().expect("lock IPC poisoned");
+        match cmd {
+            FlowCmd::SignalReady => {
+                state.hold = Hold::Held;
+                std::mem::take(&mut state.joiners)
+            }
+            FlowCmd::DetachAuth => {
+                state.hold = Hold::Releasing;
+                return false;
+            }
+            // A signal leaves a held lock to the compositor, so it stays held.
+            FlowCmd::Exit(outcome) if !matches!(outcome, LockOutcome::Terminated(_)) => {
+                if state.hold == Hold::Pending && *outcome == LockOutcome::Unlocked {
+                    vigil_log::say!(
+                        "vigil-lock: lock ended before it was confirmed: logind unlocked it"
+                    );
+                }
+                state.hold = Hold::Releasing;
+                return false;
+            }
+            _ => return false,
+        }
+    };
+    for mut joiner in joiners {
+        let _ = joiner.write_all(b"locked\n");
+    }
+    true
 }
 
 impl Drop for LockIpcSocket {
@@ -1287,15 +1356,21 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
             let mut command = [0_u8; 7];
             if stream.read_exact(&mut command).is_ok() && command == *b"commit\n" {
                 let mut state = server_state.lock().expect("warning IPC poisoned");
-                if state.locked {
-                    let _ = stream.write_all(b"locked\n");
-                } else {
-                    eprintln!("vigil-lock: warning join requested immediate lock");
-                    state.commit_requested = true;
-                    state.joiners.push(stream);
-                    if let Some(waker) = state.waker.clone() {
-                        waker.wake();
+                match state.hold {
+                    Hold::Held => {
+                        let _ = stream.write_all(b"locked\n");
                     }
+                    Hold::Pending => {
+                        vigil_log::say!("vigil-lock: warning join requested immediate lock");
+                        state.commit_requested = true;
+                        state.joiners.push(stream);
+                        if let Some(waker) = state.waker.clone() {
+                            waker.wake();
+                        }
+                    }
+                    // Never answered. This client's exit closes the stream,
+                    // and the joiner then takes the singleton and locks afresh.
+                    Hold::Releasing => state.joiners.push(stream),
                 }
             }
         }
@@ -1303,91 +1378,82 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
     Ok((LockIpcSocket { path }, state))
 }
 
-fn signal_ready_fd(ready_fd: Option<i32>) {
+fn signal_ready_fd(ready_fd: Option<OwnedFd>) {
     if let Some(fd) = ready_fd {
-        use std::os::fd::FromRawFd;
-        let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
-        let _ = ready.write_all(b"1");
+        let _ = std::fs::File::from(fd).write_all(b"1");
     }
 }
 
-thread_local! {
-    static COSMETIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+struct StderrLines;
+
+impl span_lines::Sink for StderrLines {
+    fn write(&self, record: &[u8]) {
+        vigil_log::emit(record);
+    }
 }
 
-// A panic ends the lock before it can sit half alive with a dead PAM worker,
-// a lost sleep signal or a poisoned lock. ext-session-lock keeps the session
-// locked when its client dies. _exit leaves no core, which would hold the
-// password, and the report names only the place, since a panic message can
-// quote text. Only work run through `cosmetic` survives its own panic.
-fn exit_on_panic() {
-    std::panic::set_hook(Box::new(|info| {
-        let place = info
-            .location()
-            .map(|at| format!("{}:{}", at.file(), at.line()))
-            .unwrap_or_default();
-        let cosmetic = COSMETIC.try_with(std::cell::Cell::get).unwrap_or(false);
-        let then = if cosmetic {
-            "going on without it"
-        } else {
-            "exiting"
-        };
-        let _ = writeln!(std::io::stderr(), "vigil-lock: panic at {place}; {then}");
-        if !cosmetic {
-            unsafe { libc::_exit(101) };
-        }
-    }));
-}
-
-fn cosmetic<T>(work: impl FnOnce() -> T) -> Option<T> {
-    COSMETIC.set(true);
-    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).ok();
-    COSMETIC.set(false);
-    done
-}
-
-// RLIMIT_CORE survives exec but PR_SET_DUMPABLE resets on it, so every exec'd binary calls this itself.
-fn deny_memory_dumps() -> std::io::Result<()> {
-    use rustix::process::{DumpableBehavior, Resource, Rlimit, set_dumpable_behavior, setrlimit};
-    let core = setrlimit(
-        Resource::Core,
-        Rlimit {
-            current: Some(0),
-            maximum: Some(0),
-        },
-    );
-    let dumpable = set_dumpable_behavior(DumpableBehavior::NotDumpable);
-    core.and(dumpable).map_err(std::io::Error::from)
+#[allow(unsafe_code)]
+fn adopt_ready_fd(arg: &str) -> Result<OwnedFd, String> {
+    use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+    use std::os::unix::fs::FileTypeExt;
+    let fd: RawFd = arg.parse().map_err(|_| format!("bad --ready-fd {arg}"))?;
+    let kind = std::fs::metadata(format!("/proc/self/fd/{fd}"))
+        .map_err(|e| format!("--ready-fd {fd} is not open: {e}"))?
+        .file_type();
+    if !(kind.is_fifo() || kind.is_socket()) {
+        return Err(format!("--ready-fd {fd} is not a pipe or socket"));
+    }
+    // SAFETY: main parses arguments before this process opens any descriptor, and /proc shows
+    // `fd` open as a pipe or socket, so it is the caller's descriptor and nothing here owns it.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let ready = owned
+        .try_clone()
+        .map_err(|e| format!("--ready-fd {fd}: {e}"))?;
+    if fd > 2 {
+        return Ok(ready);
+    }
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .map_err(|e| format!("/dev/null: {e}"))?;
+    match fd {
+        0 => rustix::stdio::dup2_stdin(&null),
+        1 => rustix::stdio::dup2_stdout(&null),
+        _ => rustix::stdio::dup2_stderr(&null),
+    }
+    .map_err(|e| format!("--ready-fd {fd}: {e}"))?;
+    let _stdio_now_null = owned.into_raw_fd();
+    Ok(ready)
 }
 
 fn main() {
+    vigil_secret::exit_on_panic();
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
-    if let Err(e) = deny_memory_dumps() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "vigil-lock: could not keep memory out of core dumps: {e}"
-        );
+    let _ = span_lines::set_sink(StderrLines);
+    if let Err(e) = vigil_secret::deny_memory_dumps() {
+        vigil_log::say!("vigil-lock: could not keep memory out of core dumps: {e}");
     }
-    exit_on_panic();
+    let parsed = parse_cli();
     tracing_subscriber::registry()
         .with(span_lines::tracing_layer::install(&["vigil"]))
         .init();
 
-    let mut cli = match parse_cli() {
+    let mut cli = match parsed {
         Ok(cli) => cli,
         Err(e) => {
-            eprintln!("vigil-lock: {e}");
+            vigil_log::say!("vigil-lock: {e}");
             span_lines::exit(2);
         }
     };
     if cli.wait {
-        detach_and_wait_for_lock();
+        detach_and_wait_for_lock(cli.ready_fd.take());
     }
     let mut config = Config::load_layered(cli.config.as_deref());
     apply_cli_to_config(&cli, &mut config);
     if let Err(error) = config.validate_warning() {
-        eprintln!("vigil-lock: {error}");
+        vigil_log::say!("vigil-lock: {error}");
         span_lines::exit(2);
     }
     let mut lock_policy = config.lock.clone();
@@ -1397,7 +1463,9 @@ fn main() {
             Ok(Some(guard)) => match start_lock_ipc() {
                 Ok((socket, state)) => break (guard, Some(socket), state),
                 Err(error) => {
-                    eprintln!("vigil-lock: lock IPC unavailable: {error}; locking immediately");
+                    vigil_log::say!(
+                        "vigil-lock: lock IPC unavailable: {error}; locking immediately"
+                    );
                     lock_policy.warning.duration_ms = 0;
                     break (guard, None, Arc::new(Mutex::new(LockIpcState::default())));
                 }
@@ -1411,11 +1479,11 @@ fn main() {
                             span_lines::exit(0);
                         }
                         Ok(false) => {}
-                        Err(error) => eprintln!("vigil-lock: {error}"),
+                        Err(error) => vigil_log::say!("vigil-lock: {error}"),
                     }
                     attempts += 1;
                     if attempts >= 20 {
-                        eprintln!(
+                        vigil_log::say!(
                             "vigil-lock: another locker owns the seat but never confirmed the lock; refusing to stack"
                         );
                         span_lines::exit(2);
@@ -1431,7 +1499,7 @@ fn main() {
                 continue;
             }
             Err(error) => {
-                eprintln!("vigil-lock: {error}");
+                vigil_log::say!("vigil-lock: {error}");
                 span_lines::exit(2);
             }
         }
@@ -1439,7 +1507,7 @@ fn main() {
     let locker = match Locker::new(cli, config, lock_ipc) {
         Ok(locker) => locker,
         Err(e) => {
-            eprintln!("vigil-lock: {e}");
+            vigil_log::say!("vigil-lock: {e}");
             span_lines::exit(1);
         }
     };
@@ -1447,21 +1515,26 @@ fn main() {
     let outcome = match vigil_wayland::run_with_lock(locker, &lock_policy, None) {
         Ok(outcome) => outcome,
         Err(e) => {
-            eprintln!("vigil-lock: {e}");
+            vigil_log::say!("vigil-lock: {e}");
             span_lines::exit(1);
         }
     };
     match outcome {
         LockOutcome::Unlocked | LockOutcome::Cancelled => {}
-        LockOutcome::Denied => eprintln!("vigil-lock: lock denied (another locker running?)"),
-        LockOutcome::Invalidated => eprintln!("vigil-lock: lock invalidated by the compositor"),
-        LockOutcome::Terminated(signal) => eprintln!(
+        LockOutcome::Denied => vigil_log::say!("vigil-lock: lock denied (another locker running?)"),
+        LockOutcome::Invalidated => {
+            vigil_log::say!("vigil-lock: lock invalidated by the compositor")
+        }
+        LockOutcome::Terminated(signal) => vigil_log::say!(
             "vigil-lock: {} received; exiting, a held session lock stays held by the compositor",
             signal.name()
         ),
     }
     span_lines::exit(outcome.exit_code());
 }
+
+#[cfg(test)]
+mod logind_forgery;
 
 #[cfg(test)]
 mod tests {
@@ -1495,13 +1568,13 @@ mod tests {
 
     #[derive(Default)]
     struct FakeAttempt {
-        answered: Rc<RefCell<Vec<String>>>,
+        answered: Rc<RefCell<Vec<Secret>>>,
         cancelled: Rc<std::cell::Cell<bool>>,
         detached: Rc<std::cell::Cell<bool>>,
     }
 
     impl AuthAttempt for FakeAttempt {
-        fn respond(&self, text: String) {
+        fn respond(&self, text: Secret) {
             self.answered.borrow_mut().push(text);
         }
         fn cancel(&mut self) {
@@ -1578,7 +1651,7 @@ mod tests {
 
     #[test]
     fn responses_and_cancellation_reach_the_live_attempt_only() {
-        let answered: Rc<RefCell<Vec<String>>> = Rc::default();
+        let answered: Rc<RefCell<Vec<Secret>>> = Rc::default();
         let cancelled: Rc<std::cell::Cell<bool>> = Rc::default();
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
         let (answered_probe, cancelled_probe) = (answered.clone(), cancelled.clone());
@@ -1589,7 +1662,7 @@ mod tests {
         });
         track.respond("hunter2".into());
         track.cancel();
-        assert_eq!(*answered.borrow(), vec!["hunter2".to_owned()]);
+        assert_eq!(*answered.borrow(), vec![Secret::from("hunter2")]);
         assert!(cancelled.get());
 
         track.retire();
@@ -1599,7 +1672,7 @@ mod tests {
 
     #[test]
     fn an_empty_enter_never_answers_a_secret_question() {
-        let answered: Rc<RefCell<Vec<String>>> = Rc::default();
+        let answered: Rc<RefCell<Vec<Secret>>> = Rc::default();
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
         let probe = answered.clone();
         let mut worker = None;
@@ -1617,14 +1690,14 @@ mod tests {
         };
         let _ = worker.send(prompt("Password:", true));
         let _ = track.drain();
-        track.respond(String::new());
+        track.respond(Secret::default());
         track.respond("hunter2".into());
         let _ = worker.send(prompt("Code:", false));
         let _ = track.drain();
-        track.respond(String::new());
+        track.respond(Secret::default());
         assert_eq!(
             *answered.borrow(),
-            ["hunter2", ""],
+            [Secret::from("hunter2"), Secret::default()],
             "an empty visible answer is sent, an empty secret one is not"
         );
     }
@@ -1648,7 +1721,7 @@ mod tests {
     fn a_panic_on_any_thread_ends_the_lock_at_once_without_a_core() {
         use std::os::unix::process::ExitStatusExt;
         if std::env::var_os("VIGIL_LOCK_PANIC_PROBE").is_some() {
-            exit_on_panic();
+            vigil_secret::exit_on_panic();
             let _ = std::thread::spawn(|| {
                 let typed = String::from("hunter\u{e9}");
                 let _ = &typed[..7];
@@ -1674,7 +1747,7 @@ mod tests {
     #[test]
     fn the_lock_keeps_its_memory_out_of_core_dumps() {
         if std::env::var_os("VIGIL_LOCK_DUMP_PROBE").is_some() {
-            deny_memory_dumps().unwrap();
+            vigil_secret::deny_memory_dumps().unwrap();
             let core = rustix::process::getrlimit(rustix::process::Resource::Core);
             let dumpable = rustix::process::dumpable_behavior().unwrap();
             let denied = (core.current, core.maximum) == (Some(0), Some(0))
@@ -1712,16 +1785,16 @@ mod tests {
 
     #[test]
     fn an_empty_enter_before_the_first_question_never_reaches_pam() {
-        let answered: Rc<RefCell<Vec<String>>> = Rc::default();
+        let answered: Rc<RefCell<Vec<Secret>>> = Rc::default();
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
         let probe = answered.clone();
         track.start(|_| FakeAttempt {
             answered: probe,
             ..FakeAttempt::default()
         });
-        track.respond(String::new());
+        track.respond(Secret::default());
         track.respond("hunter2".into());
-        assert_eq!(*answered.borrow(), ["hunter2"]);
+        assert_eq!(*answered.borrow(), [Secret::from("hunter2")]);
     }
 
     #[test]
@@ -1807,6 +1880,101 @@ mod tests {
             ),
             DoneOutcome::Ignore
         );
+    }
+
+    fn ready_fd_args(fd: impl ToString) -> [String; 2] {
+        ["--ready-fd".to_owned(), fd.to_string()]
+    }
+
+    #[test]
+    fn ready_fd_takes_a_socket_and_signals_once() {
+        use std::os::fd::IntoRawFd;
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        let cli = parse_cli_from(ready_fd_args(child.into_raw_fd())).unwrap();
+        signal_ready_fd(cli.ready_fd);
+        let mut got = Vec::new();
+        parent.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"1");
+    }
+
+    #[test]
+    fn ready_fd_given_twice_is_refused() {
+        use std::os::fd::IntoRawFd;
+        let (_parent, child) = UnixStream::pair().unwrap();
+        let fd = child.into_raw_fd();
+        let [flag, value] = ready_fd_args(fd);
+        let refused = parse_cli_from([flag.clone(), value.clone(), flag, value])
+            .err()
+            .unwrap();
+        assert!(refused.contains("twice"), "{refused}");
+    }
+
+    #[test]
+    fn an_adopted_ready_fd_is_not_inherited() {
+        use std::os::fd::IntoRawFd;
+        let (_parent, child) = UnixStream::pair().unwrap();
+        let ready = parse_cli_from(ready_fd_args(child.into_raw_fd()))
+            .unwrap()
+            .ready_fd
+            .unwrap();
+        let flags = rustix::io::fcntl_getfd(&ready).unwrap();
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+    }
+
+    #[test]
+    fn the_callers_ready_fd_is_not_forwarded_to_the_detached_child() {
+        assert_eq!(
+            daemon_child_args([
+                "--wait".to_owned(),
+                "--ready-fd".to_owned(),
+                "5".to_owned(),
+                "--immediate".to_owned(),
+            ]),
+            ["--immediate"]
+        );
+    }
+
+    #[test]
+    fn ready_fd_refuses_a_closed_descriptor_and_a_regular_file() {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("Cargo.toml").unwrap();
+        let refused = parse_cli_from(ready_fd_args(file.as_raw_fd()))
+            .err()
+            .unwrap();
+        assert!(refused.contains("not a pipe or socket"), "{refused}");
+        let refused = parse_cli_from(ready_fd_args(1_000_000)).err().unwrap();
+        assert!(refused.contains("not open"), "{refused}");
+        assert!(parse_cli_from(ready_fd_args("one")).is_err());
+    }
+
+    #[test]
+    fn a_ready_fd_on_stdout_leaves_dev_null_behind() {
+        if std::env::var_os("VIGIL_READY_CHILD").is_some() {
+            vigil_secret::deny_memory_dumps().unwrap();
+            let cli = parse_cli_from(ready_fd_args(1)).unwrap();
+            signal_ready_fd(cli.ready_fd);
+            let opened = std::fs::File::open("Cargo.toml").unwrap();
+            assert_ne!(std::os::fd::AsRawFd::as_raw_fd(&opened), 1);
+            rustix::io::write(rustix::stdio::stdout(), b"stray").unwrap();
+            return;
+        }
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_ready_fd_on_stdout_leaves_dev_null_behind",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("VIGIL_READY_CHILD", "1")
+            .stdout(std::process::Stdio::from(OwnedFd::from(child)))
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let mut got = String::new();
+        parent.read_to_string(&mut got).unwrap();
+        assert!(status.success(), "{status}");
+        assert!(got.ends_with('1') && !got.contains("stray"), "{got:?}");
     }
 
     #[test]
@@ -1943,7 +2111,7 @@ mod tests {
     #[test]
     fn a_panic_rendering_the_wallpaper_still_locks_without_one() {
         if std::env::var_os("VIGIL_LOCK_WALLPAPER_PROBE").is_some() {
-            exit_on_panic();
+            vigil_secret::exit_on_panic();
             let path = std::env::temp_dir().join(format!(
                 "vigil-lock-wallpaper-panic-{}.png",
                 std::process::id()
@@ -2008,7 +2176,7 @@ mod tests {
         let key = |window: &mut OutputWindow, keysym: u32, utf8: Option<&str>, pressed| {
             window.dispatch(vigil_core::InputEvent::Key {
                 keysym,
-                utf8: utf8.map(str::to_owned),
+                utf8: utf8.map(vigil_core::KeyText::from),
                 pressed,
             });
         };
@@ -2049,17 +2217,17 @@ mod tests {
             "four masked dots after the failure: the retry is kept and hidden"
         );
         tap(&mut window, 0xff0d, Some("\r"));
+        let sent = sent.borrow();
         let answers: Vec<_> = sent
-            .borrow()
             .iter()
             .filter_map(|message| match message {
-                UiMessage::Respond(text) => Some(text.clone()),
+                UiMessage::Respond(text) => Some(text),
                 _ => None,
             })
             .collect();
         assert_eq!(
             answers,
-            ["aaaa", "aaaa"],
+            [&Secret::from("aaaa"), &Secret::from("aaaa")],
             "the retry typed during the check is kept"
         );
     }
@@ -2083,13 +2251,177 @@ mod tests {
         let joiners = {
             let mut state = state.lock().unwrap();
             assert!(state.commit_requested);
-            state.locked = true;
+            state.hold = Hold::Held;
             std::mem::take(&mut state.joiners)
         };
         for mut stream in joiners {
             stream.write_all(b"locked\n").unwrap();
         }
         assert!(join.join().unwrap());
+        drop(guard);
+    }
+
+    #[test]
+    fn a_join_during_the_unlock_is_not_told_the_session_is_locked() {
+        let path = std::env::temp_dir().join(format!(
+            "vigil-lock-ipc-releasing-test-{}.sock",
+            std::process::id()
+        ));
+        let (guard, state) = start_lock_ipc_at(path.clone()).unwrap();
+        state.lock().unwrap().hold = Hold::Releasing;
+        let join = std::thread::spawn(move || join_lock_at(&path));
+
+        for _ in 0..200 {
+            if !state.lock().unwrap().joiners.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let parked = std::mem::take(&mut state.lock().unwrap().joiners);
+        assert_eq!(parked.len(), 1, "the joiner was answered or never arrived");
+        assert!(!state.lock().unwrap().commit_requested);
+        drop(parked);
+        assert!(
+            !matches!(join.join().unwrap(), Ok(true)),
+            "a client that is unlocking confirmed the lock to a joiner"
+        );
+        drop(guard);
+    }
+
+    fn step(
+        ipc: &Mutex<LockIpcState>,
+        flow: &mut vigil_flow::LockFlow,
+        ms: u64,
+        event: FlowEvent,
+    ) -> bool {
+        flow.step(vigil_flow::Now::at(Duration::from_millis(ms)), event)
+            .iter()
+            .fold(false, |confirmed, cmd| follow_flow(ipc, cmd) | confirmed)
+    }
+
+    fn locked_flow(ipc: &Mutex<LockIpcState>) -> vigil_flow::LockFlow {
+        let (mut flow, _) = vigil_flow::LockFlow::new(
+            vigil_flow::Now::at(Duration::ZERO),
+            &vigil_config::Lock::default(),
+            Some(0),
+        );
+        step(ipc, &mut flow, 400, FlowEvent::Tick);
+        assert!(step(ipc, &mut flow, 410, FlowEvent::LockConfirmed));
+        flow
+    }
+
+    fn join_until_exit(path: PathBuf, ipc: &Mutex<LockIpcState>) -> Result<bool, String> {
+        let join = std::thread::spawn(move || join_lock_at(&path));
+        for _ in 0..200 {
+            if join.is_finished() || !ipc.lock().unwrap().joiners.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(std::mem::take(&mut ipc.lock().unwrap().joiners));
+        join.join().unwrap()
+    }
+
+    fn ipc_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("vigil-lock-ipc-{name}-{}.sock", std::process::id()))
+    }
+
+    #[test]
+    fn a_join_before_a_confirm_that_unlocks_is_not_told_the_session_is_locked() {
+        let path = ipc_path("latched");
+        let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
+        let (mut flow, _) = vigil_flow::LockFlow::new(
+            vigil_flow::Now::at(Duration::ZERO),
+            &vigil_config::Lock::default(),
+            Some(0),
+        );
+        step(&ipc, &mut flow, 100, FlowEvent::LogindUnlock);
+        step(&ipc, &mut flow, 400, FlowEvent::Tick);
+        let join = std::thread::spawn(move || join_lock_at(&path));
+        for _ in 0..200 {
+            if !ipc.lock().unwrap().joiners.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !step(&ipc, &mut flow, 410, FlowEvent::LockConfirmed),
+            "readiness was signalled for a lock that unlocks at once"
+        );
+        drop(std::mem::take(&mut ipc.lock().unwrap().joiners));
+        assert!(
+            !matches!(join.join().unwrap(), Ok(true)),
+            "a joiner was told locked by a client that unlocks at once"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn a_join_after_the_compositor_drops_the_lock_is_not_told_the_session_is_locked() {
+        let path = ipc_path("invalidated");
+        let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
+        let mut flow = locked_flow(&ipc);
+        step(&ipc, &mut flow, 500, FlowEvent::LockInvalidated);
+        assert!(
+            !matches!(join_until_exit(path, &ipc), Ok(true)),
+            "a client whose lock the compositor dropped told a joiner locked"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn only_an_unlock_before_the_lock_is_held_is_journaled_as_unconfirmed() {
+        const CHILD: &str = "VIGIL_LOCK_TEST_UNCONFIRMED";
+        let cases = [
+            (Hold::Pending, LockOutcome::Unlocked),
+            (Hold::Held, LockOutcome::Unlocked),
+            (Hold::Pending, LockOutcome::Cancelled),
+        ];
+        if std::env::var_os(CHILD).is_some() {
+            for (hold, outcome) in cases {
+                vigil_log::say!("case {hold:?} {outcome:?}");
+                let ipc = Mutex::new(LockIpcState {
+                    hold,
+                    ..LockIpcState::default()
+                });
+                follow_flow(&ipc, &FlowCmd::Exit(outcome));
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::only_an_unlock_before_the_lock_is_held_is_journaled_as_unconfirmed",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(
+            stderr.lines().collect::<Vec<_>>(),
+            [
+                "case Pending Unlocked",
+                "vigil-lock: lock ended before it was confirmed: logind unlocked it",
+                "case Held Unlocked",
+                "case Pending Cancelled",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_join_after_a_signal_is_told_the_held_lock_stays() {
+        let path = ipc_path("terminated");
+        let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
+        let mut flow = locked_flow(&ipc);
+        step(
+            &ipc,
+            &mut flow,
+            500,
+            FlowEvent::Terminate(vigil_flow::Signal::Terminate),
+        );
+        assert_eq!(join_until_exit(path, &ipc), Ok(true));
         drop(guard);
     }
 

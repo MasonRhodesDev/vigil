@@ -1,8 +1,12 @@
+#![forbid(unsafe_code)]
+
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId, PowerAction, UiMessage};
+use vigil_core::{
+    AuthUi, FrameTarget, InputEvent, KeyText, OutputId, PowerAction, Secret, UiMessage,
+};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
 
@@ -24,7 +28,7 @@ const H: u32 = 800;
 
 #[derive(Debug, PartialEq)]
 enum Sent {
-    Respond(String),
+    Respond(Secret),
     Cancel,
     Session(usize),
     User(usize),
@@ -82,7 +86,7 @@ impl Greeter {
     fn event(&mut self, keysym: u32, utf8: Option<&str>, pressed: bool) {
         self.window.dispatch(InputEvent::Key {
             keysym,
-            utf8: utf8.map(str::to_owned),
+            utf8: utf8.map(KeyText::from),
             pressed,
         });
         self.settle();

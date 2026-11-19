@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::session_lock::{
     SessionLock, SessionLockHandler, SessionLockState, SessionLockSurface,
@@ -60,23 +61,23 @@ fn main() {
     probe.lock = match lock_state.lock(&qh) {
         Ok(lock) => Some(lock),
         Err(error) => {
-            eprintln!("lock_probe: ext-session-lock-v1 unavailable: {error}");
+            vigil_log::say!("lock_probe: ext-session-lock-v1 unavailable: {error}");
             std::process::exit(2);
         }
     };
     for _ in 0..100 {
         if queue.blocking_dispatch(&mut probe).is_err() {
-            eprintln!("lock_probe: dispatch failed");
+            vigil_log::say!("lock_probe: dispatch failed");
             std::process::exit(2);
         }
         if let Some(code) = probe.outcome {
-            println!(
+            vigil_log::out!(
                 "lock_probe: session was {}",
                 if code == 0 { "unlocked" } else { "locked" }
             );
             std::process::exit(code);
         }
     }
-    eprintln!("lock_probe: no verdict after 100 dispatches");
+    vigil_log::say!("lock_probe: no verdict after 100 dispatches");
     std::process::exit(2);
 }

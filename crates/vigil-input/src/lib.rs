@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -6,7 +8,7 @@ use smithay::reexports::input;
 use smithay::reexports::input::event::keyboard::{KeyState, KeyboardEventTrait};
 use smithay::reexports::input::event::pointer::{ButtonState, PointerEvent};
 use smithay::reexports::input::{LibinputInterface, event};
-use vigil_core::{DeviceOpener, HeldKeys, InputEvent, KeymapSettings};
+use vigil_core::{DeviceOpener, HeldKeys, InputEvent, KeyText, KeymapSettings};
 use xkbcommon::xkb;
 use xkbcommon::xkb::compose;
 
@@ -116,8 +118,11 @@ impl InputSystem {
     }
 }
 
+#[allow(unsafe_code)]
 impl std::os::fd::AsFd for InputSystem {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: the fd belongs to the libinput context `self` owns, so it
+        // stays open for the borrow of `self`.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }
@@ -176,7 +181,7 @@ fn compose_state(locale: &str) -> Option<compose::State> {
     ) {
         Ok(table) => Some(compose::State::new(&table, compose::STATE_NO_FLAGS)),
         Err(()) => {
-            eprintln!("vigil-input: no compose table for locale {locale}; compose disabled");
+            vigil_log::say!("vigil-input: no compose table for locale {locale}; compose disabled");
             None
         }
     }
@@ -195,7 +200,7 @@ impl KeyboardState {
         let keymap = compile_keymap(&context, settings)
             .or_else(|| {
                 if *settings != KeymapSettings::default() {
-                    eprintln!(
+                    vigil_log::say!(
                         "vigil-input: keymap {settings:?} did not compile; using system default"
                     );
                     compile_keymap(&context, &KeymapSettings::default())
@@ -257,7 +262,7 @@ impl KeyboardState {
                     self.repeat = None;
                     return Some(InputEvent::Key {
                         keysym: keysym.unwrap_or_else(|| self.state.key_get_one_sym(keycode).raw()),
-                        utf8: utf8.filter(|text| !text.is_empty()),
+                        utf8: utf8.filter(|text| !text.is_empty()).map(KeyText::from),
                         pressed: true,
                     });
                 }
@@ -288,7 +293,7 @@ impl KeyboardState {
         let utf8 = self.state.key_get_utf8(keycode);
         InputEvent::Key {
             keysym: self.state.key_get_one_sym(keycode).raw(),
-            utf8: (!utf8.is_empty()).then_some(utf8),
+            utf8: (!utf8.is_empty()).then(|| KeyText::from(utf8)),
             pressed,
         }
     }
@@ -315,6 +320,48 @@ impl KeyboardState {
     }
 }
 
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    use super::*;
+
+    pub struct Keyboard {
+        state: KeyboardState,
+        now: Instant,
+    }
+
+    impl Keyboard {
+        pub fn new(settings: &KeymapSettings, compose_locale: &str) -> Option<Self> {
+            let mut state = KeyboardState::new(settings).ok()?;
+            state.compose = compose_state(compose_locale);
+            Some(Self {
+                state,
+                now: Instant::now(),
+            })
+        }
+
+        pub fn reset(&mut self) {
+            self.state.state = xkb::State::new(&self.state.keymap);
+            if let Some(compose) = &mut self.state.compose {
+                compose.reset();
+            }
+            self.state.repeat = None;
+        }
+
+        pub fn key(&mut self, evdev_keycode: u16, pressed: bool) -> Option<InputEvent> {
+            self.state.key(u32::from(evdev_keycode), pressed, self.now)
+        }
+
+        pub fn wait(&mut self, time: Duration) -> Vec<InputEvent> {
+            self.now += time;
+            self.state.tick_repeat(self.now)
+        }
+
+        pub fn caps_lock(&self) -> bool {
+            self.state.caps_lock()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +382,7 @@ mod tests {
         else {
             panic!("expected key event")
         };
-        (keysym, utf8, pressed)
+        (keysym, utf8.map(|text| text.as_str().to_owned()), pressed)
     }
 
     fn intl_keyboard() -> KeyboardState {

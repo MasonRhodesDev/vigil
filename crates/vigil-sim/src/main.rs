@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::cell::RefCell;
 use std::fs;
 use std::io::{Read, Write};
@@ -11,7 +13,7 @@ use std::time::{Duration, Instant};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use serde::Deserialize;
 use softbuffer::{Context, Surface};
-use vigil_core::{AuthUi, FrameTarget, InputEvent, OutputId};
+use vigil_core::{AuthUi, FrameTarget, InputEvent, KeyText, OutputId};
 use vigil_flow::{FlowCmd, FlowEvent, FlowPhase, LockFlow, Now};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
@@ -118,15 +120,15 @@ impl SimArgs {
 
 fn load_preview_config(path: &std::path::Path) -> vigil_config::Lock {
     let source = fs::read_to_string(path).unwrap_or_else(|error| {
-        eprintln!("vigil-sim: {}: {error}", path.display());
+        vigil_log::say!("vigil-sim: {}: {error}", path.display());
         std::process::exit(2);
     });
     let config = vigil_config::parse(&source).unwrap_or_else(|error| {
-        eprintln!("vigil-sim: {}: {error}", path.display());
+        vigil_log::say!("vigil-sim: {}: {error}", path.display());
         std::process::exit(2);
     });
     if let Err(error) = config.validate_warning() {
-        eprintln!("vigil-sim: {}: {error}", path.display());
+        vigil_log::say!("vigil-sim: {}: {error}", path.display());
         std::process::exit(2);
     }
     config.lock
@@ -134,11 +136,12 @@ fn load_preview_config(path: &std::path::Path) -> vigil_config::Lock {
 
 fn usage(error: &str) -> ! {
     if !error.is_empty() {
-        eprintln!("error: {error}");
+        vigil_log::say!("error: {error}");
     }
-    eprintln!(
-        "usage: vigil-sim [login|lock|warning] [--paused] [--at-ms MS] [--state-file PATH] [--config PATH] [--control-socket PATH]\n       vigil-sim scenario FIXTURE.toml"
+    vigil_log::say!(
+        "usage: vigil-sim [login|lock|warning] [--paused] [--at-ms MS] [--state-file PATH] [--config PATH] [--control-socket PATH]"
     );
+    vigil_log::say!("       vigil-sim scenario FIXTURE.toml");
     std::process::exit(if error.is_empty() { 0 } else { 2 });
 }
 
@@ -285,7 +288,7 @@ impl Simulator {
 
     fn record(&self, message: impl Into<String>) {
         let message = message.into();
-        eprintln!("[vigil-sim] {message}");
+        vigil_log::say!("[vigil-sim] {message}");
         self.trace.borrow_mut().push(message);
         self.write_state();
     }
@@ -322,7 +325,7 @@ impl Simulator {
             return;
         }
         if let Err(error) = fs::write(path, &body) {
-            eprintln!("[vigil-sim] state write failed: {error}");
+            vigil_log::say!("[vigil-sim] state write failed: {error}");
         } else {
             *self.last_state.borrow_mut() = body;
         }
@@ -1164,12 +1167,12 @@ fn blend_warning_frame(
         .collect()
 }
 
-fn key_event(key: &Key) -> (u32, Option<String>) {
+fn key_event(key: &Key) -> (u32, Option<KeyText>) {
     match key {
         Key::Character(text) => {
             let text = text.to_string();
             let keysym = text.chars().next().map_or(0, u32::from);
-            (keysym, Some(text))
+            (keysym, Some(text.into()))
         }
         Key::Named(NamedKey::Enter) => (0xff0d, Some("\r".into())),
         Key::Named(NamedKey::Tab) => (0xff09, Some("\t".into())),
@@ -1284,7 +1287,7 @@ fn run_scenario(platform: VigilPlatform, path: &std::path::Path) -> Result<(), S
         frame_hash: frame_hash(&simulator.pixels),
         trace: simulator.trace.borrow().clone(),
     };
-    println!(
+    vigil_log::out!(
         "{}",
         serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?
     );
@@ -1308,12 +1311,16 @@ fn render_scenario_frame(simulator: &mut Simulator) -> Result<(), String> {
 }
 
 fn main() {
+    vigil_secret::exit_on_panic();
+    if let Err(e) = vigil_secret::deny_memory_dumps() {
+        vigil_log::say!("vigil-sim: could not keep memory out of core dumps: {e}");
+    }
     let args = SimArgs::parse();
     let preview = args.config.as_deref().map(load_preview_config);
     let platform = VigilPlatform::install().expect("install Vigil Slint platform");
     if let Some(path) = args.scenario.as_deref() {
         if let Err(error) = run_scenario(platform, path) {
-            eprintln!("vigil-sim: {error}");
+            vigil_log::say!("vigil-sim: {error}");
             std::process::exit(2);
         }
         return;

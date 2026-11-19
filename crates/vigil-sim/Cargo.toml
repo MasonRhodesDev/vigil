@@ -8,11 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 vigil-core.workspace = true
 vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }
 vigil-flow.workspace = true
 vigil-config.workspace = true
+vigil-secret.workspace = true
 slint-kit.workspace = true
 winit.workspace = true
 softbuffer.workspace = true
@@ -21,3 +23,6 @@ image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+
+[lints]
+workspace = true

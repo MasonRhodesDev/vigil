@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 slint-idle-runtime.workspace = true
 vigil-core.workspace = true
 slint = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2", "renderer-femtovg"] }
@@ -18,3 +19,6 @@ gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 image.workspace = true
 slint-interpreter.workspace = true
 drm = "0.14"
+
+[lints]
+workspace = true

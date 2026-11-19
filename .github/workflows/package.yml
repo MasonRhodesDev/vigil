@@ -13,7 +13,7 @@ jobs:
   arch-ci:
     uses: MasonRhodesDev/packaging-workflows/.github/workflows/rust-ci.yml@v1
     with:
-      pacman-deps: seatd libinput libxkbcommon systemd libdrm mesa pam clang fontconfig ttf-dejavu
+      pacman-deps: seatd libinput libxkbcommon systemd libdrm mesa pam clang fontconfig ttf-dejavu dbus
 
   arch:
     uses: MasonRhodesDev/packaging-workflows/.github/workflows/arch-package.yml@v1

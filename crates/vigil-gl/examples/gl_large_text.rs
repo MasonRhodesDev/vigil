@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -38,6 +39,7 @@ impl Platform for GlPlatform {
     }
 }
 
+#[allow(unsafe_code)]
 fn main() {
     let node = std::env::var("VIGIL_GL_NODE").unwrap_or_else(|_| "/dev/dri/card0".into());
     let context = Rc::new(GlContext::open(std::path::Path::new(&node)).expect("gl context"));
@@ -54,7 +56,7 @@ fn main() {
     let compiler = slint_interpreter::Compiler::default();
     let result = spin_on(compiler.build_from_source(SCENE.into(), Default::default()));
     for diagnostic in result.diagnostics() {
-        eprintln!("scene: {diagnostic}");
+        vigil_log::say!("scene: {diagnostic}");
     }
     let instance = result
         .component("Probe")
@@ -64,6 +66,7 @@ fn main() {
     instance.show().expect("show");
     window.render().expect("render");
 
+    // SAFETY: window.render() above swapped this surface exactly once.
     let bo = unsafe { gbm.lock_front_buffer() }.expect("lock front buffer");
     let row = bo
         .map(0, H / 2, W, 1, |mapped| {
@@ -79,15 +82,16 @@ fn main() {
 
     let runs = row.windows(2).filter(|w| !w[0] && w[1]).count() + usize::from(row[0]);
     let picture: String = row.iter().map(|&ink| if ink { '#' } else { '.' }).collect();
-    println!("middle row: {picture}");
+    vigil_log::out!("middle row: {picture}");
     assert!(
         runs == 2,
         "a 160px \"0\" should cross ink twice through its middle, crossed it {runs} times \
          (once means the glyph was filled as a box: no stencil buffer)"
     );
-    println!("LARGE TEXT OK");
+    vigil_log::out!("LARGE TEXT OK");
 }
 
+#[allow(unsafe_code)]
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -95,6 +99,8 @@ fn spin_on<F: std::future::Future>(future: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: every vtable entry ignores the null data pointer, and clone hands
+    // back the same no-op waker.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);

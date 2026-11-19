@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,7 +7,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use pam_client::{Context, ConversationHandler, ErrorCode, Flag};
-use vigil_core::{AuthError, AuthEvent};
+use vigil_core::{AuthError, AuthEvent, Secret};
 
 pub mod faillock;
 
@@ -19,12 +21,12 @@ pub fn service_name() -> &'static str {
 
 struct Bridge<E: Fn(AuthEvent)> {
     emit: E,
-    responses: mpsc::Receiver<String>,
+    responses: mpsc::Receiver<Secret>,
     broken: Arc<AtomicBool>,
 }
 
 impl<E: Fn(AuthEvent)> Bridge<E> {
-    fn new(emit: E, responses: mpsc::Receiver<String>) -> Self {
+    fn new(emit: E, responses: mpsc::Receiver<Secret>) -> Self {
         Self {
             emit,
             responses,
@@ -43,8 +45,25 @@ impl<E: Fn(AuthEvent)> Bridge<E> {
             ErrorCode::CONV_ERR
         };
         let response = self.responses.recv().map_err(|_| fail())?;
-        CString::new(response).map_err(|_| fail())
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "credential adapter: pam-client takes the answer as a CString it copies and drops unwiped"
+        )]
+        let plain = response.expose();
+        CString::new(plain).map_err(|refused| {
+            vigil_secret::Zeroize::zeroize(&mut refused.into_vec());
+            fail()
+        })
     }
+}
+
+// The conversation libpam calls, for tests that call it as a hostile module would.
+#[doc(hidden)]
+pub fn conversation(
+    emit: impl Fn(AuthEvent),
+    responses: mpsc::Receiver<Secret>,
+) -> impl ConversationHandler {
+    Bridge::new(emit, responses)
 }
 
 impl<E: Fn(AuthEvent)> ConversationHandler for Bridge<E> {
@@ -63,7 +82,7 @@ impl<E: Fn(AuthEvent)> ConversationHandler for Bridge<E> {
 }
 
 pub struct PamAttempt {
-    responses: Option<mpsc::Sender<String>>,
+    responses: Option<mpsc::Sender<Secret>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -82,7 +101,7 @@ impl PamAttempt {
         }
     }
 
-    pub fn respond(&self, text: String) {
+    pub fn respond(&self, text: Secret) {
         if let Some(tx) = &self.responses {
             let _ = tx.send(text);
         }
@@ -173,8 +192,20 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_holding_nul_fails_the_conversation() {
+        let (tx, rx) = mpsc::channel();
+        let mut bridge = Bridge::new(|_| {}, rx);
+        tx.send("hun\0ter2".into()).unwrap();
+        let err = bridge
+            .prompt_echo_off(&CString::new("Password:").unwrap())
+            .unwrap_err();
+        assert_eq!(err, ErrorCode::CONV_ERR);
+        assert!(bridge.broken.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn dropped_response_channel_aborts_conversation() {
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = mpsc::channel::<Secret>();
         drop(tx);
         let mut bridge = Bridge::new(|_| {}, rx);
         let err = bridge
@@ -185,7 +216,7 @@ mod tests {
 
     #[test]
     fn a_broken_conversation_is_not_a_denial() {
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = mpsc::channel::<Secret>();
         drop(tx);
         let mut bridge = Bridge::new(|_| {}, rx);
         assert!(!bridge.broken.load(Ordering::SeqCst));
@@ -243,6 +274,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "leaves a parked thread behind by design")]
     fn drop_never_waits_on_a_wedged_worker() {
         let (tx, _rx) = mpsc::channel();
         let attempt = PamAttempt {

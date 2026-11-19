@@ -10,3 +10,6 @@ repository.workspace = true
 [dependencies]
 vigil-core.workspace = true
 vigil-config.workspace = true
+
+[lints]
+workspace = true

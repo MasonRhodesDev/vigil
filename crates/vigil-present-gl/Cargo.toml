@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 vigil-core.workspace = true
 vigil-gl = { path = "../vigil-gl" }
 vigil-present-kms = { path = "../vigil-present-kms" }
@@ -19,3 +20,6 @@ vigil-ui = { path = "../vigil-ui" }
 vigil-theme = { path = "../vigil-theme" }
 slint = { workspace = true }
 slint-interpreter.workspace = true
+
+[lints]
+workspace = true

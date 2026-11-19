@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,23 +50,32 @@ struct Mapping {
     len: usize,
 }
 
+#[allow(unsafe_code)]
 impl Mapping {
     fn bytes(&mut self) -> &mut [u8] {
+        // SAFETY: ptr and len are a live read-write mapping this value owns
+        // until Drop, and `&mut self` makes this the only view of it.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }
 
+#[allow(unsafe_code)]
 impl Drop for Mapping {
     fn drop(&mut self) {
+        // SAFETY: ptr and len are exactly what mmap returned, unmapped once.
         unsafe { libc::munmap(self.ptr.cast(), self.len) };
     }
 }
 
+#[allow(unsafe_code)]
 impl Slot {
     fn new(len: usize, map: Map) -> Self {
+        // SAFETY: the name is a NUL-terminated static string.
         let fd = unsafe { libc::memfd_create(c"present-bench".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0, "memfd_create failed");
+        // SAFETY: memfd_create returned a fresh open fd nothing else owns.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: ftruncate takes the owned memfd and a length, no pointers.
         let sized = unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) };
         assert_eq!(sized, 0, "ftruncate failed");
         let mut slot = Self {
@@ -81,6 +91,8 @@ impl Slot {
     }
 
     fn map(&self) -> Mapping {
+        // SAFETY: a fresh shared mapping of the owned memfd at a kernel-chosen
+        // address, checked against MAP_FAILED below.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -327,7 +339,7 @@ fn run(output: &Output, presents: usize, map: Map, in_frame: bool, platform: &Vi
         for series in [&mut samples.draw, &mut samples.out, &mut samples.total] {
             series.sort();
         }
-        println!(
+        vigil_log::out!(
             "output={} scenario={name} presents={} skipped={} \
              total_us_min={} total_us_p50={} total_us_p95={} total_us_max={} \
              draw_us_p50={} out_us_p50={} out_us_p95={} frame_hash={:016x}",
@@ -379,7 +391,7 @@ fn main() {
             other => panic!("unknown argument {other}"),
         }
     }
-    println!(
+    vigil_log::out!(
         "present_bench map={} cursor={cursor} presents={presents}",
         map.0
     );

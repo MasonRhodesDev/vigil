@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
@@ -38,12 +37,14 @@ fn crtc_fb(fd: RawFd, crtc: u32) -> Result<u32, i32> {
         mode_valid: 0,
         mode: [0; 68],
     };
-    let r = unsafe { libc::ioctl(fd, GETCRTC, &mut c as *mut ModeCrtc) };
+    // SAFETY: ModeCrtc is repr(C) with the 104-byte layout of drm_mode_crtc
+    // that GETCRTC encodes, set_connectors_ptr is null, and `c` is a live local.
+    let r = unsafe { libc::ioctl(fd, GETCRTC, &raw mut c) };
     if r < 0 { Err(errno()) } else { Ok(c.fb_id) }
 }
 
 fn errno() -> i32 {
-    unsafe { *libc::__errno_location() }
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,6 +55,7 @@ enum Dropped {
 }
 
 fn drop_master(fd: RawFd) -> Result<Dropped, i32> {
+    // SAFETY: DROP_MASTER takes no argument and only changes master on `fd`.
     let r = unsafe { libc::ioctl(fd, DROP_MASTER) };
     match (r, errno()) {
         (0, _) => Ok(Dropped::Yes),
@@ -68,47 +70,9 @@ fn now_ms() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    // SAFETY: ts is a live local timespec and CLOCK_MONOTONIC always exists.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
     ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
-}
-
-struct Line {
-    buf: [u8; 240],
-    len: usize,
-}
-
-impl Line {
-    fn new() -> Self {
-        Line {
-            buf: [0; 240],
-            len: 0,
-        }
-    }
-    fn emit(mut self) {
-        if self.len < self.buf.len() {
-            self.buf[self.len] = b'\n';
-            self.len += 1;
-        }
-        unsafe { libc::write(2, self.buf.as_ptr().cast(), self.len) };
-    }
-}
-
-impl std::fmt::Write for Line {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let room = self.buf.len() - 1 - self.len;
-        let n = s.len().min(room);
-        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
-        self.len += n;
-        Ok(())
-    }
-}
-
-macro_rules! say {
-    ($($arg:tt)*) => {{
-        let mut l = Line::new();
-        let _ = write!(l, $($arg)*);
-        l.emit();
-    }};
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -150,7 +114,7 @@ fn watch(devices: &[Device], timeout: Duration) -> Released {
     let left = &mut left[..total.min(64)];
     loop {
         let r = poll_once(devices, left, &mut crtc_fb, |_, crtc, fb, now| {
-            say!(
+            vigil_log::say!(
                 "vigil-hold: [+{}ms] crtc {crtc} moved from fb {fb} to fb {now}: next owner has it",
                 now_ms() - start
             );
@@ -167,7 +131,8 @@ fn watch(devices: &[Device], timeout: Duration) -> Released {
             tv_sec: 0,
             tv_nsec: i64::from(POLL_MS) * 1_000_000,
         };
-        unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+        // SAFETY: ts is a live local and the remainder pointer may be null.
+        unsafe { libc::nanosleep(&raw const ts, std::ptr::null_mut()) };
     }
 }
 
@@ -184,10 +149,13 @@ fn close_others(keep: &[RawFd]) {
 }
 
 fn close_range(first: libc::c_uint, last: libc::c_uint) {
+    // SAFETY: only the forked hold child calls this, single threaded, and it
+    // ends in _exit, so no Rust owner of a closed fd ever runs again.
     let r = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) };
     if r < 0 {
         let top = last.min(4096);
         for fd in first..=top {
+            // SAFETY: as for close_range above; the fd may not be open, which close reports.
             unsafe { libc::close(fd as RawFd) };
         }
     }
@@ -218,12 +186,12 @@ pub fn start(devices: &[Device], timeout: Duration) -> Result<i32, String> {
     }
     for d in &held {
         match drop_master(d.fd) {
-            Ok(Dropped::Yes) => eprintln!("vigil: hold: dropped DRM master on fd {}", d.fd),
-            Ok(Dropped::NotMaster) => eprintln!(
+            Ok(Dropped::Yes) => vigil_log::say!("vigil: hold: dropped DRM master on fd {}", d.fd),
+            Ok(Dropped::NotMaster) => vigil_log::say!(
                 "vigil: hold: fd {} was not master (already released); nothing to drop",
                 d.fd
             ),
-            Ok(Dropped::SeatManaged(e)) => eprintln!(
+            Ok(Dropped::SeatManaged(e)) => vigil_log::say!(
                 "vigil: hold: fd {} master is managed by the seat manager (errno {e}); holding the fd open, the seat manager drops master when it releases this session",
                 d.fd
             ),
@@ -238,41 +206,54 @@ pub fn start(devices: &[Device], timeout: Duration) -> Result<i32, String> {
     let mut keep: Vec<RawFd> = held.iter().map(|d| d.fd).collect();
     keep.sort_unstable();
 
+    // SAFETY: the child allocates nothing, calls only async-signal-safe
+    // functions on data built before the fork, and leaves through _exit.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(format!("fork failed: errno {}", errno())),
         0 => {
-            unsafe {
-                libc::setsid();
-                libc::prctl(libc::PR_SET_NAME, c"vigil-hold".as_ptr(), 0, 0, 0);
-                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-                if null >= 0 {
-                    libc::dup2(null, 0);
-                    libc::dup2(null, 1);
-                    if null > 2 {
-                        libc::close(null);
-                    }
+            // SAFETY: setsid takes no arguments and moves only this child.
+            unsafe { libc::setsid() };
+            // SAFETY: PR_SET_NAME reads a NUL-terminated static string.
+            unsafe { libc::prctl(libc::PR_SET_NAME, c"vigil-hold".as_ptr(), 0, 0, 0) };
+            // SAFETY: the path is a NUL-terminated static string.
+            let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            if null >= 0 {
+                // SAFETY: the single-threaded child replaces its stdin with /dev/null.
+                unsafe { libc::dup2(null, 0) };
+                // SAFETY: the single-threaded child replaces its stdout with /dev/null.
+                unsafe { libc::dup2(null, 1) };
+                if null > 2 {
+                    // SAFETY: `null` is the fd opened above and nothing else holds it.
+                    unsafe { libc::close(null) };
                 }
-                libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-                libc::signal(libc::SIGHUP, libc::SIG_IGN);
             }
+            // SAFETY: SIG_IGN installs no handler code.
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+            // SAFETY: SIG_IGN installs no handler code.
+            unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
             close_others(&keep);
             let crtcs: usize = held.iter().map(|d| d.crtcs.len()).sum();
-            say!(
-                "vigil-hold: pid {} holding {crtcs} crtc(s) on {} device(s), timeout {} ms",
-                unsafe { libc::getpid() },
+            // SAFETY: getpid takes no arguments and cannot fail.
+            let pid = unsafe { libc::getpid() };
+            vigil_log::say!(
+                "vigil-hold: pid {pid} holding {crtcs} crtc(s) on {} device(s), timeout {} ms",
                 held.len(),
                 timeout.as_millis()
             );
             let why = watch(&held, timeout);
             match why {
-                Released::HandedOver => say!("vigil-hold: released, handed over"),
-                Released::TimedOut => say!(
+                Released::HandedOver => vigil_log::say!("vigil-hold: released, handed over"),
+                Released::TimedOut => vigil_log::say!(
                     "vigil-hold: released, no next owner within {} ms; the screens go dark as they would have",
                     timeout.as_millis()
                 ),
-                Released::DeviceError(e) => say!("vigil-hold: released, device error {e}"),
+                Released::DeviceError(e) => {
+                    vigil_log::say!("vigil-hold: released, device error {e}")
+                }
             }
+            // SAFETY: _exit ends the child without running the parent's
+            // destructors, which would release resources the parent still owns.
             unsafe { libc::_exit(0) }
         }
         pid => Ok(pid),

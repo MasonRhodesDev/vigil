@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
@@ -37,6 +38,7 @@ impl std::os::fd::AsFd for Card {
 impl drm::Device for Card {}
 impl ControlDevice for Card {}
 
+#[allow(unsafe_code)]
 fn main() {
     let node = std::env::var("VIGIL_GL_NODE").unwrap_or_else(|_| "/dev/dri/card0".into());
 
@@ -70,7 +72,7 @@ fn main() {
         .expect("no connected connector with a mode");
     let (w, h) = mode.size();
     let (w, h) = (w as u32, h as u32);
-    println!(
+    vigil_log::out!(
         "connector {:?}: {w}x{h}@{}",
         connector.interface(),
         mode.vrefresh()
@@ -94,7 +96,7 @@ fn main() {
     let source = include_str!("../../../themes/default/theme.slint");
     let result = spin_on(compiler.build_from_source(source.into(), Default::default()));
     for diagnostic in result.diagnostics() {
-        eprintln!("theme: {diagnostic}");
+        vigil_log::say!("theme: {diagnostic}");
     }
     let definition = result.component("DefaultTheme").expect("DefaultTheme");
     let instance = definition.create().expect("instantiate");
@@ -116,12 +118,13 @@ fn main() {
     instance.show().expect("show");
 
     window.render().expect("render");
-    println!("rendered the default theme through femtovg: ok");
+    vigil_log::out!("rendered the default theme through femtovg: ok");
 
+    // SAFETY: window.render() above swapped this surface exactly once.
     let bo = unsafe { gbm.lock_front_buffer() }.expect("lock front buffer");
     let buffer = GbmBuffer::from_bo(bo, true);
     let fb = framebuffer_from_bo(&drm.0, &buffer, false).expect("drm framebuffer");
-    println!("drm framebuffer from the gbm buffer: ok");
+    vigil_log::out!("drm framebuffer from the gbm buffer: ok");
 
     drm.set_crtc(
         crtc,
@@ -131,16 +134,17 @@ fn main() {
         Some(mode),
     )
     .expect("set_crtc");
-    println!("MODESET OK: a GL frame is on the CRTC");
+    vigil_log::out!("MODESET OK: a GL frame is on the CRTC");
 
     let hold = std::env::var("VIGIL_GL_HOLD_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1500);
     std::thread::sleep(std::time::Duration::from_millis(hold));
-    println!("DONE");
+    vigil_log::out!("DONE");
 }
 
+#[allow(unsafe_code)]
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -148,6 +152,8 @@ fn spin_on<F: std::future::Future>(future: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: every vtable entry ignores the null data pointer, and clone hands
+    // back the same no-op waker.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);

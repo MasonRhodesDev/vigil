@@ -94,7 +94,7 @@ impl Scene {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!(
+                vigil_log::say!(
                     "vigil: scene spec {}: {e}; using the built-in defaults",
                     path.display()
                 );
@@ -104,7 +104,7 @@ impl Scene {
         match Scene::parse(&text) {
             Ok(scene) => scene,
             Err(e) => {
-                eprintln!(
+                vigil_log::say!(
                     "vigil: scene spec {}: {e}; using the built-in defaults",
                     path.display()
                 );
@@ -232,12 +232,14 @@ impl Scene {
     }
 }
 
+#[allow(unsafe_code)]
 pub fn monotonic_s() -> f64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    // SAFETY: ts is a live local timespec and CLOCK_MONOTONIC always exists.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
     ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
 }
 

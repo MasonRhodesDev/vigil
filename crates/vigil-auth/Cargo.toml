@@ -8,5 +8,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 vigil-core.workspace = true
 greetd_ipc.workspace = true
+serde_json.workspace = true
+vigil-secret.workspace = true
+
+[dev-dependencies]
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+
+[[test]]
+name = "attack"
+harness = false
+
+[lints]
+workspace = true
