@@ -6,7 +6,7 @@ use smithay::reexports::input;
 use smithay::reexports::input::event::keyboard::{KeyState, KeyboardEventTrait};
 use smithay::reexports::input::event::pointer::{ButtonState, PointerEvent};
 use smithay::reexports::input::{LibinputInterface, event};
-use vigil_core::{DeviceOpener, InputEvent, KeymapSettings};
+use vigil_core::{DeviceOpener, HeldKeys, InputEvent, KeymapSettings};
 use xkbcommon::xkb;
 use xkbcommon::xkb::compose;
 
@@ -145,6 +145,7 @@ struct KeyboardState {
     state: xkb::State,
     compose: Option<compose::State>,
     repeat: Option<Repeat>,
+    held: HeldKeys,
 }
 
 #[derive(Clone, Copy)]
@@ -209,10 +210,32 @@ impl KeyboardState {
             state,
             compose: compose_state(&default_compose_locale()),
             repeat: None,
+            held: HeldKeys::default(),
         })
     }
 
     fn key(&mut self, evdev_keycode: u32, pressed: bool, now: Instant) -> Option<InputEvent> {
+        let event = self.translate(evdev_keycode, pressed, now);
+        match &event {
+            Some(InputEvent::Key { keysym, .. }) if pressed => {
+                self.held.press(evdev_keycode, *keysym, None);
+                event
+            }
+            Some(InputEvent::Key { keysym, .. }) => Some(InputEvent::Key {
+                keysym: self.held.release(evdev_keycode).unwrap_or(*keysym),
+                utf8: None,
+                pressed: false,
+            }),
+            _ => event,
+        }
+    }
+
+    fn translate(
+        &mut self,
+        evdev_keycode: u32,
+        pressed: bool,
+        now: Instant,
+    ) -> Option<InputEvent> {
         let keycode = xkb::Keycode::new(evdev_keycode + 8);
         self.state.update_key(
             keycode,

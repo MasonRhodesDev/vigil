@@ -358,6 +358,7 @@ struct App<S: LockSession + 'static> {
     fractional_mgr: Option<WpFractionalScaleManagerV1>,
     entries: Vec<Entry>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    held_keys: vigil_core::HeldKeys,
     pointer: Option<wl_pointer::WlPointer>,
     got_locked: bool,
     outcome: Option<LockOutcome>,
@@ -1268,6 +1269,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
         fractional_mgr: globals.bind(&qh, 1..=1, ()).ok(),
         entries: Vec::new(),
         keyboard: None,
+        held_keys: vigil_core::HeldKeys::default(),
         pointer: None,
         got_locked: false,
         outcome: None,
@@ -1496,6 +1498,10 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
+        self.held_keys = vigil_core::HeldKeys::default();
+        for release in vigil_core::modifier_releases() {
+            self.deliver_input(release);
+        }
     }
     fn press_key(
         &mut self,
@@ -1505,6 +1511,8 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: u32,
         event: KeyEvent,
     ) {
+        self.held_keys
+            .press(event.raw_code, event.keysym.raw(), event.utf8.clone());
         self.deliver_input(InputEvent::Key {
             keysym: event.keysym.raw(),
             utf8: event.utf8,
@@ -1519,9 +1527,13 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: u32,
         event: KeyEvent,
     ) {
+        let (keysym, utf8) = self
+            .held_keys
+            .pressed(event.raw_code)
+            .unwrap_or((event.keysym.raw(), None));
         self.deliver_input(InputEvent::Key {
-            keysym: event.keysym.raw(),
-            utf8: event.utf8,
+            keysym,
+            utf8,
             pressed: true,
         });
     }
@@ -1533,8 +1545,12 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: u32,
         event: KeyEvent,
     ) {
+        let keysym = self
+            .held_keys
+            .release(event.raw_code)
+            .unwrap_or(event.keysym.raw());
         self.deliver_input(InputEvent::Key {
-            keysym: event.keysym.raw(),
+            keysym,
             utf8: None,
             pressed: false,
         });
