@@ -2,8 +2,11 @@ const NON_LOGIN_SHELLS: &[&str] = &["nologin", "false", "true", "sync", "shutdow
 
 pub const OTHER_USER: &str = "Other…";
 
-pub fn username_stage_row(_users: &[String], _selected: usize) -> Option<usize> {
-    None
+pub fn username_stage_row(users: &[String], selected: usize) -> Option<usize> {
+    users
+        .iter()
+        .position(|name| name == OTHER_USER)
+        .filter(|&row| row != selected)
 }
 
 pub fn enumerate() -> Vec<String> {
