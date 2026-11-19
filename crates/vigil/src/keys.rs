@@ -37,7 +37,7 @@ pub fn route(sink: &mut impl KeySink, event: InputEvent) {
 mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
@@ -121,13 +121,19 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("vigil-keys-{}-{name}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let listener = match UnixListener::bind(dir.join("greetd.sock")) {
+            let listener = UnixListener::bind(dir.join("greetd.sock")).and_then(|listener| {
+                let probe = UnixStream::connect(dir.join("greetd.sock"))?;
+                listener.accept()?;
+                drop(probe);
+                Ok(listener)
+            });
+            let listener = match listener {
                 Ok(listener) => listener,
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                     std::fs::remove_dir_all(&dir).unwrap();
                     return None;
                 }
-                Err(error) => panic!("bind the scripted greetd socket: {error}"),
+                Err(error) => panic!("open the scripted greetd socket: {error}"),
             };
             let requests = Arc::new(Mutex::new(Vec::new()));
             let seen = requests.clone();
