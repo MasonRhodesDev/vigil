@@ -46,11 +46,44 @@ fn rotated_rects(n: usize, paint: &str) -> String {
     .repeat(n))
 }
 
-fn focal_repeat(n: usize) -> String {
+const STOPS: &str = r##"<stop offset="0" stop-color="#000"/><stop offset=".5" stop-color="#f00" stop-opacity=".5"/><stop offset="1" stop-color="#00f"/>"##;
+
+// Rects over the whole box, each painted by one gradient of a kind and spread.
+fn gradient(kind: &str, spread: &str, stops: &str, n: usize) -> String {
+    let at = r#"cx="50" cy="50" r="3" gradientUnits="userSpaceOnUse""#;
+    let open = match kind {
+        "linear" => format!(r#"<linearGradient id="g" x2="0.01" spreadMethod="{spread}">"#),
+        "radial" => format!(r#"<radialGradient id="g" {at} spreadMethod="{spread}">"#),
+        _ => format!(
+            r#"<radialGradient id="g" {at} fx="52" fy="50" fr="1" spreadMethod="{spread}">"#
+        ),
+    };
+    let close = if kind == "linear" {
+        "</linearGradient>"
+    } else {
+        "</radialGradient>"
+    };
     svg(&format!(
-        r##"<radialGradient id="g" cx="50" cy="50" r="3" fx="52" fy="50" fr="1" gradientUnits="userSpaceOnUse" spreadMethod="repeat"><stop offset="0" stop-color="#000"/><stop offset=".5" stop-color="#f00" stop-opacity=".5"/><stop offset="1" stop-color="#00f"/></radialGradient>{}"##,
+        "{open}{stops}{close}{}",
         r#"<rect width="100" height="100" fill="url(#g)"/>"#.repeat(n)
     ))
+}
+
+fn many_stops(n: usize) -> String {
+    let stops: String = (0..50)
+        .map(|i| {
+            format!(
+                r##"<stop offset="{}" stop-color="#{:06x}"/>"##,
+                f64::from(i) / 50.0,
+                (i * 40503) % 0xff_ffff
+            )
+        })
+        .collect();
+    gradient("linear", "reflect", &stops, n)
+}
+
+fn focal_repeat(n: usize) -> String {
+    gradient("focal", "repeat", STOPS, n)
 }
 
 fn used_path(uses: usize, paint: &str) -> String {
@@ -170,6 +203,29 @@ pub const FAMILIES: &[(&str, usize, Family)] = &[
         }
         svg(&(body + r#"<rect width="100" height="100" mask="url(#m0)"/>"#))
     }),
+    ("alpha fills, the review's C1", 289, |n| {
+        rotated_rects(n, r#"fill-opacity=".5""#)
+    }),
+    ("linear pad", 3000, |n| gradient("linear", "pad", STOPS, n)),
+    ("linear reflect", 3000, |n| {
+        gradient("linear", "reflect", STOPS, n)
+    }),
+    ("linear repeat", 3000, |n| {
+        gradient("linear", "repeat", STOPS, n)
+    }),
+    ("radial pad", 3000, |n| gradient("radial", "pad", STOPS, n)),
+    ("radial reflect", 3000, |n| {
+        gradient("radial", "reflect", STOPS, n)
+    }),
+    ("radial repeat", 3000, |n| {
+        gradient("radial", "repeat", STOPS, n)
+    }),
+    ("focal pad", 3000, |n| gradient("focal", "pad", STOPS, n)),
+    ("focal reflect", 3000, |n| {
+        gradient("focal", "reflect", STOPS, n)
+    }),
+    ("focal repeat, the review's C2", 114, focal_repeat),
+    ("50 stops reflected", 3000, many_stops),
     ("gradient stops", 9000, |n| {
         let stops: String = (0..n)
             .map(|i| {
