@@ -98,10 +98,10 @@ fn draw_in_child(path: &Path) -> (Duration, u64) {
     )
 }
 
-// Timed in release only. An unoptimised tiny-skia is tens of times slower,
-// so a debug run would measure the build, not the budget.
+// Wall-clock bounds hold on CI's release runners, not on every package
+// builder, and an unoptimised tiny-skia is tens of times slower.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "timed; run with --release")]
+#[ignore = "timed; run in release with --include-ignored"]
 fn the_largest_accepted_inputs_draw_quickly_in_bounded_memory() {
     let dir = std::env::temp_dir().join(format!("vigil-scene-budget-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -117,7 +117,7 @@ fn the_largest_accepted_inputs_draw_quickly_in_bounded_memory() {
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "timed; run with --release")]
+#[ignore = "timed; run in release with --include-ignored"]
 fn the_reviews_glow_specs_draw_quickly() {
     let mark =
         std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mark.svg"))
