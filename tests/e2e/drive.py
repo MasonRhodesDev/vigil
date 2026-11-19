@@ -41,6 +41,10 @@ def click(x, y, width=None, height=None):
 
 cmd("qmp_capabilities")
 
+def conversations():
+    with open(f"{outdir}/vigil.log") as fh:
+        return fh.read().count("fake-greetd: <- create_session")
+
 def load_ppm(path):
     with open(path, "rb") as fh:
         data = fh.read()
@@ -74,6 +78,9 @@ cmd("screendump", filename=f"{outdir}/0b-second-output.ppm", device="gpu1")
 
 cmd("screendump", filename=f"{outdir}/1-username.ppm")
 typestr("demo")
+time.sleep(1.0)
+if conversations() != 0:
+    sys.exit("greetd was sent a create_session before the first Enter")
 sendkey("ret"); time.sleep(1.5)
 cmd("screendump", filename=f"{outdir}/2-password.ppm")
 
@@ -85,6 +92,8 @@ cmd("screendump", filename=f"{outdir}/2c-back.ppm")
 typestr("wrong")
 sendkey("ret"); time.sleep(2.0)
 cmd("screendump", filename=f"{outdir}/3-error.ppm")
+if conversations() == 0:
+    sys.exit("greetd was sent no create_session after a password was submitted")
 
 sendkey("esc"); time.sleep(1.0)
 cmd("screendump", filename=f"{outdir}/4-username-again.ppm")
@@ -94,9 +103,14 @@ sendkey("ret"); time.sleep(1.5)
 click(98, 754)
 cmd("screendump", filename=f"{outdir}/5-picker.ppm")
 
+before_typing = conversations()
 typestr("hunter2")
 time.sleep(0.4)
 cmd("screendump", filename=f"{outdir}/6-typed.ppm")
+if conversations() != before_typing:
+    sys.exit("greetd was sent a create_session while a password was being typed")
 sendkey("ret")
 time.sleep(4)
+if conversations() != before_typing + 1:
+    sys.exit("submitting the password did not open exactly one conversation")
 print("driven; check guest log for VIGIL-EXIT:0")
