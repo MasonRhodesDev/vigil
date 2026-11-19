@@ -161,12 +161,27 @@ stay on a screen someone walked away from.
 
 PAM's messages, such as a failed attempt or a request to touch a
 security key, stay on the line under the field while focus is on
-another control. The key hint shows only when there is no message.
+another control. The key hint shows only when there is no message. A
+PAM info message, such as a request to touch a security key, also shows
+in place of "Checking…" while the answer is checked.
 
 A pointer click on Restart or Shut Down asks to confirm too. The confirm
 ignores clicks for half a second after it opens, so a double click on
 Shut Down never shuts down. vigil-lock has the same field and show/hide
 keys and shows no power buttons.
+
+### Known limits
+
+- Enter with nothing typed never answers a hidden question. A PAM module
+  that takes an empty hidden answer cannot get one. An optional second
+  factor that you skip with an empty Enter cannot be skipped, and an
+  account with an empty password cannot sign in.
+- The field is not cleared when you stop typing. A half-typed password
+  stays in the field, masked, until a submit, an Esc, or a question with
+  new text. A retry typed while vigil-lock checks an attempt stays after
+  the failure, hidden.
+- With Ctrl held, only the `a` keysym passes, so a non-Latin layout gets
+  no Select All.
 
 ## Monitor layout
 
