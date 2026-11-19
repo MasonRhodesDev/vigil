@@ -1900,6 +1900,7 @@ impl App {
                 }
                 continue;
             }
+            let drawn = started.elapsed();
             self.metrics.record_buffer_acquire();
             match presenter.with_frame(&mut |canvas| {
                 let Canvas::Cpu(mut target) = canvas else {
@@ -1951,7 +1952,8 @@ impl App {
                         *shown_once = true;
                         self.metrics.record_render();
                         self.metrics.record_commit();
-                        if let Some(line) = budget.record(started.elapsed(), Instant::now()) {
+                        if let Some(line) = budget.record(drawn, started.elapsed(), Instant::now())
+                        {
                             eprintln!("vigil: {connector}: {line}");
                         }
                     }

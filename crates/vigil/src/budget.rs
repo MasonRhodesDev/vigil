@@ -25,7 +25,7 @@ impl FrameBudget {
         }
     }
 
-    pub fn record(&mut self, took: Duration, now: Instant) -> Option<String> {
+    pub fn record(&mut self, draw: Duration, took: Duration, now: Instant) -> Option<String> {
         if took <= self.budget {
             return None;
         }
@@ -38,9 +38,11 @@ impl FrameBudget {
             return None;
         }
         let line = format!(
-            "slow present: {:.1} ms against a {:.1} ms frame budget \
-             ({} over budget since the last report, worst {:.1} ms)",
+            "slow present: {:.1} ms (draw {:.1} ms, copy and flip {:.1} ms) against a {:.1} ms \
+             frame budget ({} over budget since the last report, worst {:.1} ms)",
             took.as_secs_f64() * 1000.0,
+            draw.as_secs_f64() * 1000.0,
+            took.saturating_sub(draw).as_secs_f64() * 1000.0,
             self.budget.as_secs_f64() * 1000.0,
             self.over,
             self.worst.as_secs_f64() * 1000.0,
@@ -61,19 +63,30 @@ mod tests {
     #[test]
     fn a_present_inside_the_refresh_interval_is_silent() {
         let mut budget = FrameBudget::new(60_000);
-        assert_eq!(budget.record(16 * MS, Instant::now()), None);
+        assert_eq!(budget.record(MS, 16 * MS, Instant::now()), None);
     }
 
     #[test]
     fn slow_presents_report_at_most_once_per_interval_and_count_the_rest() {
         let mut budget = FrameBudget::new(60_000);
         let start = Instant::now();
-        let first = budget.record(40 * MS, start).expect("first slow present");
-        assert!(first.starts_with("slow present: 40.0 ms against a 16.7 ms frame budget"));
-        assert_eq!(budget.record(90 * MS, start + Duration::from_secs(1)), None);
-        assert_eq!(budget.record(30 * MS, start + Duration::from_secs(2)), None);
+        let first = budget
+            .record(3 * MS, 40 * MS, start)
+            .expect("first slow present");
+        assert!(
+            first.starts_with(
+                "slow present: 40.0 ms (draw 3.0 ms, copy and flip 37.0 ms) against a 16.7 ms"
+            ),
+            "{first}"
+        );
+        let second = start + Duration::from_secs(1);
+        assert_eq!(budget.record(MS, 90 * MS, second), None);
+        assert_eq!(
+            budget.record(MS, 30 * MS, second + Duration::from_secs(1)),
+            None
+        );
         let later = budget
-            .record(20 * MS, start + REPORT_EVERY)
+            .record(MS, 20 * MS, start + REPORT_EVERY)
             .expect("report after the interval");
         assert!(
             later.ends_with("(3 over budget since the last report, worst 90.0 ms)"),
@@ -84,7 +97,7 @@ mod tests {
     #[test]
     fn an_unknown_refresh_rate_budgets_for_sixty_hertz() {
         let mut budget = FrameBudget::new(0);
-        assert_eq!(budget.record(16 * MS, Instant::now()), None);
-        assert!(budget.record(17 * MS, Instant::now()).is_some());
+        assert_eq!(budget.record(MS, 16 * MS, Instant::now()), None);
+        assert!(budget.record(MS, 17 * MS, Instant::now()).is_some());
     }
 }
