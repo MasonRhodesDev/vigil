@@ -92,11 +92,11 @@
 #define VIGIL_SCENE_STRIKING_DEADLINE_MS 4500
 
 /**
- * After this many counted timeouts for one logo and spec at one size class,
- * each within ten minutes of the one before, the library returns
+ * After this many counted timeouts for one logo and spec at one size class
+ * and layer, each within ten minutes of the one before, the library returns
  * `VIGIL_SCENE_ERR_TOO_SLOW` for them there. The size class is the log2 of
  * the mode's area. Timeouts of calls that overlap count once, and a drawing
- * of that logo and spec at that size class clears the count.
+ * of that logo and spec at that size class and layer clears the count.
  */
 #define VIGIL_SCENE_TIMEOUTS_BEFORE_TOO_SLOW 2
 
@@ -150,9 +150,10 @@ extern "C" {
  * library, and the call returns within `deadline_ms`, plus the kernel's
  * teardown of a killed helper and the copy of the layer into `out`, whatever
  * the logo holds. Past the deadline that has taken under 10 ms on an idle
- * host. With a load average of 50 to 77 on 12 cores it took up to 233 ms
- * for the helper and 1.35 s for a shell script in its place, in a debug
- * build. A request without a logo is drawn in the calling process.
+ * host. With a load average of 50 to 77 on 12 cores, in a debug build, a
+ * helper killed mid-run took up to about 1.35 s, measured with a shell
+ * script spinner in its place. A helper killed before it began drawing took
+ * up to 233 ms. A request without a logo is drawn in the calling process.
  * On any error `out` is left unwritten, and a caller should draw the
  * ground-only scene by asking again without the logo.
  *
