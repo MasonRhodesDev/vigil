@@ -952,7 +952,9 @@ fn contrast(a: Color, b: Color) -> f64 {
                 ((c + 0.055) / 1.055).powf(2.4)
             }
         };
-        0.2126 * linear(color.red()) + 0.7152 * linear(color.green()) + 0.0722 * linear(color.blue())
+        0.2126 * linear(color.red())
+            + 0.7152 * linear(color.green())
+            + 0.0722 * linear(color.blue())
     };
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)

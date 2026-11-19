@@ -419,8 +419,10 @@ mod tests {
     }
 
     fn click_shut_down(rig: &mut Rig) {
-        rig.window
-            .dispatch(InputEvent::PointerAbsolute { x: 1240.0, y: 754.0 });
+        rig.window.dispatch(InputEvent::PointerAbsolute {
+            x: 1240.0,
+            y: 754.0,
+        });
         for pressed in [true, false] {
             rig.window.dispatch(InputEvent::PointerButton {
                 button: 0x110,

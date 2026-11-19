@@ -230,12 +230,7 @@ impl KeyboardState {
         }
     }
 
-    fn translate(
-        &mut self,
-        evdev_keycode: u32,
-        pressed: bool,
-        now: Instant,
-    ) -> Option<InputEvent> {
+    fn translate(&mut self, evdev_keycode: u32, pressed: bool, now: Instant) -> Option<InputEvent> {
         let keycode = xkb::Keycode::new(evdev_keycode + 8);
         self.state.update_key(
             keycode,
@@ -276,8 +271,8 @@ impl KeyboardState {
         }
 
         if pressed {
-            let one_shot = vigil_core::ONE_SHOT_KEYSYMS
-                .contains(&self.state.key_get_one_sym(keycode).raw());
+            let one_shot =
+                vigil_core::ONE_SHOT_KEYSYMS.contains(&self.state.key_get_one_sym(keycode).raw());
             self.repeat = (!one_shot && self.keymap.key_repeats(keycode)).then_some(Repeat {
                 keycode,
                 deadline: now + REPEAT_DELAY,
@@ -433,7 +428,10 @@ mod tests {
         let _ = keyboard.key(KEY_A, true, now);
         let late = now + REPEAT_DELAY + REPEAT_INTERVAL * 30;
         assert_eq!(keyboard.tick_repeat(late).len(), 1);
-        assert_eq!(keyboard.next_repeat_deadline(), Some(late + REPEAT_INTERVAL));
+        assert_eq!(
+            keyboard.next_repeat_deadline(),
+            Some(late + REPEAT_INTERVAL)
+        );
     }
 
     #[test]

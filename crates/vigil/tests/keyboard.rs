@@ -678,7 +678,11 @@ fn a_shown_password_hides_again_after(event: impl FnOnce(&mut Greeter)) {
     g.type_text("aaaa");
     let masked = settled_row(&mut g, &mut buf);
     g.chord(ALT_L, F8, None);
-    assert_ne!(masked, field_row(&mut g.window, &mut buf), "Alt+F8 shows it");
+    assert_ne!(
+        masked,
+        field_row(&mut g.window, &mut buf),
+        "Alt+F8 shows it"
+    );
     event(&mut g);
     assert_eq!(masked, settled_row(&mut g, &mut buf));
 }
@@ -718,7 +722,11 @@ fn a_shown_password_hides_again_after_idle_but_not_while_typing() {
         g.type_text("a");
         g.tap(0xff08);
     }
-    assert_ne!(masked, field_row(&mut g.window, &mut buf), "typing keeps it shown");
+    assert_ne!(
+        masked,
+        field_row(&mut g.window, &mut buf),
+        "typing keeps it shown"
+    );
     std::thread::sleep(idle * 2);
     assert_eq!(masked, field_row(&mut g.window, &mut buf), "idle hides it");
 }
@@ -756,13 +764,10 @@ fn a_double_click_on_power_never_acts(width: u32, height: u32) {
     g.tap(RETURN);
     std::thread::sleep(std::time::Duration::from_millis(700));
     vigil_ui::advance_timers();
-    let sent = (width / 2..width - 28)
-        .rev()
-        .step_by(4)
-        .find_map(|x| {
-            click(&mut g, f64::from(x), y);
-            g.take().pop()
-        });
+    let sent = (width / 2..width - 28).rev().step_by(4).find_map(|x| {
+        click(&mut g, f64::from(x), y);
+        g.take().pop()
+    });
     assert_eq!(
         sent,
         Some(Sent::Power(PowerAction::Poweroff)),
@@ -820,7 +825,10 @@ fn a_kit_that_flattens_fg_and_page_bg_still_gets_a_9_to_1_ring() {
         colors: Default::default(),
     });
     let ratio = ring_contrast(&mut g);
-    assert!(ratio >= 9.0, "under the kit the ring's tones are {ratio:.2}:1");
+    assert!(
+        ratio >= 9.0,
+        "under the kit the ring's tones are {ratio:.2}:1"
+    );
 }
 
 fn a_pam_message_stays_shown_while_navigating(show: impl FnOnce(&mut OutputWindow)) {
