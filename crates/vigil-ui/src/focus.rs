@@ -187,6 +187,11 @@ impl Focus {
             (_, Key::Tab) => (to(cycle(card, stop, 1)), Effect::Consume),
             (_, Key::BackTab) => (to(cycle(card, stop, -1)), Effect::Consume),
             (Stop::Field, _) => (Focus { stop, ..self }, Effect::Forward),
+            (Stop::Cancel(_) | Stop::Confirm(_), Key::Escape)
+                if !matches!(self.stop, Stop::Cancel(_) | Stop::Confirm(_)) =>
+            {
+                (Focus::default(), Effect::Disarm)
+            }
             (Stop::Cancel(action) | Stop::Confirm(action), Key::Escape) => {
                 (to(Stop::Power(action)), Effect::Disarm)
             }

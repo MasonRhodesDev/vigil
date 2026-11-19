@@ -27,11 +27,9 @@ pub fn route(sink: &mut impl KeySink, event: InputEvent) {
         sink.settle();
         return;
     }
-    if keysym == ESCAPE && sink.field_focused() {
-        if pressed {
-            sink.cancel();
-            sink.settle();
-        }
+    if keysym == ESCAPE && pressed && sink.field_focused() {
+        sink.cancel();
+        sink.settle();
         return;
     }
     sink.forward(event);
@@ -98,13 +96,17 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_and_never_reaches_the_window() {
+    fn escape_cancels_and_only_its_release_reaches_the_window() {
         let mut sink = Recorder::default();
         for event in tap(ESCAPE, None).into_iter().chain(text("a")) {
             route(&mut sink, event);
         }
         assert_eq!(sink.cancels, 1);
-        assert_eq!(sink.forwarded, [('a' as u32, true), ('a' as u32, false)]);
+        assert_eq!(
+            sink.forwarded,
+            [(ESCAPE, false), ('a' as u32, true), ('a' as u32, false)],
+            "the window sees the release, so it never takes the next Esc for a repeat"
+        );
     }
 
     #[test]
@@ -450,9 +452,10 @@ mod tests {
             "Esc closed the confirm, so the same click opened it again instead of shutting down"
         );
 
-        let mut drive = tap(ESCAPE, None).to_vec();
-        drive.extend(tap(RETURN, None));
-        for event in drive {
+        for event in tap(ESCAPE, None) {
+            route(&mut rig, event);
+        }
+        for event in tap(RETURN, None) {
             route(&mut rig, event);
         }
         rig.tick();
