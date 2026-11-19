@@ -280,13 +280,24 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
     drop(writer);
 }
 
+// A script this process opened for writing cannot be run while any child
+// forked by another test thread still holds that descriptor, and a rename
+// keeps the inode, so a short-lived shell writes it instead.
 fn fake_script(name: &str, script: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("vigil-scene-fake-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let written = Command::new("sh")
+        .args([
+            "-c",
+            r#"printf '#!/bin/sh\n%s\n' "$2" > "$1" && chmod 755 "$1""#,
+            "sh",
+        ])
+        .arg(&path)
+        .arg(script)
+        .status()
+        .unwrap();
+    assert!(written.success(), "writing {}", path.display());
     path
 }
 
@@ -379,6 +390,7 @@ fn child_draws_with_sigchld_ignored() {
     if std::env::var_os(CHILD).is_none() {
         return;
     }
+    let spin = fake_helper("spin-ignored", "while :; do :; done");
     // SAFETY: SIG_IGN is a valid disposition, and this process runs this one
     // test alone, so no other code relies on SIGCHLD.
     #[allow(unsafe_code)]
@@ -406,7 +418,6 @@ fn child_draws_with_sigchld_ignored() {
         Helper::new(BIN, PATIENT).draw(&request(hostile, Layer::Logo), &mut out),
         Err(Error::Refused(_))
     ));
-    let spin = fake_helper("spin-ignored", "while :; do :; done");
     let start = Instant::now();
     assert!(spin.draw(&request(&svg, Layer::Logo), &mut out).is_err());
     assert!(start.elapsed() < Duration::from_millis(300) + SLACK);
