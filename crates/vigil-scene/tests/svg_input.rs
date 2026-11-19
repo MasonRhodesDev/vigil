@@ -1,3 +1,5 @@
+mod common;
+
 use std::time::{Duration, Instant};
 
 use image::ImageEncoder;
@@ -326,33 +328,49 @@ fn mutate(rng: &mut XorShift, mut data: Vec<u8>) -> Vec<u8> {
     data
 }
 
+fn peak_rss_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap()
+}
+
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 #[test]
 fn mutated_svgs_fail_cleanly_and_quickly() {
-    let cases = std::env::var("VIGIL_SCENE_FUZZ_CASES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2000usize);
-    let seed = std::env::var("VIGIL_SCENE_FUZZ_SEED")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0x9e37_79b9_7f4a_7c15u64);
+    let cases = env_or("VIGIL_SCENE_FUZZ_CASES", 2000usize);
+    let seed = env_or("VIGIL_SCENE_FUZZ_SEED", 0x9e37_79b9_7f4a_7c15u64);
+    let edge = env_or("VIGIL_SCENE_FUZZ_EDGE", 97u32);
+    let seeds: Vec<Vec<u8>> = SEEDS
+        .iter()
+        .map(|body| svg(body))
+        .chain(common::FAMILIES.iter().map(|(_, n, family)| family(n / 10)))
+        .map(String::into_bytes)
+        .collect();
     let mut rng = XorShift(seed | 1);
     let started = Instant::now();
     let (mut loaded, mut slowest) = (0, Duration::ZERO);
     for case in 0..cases {
-        let seed = svg(SEEDS[case % SEEDS.len()]).into_bytes();
-        let data = mutate(&mut rng, seed);
+        let data = mutate(&mut rng, seeds[case % seeds.len()].clone());
         let start = Instant::now();
         if let Ok(logo) = Logo::svg(&data) {
             loaded += 1;
-            let _ = logo.mask(97);
+            let _ = logo.mask(edge);
         }
         let took = start.elapsed();
         slowest = slowest.max(took);
         assert!(
             took < Duration::from_secs(3),
             "case {case} took {took:?}: {}",
-            String::from_utf8_lossy(&data)
+            String::from_utf8_lossy(&data[..data.len().min(400)])
         );
     }
     assert!(
@@ -360,10 +378,12 @@ fn mutated_svgs_fail_cleanly_and_quickly() {
         "only {loaded} of {cases} mutants loaded"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(120),
+        started.elapsed() < Duration::from_secs(300),
         "{cases} cases took {:?}, slowest {slowest:?}",
         started.elapsed()
     );
+    let kib = peak_rss_kib();
+    assert!(kib < 1 << 20, "peak RSS {kib} KiB");
 }
 
 #[test]
