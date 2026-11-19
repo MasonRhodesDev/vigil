@@ -20,6 +20,7 @@ const APPEARANCE_NS: &str = "org.freedesktop.appearance";
 
 pub struct LoginSession {
     conn: Connection,
+    id: String,
     path: OwnedObjectPath,
 }
 
@@ -49,8 +50,12 @@ impl LoginSession {
         let auto = Proxy::new(&conn, DEST, SESSION_AUTO, SESSION_IFACE).await?;
         let id: String = auto.get_property("Id").await?;
         let manager = Proxy::new(&conn, DEST, MANAGER_PATH, MANAGER_IFACE).await?;
-        let path: OwnedObjectPath = manager.call("GetSession", &(id,)).await?;
-        Ok(Self { conn, path })
+        let path: OwnedObjectPath = manager.call("GetSession", &(&id,)).await?;
+        Ok(Self { conn, id, path })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     pub fn set_locked_hint(&self, locked: bool) {

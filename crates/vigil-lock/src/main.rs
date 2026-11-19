@@ -485,7 +485,10 @@ fn show_failure(window: &mut OutputWindow, message: &str) {
     window.set_busy(false);
 }
 
-fn login_flow_event(event: LoginEvent) -> Option<FlowEvent> {
+#[cfg(test)]
+static TEST_TRUST: std::sync::OnceLock<(PathBuf, u32)> = std::sync::OnceLock::new();
+
+fn login_flow_event(event: LoginEvent, _session: Option<&str>) -> Option<FlowEvent> {
     match event {
         LoginEvent::Unlock => Some(FlowEvent::LogindUnlock),
         LoginEvent::Lock => Some(FlowEvent::CommitRequested),
@@ -712,7 +715,8 @@ impl Locker {
 
     fn pump_login(&mut self) {
         while let Ok(event) = self.login_rx.try_recv() {
-            if let Some(event) = login_flow_event(event) {
+            let session = self.login.as_ref().map(LoginSession::id);
+            if let Some(event) = login_flow_event(event, session) {
                 self.pending.push(event);
             }
         }

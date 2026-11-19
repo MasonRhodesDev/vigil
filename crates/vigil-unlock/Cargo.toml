@@ -1,0 +1,18 @@
+[package]
+name = "vigil-unlock"
+description = "Root's way to unlock a vigil-lock session: a token for the session, then logind's UnlockSession"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vigil-log.workspace = true
+vigil-secret.workspace = true
+vigil-unlock-token = { path = "../vigil-unlock-token" }
+zbus.workspace = true
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+
+[lints]
+workspace = true

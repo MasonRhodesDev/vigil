@@ -19,6 +19,7 @@ monitor-profiles.workspace = true
 appearance-profiles.workspace = true
 vigil-config.workspace = true
 vigil-login = { path = "../vigil-login" }
+vigil-unlock-token = { path = "../vigil-unlock-token" }
 vigil-flow.workspace = true
 vigil-wayland = { path = "../vigil-wayland" }
 vigil-warning = { path = "../vigil-warning" }
