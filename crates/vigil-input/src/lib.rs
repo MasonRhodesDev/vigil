@@ -423,6 +423,42 @@ mod tests {
     }
 
     #[test]
+    fn a_release_reports_the_keysym_its_press_reported() {
+        const KEY_LEFTCTRL: u32 = 29;
+        const KEY_LEFTALT: u32 = 56;
+        let cases: [(&str, &[u32]); 3] = [
+            ("", &[KEY_LEFTALT, KEY_LEFTSHIFT]),
+            ("grp:lctrl_lshift_toggle", &[KEY_LEFTCTRL, KEY_LEFTSHIFT]),
+            ("altwin:meta_alt", &[KEY_LEFTALT, KEY_LEFTSHIFT]),
+        ];
+        for (options, keys) in cases {
+            for release_first in keys {
+                let mut keyboard = KeyboardState::new(&KeymapSettings {
+                    layout: "us,ru".into(),
+                    options: options.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+                let now = Instant::now();
+                let mut pressed = Vec::new();
+                for key in keys {
+                    let (keysym, _, _) = key_parts(keyboard.key(*key, true, now).expect("press"));
+                    pressed.push((*key, keysym));
+                }
+                pressed.sort_by_key(|(key, _)| *key != *release_first);
+                for (key, keysym) in pressed {
+                    let (released, _, _) =
+                        key_parts(keyboard.key(key, false, now).expect("release"));
+                    assert_eq!(
+                        released, keysym,
+                        "{options:?}: key {key} pressed as {keysym:#x}, released as {released:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn non_repeating_key_never_arms() {
         let mut keyboard = KeyboardState::new(&KeymapSettings::default()).unwrap();
         let _ = keyboard.key(KEY_LEFTSHIFT, true, Instant::now());
