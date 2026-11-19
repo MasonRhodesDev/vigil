@@ -127,8 +127,8 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
   logo rect (#130).
 - New vigil-scene crate, CLI and C ABI library draw the boot scene. Both
   packages install the sandboxed helper at /usr/lib/vigil/vigil-scene; a
-  crashing logo is a refusal and a slow one is skipped for an hour (#136,
-  #146).
+  crashing logo is a refusal and a slow one is skipped for an hour
+  (#136, #146).
 - crates/vigil-log is MIT, so vigil-config can log through it; it links
   only libc.
 - rustix 1.1.6 for RUSTSEC-2026-0486 (#137).
