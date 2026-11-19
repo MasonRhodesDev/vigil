@@ -46,7 +46,7 @@ pub fn exit_code(binary: &str, args: &[&str], stderr: Stderr) -> Option<i32> {
     None
 }
 
-fn fill(writer: &impl AsRawFd) {
+pub fn fill(writer: &impl AsRawFd) {
     let mut own: File = OpenOptions::new()
         .write(true)
         .custom_flags(libc::O_NONBLOCK)

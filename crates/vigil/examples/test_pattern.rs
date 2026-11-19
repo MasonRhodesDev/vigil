@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;

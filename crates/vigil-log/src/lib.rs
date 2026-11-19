@@ -4,6 +4,10 @@ use std::fmt;
 use std::io::Write as _;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub mod testing;
+
 const MAX_LINE: usize = 2048;
 const TRUNCATED: &[u8] = b" trunc=1";
 const ROOM: usize = MAX_LINE - 1 - TRUNCATED.len();
@@ -253,7 +257,6 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -265,17 +268,6 @@ mod tests {
             let _ = done.send(());
         });
         finished.recv_timeout(Duration::from_secs(5)).is_ok()
-    }
-
-    fn fill_pipe(fd: RawFd) {
-        let mut own = OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(format!("/proc/self/fd/{fd}"))
-            .unwrap();
-        for chunk in [&[b'x'; 4096][..], b"x"] {
-            while own.write(chunk).is_ok() {}
-        }
     }
 
     fn flags(fd: RawFd) -> i32 {
@@ -303,7 +295,7 @@ mod tests {
     #[test]
     fn a_pipe_nobody_drains_drops_the_line_instead_of_blocking() {
         let (_reader, writer) = std::io::pipe().unwrap();
-        fill_pipe(writer.as_raw_fd());
+        testing::fill(&writer);
         assert_eq!(flags(writer.as_raw_fd()) & libc::O_NONBLOCK, 0);
         assert!(returns_promptly(writer.as_raw_fd(), b"lost\n"));
     }

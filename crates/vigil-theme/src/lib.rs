@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};

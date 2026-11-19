@@ -11,3 +11,6 @@ vigil-log.workspace = true
 serde = { workspace = true }
 toml = { workspace = true }
 xdg-paths = { workspace = true }
+
+[lints]
+workspace = true

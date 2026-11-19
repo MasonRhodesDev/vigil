@@ -11,3 +11,6 @@ repository.workspace = true
 vigil-log.workspace = true
 vigil-core.workspace = true
 zbus.workspace = true
+
+[lints]
+workspace = true

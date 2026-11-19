@@ -1,5 +1,8 @@
+#![deny(unsafe_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -10,7 +13,7 @@ use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHan
 use vigil_config::{Config, LockTransition};
 use vigil_core::{
     AppearanceEvent, AuthError, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget,
-    LoginEvent, OutputId, OutputInfo, UiMessage,
+    LoginEvent, OutputId, OutputInfo, Secret, UiMessage,
 };
 use vigil_flow::{FlowCmd, FlowEvent};
 use vigil_login::{AppearanceWatcher, LoginSession};
@@ -26,7 +29,7 @@ struct Cli {
     background: Option<PathBuf>,
     bg_mode: Option<BackgroundFit>,
     grace: Option<u64>,
-    ready_fd: Option<i32>,
+    ready_fd: Option<OwnedFd>,
     wait: bool,
     warning_ms: Option<u64>,
     immediate: bool,
@@ -84,7 +87,10 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
             }
             "--ready-fd" => {
                 let v = value("--ready-fd")?;
-                cli.ready_fd = Some(v.parse().map_err(|_| format!("bad --ready-fd {v}"))?);
+                if cli.ready_fd.is_some() {
+                    return Err("--ready-fd given twice".into());
+                }
+                cli.ready_fd = Some(adopt_ready_fd(&v)?);
             }
             "--wait" | "--daemonize" => cli.wait = true,
             "--warn" => {
@@ -283,13 +289,13 @@ impl BackgroundWorker {
 }
 
 trait AuthAttempt {
-    fn respond(&self, text: String);
+    fn respond(&self, text: Secret);
     fn cancel(&mut self);
     fn detach(&mut self);
 }
 
 impl AuthAttempt for PamAttempt {
-    fn respond(&self, text: String) {
+    fn respond(&self, text: Secret) {
         PamAttempt::respond(self, text);
     }
     fn cancel(&mut self) {
@@ -330,7 +336,7 @@ impl<A: AuthAttempt> AuthTrack<A> {
         self.live = None;
     }
 
-    fn respond(&self, text: String) {
+    fn respond(&self, text: Secret) {
         if let Some(live) = &self.live {
             live.attempt.respond(text);
         }
@@ -425,7 +431,7 @@ struct Locker {
     scheme: ColorScheme,
     unlocked: bool,
     last_clock: (Instant, String),
-    ready_fd: Option<i32>,
+    ready_fd: Option<OwnedFd>,
     pending: Vec<FlowEvent>,
     wallpaper_ready: bool,
     snapshot: UiSnapshot,
@@ -578,6 +584,7 @@ impl Locker {
         });
     }
 
+    #[allow(unsafe_code)]
     fn signal_locked(&mut self) {
         vigil_log::say!("vigil-lock: session locked");
         let joiners = {
@@ -588,12 +595,7 @@ impl Locker {
         for mut joiner in joiners {
             let _ = joiner.write_all(b"locked\n");
         }
-        if let Some(fd) = self.ready_fd.take() {
-            use std::io::Write;
-            use std::os::fd::FromRawFd;
-            let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
-            let _ = ready.write_all(b"1");
-        }
+        signal_ready_fd(self.ready_fd.take());
     }
 
     fn apply_panel(&mut self) {
@@ -750,11 +752,14 @@ impl Locker {
         self.each_window(|w| apply_kit_tokens_from_disk(w, mode));
     }
 
+    #[allow(unsafe_code)]
     fn detach_auth(&mut self) {
         self.auth.detach();
         self.unlocked = true;
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(5));
+            // SAFETY: _exit takes no pointers and ends the process without
+            // running destructors, which an unlocked daemon no longer needs.
             unsafe { libc::_exit(0) };
         });
     }
@@ -1109,24 +1114,37 @@ impl LockSession for Locker {
     }
 }
 
+#[allow(unsafe_code)]
 fn clock_text(format: &str) -> String {
     let Ok(fmt) = std::ffi::CString::new(format) else {
         return String::new();
     };
-    unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&now, &mut tm).is_null() {
-            return String::new();
-        }
-        let mut buf = vec![0_u8; 256];
-        let written = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), fmt.as_ptr(), &tm);
-        buf.truncate(written);
-        String::from_utf8(buf).unwrap_or_default()
+    // SAFETY: time accepts a null output pointer.
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    // SAFETY: tm is integers and a nullable tm_zone pointer, all valid when zero.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are live locals of the right types, and localtime_r
+    // is the reentrant form.
+    if unsafe { libc::localtime_r(&raw const now, &raw mut tm) }.is_null() {
+        return String::new();
     }
+    let mut buf = vec![0_u8; 256];
+    // SAFETY: strftime writes at most buf.len() bytes into buf, fmt is NUL
+    // terminated, and localtime_r filled tm.
+    let written = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            fmt.as_ptr(),
+            &raw const tm,
+        )
+    };
+    buf.truncate(written);
+    String::from_utf8(buf).unwrap_or_default()
 }
 
-fn detach_and_wait_for_lock() -> ! {
+#[allow(unsafe_code)]
+fn detach_and_wait_for_lock(ready_fd: Option<OwnedFd>) -> ! {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -1142,20 +1160,25 @@ fn detach_and_wait_for_lock() -> ! {
             .args(["--ready-fd", "1"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(OwnedFd::from(child_end)));
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
+        let detach = || {
+            // SAFETY: setsid takes no arguments and moves only this child.
+            if unsafe { libc::setsid() } == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        // SAFETY: the hook runs between fork and exec, allocates nothing, and
+        // calls only setsid and errno reads, which are async-signal-safe.
+        unsafe { command.pre_exec(detach) };
         let mut child = command.spawn().map_err(|e| format!("spawn locker: {e}"))?;
         drop(command);
         let mut byte = [0u8; 1];
         match parent_end.read_exact(&mut byte) {
-            Ok(()) => Ok(0),
+            Ok(()) => {
+                signal_ready_fd(ready_fd);
+                Ok(0)
+            }
             Err(_) => {
                 let status = child.wait().map_err(|e| format!("wait locker: {e}"))?;
                 Ok(status.code().unwrap_or(1).max(1))
@@ -1172,9 +1195,18 @@ fn detach_and_wait_for_lock() -> ! {
 }
 
 fn daemon_child_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
-    args.into_iter()
-        .filter(|arg| arg != "--wait" && arg != "--daemonize")
-        .collect()
+    let mut kept = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--wait" | "--daemonize" => {}
+            "--ready-fd" => {
+                args.next();
+            }
+            _ => kept.push(arg),
+        }
+    }
+    kept
 }
 
 struct LockIpcSocket {
@@ -1289,11 +1321,9 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
     Ok((LockIpcSocket { path }, state))
 }
 
-fn signal_ready_fd(ready_fd: Option<i32>) {
+fn signal_ready_fd(ready_fd: Option<OwnedFd>) {
     if let Some(fd) = ready_fd {
-        use std::os::fd::FromRawFd;
-        let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
-        let _ = ready.write_all(b"1");
+        let _ = std::fs::File::from(fd).write_all(b"1");
     }
 }
 
@@ -1305,15 +1335,55 @@ impl span_lines::Sink for StderrLines {
     }
 }
 
+#[allow(unsafe_code)]
+fn adopt_ready_fd(arg: &str) -> Result<OwnedFd, String> {
+    use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+    use std::os::unix::fs::FileTypeExt;
+    let fd: RawFd = arg.parse().map_err(|_| format!("bad --ready-fd {arg}"))?;
+    let kind = std::fs::metadata(format!("/proc/self/fd/{fd}"))
+        .map_err(|e| format!("--ready-fd {fd} is not open: {e}"))?
+        .file_type();
+    if !(kind.is_fifo() || kind.is_socket()) {
+        return Err(format!("--ready-fd {fd} is not a pipe or socket"));
+    }
+    // SAFETY: main parses arguments before this process opens any descriptor, and /proc shows
+    // `fd` open as a pipe or socket, so it is the caller's descriptor and nothing here owns it.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let ready = owned
+        .try_clone()
+        .map_err(|e| format!("--ready-fd {fd}: {e}"))?;
+    if fd > 2 {
+        return Ok(ready);
+    }
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .map_err(|e| format!("/dev/null: {e}"))?;
+    match fd {
+        0 => rustix::stdio::dup2_stdin(&null),
+        1 => rustix::stdio::dup2_stdout(&null),
+        _ => rustix::stdio::dup2_stderr(&null),
+    }
+    .map_err(|e| format!("--ready-fd {fd}: {e}"))?;
+    let _stdio_now_null = owned.into_raw_fd();
+    Ok(ready)
+}
+
 fn main() {
+    vigil_secret::exit_on_panic();
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     let _ = span_lines::set_sink(StderrLines);
+    if let Err(e) = vigil_secret::deny_memory_dumps() {
+        vigil_log::say!("vigil-lock: could not keep memory out of core dumps: {e}");
+    }
+    let parsed = parse_cli();
     tracing_subscriber::registry()
         .with(span_lines::tracing_layer::install(&["vigil"]))
         .init();
 
-    let mut cli = match parse_cli() {
+    let mut cli = match parsed {
         Ok(cli) => cli,
         Err(e) => {
             vigil_log::say!("vigil-lock: {e}");
@@ -1321,7 +1391,7 @@ fn main() {
         }
     };
     if cli.wait {
-        detach_and_wait_for_lock();
+        detach_and_wait_for_lock(cli.ready_fd.take());
     }
     let mut config = Config::load_layered(cli.config.as_deref());
     apply_cli_to_config(&cli, &mut config);
@@ -1441,13 +1511,13 @@ mod tests {
 
     #[derive(Default)]
     struct FakeAttempt {
-        answered: Rc<RefCell<Vec<String>>>,
+        answered: Rc<RefCell<Vec<Secret>>>,
         cancelled: Rc<std::cell::Cell<bool>>,
         detached: Rc<std::cell::Cell<bool>>,
     }
 
     impl AuthAttempt for FakeAttempt {
-        fn respond(&self, text: String) {
+        fn respond(&self, text: Secret) {
             self.answered.borrow_mut().push(text);
         }
         fn cancel(&mut self) {
@@ -1524,7 +1594,7 @@ mod tests {
 
     #[test]
     fn responses_and_cancellation_reach_the_live_attempt_only() {
-        let answered: Rc<RefCell<Vec<String>>> = Rc::default();
+        let answered: Rc<RefCell<Vec<Secret>>> = Rc::default();
         let cancelled: Rc<std::cell::Cell<bool>> = Rc::default();
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
         let (answered_probe, cancelled_probe) = (answered.clone(), cancelled.clone());
@@ -1535,7 +1605,7 @@ mod tests {
         });
         track.respond("hunter2".into());
         track.cancel();
-        assert_eq!(*answered.borrow(), vec!["hunter2".to_owned()]);
+        assert_eq!(*answered.borrow(), vec![Secret::from("hunter2")]);
         assert!(cancelled.get());
 
         track.retire();
@@ -1626,6 +1696,101 @@ mod tests {
             ),
             DoneOutcome::Ignore
         );
+    }
+
+    fn ready_fd_args(fd: impl ToString) -> [String; 2] {
+        ["--ready-fd".to_owned(), fd.to_string()]
+    }
+
+    #[test]
+    fn ready_fd_takes_a_socket_and_signals_once() {
+        use std::os::fd::IntoRawFd;
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        let cli = parse_cli_from(ready_fd_args(child.into_raw_fd())).unwrap();
+        signal_ready_fd(cli.ready_fd);
+        let mut got = Vec::new();
+        parent.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"1");
+    }
+
+    #[test]
+    fn ready_fd_given_twice_is_refused() {
+        use std::os::fd::IntoRawFd;
+        let (_parent, child) = UnixStream::pair().unwrap();
+        let fd = child.into_raw_fd();
+        let [flag, value] = ready_fd_args(fd);
+        let refused = parse_cli_from([flag.clone(), value.clone(), flag, value])
+            .err()
+            .unwrap();
+        assert!(refused.contains("twice"), "{refused}");
+    }
+
+    #[test]
+    fn an_adopted_ready_fd_is_not_inherited() {
+        use std::os::fd::IntoRawFd;
+        let (_parent, child) = UnixStream::pair().unwrap();
+        let ready = parse_cli_from(ready_fd_args(child.into_raw_fd()))
+            .unwrap()
+            .ready_fd
+            .unwrap();
+        let flags = rustix::io::fcntl_getfd(&ready).unwrap();
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+    }
+
+    #[test]
+    fn the_callers_ready_fd_is_not_forwarded_to_the_detached_child() {
+        assert_eq!(
+            daemon_child_args([
+                "--wait".to_owned(),
+                "--ready-fd".to_owned(),
+                "5".to_owned(),
+                "--immediate".to_owned(),
+            ]),
+            ["--immediate"]
+        );
+    }
+
+    #[test]
+    fn ready_fd_refuses_a_closed_descriptor_and_a_regular_file() {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("Cargo.toml").unwrap();
+        let refused = parse_cli_from(ready_fd_args(file.as_raw_fd()))
+            .err()
+            .unwrap();
+        assert!(refused.contains("not a pipe or socket"), "{refused}");
+        let refused = parse_cli_from(ready_fd_args(1_000_000)).err().unwrap();
+        assert!(refused.contains("not open"), "{refused}");
+        assert!(parse_cli_from(ready_fd_args("one")).is_err());
+    }
+
+    #[test]
+    fn a_ready_fd_on_stdout_leaves_dev_null_behind() {
+        if std::env::var_os("VIGIL_READY_CHILD").is_some() {
+            vigil_secret::deny_memory_dumps().unwrap();
+            let cli = parse_cli_from(ready_fd_args(1)).unwrap();
+            signal_ready_fd(cli.ready_fd);
+            let opened = std::fs::File::open("Cargo.toml").unwrap();
+            assert_ne!(std::os::fd::AsRawFd::as_raw_fd(&opened), 1);
+            rustix::io::write(rustix::stdio::stdout(), b"stray").unwrap();
+            return;
+        }
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_ready_fd_on_stdout_leaves_dev_null_behind",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("VIGIL_READY_CHILD", "1")
+            .stdout(std::process::Stdio::from(OwnedFd::from(child)))
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let mut got = String::new();
+        parent.read_to_string(&mut got).unwrap();
+        assert!(status.success(), "{status}");
+        assert!(got.ends_with('1') && !got.contains("stray"), "{got:?}");
     }
 
     #[test]

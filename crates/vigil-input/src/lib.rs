@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -6,7 +8,7 @@ use smithay::reexports::input;
 use smithay::reexports::input::event::keyboard::{KeyState, KeyboardEventTrait};
 use smithay::reexports::input::event::pointer::{ButtonState, PointerEvent};
 use smithay::reexports::input::{LibinputInterface, event};
-use vigil_core::{DeviceOpener, InputEvent, KeymapSettings};
+use vigil_core::{DeviceOpener, InputEvent, KeyText, KeymapSettings};
 use xkbcommon::xkb;
 use xkbcommon::xkb::compose;
 
@@ -119,8 +121,11 @@ impl InputSystem {
     }
 }
 
+#[allow(unsafe_code)]
 impl std::os::fd::AsFd for InputSystem {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: the fd belongs to the libinput context `self` owns, so it
+        // stays open for the borrow of `self`.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }
@@ -242,7 +247,7 @@ impl KeyboardState {
                     self.repeat = None;
                     return Some(InputEvent::Key {
                         keysym: keysym.unwrap_or_else(|| self.state.key_get_one_sym(keycode).raw()),
-                        utf8: utf8.filter(|text| !text.is_empty()),
+                        utf8: utf8.filter(|text| !text.is_empty()).map(KeyText::from),
                         pressed: true,
                     });
                 }
@@ -272,7 +277,7 @@ impl KeyboardState {
         let utf8 = self.state.key_get_utf8(keycode);
         InputEvent::Key {
             keysym: self.state.key_get_one_sym(keycode).raw(),
-            utf8: (!utf8.is_empty()).then_some(utf8),
+            utf8: (!utf8.is_empty()).then(|| KeyText::from(utf8)),
             pressed,
         }
     }
@@ -320,7 +325,7 @@ mod tests {
         else {
             panic!("expected key event")
         };
-        (keysym, utf8, pressed)
+        (keysym, utf8.map(|text| text.as_str().to_owned()), pressed)
     }
 
     fn intl_keyboard() -> KeyboardState {

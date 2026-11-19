@@ -1,7 +1,6 @@
-#[path = "../../../tests/support/unwritable_stderr.rs"]
-mod support;
+#![forbid(unsafe_code)]
 
-use support::{Stderr, exit_code};
+use vigil_log::testing::{Stderr, exit_code};
 
 const LOCKER: &str = env!("CARGO_BIN_EXE_vigil-lock");
 

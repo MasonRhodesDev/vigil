@@ -9,11 +9,40 @@ license = "GPL-3.0-only"
 publish = false
 repository = "https://github.com/MasonRhodesDev/vigil"
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "forbid"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+missing_safety_doc = "deny"
+multiple_unsafe_ops_per_block = "deny"
+mem_forget = "deny"
+as_ptr_cast_mut = "deny"
+cast_ptr_alignment = "deny"
+ptr_as_ptr = "deny"
+ptr_cast_constness = "deny"
+borrow_as_ptr = "deny"
+transmute_ptr_to_ptr = "deny"
+transmute_undefined_repr = "deny"
+transmutes_expressible_as_ptr_casts = "deny"
+uninit_vec = "deny"
+uninit_assumed_init = "deny"
+mem_replace_with_uninit = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
 [workspace.dependencies]
 vigil-core = { path = "crates/vigil-core" }
 vigil-config = { path = "crates/vigil-config" }
 vigil-flow = { path = "crates/vigil-flow" }
 vigil-log = { path = "crates/vigil-log" }
+vigil-secret = { path = "crates/vigil-secret" }
 monitor-profiles = { git = "https://github.com/MasonRhodesDev/monitor-profiles", rev = "64d5d1ed079582a2014ebf23c403a3ca03ee9c64" }
 appearance-profiles = { git = "https://github.com/MasonRhodesDev/appearance-profiles.git", rev = "780296ec160b18411c65982d323562e5617d6465" }
 serde = { version = "1", features = ["derive"] }
@@ -47,3 +76,9 @@ libc = "0.2"
 winit = "0.30"
 softbuffer = "0.4"
 font8x8 = "0.3"
+
+[profile.release]
+overflow-checks = true
+
+[profile.release.package."*"]
+overflow-checks = false

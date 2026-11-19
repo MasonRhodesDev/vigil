@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::future::poll_fn;
 use std::pin::pin;
 use std::sync::mpsc::Sender;

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};

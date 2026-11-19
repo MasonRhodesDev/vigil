@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use vigil_core::{AuthUi, BufferDamage, FrameTarget, InputEvent, OutputId, scene_to_panel};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};

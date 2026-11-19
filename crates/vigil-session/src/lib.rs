@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::os::fd::OwnedFd;
 use std::path::Path;
 

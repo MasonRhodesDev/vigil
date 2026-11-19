@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod cursor;
 
 pub use cursor::CursorPlane;

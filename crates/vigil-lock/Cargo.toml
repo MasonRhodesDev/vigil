@@ -14,6 +14,7 @@ singleton-guard.workspace = true
 span-lines.workspace = true
 tracing-subscriber.workspace = true
 vigil-core.workspace = true
+vigil-secret.workspace = true
 monitor-profiles.workspace = true
 appearance-profiles.workspace = true
 vigil-config.workspace = true
@@ -25,7 +26,12 @@ vigil-pam = { path = "../vigil-pam" }
 vigil-theme = { path = "../vigil-theme" }
 vigil-ui = { path = "../vigil-ui" }
 libc.workspace = true
+rustix = { version = "1.1", default-features = false, features = ["std", "stdio"] }
 
 [dev-dependencies]
+vigil-log = { workspace = true, features = ["testing"] }
 image.workspace = true
 zbus = { workspace = true, features = ["service"] }
+
+[lints]
+workspace = true

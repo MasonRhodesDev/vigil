@@ -12,3 +12,6 @@ vigil-log.workspace = true
 vigil-core.workspace = true
 vigil-present-kms = { path = "../vigil-present-kms" }
 smithay = { workspace = true, features = ["backend_drm"] }
+
+[lints]
+workspace = true

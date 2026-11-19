@@ -7,6 +7,7 @@ vigil-config
 vigil-core
 vigil-flow
 vigil-log
+vigil-secret
 vigil-theme
 vigil-ui
 vigil-warning

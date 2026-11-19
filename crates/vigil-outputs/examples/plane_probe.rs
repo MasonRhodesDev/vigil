@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use smithay::reexports::drm::control::{Device as ControlDevice, PlaneType};
 use smithay::reexports::drm::{ClientCapability, Device};
 
