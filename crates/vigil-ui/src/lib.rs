@@ -997,8 +997,13 @@ fn pointer_button(button: u32) -> PointerEventButton {
     }
 }
 
+// Slint reads a control character or a code from U+F700 as a key such as
+// Return, Tab or an arrow, so text holding one would act instead of type.
 fn printable(text: &str) -> bool {
-    !text.is_empty() && !text.chars().all(char::is_control)
+    !text.is_empty()
+        && !text
+            .chars()
+            .any(|c| c.is_control() || ('\u{f700}'..='\u{f7ff}').contains(&c))
 }
 
 fn key_text(keysym: u32, utf8: Option<KeyText>) -> Option<slint::SharedString> {
