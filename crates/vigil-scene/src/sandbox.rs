@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use landlock::{ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetStatus, Scope};
+use landlock::{
+    ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreated, RulesetStatus, Scope,
+};
 use rustix::process::{
     DumpableBehavior, Resource, Rlimit, Signal, getrlimit, set_dumpable_behavior,
     set_parent_process_death_signal, setrlimit,
@@ -23,16 +25,13 @@ pub const NOTICE: &str = "vigil-scene: notice: ";
 /// past the deadline, 1 GiB of address space, no descriptors beyond stdio,
 /// output no bigger than the largest frame, no core dumps and no children.
 /// It dies with the thread that started it and can never gain privileges.
-/// A soft or hard limit already lower is kept. First, where the kernel has
-/// Landlock, it denies itself every file and network access, since a
-/// ruleset is a descriptor and none can be made past the limit. Landlock is
-/// best effort, and a kernel without it is returned as a notice.
+/// A soft or hard limit already lower is kept. Where the kernel has
+/// Landlock, it also denies itself every file and network access. Landlock
+/// is best effort, and a kernel without it is returned as a notice.
 pub fn confine(deadline: Duration) -> Result<Option<String>, Error> {
-    let notice = match landlock() {
-        Ok(RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced) => None,
-        Ok(RulesetStatus::NotEnforced) => Some("this kernel has no Landlock".to_owned()),
-        Err(e) => Some(format!("Landlock: {e}")),
-    };
+    set_parent_process_death_signal(Some(Signal::KILL))
+        .map_err(|e| Error::Helper(format!("tying the helper to its caller: {e}")))?;
+    let ruleset = landlock_ruleset();
     let cpu = u64::try_from(deadline.as_millis().div_ceil(1000))
         .unwrap_or(u64::MAX)
         .saturating_add(1);
@@ -55,8 +54,12 @@ pub fn confine(deadline: Duration) -> Result<Option<String>, Error> {
         )
         .map_err(|e| Error::Helper(format!("limiting {resource:?}: {e}")))?;
     }
-    set_parent_process_death_signal(Some(Signal::KILL))
-        .and_then(|()| rustix::thread::set_no_new_privs(true))
+    let notice = match ruleset.and_then(RulesetCreated::restrict_self) {
+        Ok(status) if status.ruleset != RulesetStatus::NotEnforced => None,
+        Ok(_) => Some("this kernel has no Landlock".to_owned()),
+        Err(e) => Some(format!("Landlock: {e}")),
+    };
+    rustix::thread::set_no_new_privs(true)
         .map_err(|e| Error::Helper(format!("confining the helper: {e}")))?;
     Ok(notice)
 }
@@ -77,15 +80,15 @@ pub fn lock_down() -> Result<(), Error> {
         .map_err(|e| Error::Helper(format!("installing the filter: {e}")))
 }
 
-fn landlock() -> Result<RulesetStatus, landlock::RulesetError> {
+// The ruleset is a descriptor, so it is made before RLIMIT_NOFILE leaves
+// room for none, and applied once the limits are set.
+fn landlock_ruleset() -> Result<RulesetCreated, landlock::RulesetError> {
     let abi = ABI::V9;
-    Ok(Ruleset::default()
+    Ruleset::default()
         .handle_access(AccessFs::from_all(abi))?
         .handle_access(AccessNet::from_all(abi))?
         .scope(Scope::from_all(abi))?
-        .create()?
-        .restrict_self()?
-        .ruleset)
+        .create()
 }
 
 // Derived from strace of every helper job, the refusals, an allocation
