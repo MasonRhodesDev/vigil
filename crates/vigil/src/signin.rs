@@ -189,7 +189,7 @@ mod tests {
         );
         assert_eq!(on_disk(&greetd).user, "alice");
         start.choose("alice");
-        start.observed(&greetd);
+        assert!(!start.observed(&greetd));
         start.finished(&greetd, Some("session"));
         assert_eq!(on_disk(&greetd).unprompted_user, "alice");
         assert_eq!(greetd.finish(), ["create alice", "start"]);
@@ -227,7 +227,6 @@ mod tests {
 
     #[test]
     fn the_unasked_sign_in_stays_closed_when_its_record_cannot_be_taken_off_disk() {
-        use std::os::unix::fs::PermissionsExt;
         let Some(greetd) = Greetd::scripted("unprompted-readonly", vec![Response::Success]) else {
             return;
         };
@@ -236,18 +235,13 @@ mod tests {
             ..State::default()
         }
         .store(&greetd.state_file());
-        let dir = greetd.state_file().parent().unwrap().to_owned();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let writable = std::fs::write(dir.join("probe"), "").is_ok();
-        let mut start = (!writable).then(|| Start::new(&greetd));
-        if let Some(start) = &mut start {
-            start.choose("alice");
-        }
+        let tmp = greetd.state_file().with_extension("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let mut start = Start::new(&greetd);
+        start.choose("alice");
         drop(start);
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        if writable {
-            return;
-        }
+        assert_eq!(on_disk(&greetd).unprompted_user, "alice");
+        std::fs::remove_dir(&tmp).unwrap();
         assert_eq!(
             greetd.finish(),
             [""; 0],
@@ -271,7 +265,7 @@ mod tests {
         .store(&greetd.state_file());
         let mut start = Start::new(&greetd);
         start.choose("alice");
-        start.observed(&greetd);
+        assert!(!start.observed(&greetd));
         assert_eq!(on_disk(&greetd).unprompted_user, "");
         assert_eq!(on_disk(&greetd).user, "alice");
         drop(start);
@@ -292,7 +286,7 @@ mod tests {
         .store(&greetd.state_file());
         let mut start = Start::new(&greetd);
         start.choose("alice");
-        start.observed(&greetd);
+        assert!(!start.observed(&greetd));
         assert_eq!(on_disk(&greetd).unprompted_user, "");
         drop(start);
 
