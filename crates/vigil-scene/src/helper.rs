@@ -155,6 +155,7 @@ impl Helper {
         let mut child = Command::new(&self.path)
             .args(args)
             .args(["--deadline-ms", &self.deadline.as_millis().to_string()])
+            .args(["--out-len", &out.len().to_string()])
             .args(["--abi", HELPER_ABI])
             .env_clear()
             .current_dir("/")

@@ -23,12 +23,13 @@ pub const NOTICE: &str = "vigil-scene: notice: ";
 
 /// What the helper does to itself before it reads its input: CPU time just
 /// past the deadline, 1 GiB of address space, no descriptors beyond stdio,
-/// output no bigger than the largest frame, no core dumps and no children.
+/// no file written past `output` bytes plus room for a message, no core
+/// dumps and no children.
 /// It dies with the thread that started it and can never gain privileges.
 /// A soft or hard limit already lower is kept. Where the kernel has
 /// Landlock, it also denies itself every file and network access. Landlock
 /// is best effort, and a kernel without it is returned as a notice.
-pub fn confine(deadline: Duration) -> Result<Option<String>, Error> {
+pub fn confine(deadline: Duration, output: u64) -> Result<Option<String>, Error> {
     set_parent_process_death_signal(Some(Signal::KILL))
         .map_err(|e| Error::Helper(format!("tying the helper to its caller: {e}")))?;
     let ruleset = landlock_ruleset();
@@ -39,7 +40,7 @@ pub fn confine(deadline: Duration) -> Result<Option<String>, Error> {
         (Resource::Cpu, cpu),
         (Resource::As, MEMORY),
         (Resource::Nofile, 3),
-        (Resource::Fsize, MAX_PIXELS * 4 + MESSAGE),
+        (Resource::Fsize, output.min(MAX_PIXELS * 4) + MESSAGE),
         (Resource::Core, 0),
         (Resource::Nproc, 0),
     ] {

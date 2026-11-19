@@ -68,7 +68,7 @@ fn run_probe(probe: &str) -> ! {
             .unwrap();
     let parent = rustix::process::getppid().unwrap();
     if confined == "on" {
-        confine(Duration::from_secs(5)).unwrap();
+        confine(Duration::from_secs(5), 0).unwrap();
         lock_down().unwrap();
     }
     attempt(act, &svg, parent);
@@ -81,7 +81,7 @@ fn crash_as_helper() -> ! {
     vigil_secret::exit_on_panic();
     let mut act = String::new();
     std::io::stdin().read_to_string(&mut act).unwrap();
-    confine(Duration::from_secs(5)).unwrap();
+    confine(Duration::from_secs(5), 0).unwrap();
     lock_down().unwrap();
     match act.as_str() {
         "panic" => panic!("a parser bug"),

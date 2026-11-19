@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use image::ImageEncoder;
 use vigil_scene::{
-    Error, Format, HELPER_ABI, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE,
+    Error, Format, HELPER_ABI, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_PIXELS, MAX_SIDE,
     MAX_SPEC_BYTES, NOTICE, Plate, Request, Scene, Sprite, confine, emit_spec, lock_down,
     read_bounded,
 };
@@ -20,10 +20,11 @@ const USAGE: &str = "usage:
                      [--ref-short-side N] [--scene FILE] [--logo SVG]
                      [--level 0..1] [--progress 0..1] [--edge N]
   vigil-scene spec --out FILE [--scene FILE] [--ref-short-side N]
-  vigil-scene mask --format svg|raster --edge N --deadline-ms N --abi V
+  vigil-scene mask --format svg|raster --edge N --deadline-ms N --out-len N
+                   --abi V
   vigil-scene layer --mode WxH --transform 0-3 --layer frame|logo|glow|bar
                     --value 0..1 --svg-len N --spec-len N --deadline-ms N
-                    --abi V
+                    --out-len N --abi V
 
 stages:
   grub-menu     the mark sprite at its place on the mode (RGBA, straight alpha)
@@ -38,7 +39,7 @@ scene on it as wl_output does. Sprites print their placement as JSON.
 
 mask and layer are the helper the library runs for untrusted logos. Each
 confines itself, reads the logo (and for layer, the spec after it) from
-stdin, and writes raw pixels to stdout.";
+stdin, and writes --out-len bytes of raw pixels to stdout.";
 
 const RENDER_LIMIT: Duration = Duration::from_secs(30);
 
@@ -411,7 +412,7 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
     let run = || -> Result<(), Error> {
         close_inherited()?;
         let allowed: &[&str] = match job {
-            "mask" => &["format", "edge", "deadline-ms", "abi"],
+            "mask" => &["format", "edge", "deadline-ms", "out-len", "abi"],
             _ => &[
                 "mode",
                 "transform",
@@ -420,6 +421,7 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
                 "svg-len",
                 "spec-len",
                 "deadline-ms",
+                "out-len",
                 "abi",
             ],
         };
@@ -434,7 +436,14 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
             .num::<u64>("deadline-ms")
             .map_err(Error::Helper)?
             .ok_or_else(|| Error::Helper("--deadline-ms is required".into()))?;
-        if let Some(notice) = confine(Duration::from_millis(deadline))? {
+        let out_len = args
+            .num::<u64>("out-len")
+            .map_err(Error::Helper)?
+            .filter(|n| *n <= MAX_PIXELS * 4)
+            .ok_or_else(|| {
+                Error::Helper(format!("--out-len up to {} is required", MAX_PIXELS * 4))
+            })?;
+        if let Some(notice) = confine(Duration::from_millis(deadline), out_len)? {
             let _ = record(
                 rustix::stdio::stderr(),
                 format!("{NOTICE}{notice}\n").as_bytes(),
@@ -444,6 +453,12 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
             "mask" => mask_job(&args)?,
             _ => layer_job(&args)?,
         };
+        if pixels.len() as u64 != out_len {
+            return Err(Error::Helper(format!(
+                "drew {} bytes, but the caller expects {out_len}",
+                pixels.len()
+            )));
+        }
         record(rustix::stdio::stdout(), &pixels)
     };
     match run() {
