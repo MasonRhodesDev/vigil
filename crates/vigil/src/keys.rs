@@ -267,13 +267,7 @@ mod tests {
     fn escape_clears_a_fixed_users_password_field() {
         let Some(greetd) = Greetd::scripted(
             "fixed-escape",
-            vec![
-                secret(),
-                Response::Success,
-                secret(),
-                Response::Success,
-                Response::Success,
-            ],
+            vec![secret(), Response::Success, Response::Success],
         ) else {
             return;
         };
@@ -297,29 +291,14 @@ mod tests {
         rig.tick();
 
         drop(rig);
-        assert_eq!(
-            greetd.finish(),
-            [
-                "create alice",
-                "cancel",
-                "create alice",
-                "answer pw",
-                "start"
-            ]
-        );
+        assert_eq!(greetd.finish(), ["create alice", "answer pw", "start"]);
     }
 
     #[test]
     fn escape_a_name_and_a_password_in_one_batch_sign_that_user_in() {
         let Some(greetd) = Greetd::scripted(
             "escape",
-            vec![
-                secret(),
-                Response::Success,
-                secret(),
-                Response::Success,
-                Response::Success,
-            ],
+            vec![secret(), Response::Success, Response::Success],
         ) else {
             return;
         };
@@ -344,10 +323,7 @@ mod tests {
 
         let complete = rig.auth.is_complete();
         drop(rig);
-        assert_eq!(
-            greetd.finish(),
-            ["create alice", "cancel", "create bob", "answer pw", "start"]
-        );
+        assert_eq!(greetd.finish(), ["create bob", "answer pw", "start"]);
         assert!(complete);
     }
 }
