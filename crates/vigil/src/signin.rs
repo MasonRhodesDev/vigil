@@ -9,17 +9,14 @@ use crate::autologin;
 // a remembered question is matched word for word against what PAM asks.
 const MAX_QUESTION_BYTES: usize = 512;
 
-pub fn seed(auth: &mut AuthMachine, state: &State, path: &Path) {
-    if !state.unprompted_user.is_empty() {
-        // Off disk while the unasked sign-in is open, so a greeter that dies
-        // in it cannot open the user unasked again; success writes it back.
-        State {
-            unprompted_user: String::new(),
-            ..state.clone()
-        }
-        .store(path);
+pub fn seed(auth: &mut AuthMachine, state: &mut State, path: &Path) {
+    // Off disk and out of memory while the unasked sign-in is open, so no
+    // later store carries it and a greeter that dies in it cannot open the
+    // user unasked again; only a silent success writes it back.
+    let unprompted = std::mem::take(&mut state.unprompted_user);
+    if !unprompted.is_empty() && state.store(path) {
+        auth.set_unprompted(Some(unprompted));
     }
-    auth.set_unprompted(Some(state.unprompted_user.clone()).filter(|user| !user.is_empty()));
     auth.set_first_questions(
         state
             .first_question
@@ -38,9 +35,6 @@ pub fn seed(auth: &mut AuthMachine, state: &State, path: &Path) {
 
 pub fn observe(state: &mut State, auth: &AuthMachine) -> bool {
     let before = state.clone();
-    if auth.unprompted().is_none() {
-        state.unprompted_user.clear();
-    }
     // A name typed at the name stage may be a mistyped password, so it
     // reaches the state file only through `signed_in`.
     if !auth.typed_user() {
@@ -110,8 +104,8 @@ mod tests {
         fn new(greetd: &Greetd) -> Self {
             let mut auth = AuthMachine::connect(greetd.socket().to_str()).expect("connect");
             auth.set_session(vec!["session".into()], Vec::new());
-            let stored = State::load(&greetd.state_file());
-            if let Some(state) = &stored {
+            let mut stored = State::load(&greetd.state_file());
+            if let Some(state) = &mut stored {
                 seed(&mut auth, state, &greetd.state_file());
             }
             Self {
@@ -215,11 +209,17 @@ mod tests {
         }
         .store(&greetd.state_file());
         let mut start = Start::new(&greetd);
-        assert_eq!(start.state.unprompted_user, "", "a later store must not carry it");
+        assert_eq!(
+            start.state.unprompted_user, "",
+            "a later store must not carry it"
+        );
         start.choose("bob");
         start.submit("hunter2");
         assert!(start.observed(&greetd));
-        assert_eq!(on_disk(&greetd).first_question, [question("bob", PIN, true)]);
+        assert_eq!(
+            on_disk(&greetd).first_question,
+            [question("bob", PIN, true)]
+        );
         assert_eq!(on_disk(&greetd).unprompted_user, "");
         drop(start);
         assert_eq!(greetd.finish(), ["create bob"]);
@@ -248,7 +248,11 @@ mod tests {
         if writable {
             return;
         }
-        assert_eq!(greetd.finish(), [""; 0], "nothing opens unasked while the record is on disk");
+        assert_eq!(
+            greetd.finish(),
+            [""; 0],
+            "nothing opens unasked while the record is on disk"
+        );
     }
 
     #[test]
@@ -267,7 +271,7 @@ mod tests {
         .store(&greetd.state_file());
         let mut start = Start::new(&greetd);
         start.choose("alice");
-        assert!(start.observed(&greetd));
+        start.observed(&greetd);
         assert_eq!(on_disk(&greetd).unprompted_user, "");
         assert_eq!(on_disk(&greetd).user, "alice");
         drop(start);
@@ -288,7 +292,7 @@ mod tests {
         .store(&greetd.state_file());
         let mut start = Start::new(&greetd);
         start.choose("alice");
-        assert!(start.observed(&greetd));
+        start.observed(&greetd);
         assert_eq!(on_disk(&greetd).unprompted_user, "");
         drop(start);
 

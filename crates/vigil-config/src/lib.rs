@@ -921,7 +921,7 @@ impl State {
         }
     }
 
-    pub fn store(&self, path: &Path) {
+    pub fn store(&self, path: &Path) -> bool {
         let mut body = format!(
             "user = {}\nsession = {}\nauto_streak = {}\n",
             quoted(&self.user),
@@ -947,12 +947,13 @@ impl State {
         }
         let tmp = path.with_extension("tmp");
         let result = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
-        if let Err(e) = result {
+        if let Err(e) = &result {
             eprintln!(
                 "vigil-config: cannot store state at {}: {e}",
                 path.display()
             );
         }
+        result.is_ok()
     }
 }
 

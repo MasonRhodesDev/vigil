@@ -2134,7 +2134,7 @@ fn run() -> Result<i32, String> {
     };
 
     let remember = resolved.cmd.is_empty() && config.sessions.remember;
-    let stored = vigil_config::State::load(&config.sessions.state_file);
+    let mut stored = vigil_config::State::load(&config.sessions.state_file);
     let remembered = remember.then_some(stored.as_ref()).flatten();
     let verdict = autologin::assess(stored.as_ref(), autologin::now_secs());
     let auto_streak = match verdict {
@@ -2162,7 +2162,7 @@ fn run() -> Result<i32, String> {
         Some(_) => None,
         None => remembered_user.clone(),
     });
-    if let Some(state) = &stored {
+    if let Some(state) = &mut stored {
         signin::seed(&mut auth, state, &config.sessions.state_file);
     }
     auth.set_session(
