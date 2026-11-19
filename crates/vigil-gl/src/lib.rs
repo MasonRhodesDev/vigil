@@ -50,8 +50,10 @@ impl GlContext {
     #[allow(unsafe_code)]
     pub fn from_fd(fd: Arc<OwnedFd>) -> Result<Self, GlError> {
         let device = GbmDevice::new(fd).map_err(|e| GlError(format!("gbm device: {e}")))?;
-        // SAFETY: smithay is the only EGL client in the process, so no foreign
-        // eglTerminate can close the display smithay tracks for this device.
+        #[expect(
+            clippy::undocumented_unsafe_blocks,
+            reason = "unjustified: holds only while nothing else in the process creates or terminates EGL displays"
+        )]
         let display =
             unsafe { EGLDisplay::new(device.clone()) }.map_err(|e| GlError(format!("egl: {e}")))?;
         let context =
@@ -310,8 +312,8 @@ unsafe impl OpenGLInterface for GlSurface {
 
     fn get_proc_address(&self, name: &CStr) -> *const c_void {
         match name.to_str() {
-            // SAFETY: GlWindow makes this context current before femtovg, the
-            // only caller, resolves any function.
+            // SAFETY: `self` owns a GlContext, so libEGL is loaded, and EGL 1.5
+            // function pointers do not depend on which context is current.
             Ok(name) => unsafe { get_proc_address(name) },
             Err(_) => std::ptr::null(),
         }
@@ -344,8 +346,8 @@ unsafe impl OpenGLInterface for Surfaceless {
 
     fn get_proc_address(&self, name: &CStr) -> *const c_void {
         match name.to_str() {
-            // SAFETY: GlWindow makes this context current before femtovg, the
-            // only caller, resolves any function.
+            // SAFETY: `self` owns a GlContext, so libEGL is loaded, and EGL 1.5
+            // function pointers do not depend on which context is current.
             Ok(name) => unsafe { get_proc_address(name) },
             Err(_) => std::ptr::null(),
         }

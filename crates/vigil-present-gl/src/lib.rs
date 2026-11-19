@@ -205,8 +205,10 @@ impl Presenter for GbmPresenter {
             return Ok(true);
         }
 
-        // SAFETY: `drew` means femtovg rendered and swapped this surface once,
-        // and flip_pending blocks a second lock until the flip returns the buffer.
+        #[expect(
+            clippy::undocumented_unsafe_blocks,
+            reason = "unjustified: one swap per lock rests on the draw closure telling the truth about drew"
+        )]
         let bo = unsafe { self.gbm.lock_front_buffer() }.map_err(backend)?;
         let buffer = GbmBuffer::from_bo(bo, true);
         let fb = framebuffer_from_bo(&self.drm, &buffer, false).map_err(backend)?;

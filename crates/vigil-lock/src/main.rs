@@ -594,8 +594,10 @@ impl Locker {
         if let Some(fd) = self.ready_fd.take() {
             use std::io::Write;
             use std::os::fd::FromRawFd;
-            // SAFETY: the fd came open from the parent through --ready-fd, nothing
-            // else in this process owns it, and take() makes this the one conversion.
+            #[expect(
+                clippy::undocumented_unsafe_blocks,
+                reason = "unjustified: the fd number is trusted from --ready-fd, not owned by any type"
+            )]
             let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
             let _ = ready.write_all(b"1");
         }
@@ -1311,8 +1313,10 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
 fn signal_ready_fd(ready_fd: Option<i32>) {
     if let Some(fd) = ready_fd {
         use std::os::fd::FromRawFd;
-        // SAFETY: the fd came open from the parent through --ready-fd, nothing
-        // else in this process owns it, and the Option is consumed here.
+        #[expect(
+            clippy::undocumented_unsafe_blocks,
+            reason = "unjustified: the fd number is trusted from --ready-fd, not owned by any type"
+        )]
         let mut ready = unsafe { std::fs::File::from_raw_fd(fd) };
         let _ = ready.write_all(b"1");
     }
