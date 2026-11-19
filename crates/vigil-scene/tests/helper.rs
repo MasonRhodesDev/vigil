@@ -577,6 +577,68 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
 }
 
 #[test]
+fn child_refuses_a_logo_that_keeps_timing_out() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    let spin = spinner("strikes");
+    let logo = |n: u32| [mark(), format!("<!-- {n} -->").into_bytes()].concat();
+    let (slow, other, cleared) = (logo(1), logo(2), logo(3));
+    let need = request(&slow, Layer::Logo).bytes().unwrap();
+    let draw = |helper: &Helper, svg: &[u8]| {
+        let mut out = vec![0u8; need];
+        let got = helper.draw(&request(svg, Layer::Logo), &mut out);
+        assert!(
+            got.is_ok() || out.iter().all(|&b| b == 0),
+            "written on {got:?}"
+        );
+        got
+    };
+    let timeout = |got: Result<(), Error>| matches!(got, Err(Error::Timeout(_)));
+
+    let burst: Vec<_> = std::thread::scope(|s| {
+        let calls: Vec<_> = (0..4).map(|_| s.spawn(|| draw(&spin, &slow))).collect();
+        calls.into_iter().map(|c| c.join().unwrap()).collect()
+    });
+    assert!(burst.into_iter().all(timeout), "a burst times out");
+    assert!(
+        timeout(draw(&spin, &slow)),
+        "overlapping timeouts were one strike"
+    );
+    match draw(&spin, &slow) {
+        Err(Error::Refused(m)) => assert!(m.contains("timed out"), "{m}"),
+        other => panic!("the third strike: {other:?}"),
+    }
+    let start = Instant::now();
+    assert!(matches!(draw(&spin, &slow), Err(Error::Refused(_))));
+    assert!(start.elapsed() < BRIEF, "a refused logo stalls nobody");
+    let missing = Helper::new("/nonexistent/vigil-scene", BRIEF);
+    assert!(
+        matches!(draw(&missing, &slow), Err(Error::Refused(_))),
+        "a refused logo runs no helper"
+    );
+    assert!(
+        timeout(draw(&spin, &other)),
+        "another logo has its own count"
+    );
+
+    let exact = fake_helper("strikes-exact", &format!("printf '%0{need}d' 0"));
+    assert!(timeout(draw(&spin, &cleared)));
+    assert!(timeout(draw(&spin, &cleared)));
+    draw(&exact, &cleared).unwrap();
+    assert!(
+        timeout(draw(&spin, &cleared)),
+        "a drawing clears the strikes"
+    );
+    assert!(timeout(draw(&spin, &cleared)));
+}
+
+#[test]
+fn a_logo_that_keeps_timing_out_is_refused_for_the_process() {
+    in_fresh_process("child_refuses_a_logo_that_keeps_timing_out", "1");
+}
+
+#[test]
 fn child_draws_with_sigchld_ignored() {
     if std::env::var_os(CHILD).is_none() {
         return;
