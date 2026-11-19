@@ -416,6 +416,55 @@ mod tests {
         assert_eq!(greetd.finish(), ["create alice"]);
     }
 
+    fn click_shut_down(rig: &mut Rig) {
+        rig.window
+            .dispatch(InputEvent::PointerAbsolute { x: 1240.0, y: 754.0 });
+        for pressed in [true, false] {
+            rig.window.dispatch(InputEvent::PointerButton {
+                button: 0x110,
+                pressed,
+            });
+        }
+        rig.tick();
+    }
+
+    #[test]
+    fn escape_closes_a_confirm_opened_by_a_click_and_returns_to_the_field() {
+        let Some(greetd) = Greetd::scripted("click-confirm", vec![secret()]) else {
+            return;
+        };
+        let mut rig = Rig::new(&greetd);
+        rig.auth
+            .begin(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        click_shut_down(&mut rig);
+        assert!(!rig.window.field_focused(), "the click opened the confirm");
+        for event in tap(ESCAPE, None) {
+            route(&mut rig, event);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        vigil_ui::advance_timers();
+        click_shut_down(&mut rig);
+        assert!(
+            !rig.window.field_focused(),
+            "Esc closed the confirm, so the same click opened it again instead of shutting down"
+        );
+
+        let mut drive = tap(ESCAPE, None).to_vec();
+        drive.extend(tap(RETURN, None));
+        for event in drive {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        drop(rig);
+        assert_eq!(
+            greetd.finish(),
+            ["create alice"],
+            "Esc returned to the field without cancelling, and Enter reached it"
+        );
+    }
+
     #[test]
     fn modifiers_held_across_a_vt_switch_do_not_stick() {
         let Some(greetd) = Greetd::scripted(
