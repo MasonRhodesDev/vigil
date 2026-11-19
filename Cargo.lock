@@ -5144,7 +5144,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vigil"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "appearance-profiles 0.2.0",
  "bytemuck",
@@ -5180,7 +5180,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-auth"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "greetd_ipc",
  "proptest",
@@ -5192,7 +5192,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-config"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "serde",
  "toml 0.9.12+spec-1.1.0",
@@ -5202,7 +5202,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-core"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "monitor-profiles",
  "vigil-secret",
@@ -5210,7 +5210,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-flow"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "vigil-config",
  "vigil-core",
@@ -5219,7 +5219,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-gl"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "drm",
  "gbm",
@@ -5234,7 +5234,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-input"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "input 0.9.1",
  "smithay",
@@ -5245,7 +5245,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-lock"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "appearance-profiles 0.2.0",
  "image",
@@ -5272,14 +5272,14 @@ dependencies = [
 
 [[package]]
 name = "vigil-log"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "vigil-login"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "vigil-core",
  "vigil-log",
@@ -5288,7 +5288,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-outputs"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "smithay",
  "smithay-drm-extras",
@@ -5298,7 +5298,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-pam"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "libc",
  "pam-client",
@@ -5309,7 +5309,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-present-dumb"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "smithay",
  "vigil-core",
@@ -5319,7 +5319,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-present-gl"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "gbm",
  "slint",
@@ -5335,7 +5335,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-present-kms"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "smithay",
  "vigil-core",
@@ -5343,7 +5343,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-scene"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "image",
  "landlock",
@@ -5359,11 +5359,11 @@ dependencies = [
 
 [[package]]
 name = "vigil-scene-corpus"
-version = "0.4.3"
+version = "0.5.0"
 
 [[package]]
 name = "vigil-scene-ffi"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "cbindgen",
  "image",
@@ -5375,7 +5375,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-secret"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "libc",
  "rustix 1.1.6",
@@ -5386,7 +5386,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-session"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "smithay",
  "vigil-core",
@@ -5394,7 +5394,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-sim"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "font8x8",
  "image",
@@ -5415,7 +5415,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-theme"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "slint",
  "slint-interpreter",
@@ -5426,7 +5426,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-ui"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "bytemuck",
  "image",
@@ -5441,7 +5441,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-warning"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "vigil-config",
  "vigil-core",
@@ -5449,7 +5449,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-wayland"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "calloop-wayland-source 0.4.1",
  "libc",

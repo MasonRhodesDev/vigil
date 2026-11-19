@@ -1,7 +1,7 @@
 %bcond_without check
 
 Name:           vigil
-Version:        0.4.3
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Compositor-less greetd greeter and matching session lockscreen
 License:        GPL-3.0-only
@@ -92,6 +92,39 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %dir %attr(2775,root,monitor-profiles) %{_sysconfdir}/monitor-profiles
 
 %changelog
+* Thu Nov 19 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.5.0-1
+- Automatic login needs one Enter after the upgrade. The greeter opens no
+  PAM conversation until Enter, so Esc or a user switch before a submit no
+  longer counts in pam_faillock; a user is opened unasked only after a
+  sign-in in which PAM asked nothing (#127).
+- Security: act on logind and portal signals only from the bus name's
+  owner; a forged logind Unlock from any local account unlocked vigil-lock
+  (#133).
+- Security: logging never panics or blocks, so a full disk or a stalled or
+  readerless stderr no longer stops vigil-lock from locking. Every control
+  character is escaped, a backslash is doubled, and a line over 2048 bytes
+  ends in trunc=1 (#139).
+- Security: an attack harness in CI, and its fixes. A lock request during an
+  unlock is no longer told "locked"; vigil-lock --wait now exits 1 when
+  logind unlocks before the lock is confirmed. Oversized greetd replies are
+  refused and greetd error text is escaped (#135).
+- Security: credentials are typed as Secret and wiped, core dumps are
+  refused, and a panic on any thread exits at once with status 101 (#134).
+- Every greeter and lock control is reachable by keyboard, with a focus
+  ring, a key hint, and a confirm before Restart and Shut Down (#131).
+- vigil-lock keeps a refused password on screen over the re-ask (#145).
+- Outputs missing from the monitor profile stay reachable, and keyboard
+  login is deterministic (#125). Software presents copy only damage and use
+  a hardware cursor plane (#126). The splash logo sits on the boot scene's
+  logo rect (#130).
+- New vigil-scene crate, CLI and C ABI library draw the boot scene. Both
+  packages install the sandboxed helper at /usr/lib/vigil/vigil-scene; a
+  crashing logo is a refusal and a slow one is skipped for an hour (#136,
+  #146).
+- crates/vigil-log is MIT, so vigil-config can log through it; it links
+  only libc.
+- rustix 1.1.6 for RUSTSEC-2026-0486 (#137).
+
 * Tue Nov 17 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.4.3-1
 - GL renderer: ask EGL for a stencil buffer, so the clock's large glyphs
   draw as text instead of solid boxes (#105). Supersedes the unreleased 0.4.2.
@@ -158,8 +191,6 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 - crates/vigil-config is relicensed MIT (the workspace binaries stay
   GPL-3.0-only) so the MIT configurator can share the one parse-only crate;
   it links no GPL code.
-- crates/vigil-log is MIT too, so vigil-config can log through it; it links
-  only libc.
 * Thu Sep 04 2026 Mason Rhodes <mrhodesdev@gmail.com> - 0.3.6-1
 - A correct password is no longer intermittently rejected. Every PAM
   worker shared one event channel with no attempt identity, so a
