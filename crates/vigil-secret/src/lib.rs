@@ -74,6 +74,7 @@ thread_local! {
 /// the place, since a panic message can quote typed text. Only work run through [`cosmetic`]
 /// survives its own panic.
 pub fn exit_on_panic() {
+    #[expect(clippy::disallowed_methods, reason = "this is the one panic hook")]
     std::panic::set_hook(Box::new(|info| {
         let place = info
             .location()

@@ -38,6 +38,7 @@ REQUIRED_LINTS = {
     ],
 }
 EXPOSE_BAN = "vigil_secret::Secret::expose"
+REQUIRED_BANS = (EXPOSE_BAN, "std::panic::set_hook", "std::panic::take_hook")
 PANIC_HOOK = ["vigil_secret", ":", ":", "exit_on_panic", "(", ")", ";"]
 ADVISORY_ID = re.compile(r"(?:RUSTSEC-\d{4}-\d{4}|GHSA(?:-[23456789cfghjmpqrvwx]{4}){3})")
 ADVISORY_REASON = re.compile(r"expires (\d{4}-\d{2}-\d{2}): \S")
@@ -327,7 +328,7 @@ def metadata():
 
 
 def lint_groups(denied):
-    groups, reading = set(), False
+    groups, reading, parsed = set(), False, 0
     for line in neutral_run(["rustc", "-W", "help"]).splitlines():
         if line.startswith("Lint groups provided by rustc"):
             reading = True
@@ -335,10 +336,11 @@ def lint_groups(denied):
             break
         elif reading and line.strip():
             name, _, members = line.strip().partition(" ")
+            parsed += 1
             if {m.strip().replace("-", "_") for m in members.split(",")} & denied:
                 groups.add(name.replace("-", "_"))
-    if not reading:
-        die("rustc -W help lists no lint groups")
+    if not reading or not parsed:
+        die("rustc -W help lists no lint groups this gate can read")
     return groups
 
 
@@ -440,8 +442,9 @@ def check_workspace(found, lints):
         found.add("clippy.toml", "clippy-config", f"clippy.toml: {e}")
         return
     paths = [entry if isinstance(entry, str) else entry.get("path") for entry in banned]
-    if EXPOSE_BAN not in paths:
-        found.add("clippy.toml", "clippy-config", f"clippy.toml: disallowed-methods no longer lists {EXPOSE_BAN}")
+    for ban in REQUIRED_BANS:
+        if ban not in paths:
+            found.add("clippy.toml", "clippy-config", f"clippy.toml: disallowed-methods no longer lists {ban}")
 
 
 def gate_fence(found, args):
