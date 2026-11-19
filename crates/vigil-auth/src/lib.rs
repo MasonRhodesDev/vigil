@@ -233,7 +233,10 @@ impl AuthMachine {
         self.state = State::Idle;
         match response {
             Response::Success => Ok(()),
-            Response::Error { description, .. } => Err(AuthError(description)),
+            Response::Error { description, .. } => {
+                eprintln!("vigil: auth: greetd refused the cancel: {description}");
+                Ok(())
+            }
             Response::AuthMessage { .. } => Err(AuthError(
                 "greetd returned an authentication message after cancellation".into(),
             )),
@@ -1053,6 +1056,28 @@ mod tests {
                 "create alice"
             ]
         );
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Password:".into(), true))
+        );
+    }
+
+    #[test]
+    fn a_refused_cancel_still_leaves_a_prompt() {
+        let Some((server, requests)) = scripted(vec![
+            secret_prompt(),
+            refusal("session worker is gone"),
+            secret_prompt(),
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Cancel, &mut ui);
+        assert!(machine.awaiting_username());
+        let _ = machine.handle(UiMessage::Respond("bob".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "cancel", "create bob"]);
         assert_eq!(
             shown(&ui).last(),
             Some(&&UiCall::Prompt("Password:".into(), true))
