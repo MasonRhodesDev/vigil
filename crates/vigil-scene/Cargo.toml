@@ -1,0 +1,17 @@
+[package]
+name = "vigil-scene"
+description = "The boot scene, drawn the same at every stage: geometry, logo, glow, ground and bar"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+image.workspace = true
+resvg = { version = "0.47", default-features = false }
+
+[[bin]]
+name = "vigil-scene"
+path = "src/main.rs"

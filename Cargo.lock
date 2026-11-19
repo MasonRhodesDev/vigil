@@ -5042,7 +5042,6 @@ dependencies = [
  "image",
  "libc",
  "monitor-profiles",
- "resvg",
  "serde_json",
  "slint-idle-runtime",
  "slint-kit",
@@ -5055,6 +5054,7 @@ dependencies = [
  "vigil-outputs",
  "vigil-present-dumb",
  "vigil-present-gl",
+ "vigil-scene",
  "vigil-session",
  "vigil-theme",
  "vigil-ui",
@@ -5195,6 +5195,15 @@ version = "0.4.3"
 dependencies = [
  "smithay",
  "vigil-core",
+]
+
+[[package]]
+name = "vigil-scene"
+version = "0.4.3"
+dependencies = [
+ "image",
+ "resvg",
+ "serde_json",
 ]
 
 [[package]]

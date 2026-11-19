@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 slint-idle-runtime.workspace = true
 vigil-core.workspace = true
+vigil-scene = { path = "../vigil-scene" }
 vigil-config.workspace = true
 monitor-profiles.workspace = true
 appearance-profiles.workspace = true
@@ -29,8 +30,6 @@ serde_json.workspace = true
 libc.workspace = true
 font8x8.workspace = true
 bytemuck = "1.25"
-image.workspace = true
-resvg = { version = "0.47", default-features = false }
 
 [dev-dependencies]
 image.workspace = true
