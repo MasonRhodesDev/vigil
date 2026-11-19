@@ -1068,6 +1068,10 @@ impl LockSession for Locker {
         }
     }
 
+    fn keyboard_left(&mut self) {
+        self.each_window(OutputWindow::release_keys);
+    }
+
     fn caps_lock(&mut self, on: bool) {
         if self.caps_lock != on {
             self.caps_lock = on;

@@ -385,8 +385,12 @@ struct App<S: LockSession + 'static> {
     protocol_events: Vec<FlowEvent>,
 }
 
+// A key released after the keyboard left is never reported, so a held Ctrl
+// would otherwise hold back every letter until it was pressed again. This is
+// not input, so it never reaches the flow, where it could end a grace window.
 fn keyboard_left<S: LockSession>(held: &mut vigil_core::HeldKeys, session: &mut S) {
-    let _ = (held, session);
+    *held = vigil_core::HeldKeys::default();
+    session.keyboard_left();
 }
 
 fn soonest_retry(
@@ -1503,6 +1507,7 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
+        keyboard_left(&mut self.held_keys, &mut self.session);
     }
     fn press_key(
         &mut self,
@@ -1650,6 +1655,7 @@ impl<S: LockSession> SeatHandler for App<S> {
                 if let Some(keyboard) = self.keyboard.take() {
                     keyboard.release();
                 }
+                keyboard_left(&mut self.held_keys, &mut self.session);
             }
             Capability::Pointer => {
                 if let Some(pointer) = self.pointer.take() {

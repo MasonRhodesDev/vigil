@@ -377,20 +377,22 @@ impl OutputWindow {
 
     pub fn set_panel_visible(&mut self, visible: bool) {
         if !visible {
-            for (at, keysym) in vigil_core::MODIFIER_KEYSYMS.into_iter().enumerate() {
-                if self.held & (1 << at) != 0 {
-                    self.send_key(keysym, None, false);
-                }
-            }
-            self.held = 0;
-            self.down = None;
+            self.release_keys();
             self.reset_focus();
             self.hide_password();
         }
         self.set_property("panel-visible", Value::Bool(visible));
     }
 
-    pub fn release_keys(&mut self) {}
+    pub fn release_keys(&mut self) {
+        for (at, keysym) in vigil_core::MODIFIER_KEYSYMS.into_iter().enumerate() {
+            if at % 2 == 0 && self.held & (0b11 << at) != 0 {
+                self.send_key(keysym, None, false);
+            }
+        }
+        self.held = 0;
+        self.down = None;
+    }
 
     pub fn set_power_visible(&mut self, visible: bool) {
         self.set_optional_property("power-visible", Value::Bool(visible));
