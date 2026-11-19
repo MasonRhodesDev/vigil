@@ -153,7 +153,7 @@ fn child_stops_a_helper_past_its_deadline() {
     let got = Helper::new(BIN, Duration::from_millis(1)).draw(&req, &mut out);
     let took = start.elapsed();
     match got {
-        Err(Error::Refused(m)) => assert!(m.contains("deadline"), "{m}"),
+        Err(Error::Timeout(m)) => assert!(m.contains("deadline"), "{m}"),
         other => panic!("{other:?}"),
     }
     assert!(took < SLACK, "returned after {took:?}");
@@ -381,16 +381,21 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
     let req = request(&svg, Layer::Logo);
     let need = req.bytes().unwrap();
     type Expect = fn(&Error) -> bool;
-    let cases: [(&str, String, Expect); 6] = [
+    let cases: [(&str, String, Expect); 7] = [
         (
             "spins",
             "while :; do :; done".into(),
-            |e| matches!(e, Error::Refused(m) if m.contains("deadline")),
+            |e| matches!(e, Error::Timeout(m) if m.contains("deadline")),
         ),
         (
             "signal",
             "kill -9 $$".into(),
             |e| matches!(e, Error::Refused(m) if m.contains("signal 9")),
+        ),
+        (
+            "forbidden",
+            "ulimit -c 0; kill -s SYS $$".into(),
+            |e| matches!(e, Error::Helper(m) if m.contains("system call")),
         ),
         ("short", "printf abc".into(), |e| {
             matches!(e, Error::Invalid(_))

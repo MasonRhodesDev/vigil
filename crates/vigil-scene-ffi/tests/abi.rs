@@ -419,6 +419,31 @@ fn a_missing_helper_is_its_own_code_and_the_ground_still_draws() {
 
 const CHILD: &str = "VIGIL_SCENE_ABI_TEST";
 
+#[test]
+fn a_helper_stopped_at_its_deadline_is_a_timeout_not_a_refusal() {
+    let dir = std::env::temp_dir().join(format!("vigil-scene-abi-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spin = dir.join("spins");
+    let written = Command::new("sh")
+        .args([
+            "-c",
+            r#"printf '#!/bin/sh\nwhile :; do :; done\n' > "$1" && chmod 755 "$1""#,
+        ])
+        .args(["sh".as_ref(), spin.as_os_str()])
+        .status()
+        .unwrap();
+    assert!(written.success());
+    let mut req = request(&mark(), VIGIL_SCENE_LAYER_LOGO);
+    req.deadline_ms = 200;
+    let (_, at) = render_by(&spin, &req, &mut []);
+    let mut out = vec![0u8; at.stride * at.height as usize];
+    let start = Instant::now();
+    assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TIMEOUT);
+    assert!(start.elapsed() < Duration::from_millis(700));
+    assert!(out.iter().all(|&b| b == 0));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 fn peak_rss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .unwrap()
