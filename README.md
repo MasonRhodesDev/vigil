@@ -147,6 +147,29 @@ scan order with a DPI-derived scale from the monitor's EDID. A profile that is
 unreadable, unmatched, or nonsensical degrades the same way — a layout file
 must never be what keeps someone from logging in.
 
+## Safety gates
+
+vigil handles passwords, so CI rejects unsafe patterns instead of trusting
+review to catch them. `tests/check.sh` runs the checks of CI's check job in
+the same order, so a failure shows up before a push.
+
+- **Unsafe code.** The workspace denies `unsafe_code`. Crates with no unsafe
+  forbid it, and the rest allow it only on named FFI and OS items, with a
+  `// SAFETY:` line on every unsafe block. `tests/check-unsafe-fence.sh` pins
+  the count in each file to `tests/unsafe-baseline.txt` and fails a pull
+  request whose totals exceed the base branch's. After removing unsafe code,
+  run `./tests/check-unsafe-fence.sh --write` and commit the smaller baseline.
+- **Credentials.** Typed text travels as `vigil_secret::Secret`, which wipes
+  itself on drop and never prints. `clippy.toml` disallows `Secret::expose`.
+  The few adapters that hand plaintext to greetd or PAM carry
+  `#[expect(clippy::disallowed_methods)]` and count in the same baseline.
+- **Process.** The greeter and the locker start by setting `RLIMIT_CORE` to 0
+  and clearing `PR_SET_DUMPABLE`, which keeps their memory out of core dumps
+  and away from same-user ptrace.
+- **Dependencies.** Every advisory ignore in `deny.toml` starts its reason
+  with `expires YYYY-MM-DD:`, at most 183 days out.
+  `tests/check-advisory-expiry.sh` fails once that date passes.
+
 ## License
 
 [GPL-3.0](LICENSE). Slint is used under its GPLv3 license option.
