@@ -392,16 +392,14 @@ export component DefaultTheme inherits Window {
                         font-size: 13px;
                         wrap: word-wrap;
                         vertical-alignment: center;
-                        text: root.navigating ? root.key-hint
-                            : root.auth-state == "busy" ? "Checking…"
+                        text: root.auth-state == "busy" ? "Checking…"
                             : root.error-message != "" ? root.error-message
                             : root.info-message != "" ? root.info-message
                             : root.key-hint != "" ? root.key-hint
                             : "Press Enter to continue";
-                        color: root.navigating ? Theme.fg-muted
-                            : root.auth-state == "busy" ? Theme.fg-muted
+                        color: root.auth-state == "busy" ? Theme.fg-muted
                             : root.error-message != "" ? Theme.danger
-                            : root.info-message != "" ? Theme.fg-muted
+                            : root.info-message != "" || root.navigating ? Theme.fg-muted
                             : Theme.fg-muted.with-alpha(0.7);
                     }
                 }
