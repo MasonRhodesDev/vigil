@@ -13,7 +13,10 @@ for tool in sway swaymsg flock wtype prlimit pgrep; do
     command -v "$tool" >/dev/null 2>&1 || skip "$tool is not installed"
 done
 
-TARGET=${CARGO_TARGET_DIR:-$REPO/target}
+# cargo knows where its builds went, whatever wrapper or variable moved them.
+TARGET=$(cd "$REPO" && cargo metadata --format-version 1 --no-deps 2>/dev/null |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p') || true
+TARGET=${TARGET:-${CARGO_TARGET_DIR:-$REPO/target}}
 VLOCK=$TARGET/debug/vigil-lock
 PROBE=$TARGET/debug/examples/lock_probe
 [ -x "$VLOCK" ] && [ -x "$PROBE" ] || {
@@ -39,6 +42,10 @@ trap cleanup EXIT INT TERM
 # A crashed lock client must not leave a core with typed text on disk.
 ulimit -c 0
 
+# The lock client and the host's PAM modules talk D-Bus. Neither may reach
+# the host's buses, so both addresses name a socket nobody listens on.
+export DBUS_SYSTEM_BUS_ADDRESS=unix:path=$WORK/no-system-bus
+export DBUS_SESSION_BUS_ADDRESS=unix:path=$WORK/no-session-bus
 export XDG_RUNTIME_DIR=$WORK/run
 mkdir -p "$XDG_RUNTIME_DIR" "$WORK/canary"
 chmod 700 "$XDG_RUNTIME_DIR"
