@@ -822,3 +822,42 @@ fn a_kit_that_flattens_fg_and_page_bg_still_gets_a_9_to_1_ring() {
     let ratio = ring_contrast(&mut g);
     assert!(ratio >= 9.0, "under the kit the ring's tones are {ratio:.2}:1");
 }
+
+fn a_pam_message_stays_shown_while_navigating(show: impl FnOnce(&mut OutputWindow)) {
+    let mut g = Greeter::with_pickers();
+    let plain = frame(&mut g.window);
+    g.window.show_info("Touch your security key");
+    let info = frame(&mut g.window);
+    let rows: Vec<usize> = (0..H as usize)
+        .filter(|&y| {
+            let row = y * W as usize * 4..(y + 1) * W as usize * 4;
+            plain[row.clone()] != info[row]
+        })
+        .collect();
+    assert!(!rows.is_empty(), "the message line is found");
+    show(&mut g.window);
+    frame(&mut g.window);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let shown = frame(&mut g.window);
+    for stop in 0..5 {
+        g.tap(TAB);
+        let now = frame(&mut g.window);
+        for &y in &rows {
+            let row = y * W as usize * 4..(y + 1) * W as usize * 4;
+            assert!(
+                shown[row.clone()] == now[row],
+                "the message line changed at row {y} with focus on stop {stop}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_pam_info_message_stays_shown_while_navigating() {
+    a_pam_message_stays_shown_while_navigating(|_| {});
+}
+
+#[test]
+fn a_pam_error_stays_shown_while_navigating() {
+    a_pam_message_stays_shown_while_navigating(|w| w.show_error("Authentication failure"));
+}
