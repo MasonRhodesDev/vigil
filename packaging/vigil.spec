@@ -104,6 +104,10 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 - Security: act on logind and portal signals only from the bus name's
   owner; a forged logind Unlock from any local account unlocked vigil-lock
   (#133).
+- Security: vigil-lock acts on a logind Unlock only when root asked for it.
+  sudo vigil-unlock <session|user> writes a short-lived root token and asks
+  logind to unlock; a plain loginctl unlock-session no longer unlocks
+  vigil-lock (#148).
 - Security: logging never panics or blocks, so a full disk or a stalled or
   readerless stderr no longer stops vigil-lock from locking. Every control
   character is escaped, a backslash is doubled, and a line over 2048 bytes
