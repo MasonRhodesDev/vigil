@@ -139,13 +139,16 @@ impl Row {
         }
         auto.sort_by(|a, b| a.connector.cmp(b.connector).then(a.id.cmp(&b.id)));
         for output in auto {
-            let right = row
+            let (right, top) = row
                 .spans
                 .iter()
-                .map(|span| span.x + span.width)
-                .fold(0.0, f64::max);
+                .map(|span| (span.x + span.width, span.y))
+                .fold(
+                    (0.0, 0.0),
+                    |best, edge| if edge.0 > best.0 { edge } else { best },
+                );
             row.spans
-                .push(Span::sized(output, Placed::Auto, right.ceil(), 0.0));
+                .push(Span::sized(output, Placed::Auto, right.ceil(), top));
         }
         row
     }
@@ -173,10 +176,16 @@ impl Row {
 
     pub fn home(&self) -> Option<OutputId> {
         let listed = self.spans.iter().any(|span| span.placed == Placed::Profile);
-        self.spans
-            .iter()
-            .filter(|span| !listed || span.placed == Placed::Profile)
-            .min_by(|a, b| a.distance2(0.0, 0.0).total_cmp(&b.distance2(0.0, 0.0)))
+        let candidates = || {
+            self.spans
+                .iter()
+                .filter(move |span| !listed || span.placed == Placed::Profile)
+        };
+        candidates()
+            .find(|span| span.contains(0.0, 0.0))
+            .or_else(|| {
+                candidates().min_by(|a, b| a.distance2(0.0, 0.0).total_cmp(&b.distance2(0.0, 0.0)))
+            })
             .map(|span| span.id)
     }
 
@@ -447,10 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unlisted_output_sits_right_of_the_profile_at_y_zero() {
+    fn an_unlisted_output_sits_right_of_the_profile_level_with_the_rightmost_output() {
         let row = profile_with_one_unlisted();
-        assert_eq!(row.centre(OutputId(3)), Some((3640.0 + 960.0, 540.0)));
-        assert_eq!(row.locate(3640.0, 0.0), hit(3, 0.0, 0.0));
+        assert_eq!(
+            row.centre(OutputId(3)),
+            Some((3640.0 + 960.0, -360.0 + 540.0))
+        );
+        assert_eq!(row.locate(3640.0, -360.0), hit(3, 0.0, 0.0));
         assert_eq!(at(&row, 100.0, 100.0), OutputId(1));
     }
 
@@ -469,7 +481,7 @@ mod tests {
     #[test]
     fn the_absolute_pointer_reaches_an_unlisted_output() {
         let row = profile_with_one_unlisted();
-        let (x, y) = row.denormalize(4600.0 / 5560.0, (540.0 + 360.0) / 1920.0);
+        let (x, y) = row.denormalize(4600.0 / 5560.0, 540.0 / 1920.0);
         assert_eq!(row.locate(x, y), hit(3, 960.0, 540.0));
     }
 
@@ -703,7 +715,7 @@ mod tests {
         assert_eq!(
             profile_with_one_unlisted().to_string(),
             "DP-1 0,0 2560x1440 profile | DP-2 2560,-360 1080x1920 profile | \
-             HDMI-A-1 3640,0 1920x1080 auto; pointer box 0,-360 5560x1920"
+             HDMI-A-1 3640,-360 1920x1080 auto; pointer box 0,-360 5560x1920"
         );
         assert_eq!(Row::default().to_string(), "no outputs");
     }
