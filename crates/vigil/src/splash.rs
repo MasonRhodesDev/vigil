@@ -294,14 +294,13 @@ impl Splash {
         let mut glow_alpha = vec![0u8; rect.w * rect.h];
         let mut mark_alpha = vec![0u8; rect.w * rect.h];
         if let Some(logo) = &logo {
-            let off = (ge.saturating_sub(edge) / 2) as i64;
             for sy in y0..y1 {
                 for sx in x0..x1 {
                     let (bx, by) = (sx as i64 - g.glow_x, sy as i64 - g.glow_y);
                     let (px, py) = scene_to_panel(transform, sw, sh, sx, sy);
                     let i = (py - rect.y) * rect.w + (px - rect.x);
                     glow_alpha[i] = glow[by as usize * ge + bx as usize];
-                    let (lx, ly) = (bx - off, by - off);
+                    let (lx, ly) = (sx as i64 - g.logo_x, sy as i64 - g.logo_y);
                     if (0..edge as i64).contains(&lx) && (0..edge as i64).contains(&ly) {
                         mark_alpha[i] = logo[ly as usize * edge + lx as usize];
                     }
