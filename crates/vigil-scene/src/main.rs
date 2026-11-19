@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use image::ImageEncoder;
 use vigil_scene::{
-    Error, Format, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE, MAX_SPEC_BYTES, NOTICE,
-    Plate, Request, Scene, Sprite, confine, emit_spec, lock_down, read_bounded,
+    Error, Format, HELPER_ABI, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE,
+    MAX_SPEC_BYTES, NOTICE, Plate, Request, Scene, Sprite, confine, emit_spec, lock_down,
+    read_bounded,
 };
 
 const USAGE: &str = "usage:
@@ -18,9 +19,10 @@ const USAGE: &str = "usage:
                      [--ref-short-side N] [--scene FILE] [--logo SVG]
                      [--level 0..1] [--progress 0..1] [--edge N]
   vigil-scene spec --out FILE [--scene FILE] [--ref-short-side N]
-  vigil-scene mask --format svg|raster --edge N --deadline-ms N
+  vigil-scene mask --format svg|raster --edge N --deadline-ms N --abi V
   vigil-scene layer --mode WxH --transform 0-3 --layer frame|logo|glow|bar
                     --value 0..1 --svg-len N --spec-len N --deadline-ms N
+                    --abi V
 
 stages:
   grub-menu     the mark sprite at its place on the mode (RGBA, straight alpha)
@@ -395,7 +397,7 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
     let run = || -> Result<(), Error> {
         close_inherited()?;
         let allowed: &[&str] = match job {
-            "mask" => &["format", "edge", "deadline-ms"],
+            "mask" => &["format", "edge", "deadline-ms", "abi"],
             _ => &[
                 "mode",
                 "transform",
@@ -404,9 +406,16 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
                 "svg-len",
                 "spec-len",
                 "deadline-ms",
+                "abi",
             ],
         };
         let args = Args::parse(argv, allowed).map_err(Error::Helper)?;
+        let abi = args.need("abi").map_err(Error::Helper)?;
+        if abi != HELPER_ABI {
+            return Err(Error::Helper(format!(
+                "this helper is version {HELPER_ABI}, the library {abi}"
+            )));
+        }
         let deadline = args
             .num::<u64>("deadline-ms")
             .map_err(Error::Helper)?

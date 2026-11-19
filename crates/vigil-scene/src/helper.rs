@@ -17,6 +17,9 @@ use crate::{Error, Format, MAX_EDGE, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Mask, NOTIC
 /// Where packages install the helper. A crate that calls it takes the path
 /// from `installed_helper!`, so a build can move it.
 pub const INSTALLED_HELPER: &str = "/usr/lib/vigil/vigil-scene";
+/// The version of the helper protocol and of its drawing. The library
+/// passes it as `--abi`, and a helper built from other code refuses to run.
+pub const HELPER_ABI: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_DEADLINE: Duration = Duration::from_millis(1500);
 pub const MAX_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -136,6 +139,7 @@ impl Helper {
         let mut child = Command::new(&self.path)
             .args(args)
             .args(["--deadline-ms", &self.deadline.as_millis().to_string()])
+            .args(["--abi", HELPER_ABI])
             .env_clear()
             .current_dir("/")
             .stdin(stdin)
@@ -144,7 +148,12 @@ impl Helper {
             .spawn()
             .map_err(|e| Error::Helper(format!("cannot run {}: {e}", self.path.display())))?;
         // A host that ignores SIGCHLD has the kernel reap the helper as it
-        // exits, which loses its status and can beat pidfd_open.
+        // exits, which loses its status and can beat pidfd_open. If its pid
+        // were also reused in that gap, the kill below would reach a
+        // stranger. clone3 with CLONE_PIDFD would close it, but std makes
+        // that pidfd only on nightly, and forking by hand from a threaded
+        // compositor is worse. The reuse needs a full pid wrap within
+        // microseconds of spawn.
         let watch = |e: Errno| Error::Helper(format!("cannot watch the helper: {e}"));
         let exited = match pidfd_open(Pid::from_child(&child), PidfdFlags::empty()) {
             Err(Errno::SRCH) => Ok(true),

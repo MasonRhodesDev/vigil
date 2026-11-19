@@ -23,7 +23,7 @@ pub const NOTICE: &str = "vigil-scene: notice: ";
 /// past the deadline, 1 GiB of address space, no descriptors beyond stdio,
 /// output no bigger than the largest frame, no core dumps and no children.
 /// It dies with the thread that started it and can never gain privileges.
-/// A limit already lower is kept.
+/// A soft or hard limit already lower is kept.
 pub fn confine(deadline: Duration) -> Result<(), Error> {
     let cpu = u64::try_from(deadline.as_millis().div_ceil(1000))
         .unwrap_or(u64::MAX)
@@ -36,12 +36,13 @@ pub fn confine(deadline: Duration) -> Result<(), Error> {
         (Resource::Core, 0),
         (Resource::Nproc, 0),
     ] {
-        let limit = getrlimit(resource).maximum.map_or(want, |m| m.min(want));
+        let had = getrlimit(resource);
+        let lower = |limit: Option<u64>| Some(limit.map_or(want, |l| l.min(want)));
         setrlimit(
             resource,
             Rlimit {
-                current: Some(limit),
-                maximum: Some(limit),
+                current: lower(had.current),
+                maximum: lower(had.maximum),
             },
         )
         .map_err(|e| Error::Helper(format!("limiting {resource:?}: {e}")))?;

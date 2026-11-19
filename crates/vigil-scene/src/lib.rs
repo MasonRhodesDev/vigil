@@ -9,7 +9,7 @@ mod plate;
 mod sandbox;
 mod spec;
 
-pub use helper::{DEFAULT_DEADLINE, Helper, INSTALLED_HELPER, MAX_DEADLINE};
+pub use helper::{DEFAULT_DEADLINE, HELPER_ABI, Helper, INSTALLED_HELPER, MAX_DEADLINE};
 pub use layer::{Layer, Request};
 pub use logo::{
     Format, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_RASTER_BYTES, Mask, read_bounded, read_logo,
