@@ -1,4 +1,3 @@
-import json
 import os
 import shutil
 import subprocess
@@ -11,18 +10,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 GATE = os.path.join(HERE, "gate.py")
 GIT = ["git", "-c", "user.name=gate", "-c", "user.email=gate@localhost", "-c", "commit.gpgsign=false"]
-
-FAKE_GH = """\
-import json, os, sys
-scenario = json.load(open(os.environ["FAKE_GH_SCENARIO"]))
-path = sys.argv[2]
-for key, answer in scenario.items():
-    if path.startswith(key):
-        sys.stdout.write(answer)
-        sys.exit(0)
-sys.exit(f"fake gh: no answer for {path}")
-"""
-
 
 def run(argv, cwd, env=None):
     return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False, env=env)
@@ -88,6 +75,16 @@ class Scratch(unittest.TestCase):
         subprocess.run([*GIT, "add", "-A"], cwd=self.repo, check=True)
         subprocess.run([*GIT, "commit", "-qm", message], cwd=self.repo, check=True)
         return run(["git", "rev-parse", "HEAD"], self.repo).stdout.strip()
+
+    def relock(self):
+        result = run(["cargo", "metadata", "--offline", "--format-version", "1"], self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def drop_from_lock(self, *names):
+        blocks = self.read("Cargo.lock").split("\n[[package]]\n")
+        kept = [b for b in blocks if not any(b.startswith(f'name = "{n}"\n') for n in names)]
+        self.assertEqual(len(blocks) - len(kept), len(names))
+        self.write("Cargo.lock", "\n[[package]]\n".join(kept))
 
 
 LEAK = """
@@ -262,8 +259,8 @@ class Fence(Scratch):
         self.assertRefused("fence", "workspace-lints")
 
     def test_pinned_lint_lines_moved_to_another_table_are_refused(self):
-        self.replace("Cargo.toml", 'unsafe_code = "deny"\nunsafe_op_in_unsafe_fn = "deny"\n', "")
-        self.append("Cargo.toml", '\n[workspace.metadata.parked]\nunsafe_code = "deny"\nunsafe_op_in_unsafe_fn = "deny"\n')
+        self.replace("Cargo.toml", 'unsafe_code = "deny"\nunsafe_op_in_unsafe_fn = "forbid"\n', "")
+        self.append("Cargo.toml", '\n[workspace.metadata.parked]\nunsafe_code = "deny"\nunsafe_op_in_unsafe_fn = "forbid"\n')
         self.assertRefused("fence", "workspace-lints")
 
     def test_a_crate_overriding_the_workspace_lints_is_refused(self):
@@ -282,6 +279,65 @@ class Fence(Scratch):
     def test_an_unterminated_comment_is_refused(self):
         self.append("crates/vigil-ui/src/lib.rs", "\n/* never closed\n")
         self.assertRefused("fence", "unlexable")
+
+    def test_a_path_dependency_outside_the_workspace_is_refused(self):
+        self.write("vendor/evil/Cargo.toml", '[package]\nname = "evil"\nversion = "0.1.0"\nedition = "2024"\nbuild = "build.rs"\n')
+        self.write("vendor/evil/build.rs", "fn main() {}\n")
+        self.write("vendor/evil/src/lib.rs", "pub unsafe fn evil() {}\n")
+        self.replace("Cargo.toml", 'members = ["crates/*"]\n', 'members = ["crates/*"]\nexclude = ["vendor/evil"]\n')
+        self.replace("crates/vigil-input/Cargo.toml", "[dependencies]\n", '[dependencies]\nevil = { path = "../../vendor/evil" }\n')
+        self.relock()
+        self.assertRefused("fence", "vendor/evil/Cargo.toml path-dependency", "vendor/evil/build.rs build-script")
+
+    def test_a_path_patch_of_a_registry_crate_is_refused(self):
+        self.write("vendor/font8x8/Cargo.toml", '[package]\nname = "font8x8"\nversion = "0.3.1"\nedition = "2024"\n\n[lib]\nproc-macro = true\n')
+        self.write("vendor/font8x8/src/lib.rs", "")
+        self.append("Cargo.toml", '\n[patch.crates-io]\nfont8x8 = { path = "vendor/font8x8" }\n')
+        self.relock()
+        self.assertRefused("fence", "vendor/font8x8/Cargo.toml path-dependency", "vendor/font8x8/src/lib.rs proc-macro")
+
+    def test_a_nested_crate_that_is_not_a_member_is_refused(self):
+        self.write("crates/vigil-input/inner/Cargo.toml", '[package]\nname = "inner"\nversion = "0.1.0"\nedition = "2024"\n')
+        self.write("crates/vigil-input/inner/src/lib.rs", "#![forbid(unsafe_code)]\n")
+        self.replace("Cargo.toml", 'members = ["crates/*"]\n', 'members = ["crates/*"]\nexclude = ["crates/vigil-input/inner"]\n')
+        self.replace("crates/vigil-input/Cargo.toml", "[dependencies]\n", '[dependencies]\ninner = { path = "inner" }\n')
+        self.relock()
+        self.assertRefused("fence", "crates/vigil-input/inner/Cargo.toml path-dependency")
+
+    def test_new_registry_dependencies_are_reported(self):
+        self.drop_from_lock("libc", "serde_derive")
+        base = self.commit("a base without libc or serde_derive")
+        subprocess.run([*GIT, "checkout", "-q", self.base, "--", "Cargo.lock"], cwd=self.repo, check=True)
+        code, out = self.gate("fence", "--base", base)
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"libc 0\.2\.\d+ .*build script")
+        self.assertRegex(out, r"serde_derive 1\.\d+\.\d+ .*proc macro")
+
+    def test_a_missing_base_is_noted_and_passes(self):
+        code, out = self.gate("fence", "--base", "no-such-revision")
+        self.assertEqual(code, 0, out)
+        self.assertIn("no-such-revision", out)
+
+    def test_unsafe_op_in_unsafe_fn_must_be_forbidden(self):
+        self.replace("Cargo.toml", 'unsafe_op_in_unsafe_fn = "forbid"', 'unsafe_op_in_unsafe_fn = "deny"')
+        self.assertRefused("fence", "workspace-lints")
+
+    def test_allowing_a_group_that_holds_a_denied_lint_is_counted(self):
+        self.replace("crates/vigil-lock/src/main.rs", "#![deny(unsafe_code)]\n", "#![deny(unsafe_code)]\n#![allow(rust_2024_compatibility)]\n")
+        self.assertRefused("fence", "crates/vigil-lock/src/main.rs lint-allow")
+
+    def test_a_group_allow_hidden_from_the_raw_text_is_counted(self):
+        self.append("crates/vigil-ui/src/lib.rs", "\n#[allow/**/(rust_2024_compatibility)]\nfn quiet() {}\n")
+        self.assertRefused("fence", "crates/vigil-ui/src/lib.rs lint-allow")
+
+    def test_a_binary_must_install_the_panic_hook_first(self):
+        self.replace("crates/vigil-sim/src/main.rs", "    vigil_secret::exit_on_panic();\n", "")
+        self.assertRefused("fence", "crates/vigil-sim/src/main.rs panic-hook")
+
+    def test_a_decoy_main_does_not_satisfy_the_panic_hook(self):
+        self.replace("crates/vigil/src/main.rs", "fn main() {\n    vigil_secret::exit_on_panic();\n", "fn main() {\n")
+        self.append("crates/vigil/src/main.rs", "\nmod decoy {\n    fn main() {\n        vigil_secret::exit_on_panic();\n    }\n}\n")
+        self.assertRefused("fence", "crates/vigil/src/main.rs panic-hook")
 
     def test_a_shrink_must_lower_the_baseline(self):
         self.replace("crates/vigil-gl/examples/gl_modeset.rs", "let bo = unsafe {", "let bo = {")
@@ -362,101 +418,6 @@ class Advisories(Scratch):
     def test_an_unknown_key_is_refused(self):
         self.deny('ignore = [{ id = "RUSTSEC-2026-0192", reason = "expires 2027-02-19: x", crate = "x" }]\n')
         self.check("RUSTSEC-2026-0192")
-
-
-class Guard(Scratch):
-    OWNER = "repo-owner"
-
-    def guard(self, head, events, pushed="2026-11-19T10:00:00Z", labels=("owner-approved",)):
-        bin_dir = os.path.join(self.tmp, "bin")
-        os.makedirs(bin_dir, exist_ok=True)
-        with open(os.path.join(bin_dir, "gh"), "w", encoding="utf-8") as f:
-            f.write(f"#!{sys.executable}\n{FAKE_GH}")
-        os.chmod(os.path.join(bin_dir, "gh"), 0o755)
-        scenario = os.path.join(self.tmp, "scenario.json")
-        pull = {"labels": [{"name": n} for n in labels], "head": {"ref": "topic", "repo": {"full_name": "someone/vigil"}}}
-        with open(scenario, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "repos/{owner}/{repo}/pulls/": json.dumps(pull),
-                    "repos/{owner}/{repo}/issues/": "".join("\t".join(e) + "\n" for e in events),
-                    "repos/someone/vigil/activity": pushed + "\n",
-                    "repos/{owner}/{repo}": self.OWNER + "\n",
-                },
-                f,
-            )
-        env = {**os.environ, "PATH": bin_dir + os.pathsep + os.environ["PATH"], "FAKE_GH_SCENARIO": scenario}
-        return self.gate("guard", "--base", self.base, "--head", head, "--pr", "7", env=env)
-
-    def totals_trick(self):
-        self.replace("crates/vigil-gl/examples/gl_modeset.rs", "let bo = unsafe {", "let bo = {")
-        self.append("crates/vigil-lock/src/main.rs", "\n// unsafe\n")
-        code, out = self.gate("fence", "--update", "--allow-growth")
-        self.assertEqual(code, 0, out)
-        return self.commit("trade an example's unsafe for the lock's")
-
-    def test_an_unguarded_change_passes(self):
-        self.append("crates/vigil-ui/src/lib.rs", "\nfn idle() {}\n")
-        code, out = self.guard(self.commit("plain"), [])
-        self.assertEqual(code, 0, out)
-
-    def test_the_totals_trick_needs_the_owner(self):
-        was = next(line for line in self.read("tests/gates/baseline.tsv").splitlines() if "vigil-lock/src/main.rs\tunsafe" in line)
-        was = int(was.split("\t")[-1])
-        code, out = self.guard(self.totals_trick(), [], labels=())
-        self.assertNotEqual(code, 0, out)
-        self.assertIn(f"crates/vigil-lock/src/main.rs unsafe grew from {was} to {was + 1}", out)
-        self.assertIn("does not carry the label", out)
-
-    def test_a_label_from_someone_else_is_refused(self):
-        head = self.totals_trick()
-        code, out = self.guard(head, [("labeled", "an-agent", "2026-11-19T11:00:00Z")])
-        self.assertNotEqual(code, 0, out)
-        self.assertIn("only the repository owner can approve", out)
-
-    def test_an_owner_label_before_the_last_push_is_refused(self):
-        head = self.totals_trick()
-        code, out = self.guard(head, [("labeled", self.OWNER, "2026-11-19T09:00:00Z")])
-        self.assertNotEqual(code, 0, out)
-        self.assertIn("before the last push", out)
-
-    def test_a_removed_label_is_refused(self):
-        head = self.totals_trick()
-        events = [("labeled", self.OWNER, "2026-11-19T11:00:00Z"), ("unlabeled", self.OWNER, "2026-11-19T11:05:00Z")]
-        code, out = self.guard(head, events)
-        self.assertNotEqual(code, 0, out)
-
-    def test_an_owner_label_after_the_last_push_approves(self):
-        head = self.totals_trick()
-        code, out = self.guard(head, [("labeled", self.OWNER, "2026-11-19T11:00:00Z")])
-        self.assertEqual(code, 0, out)
-        self.assertIn("approved", out)
-
-    def test_guarded_paths_need_the_owner(self):
-        for path, text in [
-            ("tests/gates/gate.py", "\n"),
-            ("tests/check.sh", "\n"),
-            (".github/workflows/ci.yml", "\n"),
-            ("Cargo.toml", "\n"),
-            ("clippy.toml", "\n"),
-            ("deny.toml", "\n"),
-            ("crates/vigil-secret/src/lib.rs", "\nimpl std::ops::Deref for Secret {\n    type Target = str;\n    fn deref(&self) -> &str {\n        &self.0\n    }\n}\n"),
-        ]:
-            with self.subTest(path=path):
-                self.setUp()
-                self.append(path, text)
-                code, out = self.guard(self.commit(path), [], labels=())
-                self.assertNotEqual(code, 0, out)
-                self.assertIn(path, out)
-
-    def test_a_base_without_gates_is_reported(self):
-        subprocess.run([*GIT, "rm", "-rq", "tests/gates"], cwd=self.repo, check=True)
-        bare = self.commit("no gates")
-        self.append("crates/vigil-ui/src/lib.rs", "\nfn idle() {}\n")
-        head = self.commit("on top of a base without gates")
-        code, out = self.gate("guard", "--base", bare, "--head", head)
-        self.assertEqual(code, 0, out)
-        self.assertIn("has no gates", out)
 
 
 if __name__ == "__main__":

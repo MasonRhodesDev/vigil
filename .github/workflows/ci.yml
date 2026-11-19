@@ -39,6 +39,8 @@ jobs:
           sh "$judge/tests/check-sim-safety.sh"
           sh "$judge/tests/check-warning-safety.sh"
       - name: Safety gates from this branch
+        env:
+          GATE_BASE: origin/${{ github.base_ref || 'main' }}
         run: |
           python3 -I tests/gates/gate.py all
           ./tests/check-sim-safety.sh

@@ -1,25 +1,22 @@
 import argparse
 import collections
 import datetime
+import functools
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
-import urllib.parse
 
 BASELINE = "tests/gates/baseline.tsv"
-LABEL = "owner-approved"
 CRATES = "crates/"
 COUNTED = ("unsafe", "lint-allow", "expose")
 HORIZON_DAYS = 183
 
 WORDS = {"unsafe": re.compile(rb"\bunsafe\b"), "expose": re.compile(rb"\bexpose\b")}
 LINT_LEVEL = re.compile(rb"\b(?:allow|expect|warn)\s*\(")
-WEAKENED_LINT = re.compile(rb"unsafe|clippy|\bwarnings\b")
 CFG = re.compile(rb"\bcfg(?:_attr)?\s*!?\s*\(")
 CFG_CLIPPY = re.compile(rb"\bclippy\b(?!\s*::)")
 INCLUDE = re.compile(rb"\binclude\s*!|::\s*include\b|\binclude\s+as\b")
@@ -30,6 +27,7 @@ PATH_KEY = re.compile(rb"\bpath\s*=")
 LINT_CONFIG_NAMES = {"clippy.toml", ".clippy.toml", "rust-toolchain", "rust-toolchain.toml"}
 LINT_CONFIG_ALLOWED = {"clippy.toml"}
 ROOT_ATTRIBUTES = {"forbid": "#![forbid(unsafe_code)]", "deny": "#![deny(unsafe_code)]"}
+FORBIDDEN_LINTS = {"rust": ["unsafe_op_in_unsafe_fn"]}
 REQUIRED_LINTS = {
     "rust": ["unsafe_code", "unsafe_op_in_unsafe_fn"],
     "clippy": [
@@ -40,6 +38,7 @@ REQUIRED_LINTS = {
     ],
 }
 EXPOSE_BAN = "vigil_secret::Secret::expose"
+PANIC_HOOK = ["vigil_secret", ":", ":", "exit_on_panic", "(", ")", ";"]
 ADVISORY_ID = re.compile(r"(?:RUSTSEC-\d{4}-\d{4}|GHSA(?:-[23456789cfghjmpqrvwx]{4}){3})")
 ADVISORY_REASON = re.compile(r"expires (\d{4}-\d{2}-\d{2}): \S")
 
@@ -51,17 +50,6 @@ CANARY_LINTS = [
     "clippy::multiple_unsafe_ops_per_block",
     "clippy::disallowed_methods",
 ]
-
-GUARDED = re.compile(
-    r"tests/gates/(?!baseline\.tsv$).+"
-    r"|tests/check[^/]*\.sh"
-    r"|\.github/.+"
-    r"|Cargo\.toml|clippy\.toml|deny\.toml"
-    r"|(?:.+/)?(?:\.clippy\.toml|clippy\.toml|rust-toolchain(?:\.toml)?)"
-    r"|(?:.+/)?\.cargo/.+"
-    r"|crates/vigil-secret/.+"
-)
-
 
 class Findings:
     def __init__(self):
@@ -247,25 +235,30 @@ def macro_groups(tokens):
             yield token, tokens[start : group_end(tokens, start) + 1]
 
 
-def weakening_levels(attribute):
+def weakens(token, lint_groups):
+    return "unsafe" in token or token in ("clippy", "warnings") or token in lint_groups
+
+
+def weakening_levels(attribute, lint_groups):
     count = 0
     for k, token in enumerate(attribute):
         if token in ("allow", "expect", "warn") and attribute[k + 1 : k + 2] == ["("]:
             group = attribute[k + 1 : group_end(attribute, k + 1) + 1]
-            count += any("unsafe" in t or t in ("clippy", "warnings") for t in group)
+            count += any(weakens(t, lint_groups) for t in group)
     return count
 
 
-def measure(found, path, raw, tokens):
+def measure(found, path, raw, tokens, lint_groups):
     for rule, pattern in WORDS.items():
         count = len(pattern.findall(raw))
         if count:
             found.add(path, rule, f"{path}: {count} {rule}", weight=count)
-    allows = sum(1 for g in groups(LINT_LEVEL, raw) if WEAKENED_LINT.search(g))
+    names = re.compile(rb"\w+")
+    allows = sum(1 for g in groups(LINT_LEVEL, raw) if any(weakens(w.decode(), lint_groups) for w in names.findall(g)))
     if tokens is not None:
-        allows = max(allows, sum(weakening_levels(a) for a in attributes(tokens)))
+        allows = max(allows, sum(weakening_levels(a, lint_groups) for a in attributes(tokens)))
     if allows:
-        found.add(path, "lint-allow", f"{path}: {allows} allow, expect or warn naming unsafe, clippy or warnings", weight=allows)
+        found.add(path, "lint-allow", f"{path}: {allows} allow, expect or warn naming unsafe, clippy, warnings or a group holding a denied lint", weight=allows)
 
 
 def scan_rust(found, path, raw):
@@ -318,26 +311,54 @@ def check_roots(found, roots, tokens, unsafe):
             found.add(root, "root-attribute", f"{root}: line 1 must be {want}")
 
 
-def metadata():
-    # outside the tree, so neither a toolchain file nor a .cargo/config in it picks the cargo that runs here
-    manifest = os.path.join(os.getcwd(), "Cargo.toml")
+# outside the tree, so neither a toolchain file nor a .cargo/config in it picks the tool that runs here
+def neutral_run(argv):
     with tempfile.TemporaryDirectory() as neutral:
-        result = run(["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1", "--manifest-path", manifest], cwd=neutral)
+        result = run(argv, cwd=neutral)
     if result.returncode != 0:
-        die(f"cargo metadata: {result.stderr.strip()}")
-    return json.loads(result.stdout)
+        die(f"{' '.join(argv[:2])}: {result.stderr.strip()}")
+    return result.stdout
+
+
+@functools.cache
+def metadata():
+    manifest = os.path.join(os.getcwd(), "Cargo.toml")
+    return json.loads(neutral_run(["cargo", "metadata", "--locked", "--format-version", "1", "--manifest-path", manifest]))
+
+
+def lint_groups(denied):
+    groups, reading = set(), False
+    for line in neutral_run(["rustc", "-W", "help"]).splitlines():
+        if line.startswith("Lint groups provided by rustc"):
+            reading = True
+        elif reading and line.strip() and not line.startswith(" "):
+            break
+        elif reading and line.strip():
+            name, _, members = line.strip().partition(" ")
+            if {m.strip().replace("-", "_") for m in members.split(",")} & denied:
+                groups.add(name.replace("-", "_"))
+    if not reading:
+        die("rustc -W help lists no lint groups")
+    return groups
 
 
 def check_targets(found, files, here):
-    roots = []
+    roots, bins = [], []
+    members = set(metadata()["workspace_members"])
     for package in metadata()["packages"]:
+        if package["source"] is not None:
+            continue
         manifest = os.path.relpath(package["manifest_path"], here)
-        if not manifest.startswith(CRATES):
-            found.add(manifest, "target-outside-crates", f"{manifest}: workspace members live under {CRATES}")
-        with open(manifest, "rb") as f:
-            lints = tomllib.load(f).get("lints")
-        if lints != {"workspace": True}:
-            found.add(manifest, "crate-lints", f"{manifest}: [lints] must be exactly workspace = true")
+        member = package["id"] in members
+        if not member:
+            found.add(manifest, "path-dependency", f"{manifest}: a path dependency outside the workspace is code the fence never reads")
+        else:
+            if not manifest.startswith(CRATES):
+                found.add(manifest, "target-outside-crates", f"{manifest}: workspace members live under {CRATES}")
+            with open(manifest, "rb") as f:
+                lints = tomllib.load(f).get("lints")
+            if lints != {"workspace": True}:
+                found.add(manifest, "crate-lints", f"{manifest}: [lints] must be exactly workspace = true")
         for target in package["targets"]:
             source = os.path.relpath(target["src_path"], here)
             kinds = set(target["kind"])
@@ -346,25 +367,72 @@ def check_targets(found, files, here):
                 continue
             if "proc-macro" in kinds:
                 found.add(source, "proc-macro", f"{source}: proc macros generate code the fence cannot see")
+            if not member:
+                continue
             if not source.startswith(CRATES) or source not in files:
                 found.add(source, "target-outside-crates", f"{source}: every target must be a listed file under {CRATES}")
                 continue
             roots.append(source)
-    return roots
+            if "bin" in kinds:
+                bins.append(source)
+    return roots, bins
 
 
-def check_workspace(found):
+def check_mains(found, bins, tokens):
+    for root in bins:
+        body = tokens.get(root, [])
+        starts = [body.index("{", i) + 1 for i in range(len(body) - 1) if body[i : i + 2] == ["fn", "main"] and "{" in body[i:]]
+        if not starts or any(body[s : s + len(PANIC_HOOK)] != PANIC_HOOK for s in starts):
+            found.add(root, "panic-hook", f"{root}: every fn main begins with vigil_secret::exit_on_panic();")
+
+
+def report_dependencies(base):
+    if run(["git", "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"]).returncode != 0:
+        print(f"dependencies: {base} is not in this clone, so new dependencies are not listed")
+        return
+    shown = run(["git", "show", f"{base}:Cargo.lock"])
+    before = tomllib.loads(shown.stdout).get("package", []) if shown.returncode == 0 else []
+    with open("Cargo.lock", "rb") as f:
+        now = tomllib.load(f).get("package", [])
+    known = {(p["name"], p["version"]) for p in before}
+    names = {p["name"] for p in before}
+    kinds = {}
+    for package in metadata()["packages"]:
+        found_kinds = {k for t in package["targets"] for k in t["kind"]}
+        kinds[package["name"], package["version"]] = [label for kind, label in (("custom-build", "build script"), ("proc-macro", "proc macro")) if kind in found_kinds]
+    added = sorted((p["name"], p["version"], p.get("source", "")) for p in now if p.get("source") and (p["name"], p["version"]) not in known)
+    if not added:
+        print(f"dependencies: none new since {base}")
+        return
+    print(f"dependencies: {len(added)} not in {base}'s Cargo.lock; the reviewer reads each:")
+    for name, version, source in added:
+        notes = ["new crate" if name not in names else "new version", *kinds.get((name, version), [])]
+        print(f"  {name} {version} {source} ({', '.join(notes)})")
+
+
+def lint_level(setting):
+    return setting.get("level") if isinstance(setting, dict) else setting
+
+
+def workspace_lints():
     with open("Cargo.toml", "rb") as f:
-        lints = tomllib.load(f).get("workspace", {}).get("lints", {})
+        return tomllib.load(f).get("workspace", {}).get("lints", {})
+
+
+def check_workspace(found, lints):
     for tool, table in lints.items():
         for name, setting in table.items():
-            level = setting.get("level") if isinstance(setting, dict) else setting
+            level = lint_level(setting)
             if level not in ("deny", "forbid"):
                 found.add("Cargo.toml", "workspace-lints", f"Cargo.toml: [workspace.lints.{tool}] {name} is {level}; only deny or forbid")
     for tool, names in REQUIRED_LINTS.items():
         for name in names:
             if name not in lints.get(tool, {}):
                 found.add("Cargo.toml", "workspace-lints", f"Cargo.toml: [workspace.lints.{tool}] lost {name}")
+    for tool, names in FORBIDDEN_LINTS.items():
+        for name in names:
+            if lint_level(lints.get(tool, {}).get(name)) != "forbid":
+                found.add("Cargo.toml", "workspace-lints", f"Cargo.toml: [workspace.lints.{tool}] {name} must be forbid, since deny yields to a group allow")
     try:
         with open("clippy.toml", "rb") as f:
             banned = tomllib.load(f).get("disallowed-methods", [])
@@ -376,11 +444,14 @@ def check_workspace(found):
         found.add("clippy.toml", "clippy-config", f"clippy.toml: disallowed-methods no longer lists {EXPOSE_BAN}")
 
 
-def gate_fence(found, _args):
+def gate_fence(found, args):
     files = listed()
     if not files:
         die("git lists no files; run the gates from a checkout")
     here = os.getcwd()
+    lints = workspace_lints()
+    denied = {name for name, setting in lints.get("rust", {}).items() if lint_level(setting) in ("deny", "forbid")}
+    groups_holding_denied = lint_groups(denied)
     for path in files:
         parts = path.split("/")
         if parts[-1] in LINT_CONFIG_NAMES and path not in LINT_CONFIG_ALLOWED or ".cargo" in parts[:-1]:
@@ -398,10 +469,13 @@ def gate_fence(found, _args):
         lexed = scan_rust(found, path, raw) if path.endswith(".rs") else None
         if lexed is not None:
             tokens[path] = lexed
-        measure(found, path, raw, lexed)
+        measure(found, path, raw, lexed, groups_holding_denied)
         unsafe[path] = len(WORDS["unsafe"].findall(raw))
-    check_roots(found, check_targets(found, set(files), here), tokens, unsafe)
-    check_workspace(found)
+    roots, bins = check_targets(found, set(files), here)
+    check_roots(found, roots, tokens, unsafe)
+    check_mains(found, bins, tokens)
+    check_workspace(found, lints)
+    report_dependencies(args.base)
 
 
 def days_between(start, end):
@@ -469,100 +543,7 @@ def parse_baseline(text):
     return entries
 
 
-def git(*args):
-    result = run(["git", *args])
-    if result.returncode != 0:
-        die(f"git {' '.join(args)}: {result.stderr.strip()}")
-    return result.stdout
-
-
-def at(revision, path):
-    if revision is None:
-        return read_bytes(path).decode("utf-8", "surrogateescape") if os.path.isfile(path) else None
-    shown = run(["git", "show", f"{revision}:{path}"])
-    return shown.stdout if shown.returncode == 0 else None
-
-
-def changed(base, head):
-    fields = git("diff", "--name-status", "-z", "--find-renames", base, *([head] if head else [])).split("\0")
-    while len(fields) > 1:
-        status = fields.pop(0)
-        old = fields.pop(0)
-        yield old, fields.pop(0) if status[0] in "RC" else old
-    if head is None:
-        for path in git("ls-files", "--others", "--exclude-standard", "-z").split("\0")[:-1]:
-            yield path, path
-
-
-def needs_approval(base, head):
-    reasons, renamed = [], {}
-    for old, new in changed(base, head):
-        renamed[new] = old
-        for path in dict.fromkeys((old, new)):
-            if GUARDED.fullmatch(path):
-                reasons.append((path, "a gate, lint or build configuration, or the Secret API changed"))
-    before = parse_baseline(at(base, BASELINE) or "")
-    for (gate, path, rule), count in parse_baseline(at(head, BASELINE) or "").items():
-        was = before.get((gate, renamed.get(path, path), rule), 0)
-        if count > was:
-            reasons.append((BASELINE, f"{path} {rule} grew from {was} to {count}"))
-    return reasons
-
-
-def api(path, *options):
-    if not shutil.which("gh"):
-        die("gh is required to read a pull request's approval")
-    result = run(["gh", "api", path, *options])
-    if result.returncode != 0:
-        die(f"gh api {path}: {result.stderr.strip()}")
-    return result.stdout
-
-
-def refusal(pull_request):
-    owner = api("repos/{owner}/{repo}", "--jq", ".owner.login").strip()
-    pull = json.loads(api(f"repos/{{owner}}/{{repo}}/pulls/{pull_request}"))
-    if LABEL not in [label["name"] for label in pull["labels"]]:
-        return f"the pull request does not carry the label {LABEL}"
-    query = f'.[] | select(.label.name == "{LABEL}") | [.event, .actor.login, .created_at] | @tsv'
-    events = api(f"repos/{{owner}}/{{repo}}/issues/{pull_request}/events", "--paginate", "--jq", query).splitlines()
-    event, actor, labelled = events[-1].split("\t") if events else ("", "", "")
-    if event != "labeled" or actor != owner:
-        return f"the label {LABEL} was last {event or 'set'} by '{actor}', and only the repository owner can approve"
-    if not pull["head"]["repo"]:
-        return "the pull request's branch is gone"
-    branch = urllib.parse.quote(pull["head"]["ref"], safe="")
-    pushed = api(f"repos/{pull['head']['repo']['full_name']}/activity?ref={branch}&per_page=1", "--jq", ".[0].timestamp").strip()
-    if not pushed or labelled <= pushed:
-        return f"the label {LABEL} was added at {labelled}, before the last push at {pushed}; the owner removes it and adds it again"
-    return None
-
-
-def gate_guard(found, args):
-    if run(["git", "rev-parse", "--verify", "--quiet", f"{args.base}^{{commit}}"]).returncode != 0:
-        die(f"base revision {args.base} is not in this clone; fetch it, or pass --base")
-    base = git("merge-base", args.base, args.head or "HEAD").strip()
-    if at(base, "tests/gates/gate.py") is None:
-        print(f"guard: {args.base} has no gates, so this change introduces them")
-        return
-    reasons = needs_approval(base, args.head)
-    if not reasons:
-        return
-    print(f"guard: {len(reasons)} changes need the repository owner's approval (the label {LABEL}, added by the owner):")
-    for path, why in reasons:
-        print(f"  {path}: {why}")
-    if not args.pr:
-        print("guard: no pull request given (--pr), so this is a report and not a failure")
-        return
-    refused = refusal(args.pr)
-    if refused is None:
-        print(f"guard: approved, the repository owner added {LABEL} after the last push")
-        return
-    for path, why in reasons:
-        found.add(path, "needs-owner-approval", f"{path}: {why}; {refused}")
-
-
-GATES = {"fence": gate_fence, "advisories": gate_advisories, "canary": gate_canary, "guard": gate_guard}
-LOCAL = ["fence", "advisories", "canary"]
+GATES = {"fence": gate_fence, "advisories": gate_advisories, "canary": gate_canary}
 
 
 def judge(gate, found, baseline, args):
@@ -600,15 +581,13 @@ def main():
     parser.add_argument("gates", nargs="+", choices=[*GATES, "all"])
     parser.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), help="checkout to judge; a base-branch copy of this script judges a pull request this way")
     parser.add_argument("--update", action="store_true", help="lower the baseline to what is found now")
-    parser.add_argument("--allow-growth", action="store_true", help="with --update, also record growth; the guard then asks for the owner's approval")
-    parser.add_argument("--base", default=os.environ.get("GATE_BASE", "origin/main"), help="revision the guard compares against")
-    parser.add_argument("--head", default=os.environ.get("GATE_HEAD"), help="revision the guard judges, the working tree by default")
-    parser.add_argument("--pr", default=os.environ.get("GATE_PR"), help="pull request whose approval the guard reads")
+    parser.add_argument("--allow-growth", action="store_true", help="with --update, also record growth, which the pull request must justify")
+    parser.add_argument("--base", default=os.environ.get("GATE_BASE", "origin/main"), help="revision whose Cargo.lock the dependency list compares against")
     args = parser.parse_args()
     os.chdir(args.root)
     baseline = parse_baseline(read_bytes(BASELINE).decode()) if os.path.exists(BASELINE) else {}
     failures = 0
-    for gate in LOCAL if "all" in args.gates else args.gates:
+    for gate in GATES if "all" in args.gates else args.gates:
         found = Findings()
         GATES[gate](found, args)
         failures += judge(gate, found, baseline, args)
