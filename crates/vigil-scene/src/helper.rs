@@ -50,7 +50,7 @@ macro_rules! installed_helper {
 /// logo does, a call returns within the deadline, plus the kernel's teardown
 /// of a killed helper and the copy of the result, and the caller's memory
 /// grows by the result alone. A logo and spec that time out at a striking
-/// deadline `TIMEOUTS_BEFORE_TOO_SLOW` times at one size class are
+/// deadline `TIMEOUTS_BEFORE_TOO_SLOW` times at one size class and layer are
 /// `Error::TooSlow` there for `TOO_SLOW_LASTS`.
 #[derive(Debug, Clone)]
 pub struct Helper {
@@ -117,10 +117,7 @@ impl Helper {
         }
         let (mode, transform) = (format!("{}x{}", req.mode.0, req.mode.1), req.transform);
         self.run(
-            timeouts::Key::new(
-                &[Format::Svg.name().as_bytes(), svg, spec],
-                u64::from(req.mode.0) * u64::from(req.mode.1),
-            ),
+            timeouts::Key::layer(req),
             &[
                 "layer",
                 "--mode",

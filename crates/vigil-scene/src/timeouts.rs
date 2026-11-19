@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use rustix::time::{ClockId, clock_gettime};
 
-use crate::Error;
 use crate::helper::MAX_DEADLINE;
+use crate::{Error, Format, Request};
 
 /// How many timeouts at a striking deadline one logo and spec may cost at
-/// one size class before the library answers `Error::TooSlow` for them,
+/// one size class and layer before the library answers `Error::TooSlow` for them,
 /// without running the helper. A timeout of a call that began before the
 /// last strike is the same slow moment and does not count again.
 pub const TIMEOUTS_BEFORE_TOO_SLOW: u32 = 2;
@@ -25,7 +25,8 @@ pub const TOO_SLOW_LASTS: Duration = Duration::from_secs(60 * 60);
 const REMEMBERED: usize = 64;
 
 /// A logo and spec at one size class: the log2 of the area drawn, so a logo
-/// too slow for an 8K panel is still tried on a 1080p one.
+/// too slow for an 8K panel is still tried on a 1080p one. A drawn layer
+/// keys on its layer too, so a glow that times out costs the logo nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Key {
     request: u64,
@@ -35,6 +36,18 @@ pub(crate) struct Key {
 static SEED: LazyLock<RandomState> = LazyLock::new(RandomState::new);
 
 impl Key {
+    pub(crate) fn layer(req: &Request<'_>) -> Key {
+        Key::new(
+            &[
+                Format::Svg.name().as_bytes(),
+                req.layer.name().as_bytes(),
+                req.svg.unwrap_or_default(),
+                req.spec.unwrap_or_default(),
+            ],
+            u64::from(req.mode.0) * u64::from(req.mode.1),
+        )
+    }
+
     pub(crate) fn new(parts: &[&[u8]], area: u64) -> Key {
         Key {
             request: SEED.hash_one(parts),
@@ -181,6 +194,7 @@ pub(crate) fn settle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Layer;
 
     const LONGEST: Duration = MAX_DEADLINE;
     const BRIEF: Duration = Duration::from_millis(500);
@@ -241,6 +255,25 @@ mod tests {
             secs(30)
         )));
         assert!(!t.entries.contains_key(&logo(2)));
+    }
+
+    #[test]
+    fn a_logo_and_its_glow_slow_in_one_moment_are_one_strike_each() {
+        let mut t = Table::default();
+        let layer = |layer| {
+            Key::layer(&Request {
+                svg: Some(b"<svg/>"),
+                spec: None,
+                mode: (1920, 1080),
+                transform: 0,
+                layer,
+                value: 1.0,
+            })
+        };
+        let (logo, glow) = (layer(Layer::Logo), layer(Layer::Glow));
+        assert!(is_timeout(time_out(&mut t, logo, LONGEST, secs(0))));
+        assert!(is_timeout(time_out(&mut t, glow, LONGEST, LONGEST)));
+        assert!(t.check(logo, secs(20)).is_ok(), "the logo is still tried");
     }
 
     #[test]
