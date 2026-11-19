@@ -175,8 +175,7 @@ impl AuthMachine {
 
     pub fn begin(&mut self, user: Option<&str>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         self.fixed_user = user.is_some();
-        self.choose(user, false, ui);
-        Ok(())
+        self.choose(user, false, ui)
     }
 
     pub fn select_user(
@@ -189,19 +188,28 @@ impl AuthMachine {
         }
         self.fixed_user = false;
         self.close(ui)?;
-        self.choose(user, false, ui);
-        Ok(())
+        self.choose(user, false, ui)
     }
 
-    fn choose(&mut self, user: Option<&str>, typed: bool, ui: &mut dyn AuthUi) {
-        match user {
-            Some(user) => {
-                self.user = Some(user.to_owned());
-                self.typed = typed;
-                self.offer(ui);
-            }
-            None => self.prompt_username(ui),
+    fn choose(
+        &mut self,
+        user: Option<&str>,
+        typed: bool,
+        ui: &mut dyn AuthUi,
+    ) -> Result<(), AuthError> {
+        let Some(user) = user else {
+            self.prompt_username(ui);
+            return Ok(());
+        };
+        self.user = Some(user.to_owned());
+        self.typed = typed;
+        if self.unprompted.as_deref() == Some(user) {
+            eprintln!("vigil: auth unasked user={}", self.logged_user());
+            ui.reset_input();
+            return self.open(None, ui);
         }
+        self.offer(ui);
+        Ok(())
     }
 
     fn prompt_username(&mut self, ui: &mut dyn AuthUi) {
@@ -255,12 +263,11 @@ impl AuthMachine {
                     let name = text.trim();
                     if name.is_empty() {
                         let default = self.default_user.clone();
-                        self.choose(default.as_deref(), false, ui);
+                        self.choose(default.as_deref(), false, ui)
                     } else {
                         let typed = self.default_user.as_deref() != Some(name);
-                        self.choose(Some(name), typed, ui);
+                        self.choose(Some(name), typed, ui)
                     }
-                    Ok(())
                 }
                 State::AwaitingCommit => self.open(Some(text).filter(|text| !text.is_empty()), ui),
                 State::AwaitingPrompt => {
@@ -340,6 +347,13 @@ impl AuthMachine {
                     let offered = self.offered();
                     if !std::mem::replace(&mut self.asked, true) {
                         self.first_question = self.user.clone().map(|user| (user, prompt.clone()));
+                    }
+                    if self.unprompted.is_some() && self.unprompted == self.user {
+                        eprintln!(
+                            "vigil: auth: user={} was asked a question; no longer opening unasked",
+                            self.logged_user()
+                        );
+                        self.unprompted = None;
                     }
                     if let Some(answer) = answer.take().filter(|_| prompt.secret == offered.secret)
                     {
