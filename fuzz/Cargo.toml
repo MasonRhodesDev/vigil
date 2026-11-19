@@ -17,6 +17,7 @@ vigil-auth = { path = "../crates/vigil-auth" }
 vigil-config = { path = "../crates/vigil-config" }
 vigil-core = { path = "../crates/vigil-core" }
 vigil-input = { path = "../crates/vigil-input", features = ["fuzzing"] }
+vigil-theme = { path = "../crates/vigil-theme" }
 
 [[bin]]
 name = "greetd_response"
@@ -42,6 +43,13 @@ bench = false
 [[bin]]
 name = "keyboard"
 path = "fuzz_targets/keyboard.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "theme"
+path = "fuzz_targets/theme.rs"
 test = false
 doc = false
 bench = false

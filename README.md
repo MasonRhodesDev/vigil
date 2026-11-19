@@ -155,7 +155,7 @@ can be run alone.
 | What is attacked | Run it |
 |---|---|
 | `AuthMachine` against a scripted greetd, by generated message and input sequences | `cargo test -p vigil-auth --test attack` |
-| The greetd reply decoder, the state file, the config overlay and the keyboard state, by fuzzing | `fuzz/run.sh 300` |
+| The greetd reply decoder, the state file, the config overlay, the keyboard state and the theme loader, by fuzzing | `fuzz/run.sh 300` |
 | The PAM conversation callback, by a hostile module under AddressSanitizer | `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p vigil-pam --target x86_64-unknown-linux-gnu` |
 | The pure Rust half of `vigil-pam`, under Miri | `MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p vigil-pam` |
 | A locked session: signals, memory starvation, input flood, unlock race, compositor death | `tests/nested/attack.sh` |
