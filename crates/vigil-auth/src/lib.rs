@@ -91,7 +91,7 @@ impl Prompt {
     }
 }
 
-struct Typed {
+struct Submitted {
     text: String,
     field: Prompt,
 }
@@ -290,7 +290,7 @@ impl AuthMachine {
 
     // greetd can end a conversation that has asked a question only with an
     // answer or with a failure PAM counts, so none is opened before a submit.
-    fn open(&mut self, typed: Option<Typed>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+    fn open(&mut self, submitted: Option<Submitted>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         let Some(user) = self.user.clone() else {
             self.prompt_username(ui);
             return Ok(());
@@ -299,7 +299,7 @@ impl AuthMachine {
         self.asked = false;
         self.spoke = false;
         let response = self.transact(&Request::CreateSession { username: user }, ui)?;
-        self.process_response(response, typed, ui)
+        self.process_response(response, submitted, ui)
     }
 
     pub fn handle(&mut self, msg: UiMessage, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
@@ -317,7 +317,7 @@ impl AuthMachine {
                 }
                 State::AwaitingCommit => {
                     let field = self.offered();
-                    self.open((!text.is_empty()).then_some(Typed { text, field }), ui)
+                    self.open((!text.is_empty()).then_some(Submitted { text, field }), ui)
                 }
                 State::AwaitingPrompt => {
                     let response = self.transact(
@@ -396,7 +396,7 @@ impl AuthMachine {
     fn process_response(
         &mut self,
         mut response: Response,
-        mut typed: Option<Typed>,
+        mut submitted: Option<Submitted>,
         ui: &mut dyn AuthUi,
     ) -> Result<(), AuthError> {
         loop {
@@ -415,11 +415,11 @@ impl AuthMachine {
                         self.first_questions.insert(user, prompt.clone());
                     }
                     self.heard();
-                    match typed.take() {
-                        Some(typed) if prompt.is_the_question_under(&typed.field) => {
+                    match submitted.take() {
+                        Some(submitted) if prompt.is_the_question_under(&submitted.field) => {
                             response = self.transact(
                                 &Request::PostAuthMessageResponse {
-                                    response: Some(typed.text),
+                                    response: Some(submitted.text),
                                 },
                                 ui,
                             )?;
