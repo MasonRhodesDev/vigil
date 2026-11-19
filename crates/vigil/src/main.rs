@@ -203,6 +203,7 @@ struct Entry {
     description: Option<String>,
     width: u32,
     height: u32,
+    scale: f64,
     presenter: Box<dyn Presenter>,
     window: OutputWindow,
     hw_cursor: bool,
@@ -1059,6 +1060,7 @@ impl App {
             description: info.description(),
             width: scene_width,
             height: scene_height,
+            scale: f64::from(scale),
             hw_cursor,
             present_failures: 0,
             presenter,
@@ -1083,17 +1085,28 @@ impl App {
         let geometry: Vec<_> = self
             .entries
             .iter()
-            .map(|e| layout::Geometry {
-                id: e.id,
-                position: self
-                    .layout
-                    .iter()
-                    .find(|o| o.name == e.connector)
-                    .map(|o| o.position),
-                scene: (e.width, e.height),
+            .map(|e| {
+                let listed = self.layout.iter().find(|o| o.name == e.connector);
+                layout::Geometry {
+                    id: e.id,
+                    connector: &e.connector,
+                    position: listed.map(|o| o.position),
+                    scene: (e.width, e.height),
+                    scale: listed
+                        .map(|o| o.scale)
+                        .filter(|scale| scale.is_finite() && *scale > 0.0)
+                        .unwrap_or(e.scale),
+                }
             })
             .collect();
-        self.row = layout::Row::place(&geometry);
+        let row = layout::Row::place(&geometry);
+        if row != self.row {
+            eprintln!("vigil: layout {row}");
+            for overlap in row.overlaps() {
+                eprintln!("vigil: layout: {overlap}");
+            }
+        }
+        self.row = row;
         let (cx, cy) = self.row.clamp(self.cursor.0, self.cursor.1);
         self.cursor = (cx, cy);
         if let Some(origin) = self.layout.iter().find(|output| output.position == (0, 0))
