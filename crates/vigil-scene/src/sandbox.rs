@@ -13,7 +13,7 @@ use seccompiler::{
     SeccompRule,
 };
 
-use crate::helper::MESSAGE;
+use crate::helper::MAX_MESSAGE;
 use crate::{Error, MAX_PIXELS};
 
 const MEMORY: u64 = 1 << 30;
@@ -23,12 +23,13 @@ pub const NOTICE: &str = "vigil-scene: notice: ";
 
 /// What the helper does to itself before it reads its input: CPU time just
 /// past the deadline, 1 GiB of address space, no descriptors beyond stdio,
-/// output no bigger than the largest frame, no core dumps and no children.
+/// no file written past `output` bytes plus room for a message, no core
+/// dumps and no children.
 /// It dies with the thread that started it and can never gain privileges.
 /// A soft or hard limit already lower is kept. Where the kernel has
 /// Landlock, it also denies itself every file and network access. Landlock
 /// is best effort, and a kernel without it is returned as a notice.
-pub fn confine(deadline: Duration) -> Result<Option<String>, Error> {
+pub fn confine(deadline: Duration, output: u64) -> Result<Option<String>, Error> {
     set_parent_process_death_signal(Some(Signal::KILL))
         .map_err(|e| Error::Helper(format!("tying the helper to its caller: {e}")))?;
     let ruleset = landlock_ruleset();
@@ -39,7 +40,7 @@ pub fn confine(deadline: Duration) -> Result<Option<String>, Error> {
         (Resource::Cpu, cpu),
         (Resource::As, MEMORY),
         (Resource::Nofile, 3),
-        (Resource::Fsize, MAX_PIXELS * 4 + MESSAGE),
+        (Resource::Fsize, output.min(MAX_PIXELS * 4) + MAX_MESSAGE),
         (Resource::Core, 0),
         (Resource::Nproc, 0),
     ] {
@@ -71,13 +72,25 @@ pub fn confine(deadline: Duration) -> Result<Option<String>, Error> {
 /// kills the process at any system call outside what drawing, writing the
 /// result and dying need: it cannot open a file, reach a socket, signal or
 /// trace another process, or map executable memory. Landlock, applied by
-/// `confine`, is the second layer.
+/// `confine`, is the second layer. A panic or a fault once the filter is on
+/// is the input's doing, so it ends the process as a refusal or by its own
+/// signal, never by SIGSYS, which says the allowlist has a gap. A panic
+/// before then is the helper's own fault and exits 101, a `Helper` error. A
+/// fault before then also dies by its own signal, through std's handler
+/// before `die_of_faults` or by default after it, so the library reads it
+/// as a refusal although no byte of the logo has been parsed. The code up
+/// to here is safe Rust over argv and a bounded read, so such a fault is a
+/// bug in the helper or a dependency, not something a logo can cause.
 pub fn lock_down() -> Result<(), Error> {
+    vigil_secret::die_of_faults()
+        .map_err(|e| Error::Helper(format!("readying the helper to die of faults: {e}")))?;
     set_dumpable_behavior(DumpableBehavior::NotDumpable)
         .map_err(|e| Error::Helper(format!("making the helper undumpable: {e}")))?;
     let filter = allowlist().map_err(|e| Error::Helper(format!("building the filter: {e}")))?;
     seccompiler::apply_filter_all_threads(&filter)
-        .map_err(|e| Error::Helper(format!("installing the filter: {e}")))
+        .map_err(|e| Error::Helper(format!("installing the filter: {e}")))?;
+    vigil_secret::crash_plainly(Error::Refused(String::new()).exit_code());
+    Ok(())
 }
 
 // The ruleset is a descriptor, so it is made before RLIMIT_NOFILE leaves

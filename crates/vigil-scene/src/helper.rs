@@ -12,18 +12,24 @@ use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
+use crate::timeouts;
 use crate::{Error, Format, MAX_EDGE, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Mask, NOTICE, Request};
 
 /// Where packages install the helper. A crate that calls it takes the path
 /// from `installed_helper!`, so a build can move it.
 pub const INSTALLED_HELPER: &str = "/usr/lib/vigil/vigil-scene";
-/// The version of the helper protocol and of its drawing. The library
-/// passes it as `--abi`, and a helper built from other code refuses to run.
-pub const HELPER_ABI: &str = env!("CARGO_PKG_VERSION");
+/// The version of the helper protocol: its command line and its output. The
+/// library passes it as `--abi`, and a helper of another version refuses to
+/// run and names both. Bump it on any change to the arguments the library
+/// sends or to what the helper writes back; a test pins the argument names
+/// to this number.
+pub const HELPER_ABI: u32 = 2;
 pub const DEFAULT_DEADLINE: Duration = Duration::from_millis(1500);
 pub const MAX_DEADLINE: Duration = Duration::from_secs(5);
 
-pub(crate) const MESSAGE: u64 = 4096;
+/// The most the library reads of what the helper writes to stderr, and the
+/// most the helper's file size limit leaves room for beyond its output.
+pub const MAX_MESSAGE: u64 = 4096;
 
 /// The helper's installed path, fixed when the calling crate is built: the
 /// `VIGIL_SCENE_HELPER` build variable, else `INSTALLED_HELPER`. It is never
@@ -43,7 +49,10 @@ macro_rules! installed_helper {
 /// byte, and a deadline after which it is killed and reaped. Whatever the
 /// logo does, a call returns within the deadline, plus the kernel's teardown
 /// of a killed helper and the copy of the result, and the caller's memory
-/// grows by the result alone.
+/// grows by the result alone. A logo and spec that time out at a striking
+/// deadline `TIMEOUTS_BEFORE_TOO_SLOW` times at one size class and layer,
+/// each `STRIKES_APART` after the last, are `Error::TooSlow` there for
+/// `TOO_SLOW_LASTS`.
 #[derive(Debug, Clone)]
 pub struct Helper {
     path: PathBuf,
@@ -72,6 +81,7 @@ impl Helper {
         }
         let mut alpha = vec![0u8; edge as usize * edge as usize];
         self.run(
+            timeouts::Key::new(&[format.name().as_bytes(), logo], u64::from(edge).pow(2)),
             &[
                 "mask",
                 "--format",
@@ -108,6 +118,7 @@ impl Helper {
         }
         let (mode, transform) = (format!("{}x{}", req.mode.0, req.mode.1), req.transform);
         self.run(
+            timeouts::Key::layer(req),
             &[
                 "layer",
                 "--mode",
@@ -128,8 +139,26 @@ impl Helper {
         )
     }
 
-    fn run(&self, args: &[&str], input: &[&[u8]], out: &mut [u8]) -> Result<(), Error> {
-        let by = Instant::now() + self.deadline;
+    fn run(
+        &self,
+        key: timeouts::Key,
+        args: &[&str],
+        input: &[&[u8]],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        timeouts::check(key)?;
+        let started = timeouts::now();
+        let got = self.run_once(Instant::now() + self.deadline, args, input, out);
+        timeouts::settle(key, self.deadline, started, got)
+    }
+
+    fn run_once(
+        &self,
+        by: Instant,
+        args: &[&str],
+        input: &[&[u8]],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
         let mut stdin = memfd("vigil-scene-in")?;
         for part in input {
             stdin.write_all(part).map_err(io)?;
@@ -139,7 +168,8 @@ impl Helper {
         let mut child = Command::new(&self.path)
             .args(args)
             .args(["--deadline-ms", &self.deadline.as_millis().to_string()])
-            .args(["--abi", HELPER_ABI])
+            .args(["--out-len", &out.len().to_string()])
+            .args(["--abi", &HELPER_ABI.to_string()])
             .env_clear()
             .current_dir("/")
             .stdin(stdin)
@@ -183,17 +213,7 @@ impl Helper {
         match status.map(|s| (s.code(), s.signal())) {
             Some((Some(0), _)) => {}
             Some((Some(code), _)) => return Err(Error::from_exit(code, message(&stderr))),
-            Some((None, Some(libc::SIGSYS))) => {
-                return Err(Error::Helper(
-                    "the helper's sandbox stopped it at a forbidden system call".into(),
-                ));
-            }
-            Some((None, signal)) => {
-                return Err(Error::Refused(format!(
-                    "the helper was killed by signal {}",
-                    signal.unwrap_or(0)
-                )));
-            }
+            Some((None, signal)) => return Err(killed_by(signal.unwrap_or(0))),
             None => {
                 let why = message(&stderr);
                 if !why.is_empty() {
@@ -214,6 +234,28 @@ impl Helper {
             ONCE.call_once(|| vigil_log::say!("vigil-scene: the helper says: {notice}"));
         }
         Ok(())
+    }
+}
+
+fn killed_by(signal: i32) -> Error {
+    match signal {
+        libc::SIGSYS => {
+            Error::Helper("the helper's sandbox stopped it at a forbidden system call".into())
+        }
+        // What drawing a logo can raise: a fault, an abort, a bad
+        // instruction or division, or the output size limit.
+        libc::SIGSEGV
+        | libc::SIGBUS
+        | libc::SIGABRT
+        | libc::SIGILL
+        | libc::SIGFPE
+        | libc::SIGXFSZ => Error::Refused(format!("the helper was killed by signal {signal}")),
+        // Among the rest, the OOM killer sends SIGKILL, a session teardown
+        // SIGTERM or SIGHUP, and the helper is single-threaded, so its CPU
+        // limit fires only after the wall deadline would have.
+        _ => Error::Helper(format!(
+            "the helper was killed by signal {signal}, which says nothing about the logo"
+        )),
     }
 }
 
@@ -244,7 +286,7 @@ fn wait(pidfd: &OwnedFd, by: Instant) -> Result<bool, Error> {
 }
 
 fn stderr_text(stderr: &File) -> String {
-    let len = stderr.metadata().map_or(0, |m| m.len()).min(MESSAGE);
+    let len = stderr.metadata().map_or(0, |m| m.len()).min(MAX_MESSAGE);
     let mut buf = vec![0u8; len as usize];
     let read = stderr.read_at(&mut buf, 0).unwrap_or(0);
     String::from_utf8_lossy(&buf[..read]).into_owned()
@@ -266,4 +308,33 @@ fn message(stderr: &File) -> String {
         .trim()
         .trim_start_matches("vigil-scene: ")
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_signal_the_logo_can_raise_is_a_refusal() {
+        let refused = [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGABRT,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGXFSZ,
+        ];
+        for signal in 1..=libc::SIGRTMAX() {
+            let got = killed_by(signal);
+            assert_eq!(
+                matches!(got, Error::Refused(_)),
+                refused.contains(&signal),
+                "signal {signal}: {got:?}"
+            );
+            assert!(
+                matches!(got, Error::Refused(_) | Error::Helper(_)),
+                "signal {signal}: {got:?}"
+            );
+        }
+    }
 }

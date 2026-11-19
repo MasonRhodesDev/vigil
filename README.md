@@ -131,7 +131,9 @@ has it, and can never gain privileges. Once it holds all its input, and
 before it parses any, it stops being dumpable and installs a seccomp filter
 that kills it at any system call outside allocating, writing its result and
 exiting. A bug in the SVG or image parsers then reaches no file, socket or
-other process. The allowlist and how it was derived are in
+other process. A panic or a fault in a parser ends the helper as a refusal of
+the logo. Only a call the filter forbids ends it by SIGSYS, which the library
+reports as a helper fault. The allowlist and how it was derived are in
 `crates/vigil-scene/src/sandbox.rs`.
 
 For safe UI development inside a running session, use `vigil-sim login`,

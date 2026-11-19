@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use image::ImageEncoder;
 use vigil_scene::{
-    Error, Format, HELPER_ABI, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE,
-    MAX_SPEC_BYTES, NOTICE, Plate, Request, Scene, Sprite, confine, emit_spec, lock_down,
-    read_bounded,
+    Error, Format, HELPER_ABI, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_MESSAGE,
+    MAX_PIXELS, MAX_SIDE, MAX_SPEC_BYTES, NOTICE, Plate, Request, Scene, Sprite, confine,
+    emit_spec, lock_down, read_bounded,
 };
 
 const USAGE: &str = "usage:
@@ -20,10 +20,11 @@ const USAGE: &str = "usage:
                      [--ref-short-side N] [--scene FILE] [--logo SVG]
                      [--level 0..1] [--progress 0..1] [--edge N]
   vigil-scene spec --out FILE [--scene FILE] [--ref-short-side N]
-  vigil-scene mask --format svg|raster --edge N --deadline-ms N --abi V
+  vigil-scene mask --format svg|raster --edge N --deadline-ms N --out-len N
+                   --abi V
   vigil-scene layer --mode WxH --transform 0-3 --layer frame|logo|glow|bar
                     --value 0..1 --svg-len N --spec-len N --deadline-ms N
-                    --abi V
+                    --out-len N --abi V
 
 stages:
   grub-menu     the mark sprite at its place on the mode (RGBA, straight alpha)
@@ -38,7 +39,7 @@ scene on it as wl_output does. Sprites print their placement as JSON.
 
 mask and layer are the helper the library runs for untrusted logos. Each
 confines itself, reads the logo (and for layer, the spec after it) from
-stdin, and writes raw pixels to stdout.";
+stdin, and writes --out-len bytes of raw pixels to stdout.";
 
 const RENDER_LIMIT: Duration = Duration::from_secs(30);
 
@@ -341,6 +342,16 @@ fn record(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+const NOTICE_ROOM: usize = 256;
+
+// A refusal can quote the logo at any length, and a write past the file size
+// limit, which leaves MAX_MESSAGE beyond the output, would end the helper by
+// SIGXFSZ instead. A notice and an error together stay within it.
+fn say_within(line: &str, room: usize) {
+    let line = &line[..line.floor_char_boundary(room - 1)];
+    let _ = record(rustix::stdio::stderr(), format!("{line}\n").as_bytes());
+}
+
 // Reads all of stdin, then locks the process down before any of it is
 // parsed.
 fn input_up_to(cap: u64) -> Result<Vec<u8>, Error> {
@@ -407,11 +418,27 @@ fn layer_job(args: &Args) -> Result<Vec<u8>, Error> {
     .draw()
 }
 
+// Read before anything else in the command line, so a library of another
+// HELPER_ABI that sends an argument or a job this helper does not know
+// hears the version, not the argument.
+fn another_abi(argv: &[String]) -> Option<Error> {
+    let at = argv.iter().position(|a| a == "--abi")?;
+    let abi = argv.get(at + 1).map_or("", String::as_str);
+    (abi != HELPER_ABI.to_string()).then(|| {
+        Error::Helper(format!(
+            "this helper is version {HELPER_ABI}, the library {abi}"
+        ))
+    })
+}
+
 fn helper(job: &str, argv: &[String]) -> ExitCode {
     let run = || -> Result<(), Error> {
         close_inherited()?;
+        if let Some(e) = another_abi(argv) {
+            return Err(e);
+        }
         let allowed: &[&str] = match job {
-            "mask" => &["format", "edge", "deadline-ms", "abi"],
+            "mask" => &["format", "edge", "deadline-ms", "out-len", "abi"],
             _ => &[
                 "mode",
                 "transform",
@@ -420,42 +447,50 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
                 "svg-len",
                 "spec-len",
                 "deadline-ms",
+                "out-len",
                 "abi",
             ],
         };
         let args = Args::parse(argv, allowed).map_err(Error::Helper)?;
-        let abi = args.need("abi").map_err(Error::Helper)?;
-        if abi != HELPER_ABI {
-            return Err(Error::Helper(format!(
-                "this helper is version {HELPER_ABI}, the library {abi}"
-            )));
-        }
+        args.need("abi").map_err(Error::Helper)?;
         let deadline = args
             .num::<u64>("deadline-ms")
             .map_err(Error::Helper)?
             .ok_or_else(|| Error::Helper("--deadline-ms is required".into()))?;
-        if let Some(notice) = confine(Duration::from_millis(deadline))? {
-            let _ = record(
-                rustix::stdio::stderr(),
-                format!("{NOTICE}{notice}\n").as_bytes(),
-            );
+        let out_len = args
+            .num::<u64>("out-len")
+            .map_err(Error::Helper)?
+            .filter(|n| *n <= MAX_PIXELS * 4)
+            .ok_or_else(|| {
+                Error::Helper(format!("--out-len up to {} is required", MAX_PIXELS * 4))
+            })?;
+        if let Some(notice) = confine(Duration::from_millis(deadline), out_len)? {
+            say_within(&format!("{NOTICE}{notice}"), NOTICE_ROOM);
         }
         let pixels = match job {
             "mask" => mask_job(&args)?,
             _ => layer_job(&args)?,
         };
+        if pixels.len() as u64 != out_len {
+            return Err(Error::Helper(format!(
+                "drew {} bytes, but the caller expects {out_len}",
+                pixels.len()
+            )));
+        }
         record(rustix::stdio::stdout(), &pixels)
     };
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            let _ = record(
-                rustix::stdio::stderr(),
-                format!("vigil-scene: {e}\n").as_bytes(),
-            );
-            ExitCode::from(e.exit_code())
-        }
+        Err(e) => helper_failed(&e),
     }
+}
+
+fn helper_failed(e: &Error) -> ExitCode {
+    say_within(
+        &format!("vigil-scene: {e}"),
+        MAX_MESSAGE as usize - NOTICE_ROOM,
+    );
+    ExitCode::from(e.exit_code())
 }
 
 fn main() -> ExitCode {
@@ -469,6 +504,7 @@ fn main() -> ExitCode {
             vigil_log::out!("{USAGE}");
             return ExitCode::SUCCESS;
         }
+        _ if let Some(e) = another_abi(&argv) => return helper_failed(&e),
         _ => {
             vigil_log::say!(
                 "usage: vigil-scene render|spec|mask|layer ...; see vigil-scene --help"

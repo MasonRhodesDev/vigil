@@ -452,11 +452,13 @@ fn a_missing_helper_is_its_own_code_and_the_ground_still_draws() {
 
 const CHILD: &str = "VIGIL_SCENE_ABI_TEST";
 
-#[test]
-fn a_helper_stopped_at_its_deadline_is_a_timeout_not_a_refusal() {
+// Only a smoke check: a loaded host has overshot a deadline by 1.35 s.
+const SMOKE: Duration = Duration::from_secs(5);
+
+fn spinner(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vigil-scene-abi-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let spin = dir.join("spins");
+    let spin = dir.join(name);
     let written = Command::new("sh")
         .args([
             "-c",
@@ -466,15 +468,42 @@ fn a_helper_stopped_at_its_deadline_is_a_timeout_not_a_refusal() {
         .status()
         .unwrap();
     assert!(written.success());
+    spin
+}
+
+#[test]
+fn a_helper_stopped_at_its_deadline_is_a_timeout_not_a_refusal() {
+    let spin = spinner("spins");
     let mut req = request(&mark(), VIGIL_SCENE_LAYER_LOGO);
     req.deadline_ms = 200;
     let (_, at) = render_by(&spin, &req, &mut []);
     let mut out = vec![0u8; at.stride * at.height as usize];
-    let start = Instant::now();
-    assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TIMEOUT);
-    assert!(start.elapsed() < Duration::from_millis(700));
+    for _ in 0..VIGIL_SCENE_TIMEOUTS_BEFORE_TOO_SLOW + 1 {
+        let start = Instant::now();
+        assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TIMEOUT);
+        assert!(start.elapsed() < SMOKE);
+    }
     assert!(out.iter().all(|&b| b == 0));
-    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&spin).unwrap();
+}
+
+#[test]
+fn a_logo_that_times_out_at_the_longest_deadline_is_too_slow_not_refused() {
+    let spin = spinner("spins-longest");
+    let svg = [mark(), b"<!-- too slow -->".to_vec()].concat();
+    let mut req = request(&svg, VIGIL_SCENE_LAYER_LOGO);
+    req.deadline_ms = VIGIL_SCENE_MAX_DEADLINE_MS;
+    let (_, at) = render_by(&spin, &req, &mut []);
+    let mut out = vec![0u8; at.stride * at.height as usize];
+    assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TIMEOUT);
+    assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TIMEOUT);
+    std::thread::sleep(Duration::from_millis(VIGIL_SCENE_STRIKES_APART_MS.into()));
+    assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TOO_SLOW);
+    let start = Instant::now();
+    assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TOO_SLOW);
+    assert!(start.elapsed() < SMOKE, "answered without the helper");
+    assert!(out.iter().all(|&b| b == 0));
+    std::fs::remove_file(&spin).unwrap();
 }
 
 fn peak_rss_kib() -> u64 {
@@ -511,10 +540,7 @@ fn child_calls_the_abi_with_one_review_input() {
         "{what}: the helper failed, not the logo"
     );
     let deadline = Duration::from_millis(VIGIL_SCENE_DEFAULT_DEADLINE_MS.into());
-    assert!(
-        took < deadline + Duration::from_millis(500),
-        "{what}: {took:?}"
-    );
+    assert!(took < deadline + SMOKE, "{what}: {took:?}");
     let frame = (1920 * 1080 * 4) / 1024;
     assert!(
         grew < frame + 16 * 1024,

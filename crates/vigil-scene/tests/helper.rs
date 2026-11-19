@@ -8,13 +8,16 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use vigil_scene::{
-    DEFAULT_DEADLINE, Error, Format, Helper, Layer, Logo, MAX_EDGE, Plate, Request, Scene,
+    DEFAULT_DEADLINE, Error, Format, HELPER_ABI, Helper, Layer, Logo, MAX_DEADLINE, MAX_EDGE,
+    Plate, Request, STRIKES_APART, Scene,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_vigil-scene");
 const CHILD: &str = "VIGIL_SCENE_HELPER_TEST";
 const PATIENT: Duration = Duration::from_secs(300);
-const SLACK: Duration = Duration::from_millis(500);
+// Only a smoke check: a loaded host has overshot a deadline by 1.35 s. The
+// deadline itself is checked by the Timeout, the kill and the reaping.
+const SMOKE: Duration = Duration::from_secs(5);
 
 fn mark() -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mark.svg"))
@@ -156,15 +159,42 @@ fn child_stops_a_helper_past_its_deadline() {
         Err(Error::Timeout(m)) => assert!(m.contains("deadline"), "{m}"),
         other => panic!("{other:?}"),
     }
-    assert!(took < SLACK, "returned after {took:?}");
+    vigil_log::out!(
+        "OVERSHOOT helper {:?}",
+        took.saturating_sub(Duration::from_millis(1))
+    );
+    assert!(took < SMOKE, "returned after {took:?}");
     assert_eq!(open_fds(), fds, "a descriptor leaked");
     assert_eq!(children(), before, "a child was left unreaped");
     assert!(out.iter().all(|&b| b == 0), "nothing written when stopped");
+
+    let svg = mark();
+    let req = request(&svg, Layer::Logo);
+    let mut out = vec![0u8; req.bytes().unwrap()];
+    let start = Instant::now();
+    let got = spinner("spins").draw(&req, &mut out);
+    let took = start.elapsed();
+    assert!(
+        matches!(&got, Err(Error::Timeout(m)) if m.contains("deadline")),
+        "spins: {got:?}"
+    );
+    vigil_log::out!("OVERSHOOT spinner {:?}", took.saturating_sub(BRIEF));
+    assert!(took >= BRIEF, "spins: stopped early, after {took:?}");
+    assert!(took < BRIEF + SMOKE, "spins: returned after {took:?}");
+    assert_eq!(open_fds(), fds, "spins: a descriptor leaked");
+    assert_eq!(children(), before, "spins: the spinner was left unreaped");
+    assert!(out.iter().all(|&b| b == 0), "spins: nothing written");
 }
 
 #[test]
 fn a_helper_past_its_deadline_is_killed_and_reaped() {
-    in_fresh_process("child_stops_a_helper_past_its_deadline", "1");
+    let out = in_fresh_process("child_stops_a_helper_past_its_deadline", "1");
+    for line in out
+        .lines()
+        .filter_map(|l| l.find("OVERSHOOT ").map(|i| &l[i..]))
+    {
+        vigil_log::out!("{line}");
+    }
 }
 
 #[test]
@@ -194,7 +224,7 @@ fn child_runs_one_review_input() {
         drawn.as_ref().map(|_| "drawn")
     );
     assert!(
-        took < 2 * DEFAULT_DEADLINE + SLACK,
+        took < 2 * DEFAULT_DEADLINE + SMOKE,
         "{what}: two calls took {took:?}"
     );
     assert!(grew < 32 * 1024, "{what}: the parent grew by {grew} KiB");
@@ -296,7 +326,8 @@ fn the_shipped_helper_draws_under_its_syscall_filter() {
         .args(["layer", "--mode", "4096x4096", "--transform", "0"])
         .args(["--layer", "frame", "--value", "1", "--spec-len", "0"])
         .args(["--svg-len", &svg.len().to_string(), "--deadline-ms", "5000"])
-        .args(["--abi", vigil_scene::HELPER_ABI])
+        .args(["--out-len", &(4096 * 4096 * 4).to_string()])
+        .args(["--abi", &vigil_scene::HELPER_ABI.to_string()])
         .stdin(reader)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -327,6 +358,18 @@ fn the_shipped_helper_draws_under_its_syscall_filter() {
     let (status, environ) = seen.expect("the helper ran under a new seccomp filter");
     assert_eq!(filters(&status), ours + 1);
     assert!(status.contains("NoNewPrivs:\t1"), "{status}");
+    let caught = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigCgt:"))
+        .map(|v| u64::from_str_radix(v.trim(), 16).unwrap())
+        .unwrap();
+    for signal in [libc::SIGSEGV, libc::SIGBUS] {
+        assert_eq!(
+            caught & 1 << (signal - 1),
+            0,
+            "signal {signal} still has a handler that makes calls the filter kills"
+        );
+    }
     if !rustix::process::getuid().is_root() {
         let denied = environ.expect_err("a helper that is not dumpable hides its environ");
         assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
@@ -347,8 +390,10 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
             "64",
             "--deadline-ms",
             "2500",
+            "--out-len",
+            "4096",
             "--abi",
-            vigil_scene::HELPER_ABI,
+            &vigil_scene::HELPER_ABI.to_string(),
         ])
         .stdin(reader)
         .stdout(Stdio::null())
@@ -378,7 +423,7 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
     assert_eq!(limit("Max open files"), ("3", "3"));
     assert_eq!(limit("Max core file size"), ("0", "0"));
     assert_eq!(limit("Max processes"), ("0", "0"));
-    assert_eq!(limit("Max file size"), ("268439552", "268439552"));
+    assert_eq!(limit("Max file size"), ("8192", "8192"));
     let mut fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -396,7 +441,8 @@ fn the_helper_never_raises_a_soft_limit_it_inherits() {
     let mut child = Command::new("sh")
         .args(["-c", r#"ulimit -S -t 1 && exec "$@""#, "sh", BIN])
         .args(["mask", "--format", "svg", "--edge", "64"])
-        .args(["--deadline-ms", "2500", "--abi", vigil_scene::HELPER_ABI])
+        .args(["--deadline-ms", "2500", "--out-len", "4096"])
+        .args(["--abi", &vigil_scene::HELPER_ABI.to_string()])
         .stdin(reader)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -439,6 +485,117 @@ fn a_helper_of_another_version_is_a_helper_fault() {
     assert!(said.contains("0.0.0-elsewhere"), "{said}");
 }
 
+#[test]
+fn a_library_of_the_last_protocol_hears_the_helper_version() {
+    let out = Command::new(BIN)
+        .args(["mask", "--format", "svg", "--edge", "8"])
+        .args(["--deadline-ms", "1000", "--abi", "0.4.3"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(14), "{said}");
+    assert!(
+        said.contains("this helper is version") && said.contains("the library 0.4.3"),
+        "{said}"
+    );
+}
+
+#[test]
+fn a_newer_library_with_a_new_argument_hears_the_version_not_the_argument() {
+    for job in [&["mask", "--format", "svg", "--edge", "8"][..], &["sprite"]] {
+        let out = Command::new(BIN)
+            .args(job)
+            .args(["--future-flag", "x", "--deadline-ms", "1000"])
+            .args(["--abi", &(HELPER_ABI + 1).to_string()])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(14), "{job:?}: {said}");
+        assert!(
+            said.contains(&format!("this helper is version {HELPER_ABI}"))
+                && !said.contains("unknown argument"),
+            "{job:?}: {said}"
+        );
+    }
+}
+
+#[test]
+fn child_counts_no_timeout_at_a_brief_deadline() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    let spin = spinner("brief-strikes");
+    let svg = mark();
+    let mut out = vec![0u8; request(&svg, Layer::Logo).bytes().unwrap()];
+    for i in 0..4 {
+        let got = spin.draw(&request(&svg, Layer::Logo), &mut out);
+        assert!(matches!(got, Err(Error::Timeout(_))), "call {i}: {got:?}");
+    }
+}
+
+#[test]
+fn a_brief_deadline_never_makes_a_logo_too_slow() {
+    in_fresh_process("child_counts_no_timeout_at_a_brief_deadline", "1");
+}
+
+#[test]
+fn a_helper_that_would_write_another_size_writes_nothing() {
+    let svg = mark();
+    let mut child = Command::new(BIN)
+        .args(["mask", "--format", "svg", "--edge", "8", "--out-len", "65"])
+        .args([
+            "--deadline-ms",
+            "5000",
+            "--abi",
+            &vigil_scene::HELPER_ABI.to_string(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), &svg).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(14), "{said}");
+    assert!(said.contains("65"), "{said}");
+    assert!(out.stdout.is_empty(), "{} bytes written", out.stdout.len());
+}
+
+#[test]
+fn a_long_refusal_on_a_small_job_still_exits_as_a_refusal() {
+    let selector = "g ".repeat(8 * 1024);
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><style>{selector}{{fill:red}}</style></svg>"#
+    );
+    let stderr =
+        File::from(rustix::fs::memfd_create("stderr", rustix::fs::MemfdFlags::CLOEXEC).unwrap());
+    let mut child = Command::new(BIN)
+        .args(["mask", "--format", "svg", "--edge", "8", "--out-len", "64"])
+        .args([
+            "--deadline-ms",
+            "5000",
+            "--abi",
+            &vigil_scene::HELPER_ABI.to_string(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(stderr.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), svg.as_bytes()).unwrap();
+    let status = child.wait().unwrap();
+    let said = stderr.metadata().unwrap().len();
+    assert_eq!(
+        status.code(),
+        Some(12),
+        "{status:?} after {said} bytes of message"
+    );
+    assert!(said <= 4096, "{said} bytes of message");
+}
+
 // A script this process opened for writing cannot be run while any child
 // forked by another test thread still holds that descriptor, and a rename
 // keeps the inode, so a short-lived shell writes it instead.
@@ -460,8 +617,16 @@ fn fake_script(name: &str, script: &str) -> PathBuf {
     path
 }
 
+const BRIEF: Duration = Duration::from_millis(300);
+
 fn fake_helper(name: &str, script: &str) -> Helper {
-    Helper::new(fake_script(name, script), Duration::from_millis(300))
+    Helper::new(fake_script(name, script), PATIENT)
+}
+
+// Starting sh alone can take longer than BRIEF on a loaded host, so only a
+// helper that never ends gets so short a deadline.
+fn spinner(name: &str) -> Helper {
+    Helper::new(fake_script(name, "while :; do :; done"), BRIEF)
 }
 
 #[test]
@@ -498,16 +663,33 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
     let req = request(&svg, Layer::Logo);
     let need = req.bytes().unwrap();
     type Expect = fn(&Error) -> bool;
-    let cases: [(&str, String, Expect); 7] = [
+    let crash = |e: &Error| matches!(e, Error::Refused(m) if m.contains("signal"));
+    let cases: [(&str, String, Expect); 15] = [
         (
-            "spins",
-            "while :; do :; done".into(),
-            |e| matches!(e, Error::Timeout(m) if m.contains("deadline")),
+            "killed",
+            "kill -9 $$".into(),
+            |e| matches!(e, Error::Helper(m) if m.contains("signal 9")),
         ),
         (
-            "signal",
-            "kill -9 $$".into(),
-            |e| matches!(e, Error::Refused(m) if m.contains("signal 9")),
+            "cpu",
+            "ulimit -c 0; kill -s XCPU $$".into(),
+            |e| matches!(e, Error::Helper(m) if m.contains("signal 24")),
+        ),
+        ("segv", "ulimit -c 0; kill -s SEGV $$".into(), crash),
+        ("bus", "ulimit -c 0; kill -s BUS $$".into(), crash),
+        ("abort", "ulimit -c 0; kill -s ABRT $$".into(), crash),
+        ("ill", "ulimit -c 0; kill -s ILL $$".into(), crash),
+        ("fpe", "ulimit -c 0; kill -s FPE $$".into(), crash),
+        ("xfsz", "ulimit -c 0; kill -s XFSZ $$".into(), crash),
+        (
+            "terminated",
+            "kill -s TERM $$".into(),
+            |e| matches!(e, Error::Helper(m) if m.contains("signal 15")),
+        ),
+        (
+            "pipe",
+            "kill -s PIPE $$".into(),
+            |e| matches!(e, Error::Helper(m) if m.contains("signal 13")),
         ),
         (
             "forbidden",
@@ -534,12 +716,7 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
     for (name, script, want) in cases {
         let helper = fake_helper(name, &script);
         let mut out = vec![0u8; need];
-        let start = Instant::now();
         let got = helper.draw(&req, &mut out);
-        assert!(
-            start.elapsed() < Duration::from_millis(300) + SLACK,
-            "{name}"
-        );
         assert!(got.as_ref().is_err_and(want), "{name}: {got:?}");
         assert!(out.iter().all(|&b| b == 0), "{name}: nothing written");
     }
@@ -550,11 +727,104 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
 }
 
 #[test]
+fn child_finds_a_logo_too_slow_at_the_longest_deadline() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    let spin = Helper::new(fake_script("strikes", "while :; do :; done"), MAX_DEADLINE);
+    let svg = [mark(), b"<!-- strikes -->".to_vec()].concat();
+    let at = |mode: (u32, u32)| Request {
+        mode,
+        ..request(&svg, Layer::Logo)
+    };
+    let (hd, uhd) = (at((1920, 1080)), at((7680, 4320)));
+    let draw = |helper: &Helper, req: &Request<'_>| {
+        let mut out = vec![0u8; req.bytes().unwrap()];
+        let got = helper.draw(req, &mut out);
+        assert!(
+            got.is_ok() || out.iter().all(|&b| b == 0),
+            "written on {got:?}"
+        );
+        got
+    };
+    let timeout = |got: Result<(), Error>| matches!(got, Err(Error::Timeout(_)));
+    let too_slow = |got: Result<(), Error>| matches!(got, Err(Error::TooSlow(_)));
+
+    let burst: Vec<_> = std::thread::scope(|s| {
+        let calls: Vec<_> = (0..3).map(|_| s.spawn(|| draw(&spin, &uhd))).collect();
+        calls.into_iter().map(|c| c.join().unwrap()).collect()
+    });
+    assert!(
+        burst.into_iter().all(timeout),
+        "an overlapping burst is one strike"
+    );
+    assert!(
+        timeout(draw(&spin, &uhd)),
+        "a timeout right after a strike is the same slow moment"
+    );
+    std::thread::sleep(STRIKES_APART);
+    assert!(too_slow(draw(&spin, &uhd)), "the second strike");
+    let start = Instant::now();
+    let missing = Helper::new("/nonexistent/vigil-scene", MAX_DEADLINE);
+    assert!(
+        too_slow(draw(&missing, &uhd)),
+        "a logo too slow runs no helper"
+    );
+    assert!(start.elapsed() < SMOKE, "a logo too slow stalls nobody");
+
+    let need = hd.bytes().unwrap();
+    let exact = fake_helper("strikes-exact", &format!("printf '%0{need}d' 0"));
+    draw(&exact, &hd).expect("too slow at 8K, still drawn at 1080p");
+}
+
+#[test]
+fn a_logo_that_times_out_at_the_longest_deadline_is_too_slow_at_that_size() {
+    in_fresh_process("child_finds_a_logo_too_slow_at_the_longest_deadline", "1");
+}
+
+// The helper refuses a library of another HELPER_ABI, so a change to the
+// command line the library sends must change it too. These are the
+// argument names each job sent at this HELPER_ABI.
+#[test]
+fn the_helpers_command_line_is_pinned_to_its_abi() {
+    let echo = fake_helper("argv", r#"echo "vigil-scene: $*" >&2; exit 12"#);
+    let names = |got: Result<_, Error>| {
+        let Err(Error::Refused(argv)) = got else {
+            panic!("{got:?}")
+        };
+        let mut words: Vec<_> = argv
+            .split_whitespace()
+            .filter_map(|w| w.strip_prefix("--"))
+            .map(str::to_owned)
+            .collect();
+        words.sort();
+        format!(
+            "{} {}",
+            argv.split_whitespace().next().unwrap(),
+            words.join(" ")
+        )
+    };
+    let svg = mark();
+    let mask = names(echo.mask(&svg, Format::Svg, 8).map(|_| ()));
+    let req = request(&svg, Layer::Logo);
+    let layer = names(echo.draw(&req, &mut vec![0u8; req.bytes().unwrap()]));
+    assert_eq!(
+        (HELPER_ABI, mask.as_str(), layer.as_str()),
+        (
+            2,
+            "mask abi deadline-ms edge format out-len",
+            "layer abi deadline-ms layer mode out-len spec-len svg-len transform value",
+        ),
+        "the helper's command line changed: bump HELPER_ABI and pin the new names here"
+    );
+}
+
+#[test]
 fn child_draws_with_sigchld_ignored() {
     if std::env::var_os(CHILD).is_none() {
         return;
     }
-    let spin = fake_helper("spin-ignored", "while :; do :; done");
+    let spin = spinner("spin-ignored");
     let need = request(&[], Layer::Logo).bytes().unwrap();
     let noticed = fake_helper(
         "noticed",
@@ -594,7 +864,7 @@ fn child_draws_with_sigchld_ignored() {
     ));
     let start = Instant::now();
     assert!(spin.draw(&request(&svg, Layer::Logo), &mut out).is_err());
-    assert!(start.elapsed() < Duration::from_millis(300) + SLACK);
+    assert!(start.elapsed() < BRIEF + SMOKE);
     assert_eq!(children(), Vec::<String>::new());
 }
 
@@ -616,8 +886,10 @@ fn the_helper_dies_with_the_thread_that_started_it() {
                 "64",
                 "--deadline-ms",
                 "60000",
+                "--out-len",
+                "4096",
                 "--abi",
-                vigil_scene::HELPER_ABI,
+                &vigil_scene::HELPER_ABI.to_string(),
             ])
             .stdin(reader)
             .stdout(Stdio::null())
