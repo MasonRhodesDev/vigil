@@ -928,3 +928,22 @@ fn ctrl_a_with_one_of_two_ctrl_keys_released_types_no_letter() {
         "Ctrl+A selects, so no letter reaches the password"
     );
 }
+
+fn tab_under_a_modifier_never_reaches_the_field(modifier: u32) {
+    let mut g = Greeter::new();
+    g.type_text("secret");
+    g.chord(modifier, TAB, Some("\t"));
+    g.type_text("x");
+    g.tap(RETURN);
+    assert_eq!(g.take(), [Sent::Respond("secretx".into())]);
+}
+
+#[test]
+fn ctrl_tab_never_reaches_the_field() {
+    tab_under_a_modifier_never_reaches_the_field(CONTROL_L);
+}
+
+#[test]
+fn alt_tab_never_reaches_the_field() {
+    tab_under_a_modifier_never_reaches_the_field(ALT_L);
+}

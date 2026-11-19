@@ -503,12 +503,18 @@ impl OutputWindow {
             .iter()
             .position(|k| *k == keysym)
         {
+            let kind = 0b11 << (at & !1);
+            let was = self.held & kind != 0;
             if pressed {
                 self.held |= 1 << at;
             } else {
                 self.held &= !(1 << at);
             }
-            self.send_key(keysym, utf8, pressed);
+            // Slint keeps one flag per modifier kind, so it hears only the
+            // first press and the last release of the pair.
+            if was != (self.held & kind != 0) {
+                self.send_key(keysym, utf8, pressed);
+            }
             return;
         }
         let repeat = pressed && self.down == Some(keysym);
@@ -520,7 +526,11 @@ impl OutputWindow {
         if repeat && vigil_core::ONE_SHOT_KEYSYMS.contains(&keysym) {
             return;
         }
+        // Slint's own Tab moves its focus and selects the field, so typing
+        // then replaces the password.
+        let tab = matches!(keysym, 0xff09 | 0xfe20);
         let card = match self.card() {
+            Some(_) if tab && !pressed => return,
             Some(card) if pressed => card,
             _ => return self.send_key(keysym, utf8, pressed),
         };
@@ -536,6 +546,7 @@ impl OutputWindow {
         let c = &self.component;
         let action = |action| Value::String(focus::action_name(action).into());
         match effect {
+            Effect::Forward if tab => {}
             Effect::Forward => self.send_key(keysym, utf8, true),
             Effect::Consume => {}
             Effect::User(index) => {
