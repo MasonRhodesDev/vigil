@@ -7,7 +7,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use pam_client::{Context, ConversationHandler, ErrorCode, Flag};
-use vigil_core::{AuthError, AuthEvent};
+use vigil_core::{AuthError, AuthEvent, Secret};
 
 pub mod faillock;
 
@@ -21,12 +21,12 @@ pub fn service_name() -> &'static str {
 
 struct Bridge<E: Fn(AuthEvent)> {
     emit: E,
-    responses: mpsc::Receiver<String>,
+    responses: mpsc::Receiver<Secret>,
     broken: Arc<AtomicBool>,
 }
 
 impl<E: Fn(AuthEvent)> Bridge<E> {
-    fn new(emit: E, responses: mpsc::Receiver<String>) -> Self {
+    fn new(emit: E, responses: mpsc::Receiver<Secret>) -> Self {
         Self {
             emit,
             responses,
@@ -45,7 +45,12 @@ impl<E: Fn(AuthEvent)> Bridge<E> {
             ErrorCode::CONV_ERR
         };
         let response = self.responses.recv().map_err(|_| fail())?;
-        CString::new(response).map_err(|_| fail())
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "credential adapter: pam-client takes the answer as a CString it copies and drops unwiped"
+        )]
+        let plain = response.expose();
+        CString::new(plain).map_err(|_| fail())
     }
 }
 
@@ -65,7 +70,7 @@ impl<E: Fn(AuthEvent)> ConversationHandler for Bridge<E> {
 }
 
 pub struct PamAttempt {
-    responses: Option<mpsc::Sender<String>>,
+    responses: Option<mpsc::Sender<Secret>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -84,7 +89,7 @@ impl PamAttempt {
         }
     }
 
-    pub fn respond(&self, text: String) {
+    pub fn respond(&self, text: Secret) {
         if let Some(tx) = &self.responses {
             let _ = tx.send(text);
         }
@@ -176,7 +181,7 @@ mod tests {
 
     #[test]
     fn dropped_response_channel_aborts_conversation() {
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = mpsc::channel::<Secret>();
         drop(tx);
         let mut bridge = Bridge::new(|_| {}, rx);
         let err = bridge
@@ -187,7 +192,7 @@ mod tests {
 
     #[test]
     fn a_broken_conversation_is_not_a_denial() {
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = mpsc::channel::<Secret>();
         drop(tx);
         let mut bridge = Bridge::new(|_| {}, rx);
         assert!(!bridge.broken.load(Ordering::SeqCst));

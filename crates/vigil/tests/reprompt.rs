@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use vigil_core::{AuthUi, InputEvent, OutputId, UiMessage};
+use vigil_core::{AuthUi, InputEvent, OutputId, Secret, UiMessage};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
 
@@ -32,7 +32,7 @@ fn a_same_text_reprompt_keeps_what_is_typed_and_a_reset_clears_it() {
     let adapter = platform.claim_last_adapter().expect("adapter");
     let mut window =
         OutputWindow::new(OutputId(1), 1280, 800, 1.0, adapter, component).expect("window");
-    let sent: Rc<RefCell<Vec<String>>> = Rc::default();
+    let sent: Rc<RefCell<Vec<Secret>>> = Rc::default();
     let sink = sent.clone();
     window.on_ui_message(Rc::new(move |message| {
         if let UiMessage::Respond(text) = message {
@@ -54,5 +54,8 @@ fn a_same_text_reprompt_keeps_what_is_typed_and_a_reset_clears_it() {
     type_text(&mut window, "pw");
     key(&mut window, RETURN, None);
 
-    assert_eq!(*sent.borrow(), ["hunter2", "pw"]);
+    assert_eq!(
+        *sent.borrow(),
+        [Secret::from("hunter2"), Secret::from("pw")]
+    );
 }

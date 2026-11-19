@@ -4,6 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 baseline=tests/unsafe-baseline.txt
+columns='unsafe, allow(unsafe_code), unjustified, plaintext exemptions'
 fail=0
 
 say() {
@@ -20,17 +21,18 @@ measure() {
                 unsafe += gsub(/(^|[^A-Za-z0-9_])unsafe([^A-Za-z0-9_]|$)/, "&", line)
                 allows += gsub(/allow\(unsafe_code\)/, "&", line)
                 unjustified += gsub(/clippy::undocumented_unsafe_blocks/, "&", line)
+                exposed += gsub(/clippy::disallowed_methods/, "&", line)
             }
             END {
-                if (unsafe + allows + unjustified > 0)
-                    printf "%s %d %d %d\n", file, unsafe, allows, unjustified
+                if (unsafe + allows + unjustified + exposed > 0)
+                    printf "%s %d %d %d %d\n", file, unsafe, allows, unjustified, exposed
             }
         ' "$file"
     done
 }
 
 totals() {
-    awk '{ u += $2; a += $3; j += $4 } END { printf "%d %d %d\n", u, a, j }'
+    awk '{ u += $2; a += $3; j += $4; e += $5 } END { printf "%d %d %d %d\n", u, a, j, e }'
 }
 
 measured=$(measure)
@@ -43,37 +45,38 @@ fi
 
 recorded=$(cat "$baseline")
 
-diff=$(printf '%s\n' "$measured" | awk -v recorded="$recorded" '
+diff=$(printf '%s\n' "$measured" | awk -v recorded="$recorded" -v columns="$columns" '
     BEGIN {
         n = split(recorded, lines, "\n")
         for (i = 1; i <= n; i++) {
             split(lines[i], f, " ")
-            if (f[1] != "") want[f[1]] = f[2] " " f[3] " " f[4]
+            if (f[1] != "") want[f[1]] = f[2] " " f[3] " " f[4] " " f[5]
         }
     }
     {
-        have = $2 " " $3 " " $4
+        have = $2 " " $3 " " $4 " " $5
         if (!($1 in want))
-            printf "%s: unsafe outside the fence (unsafe, allow(unsafe_code), unjustified = %s)\n", $1, have
+            printf "%s: outside the fence (%s = %s)\n", $1, columns, have
         else if (want[$1] != have)
-            printf "%s: measured %s, baseline says %s\n", $1, have, want[$1]
+            printf "%s: measured %s, baseline says %s (%s)\n", $1, have, want[$1], columns
         seen[$1] = 1
     }
     END {
         for (path in want)
             if (!(path in seen))
-                printf "%s: in the baseline but has no unsafe left; remove the line\n", path
+                printf "%s: in the baseline but has nothing fenced left; remove the line\n", path
     }
 ')
 if [ -n "$diff" ]; then
     printf '%s\n' "$diff" >&2
-    say "The unsafe fence is $baseline. New unsafe needs a reviewed baseline change; removed unsafe must lower it."
+    say "The fence is $baseline. New unsafe or plaintext access needs a reviewed baseline change; removing some must lower it."
 fi
 
 for attr in unsafe_code unsafe_op_in_unsafe_fn warnings 'clippy::restriction' \
-    'clippy::undocumented_unsafe_blocks' 'clippy::multiple_unsafe_ops_per_block'; do
-    if git ls-files '*.rs' | xargs rg -n "^\s*#!\[(allow|expect|warn)\([^]]*${attr}" ; then
-        say "crate-wide allow of $attr defeats the per-item fence"
+    'clippy::undocumented_unsafe_blocks' 'clippy::multiple_unsafe_ops_per_block' \
+    'clippy::disallowed_methods' 'clippy::disallowed_types'; do
+    if git ls-files '*.rs' | xargs rg -n "^\s*#!\[(allow|expect|warn)\([^]]*${attr}"; then
+        say "a crate-wide allow of $attr defeats the per-item fence"
     fi
 done
 
@@ -85,12 +88,14 @@ done
 for lint in 'unsafe_code = "deny"' 'unsafe_op_in_unsafe_fn = "deny"' 'undocumented_unsafe_blocks = "deny"'; do
     grep -qx "$lint" Cargo.toml || say "Cargo.toml [workspace.lints] lost: $lint"
 done
+grep -q 'path = "vigil_secret::Secret::expose"' clippy.toml ||
+    say "clippy.toml no longer disallows Secret::expose"
 
 for dir in crates/*/; do
     crate=${dir%/}
     crate_root=$crate/src/lib.rs
     [ -f "$crate_root" ] || crate_root=$crate/src/main.rs
-    if grep -q "^$crate/src/" "$baseline"; then
+    if awk '$2 > 0 || $3 > 0 || $4 > 0' "$baseline" | grep -q "^$crate/src/"; then
         grep -qx '#!\[deny(unsafe_code)\]' "$crate_root" ||
             say "$crate_root holds fenced unsafe and must open with #![deny(unsafe_code)]"
     else
@@ -101,15 +106,13 @@ done
 
 base=${VIGIL_FENCE_BASE-origin/main}
 if [ -z "$base" ] || ! git rev-parse -q --verify "$base^{commit}" >/dev/null; then
-    printf 'unsafe fence: no base ref %s; skipping the shrink-only check\n' "${base:-(empty)}"
+    printf 'fence: no base ref %s; skipping the shrink-only check\n' "${base:-(empty)}"
 elif ! base_recorded=$(git show "$base:$baseline" 2>/dev/null); then
-    printf 'unsafe fence: %s has no %s yet; skipping the shrink-only check\n' "$base" "$baseline"
+    printf 'fence: %s has no %s yet; skipping the shrink-only check\n' "$base" "$baseline"
 else
-    now=$(printf '%s\n' "$recorded" | totals)
-    was=$(printf '%s\n' "$base_recorded" | totals)
-    set -- $now $was
-    if [ "$1" -gt "$4" ] || [ "$2" -gt "$5" ] || [ "$3" -gt "$6" ]; then
-        say "the unsafe baseline grew against $base: unsafe $4 -> $1, allow(unsafe_code) $5 -> $2, unjustified $6 -> $3"
+    set -- $(printf '%s\n' "$recorded" | totals) $(printf '%s\n' "$base_recorded" | totals)
+    if [ "$1" -gt "$5" ] || [ "$2" -gt "$6" ] || [ "$3" -gt "$7" ] || [ "$4" -gt "$8" ]; then
+        say "the fence grew against $base ($columns): $5 $6 $7 $8 -> $1 $2 $3 $4"
     fi
 fi
 
@@ -117,4 +120,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 set -- $(printf '%s\n' "$recorded" | totals)
-printf 'unsafe fence holds: %s unsafe, %s allow(unsafe_code), %s unjustified\n' "$1" "$2" "$3"
+printf 'fence holds: %s unsafe, %s allow(unsafe_code), %s unjustified, %s plaintext exemptions\n' "$1" "$2" "$3" "$4"

@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "vigil_secret::Secret::expose", reason = "plaintext leaves a Secret only in a credential adapter, marked #[expect(clippy::disallowed_methods)]" },
+]

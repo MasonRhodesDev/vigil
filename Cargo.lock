@@ -5055,6 +5055,7 @@ dependencies = [
  "vigil-outputs",
  "vigil-present-dumb",
  "vigil-present-gl",
+ "vigil-secret",
  "vigil-session",
  "vigil-theme",
  "vigil-ui",
@@ -5065,7 +5066,9 @@ name = "vigil-auth"
 version = "0.4.3"
 dependencies = [
  "greetd_ipc",
+ "serde_json",
  "vigil-core",
+ "vigil-secret",
 ]
 
 [[package]]
@@ -5082,6 +5085,7 @@ name = "vigil-core"
 version = "0.4.3"
 dependencies = [
  "monitor-profiles",
+ "vigil-secret",
 ]
 
 [[package]]
@@ -5134,6 +5138,7 @@ dependencies = [
  "vigil-flow",
  "vigil-login",
  "vigil-pam",
+ "vigil-secret",
  "vigil-theme",
  "vigil-ui",
  "vigil-warning",
@@ -5196,6 +5201,14 @@ version = "0.4.3"
 dependencies = [
  "smithay",
  "vigil-core",
+]
+
+[[package]]
+name = "vigil-secret"
+version = "0.4.3"
+dependencies = [
+ "rustix 1.1.6",
+ "zeroize",
 ]
 
 [[package]]
@@ -6266,6 +6279,12 @@ dependencies = [
  "syn 2.0.119",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 
 [[package]]
 name = "zerotrie"

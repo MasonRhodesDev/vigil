@@ -2455,6 +2455,9 @@ fn run() -> Result<i32, String> {
 }
 
 fn main() {
+    if let Err(e) = vigil_secret::deny_memory_dumps() {
+        eprintln!("vigil: could not keep memory out of core dumps: {e}");
+    }
     match run() {
         Ok(code) => std::process::exit(code),
         Err(e) => {

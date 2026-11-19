@@ -3,6 +3,7 @@
 mod damage;
 
 pub use damage::{BufferDamage, Damage, FrameDamage, Rect, next_frame_serial};
+pub use vigil_secret::Secret;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OutputId(pub u32);
@@ -300,9 +301,9 @@ pub enum PowerAction {
     Poweroff,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum UiMessage {
-    Respond(String),
+    Respond(Secret),
     Cancel,
     SelectSession(usize),
     SelectUser(usize),

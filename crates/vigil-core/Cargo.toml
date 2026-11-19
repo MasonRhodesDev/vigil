@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 monitor-profiles.workspace = true
+vigil-secret.workspace = true
 
 [lints]
 workspace = true

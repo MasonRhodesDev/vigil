@@ -12,7 +12,7 @@ use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHan
 use vigil_config::{Config, LockTransition};
 use vigil_core::{
     AppearanceEvent, AuthError, AuthEvent, AuthUi, BackgroundFit, ColorScheme, FrameTarget,
-    LoginEvent, OutputId, OutputInfo, UiMessage,
+    LoginEvent, OutputId, OutputInfo, Secret, UiMessage,
 };
 use vigil_flow::{FlowCmd, FlowEvent};
 use vigil_login::{AppearanceWatcher, LoginSession};
@@ -285,13 +285,13 @@ impl BackgroundWorker {
 }
 
 trait AuthAttempt {
-    fn respond(&self, text: String);
+    fn respond(&self, text: Secret);
     fn cancel(&mut self);
     fn detach(&mut self);
 }
 
 impl AuthAttempt for PamAttempt {
-    fn respond(&self, text: String) {
+    fn respond(&self, text: Secret) {
         PamAttempt::respond(self, text);
     }
     fn cancel(&mut self) {
@@ -332,7 +332,7 @@ impl<A: AuthAttempt> AuthTrack<A> {
         self.live = None;
     }
 
-    fn respond(&self, text: String) {
+    fn respond(&self, text: Secret) {
         if let Some(live) = &self.live {
             live.attempt.respond(text);
         }
@@ -1321,6 +1321,9 @@ fn signal_ready_fd(ready_fd: Option<i32>) {
 fn main() {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
+    if let Err(e) = vigil_secret::deny_memory_dumps() {
+        eprintln!("vigil-lock: could not keep memory out of core dumps: {e}");
+    }
     tracing_subscriber::registry()
         .with(span_lines::tracing_layer::install(&["vigil"]))
         .init();
@@ -1449,13 +1452,13 @@ mod tests {
 
     #[derive(Default)]
     struct FakeAttempt {
-        answered: Rc<RefCell<Vec<String>>>,
+        answered: Rc<RefCell<Vec<Secret>>>,
         cancelled: Rc<std::cell::Cell<bool>>,
         detached: Rc<std::cell::Cell<bool>>,
     }
 
     impl AuthAttempt for FakeAttempt {
-        fn respond(&self, text: String) {
+        fn respond(&self, text: Secret) {
             self.answered.borrow_mut().push(text);
         }
         fn cancel(&mut self) {
@@ -1532,7 +1535,7 @@ mod tests {
 
     #[test]
     fn responses_and_cancellation_reach_the_live_attempt_only() {
-        let answered: Rc<RefCell<Vec<String>>> = Rc::default();
+        let answered: Rc<RefCell<Vec<Secret>>> = Rc::default();
         let cancelled: Rc<std::cell::Cell<bool>> = Rc::default();
         let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
         let (answered_probe, cancelled_probe) = (answered.clone(), cancelled.clone());
@@ -1543,7 +1546,7 @@ mod tests {
         });
         track.respond("hunter2".into());
         track.cancel();
-        assert_eq!(*answered.borrow(), vec!["hunter2".to_owned()]);
+        assert_eq!(*answered.borrow(), vec![Secret::from("hunter2")]);
         assert!(cancelled.get());
 
         track.retire();

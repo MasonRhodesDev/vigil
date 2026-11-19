@@ -482,7 +482,7 @@ impl OutputWindow {
         let s = sink.clone();
         let r = self.component.set_callback("submit", move |args| {
             if let Some(Value::String(text)) = args.first() {
-                s(UiMessage::Respond(text.to_string()));
+                s(UiMessage::Respond(text.as_str().into()));
             }
             Value::Void
         });
