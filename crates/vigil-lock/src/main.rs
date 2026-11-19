@@ -563,7 +563,7 @@ impl Locker {
 
     fn start_attempt(&mut self) {
         debug_assert!(
-            self.lock_ipc.lock().expect("lock IPC poisoned").locked,
+            self.lock_ipc.lock().expect("lock IPC poisoned").hold == Hold::Held,
             "PAM conversation must not start before the compositor grants the lock"
         );
         let waker = self.event_waker.clone();
@@ -582,7 +582,7 @@ impl Locker {
         eprintln!("vigil-lock: session locked");
         let joiners = {
             let mut ipc = self.lock_ipc.lock().expect("warning IPC poisoned");
-            ipc.locked = true;
+            ipc.hold = Hold::Held;
             std::mem::take(&mut ipc.joiners)
         };
         for mut joiner in joiners {
@@ -753,6 +753,7 @@ impl Locker {
     fn detach_auth(&mut self) {
         self.auth.detach();
         self.unlocked = true;
+        self.lock_ipc.lock().expect("lock IPC poisoned").hold = Hold::Releasing;
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(5));
             unsafe { libc::_exit(0) };
@@ -1176,9 +1177,17 @@ struct LockIpcSocket {
     path: PathBuf,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    #[default]
+    Pending,
+    Held,
+    Releasing,
+}
+
 #[derive(Default)]
 struct LockIpcState {
-    locked: bool,
+    hold: Hold,
     commit_requested: bool,
     joiners: Vec<UnixStream>,
     waker: Option<WakeHandle>,
@@ -1268,15 +1277,21 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
             let mut command = [0_u8; 7];
             if stream.read_exact(&mut command).is_ok() && command == *b"commit\n" {
                 let mut state = server_state.lock().expect("warning IPC poisoned");
-                if state.locked {
-                    let _ = stream.write_all(b"locked\n");
-                } else {
-                    eprintln!("vigil-lock: warning join requested immediate lock");
-                    state.commit_requested = true;
-                    state.joiners.push(stream);
-                    if let Some(waker) = state.waker.clone() {
-                        waker.wake();
+                match state.hold {
+                    Hold::Held => {
+                        let _ = stream.write_all(b"locked\n");
                     }
+                    Hold::Pending => {
+                        eprintln!("vigil-lock: warning join requested immediate lock");
+                        state.commit_requested = true;
+                        state.joiners.push(stream);
+                        if let Some(waker) = state.waker.clone() {
+                            waker.wake();
+                        }
+                    }
+                    // Left unanswered: this client's exit closes the stream,
+                    // and the joiner then takes the singleton and locks afresh.
+                    Hold::Releasing => state.joiners.push(stream),
                 }
             }
         }
@@ -1760,13 +1775,40 @@ mod tests {
         let joiners = {
             let mut state = state.lock().unwrap();
             assert!(state.commit_requested);
-            state.locked = true;
+            state.hold = Hold::Held;
             std::mem::take(&mut state.joiners)
         };
         for mut stream in joiners {
             stream.write_all(b"locked\n").unwrap();
         }
         assert!(join.join().unwrap());
+        drop(guard);
+    }
+
+    #[test]
+    fn a_join_during_the_unlock_is_not_told_the_session_is_locked() {
+        let path = std::env::temp_dir().join(format!(
+            "vigil-lock-ipc-releasing-test-{}.sock",
+            std::process::id()
+        ));
+        let (guard, state) = start_lock_ipc_at(path.clone()).unwrap();
+        state.lock().unwrap().hold = Hold::Releasing;
+        let join = std::thread::spawn(move || join_lock_at(&path));
+
+        for _ in 0..200 {
+            if !state.lock().unwrap().joiners.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let parked = std::mem::take(&mut state.lock().unwrap().joiners);
+        assert_eq!(parked.len(), 1, "the joiner was answered or never arrived");
+        assert!(!state.lock().unwrap().commit_requested);
+        drop(parked);
+        assert!(
+            !matches!(join.join().unwrap(), Ok(true)),
+            "a client that is unlocking confirmed the lock to a joiner"
+        );
         drop(guard);
     }
 
