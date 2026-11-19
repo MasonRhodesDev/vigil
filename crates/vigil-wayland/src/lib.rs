@@ -1498,10 +1498,6 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
-        self.held_keys = vigil_core::HeldKeys::default();
-        for release in vigil_core::modifier_releases() {
-            self.deliver_input(release);
-        }
     }
     fn press_key(
         &mut self,
