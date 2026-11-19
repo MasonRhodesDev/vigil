@@ -8,6 +8,7 @@ pub trait KeySink {
     fn change_vt(&mut self, vt: i32);
     fn cancel(&mut self);
     fn forward(&mut self, event: InputEvent);
+    fn settle(&mut self);
 }
 
 pub fn route(sink: &mut impl KeySink, event: InputEvent) {
@@ -21,10 +22,15 @@ pub fn route(sink: &mut impl KeySink, event: InputEvent) {
         sink.change_vt((keysym - VT_FIRST + 1) as i32);
         return;
     }
-    if pressed && keysym == ESCAPE {
-        sink.cancel();
+    if keysym == ESCAPE {
+        if pressed {
+            sink.cancel();
+            sink.settle();
+        }
+        return;
     }
     sink.forward(event);
+    sink.settle();
 }
 
 #[cfg(test)]
@@ -83,6 +89,7 @@ mod tests {
                 self.forwarded.push((keysym, pressed));
             }
         }
+        fn settle(&mut self) {}
     }
 
     #[test]
@@ -206,6 +213,9 @@ mod tests {
         }
         fn forward(&mut self, event: InputEvent) {
             self.window.dispatch(event);
+        }
+        fn settle(&mut self) {
+            self.tick();
         }
     }
 

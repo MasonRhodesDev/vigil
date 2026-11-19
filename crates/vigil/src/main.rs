@@ -611,6 +611,10 @@ impl keys::KeySink for App {
             e.window.dispatch(event);
         }
     }
+
+    fn settle(&mut self) {
+        self.pump_messages();
+    }
 }
 
 impl App {
@@ -1161,10 +1165,10 @@ impl App {
     }
 
     fn route(&mut self, events: Vec<InputEvent>) {
-        if self.leaving.is_some() {
-            return;
-        }
         for event in events {
+            if self.leaving.is_some() {
+                return;
+            }
             match event {
                 InputEvent::Key { .. } => keys::route(self, event),
                 InputEvent::PointerMotion { dx, dy } => {
@@ -1178,6 +1182,7 @@ impl App {
                     if let Some(e) = self.panel_entry() {
                         e.window.dispatch(event);
                     }
+                    self.pump_messages();
                 }
             }
         }
