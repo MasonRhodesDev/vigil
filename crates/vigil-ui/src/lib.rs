@@ -484,6 +484,9 @@ impl OutputWindow {
         } else if self.down == Some(keysym) {
             self.down = None;
         }
+        if repeat && vigil_core::ONE_SHOT_KEYSYMS.contains(&keysym) {
+            return;
+        }
         let card = match self.card() {
             Some(card) if pressed => card,
             _ => return self.send_key(keysym, utf8, pressed),

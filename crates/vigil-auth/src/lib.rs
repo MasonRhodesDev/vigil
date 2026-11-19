@@ -106,6 +106,7 @@ pub struct AuthMachine {
     fixed_user: bool,
     typed: bool,
     asked: bool,
+    secret: bool,
     spoke: bool,
     unprompted: Option<String>,
     first_questions: BTreeMap<String, Prompt>,
@@ -132,6 +133,7 @@ impl AuthMachine {
             fixed_user: false,
             typed: false,
             asked: false,
+            secret: false,
             spoke: false,
             unprompted: None,
             first_questions: BTreeMap::new(),
@@ -319,6 +321,7 @@ impl AuthMachine {
                     let field = self.offered();
                     self.open((!text.is_empty()).then_some(Submitted { text, field }), ui)
                 }
+                State::AwaitingPrompt if self.secret && text.is_empty() => Ok(()),
                 State::AwaitingPrompt => {
                     let response = self.transact(
                         &Request::PostAuthMessageResponse {
@@ -435,6 +438,7 @@ impl AuthMachine {
                         None => {}
                     }
                     ui.show_prompt(&prompt.text, prompt.secret);
+                    self.secret = prompt.secret;
                     self.state = State::AwaitingPrompt;
                     self.log_stage(&prompt, false);
                     return Ok(());

@@ -303,6 +303,7 @@ impl AuthAttempt for PamAttempt {
 struct LiveAttempt<A> {
     attempt: A,
     events: mpsc::Receiver<AuthEvent>,
+    secret: bool,
 }
 
 struct AuthTrack<A = PamAttempt> {
@@ -319,6 +320,7 @@ impl<A: AuthAttempt> AuthTrack<A> {
         self.live = Some(LiveAttempt {
             attempt: spawn(tx),
             events,
+            secret: false,
         });
     }
 
@@ -330,9 +332,13 @@ impl<A: AuthAttempt> AuthTrack<A> {
         self.live = None;
     }
 
-    fn respond(&self, text: String) {
-        if let Some(live) = &self.live {
-            live.attempt.respond(text);
+    fn respond(&self, text: String) -> bool {
+        match &self.live {
+            Some(live) if !(live.secret && text.is_empty()) => {
+                live.attempt.respond(text);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -349,10 +355,16 @@ impl<A: AuthAttempt> AuthTrack<A> {
     }
 
     fn drain(&mut self) -> Vec<AuthEvent> {
-        self.live
-            .as_ref()
-            .map(|live| live.events.try_iter().collect())
-            .unwrap_or_default()
+        let Some(live) = &mut self.live else {
+            return Vec::new();
+        };
+        let events: Vec<AuthEvent> = live.events.try_iter().collect();
+        for event in &events {
+            if let AuthEvent::Prompt { secret, .. } = event {
+                live.secret = *secret;
+            }
+        }
+        events
     }
 }
 
@@ -676,12 +688,11 @@ impl Locker {
             let Some(msg) = msg else { break };
             match msg {
                 UiMessage::Respond(text) => {
-                    if self.auth.is_live() {
+                    if self.auth.respond(text) {
                         self.snapshot.busy = true;
                         self.each_window(|w| w.set_busy(true));
                         self.conversation_losses = 0;
                     }
-                    self.auth.respond(text);
                 }
                 UiMessage::Cancel => self.auth.cancel(),
                 UiMessage::SelectSession(_) | UiMessage::SelectUser(_) | UiMessage::Power(_) => {}

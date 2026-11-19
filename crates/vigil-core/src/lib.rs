@@ -263,6 +263,9 @@ pub struct KeymapSettings {
     pub options: String,
 }
 
+// Return, keypad Enter and Escape submit or cancel, so they act once per press.
+pub const ONE_SHOT_KEYSYMS: [u32; 3] = [0xff0d, 0xff8d, 0xff1b];
+
 pub const MODIFIER_KEYSYMS: [u32; 8] = [
     0xffe1, 0xffe2, 0xffe3, 0xffe4, 0xffe9, 0xffea, 0xffeb, 0xffec,
 ];

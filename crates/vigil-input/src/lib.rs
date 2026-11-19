@@ -12,9 +12,6 @@ use xkbcommon::xkb::compose;
 
 const REPEAT_DELAY: Duration = Duration::from_millis(500);
 const REPEAT_INTERVAL: Duration = Duration::from_millis(33);
-const RETURN: u32 = 0xff0d;
-const ESCAPE: u32 = 0xff1b;
-const ONE_SHOT: [u32; 2] = [RETURN, ESCAPE];
 
 #[derive(Debug)]
 pub struct InputError(pub String);
@@ -256,7 +253,8 @@ impl KeyboardState {
         }
 
         if pressed {
-            let one_shot = ONE_SHOT.contains(&self.state.key_get_one_sym(keycode).raw());
+            let one_shot = vigil_core::ONE_SHOT_KEYSYMS
+                .contains(&self.state.key_get_one_sym(keycode).raw());
             self.repeat = (!one_shot && self.keymap.key_repeats(keycode)).then_some(Repeat {
                 keycode,
                 deadline: now + REPEAT_DELAY,
@@ -285,13 +283,12 @@ impl KeyboardState {
         let Some(mut repeat) = self.repeat else {
             return Vec::new();
         };
-        let mut events = Vec::new();
-        while repeat.deadline <= now {
-            events.push(self.event(repeat.keycode, true));
-            repeat.deadline += REPEAT_INTERVAL;
+        if repeat.deadline > now {
+            return Vec::new();
         }
+        repeat.deadline = now + REPEAT_INTERVAL;
         self.repeat = Some(repeat);
-        events
+        vec![self.event(repeat.keycode, true)]
     }
 
     fn caps_lock(&self) -> bool {
