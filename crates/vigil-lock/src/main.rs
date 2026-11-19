@@ -87,6 +87,9 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
             }
             "--ready-fd" => {
                 let v = value("--ready-fd")?;
+                if cli.ready_fd.is_some() {
+                    return Err("--ready-fd given twice".into());
+                }
                 cli.ready_fd = Some(adopt_ready_fd(&v)?);
             }
             "--wait" | "--daemonize" => cli.wait = true,
@@ -1136,7 +1139,7 @@ fn clock_text(format: &str) -> String {
 }
 
 #[allow(unsafe_code)]
-fn detach_and_wait_for_lock() -> ! {
+fn detach_and_wait_for_lock(ready_fd: Option<OwnedFd>) -> ! {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -1167,7 +1170,10 @@ fn detach_and_wait_for_lock() -> ! {
         drop(command);
         let mut byte = [0u8; 1];
         match parent_end.read_exact(&mut byte) {
-            Ok(()) => Ok(0),
+            Ok(()) => {
+                signal_ready_fd(ready_fd);
+                Ok(0)
+            }
             Err(_) => {
                 let status = child.wait().map_err(|e| format!("wait locker: {e}"))?;
                 Ok(status.code().unwrap_or(1).max(1))
@@ -1184,9 +1190,18 @@ fn detach_and_wait_for_lock() -> ! {
 }
 
 fn daemon_child_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
-    args.into_iter()
-        .filter(|arg| arg != "--wait" && arg != "--daemonize")
-        .collect()
+    let mut kept = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--wait" | "--daemonize" => {}
+            "--ready-fd" => {
+                args.next();
+            }
+            _ => kept.push(arg),
+        }
+    }
+    kept
 }
 
 struct LockIpcSocket {
@@ -1321,12 +1336,12 @@ fn adopt_ready_fd(arg: &str) -> Result<OwnedFd, String> {
     // SAFETY: main parses arguments before this process opens any descriptor, and /proc shows
     // `fd` open as a pipe or socket, so it is the caller's descriptor and nothing here owns it.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    if fd > 2 {
-        return Ok(owned);
-    }
     let ready = owned
         .try_clone()
         .map_err(|e| format!("--ready-fd {fd}: {e}"))?;
+    if fd > 2 {
+        return Ok(ready);
+    }
     let null = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1362,7 +1377,7 @@ fn main() {
         }
     };
     if cli.wait {
-        detach_and_wait_for_lock();
+        detach_and_wait_for_lock(cli.ready_fd.take());
     }
     let mut config = Config::load_layered(cli.config.as_deref());
     apply_cli_to_config(&cli, &mut config);
@@ -1678,6 +1693,43 @@ mod tests {
         let mut got = Vec::new();
         parent.read_to_end(&mut got).unwrap();
         assert_eq!(got, b"1");
+    }
+
+    #[test]
+    fn ready_fd_given_twice_is_refused() {
+        use std::os::fd::IntoRawFd;
+        let (_parent, child) = UnixStream::pair().unwrap();
+        let fd = child.into_raw_fd();
+        let [flag, value] = ready_fd_args(fd);
+        let refused = parse_cli_from([flag.clone(), value.clone(), flag, value])
+            .err()
+            .unwrap();
+        assert!(refused.contains("twice"), "{refused}");
+    }
+
+    #[test]
+    fn an_adopted_ready_fd_is_not_inherited() {
+        use std::os::fd::IntoRawFd;
+        let (_parent, child) = UnixStream::pair().unwrap();
+        let ready = parse_cli_from(ready_fd_args(child.into_raw_fd()))
+            .unwrap()
+            .ready_fd
+            .unwrap();
+        let flags = rustix::io::fcntl_getfd(&ready).unwrap();
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+    }
+
+    #[test]
+    fn the_callers_ready_fd_is_not_forwarded_to_the_detached_child() {
+        assert_eq!(
+            daemon_child_args([
+                "--wait".to_owned(),
+                "--ready-fd".to_owned(),
+                "5".to_owned(),
+                "--immediate".to_owned(),
+            ]),
+            ["--immediate"]
+        );
     }
 
     #[test]
