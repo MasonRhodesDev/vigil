@@ -62,7 +62,9 @@ crash, minimise it with `cargo fuzz tmin <target> <artifact>`, add it to
 
 `tests/nested/attack.sh` needs sway, wtype and the debug builds of
 `vigil-lock` and the `lock_probe` example. It signs in as a user that
-does not exist, so it never counts a failure against a real account.
+does not exist, so it never counts a failure against a real account. Both
+D-Bus addresses name a socket nobody listens on, so neither the lock
+client nor a PAM module reaches the buses of the machine it runs on.
 
 Not covered yet: a VT switch away from a locked session. Headless sway
 has no seat session, so there is no VT to switch. The test needs sway on
@@ -70,6 +72,10 @@ a DRM device inside the QEMU guest that `tests/e2e` boots, with
 `vigil-lock` holding the lock, `chvt` to a second VT and back, and a
 framebuffer capture on each VT to show that the session contents never
 reach the screen.
+
+Not covered yet: a compositor that restarts in place. Headless sway
+cannot restart without ending its session, so A9 shows only that the
+lock client exits with its compositor and frees the singleton.
 
 ## Installation
 
