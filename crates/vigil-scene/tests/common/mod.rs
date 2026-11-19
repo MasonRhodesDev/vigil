@@ -19,6 +19,22 @@ fn zigzag(n: usize) -> String {
     d
 }
 
+fn curves(n: usize) -> String {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % 101
+    };
+    let mut d = String::from("M50 50");
+    for _ in 0..n {
+        let c: Vec<u64> = (0..6).map(|_| next()).collect();
+        d += &format!(" C{} {} {} {} {} {}", c[0], c[1], c[2], c[3], c[4], c[5]);
+    }
+    d
+}
+
 pub type Family = fn(usize) -> String;
 
 pub const FAMILIES: &[(&str, usize, Family)] = &[
@@ -41,6 +57,28 @@ pub const FAMILIES: &[(&str, usize, Family)] = &[
         svg(&format!(
             r##"<defs><rect id="r" width="100" height="100"/></defs>{}"##,
             r##"<use href="#r"/>"##.repeat(n)
+        ))
+    }),
+    ("filled curves", 5000, |n| {
+        svg(&format!(r#"<path d="{}"/>"#, curves(n)))
+    }),
+    ("wide stroked curves", 5000, |n| {
+        svg(&format!(
+            r##"<path d="{}" fill="none" stroke="#000" stroke-width="40"/>"##,
+            curves(n)
+        ))
+    }),
+    ("a stroke under a squashing scale", 5000, |n| {
+        svg(&format!(
+            r##"<g transform="scale(0.1 10)"><path d="{}" fill="none" stroke="#000" stroke-width="40" stroke-linejoin="round"/></g>"##,
+            zigzag(n)
+        ))
+    }),
+    ("nested layers past the canvas", 60, |n| {
+        svg(&format!(
+            r#"{}<rect x="299" y="299" width="500" height="500"/>{}"#,
+            r#"<g opacity="0.9">"#.repeat(n),
+            "</g>".repeat(n)
         ))
     }),
     ("nested opacity groups", 60, |n| {
