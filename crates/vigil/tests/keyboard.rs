@@ -947,3 +947,27 @@ fn an_enter_still_down_when_the_keyboard_leaves_does_not_eat_the_next_one() {
         [Sent::Respond("a".into()), Sent::Respond("".into())]
     );
 }
+
+#[test]
+fn a_pam_info_message_stays_shown_while_the_answer_is_checked() {
+    let mut g = Greeter::new();
+    let plain = frame(&mut g.window);
+    g.window.show_info("Touch your security key");
+    let info = frame(&mut g.window);
+    let rows: Vec<usize> = (0..H as usize)
+        .filter(|&y| {
+            let row = y * W as usize * 4..(y + 1) * W as usize * 4;
+            plain[row.clone()] != info[row]
+        })
+        .collect();
+    assert!(!rows.is_empty(), "the message line is found");
+    g.window.set_busy(true);
+    let checking = frame(&mut g.window);
+    for &y in &rows {
+        let row = y * W as usize * 4..(y + 1) * W as usize * 4;
+        assert!(
+            info[row.clone()] == checking[row],
+            "Checking hid the PAM message at row {y}"
+        );
+    }
+}
