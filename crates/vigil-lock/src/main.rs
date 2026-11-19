@@ -1585,22 +1585,49 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         if std::env::var_os("VIGIL_LOCK_PANIC_PROBE").is_some() {
             exit_on_panic();
-            let _ = std::thread::spawn(|| panic!("probe")).join();
+            let _ = std::thread::spawn(|| {
+                let typed = String::from("hunter\u{e9}");
+                let _ = &typed[..7];
+            })
+            .join();
             std::process::exit(0);
         }
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "tests::a_panic_on_any_thread_ends_the_lock_at_once_without_a_core",
                 "--test-threads=1",
+                "--nocapture",
             ])
             .env("VIGIL_LOCK_PANIC_PROBE", "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .output()
             .unwrap();
-        assert_eq!(status.signal(), None, "no signal, so no core dump");
-        assert_eq!(status.code(), Some(101), "a worker panic ends the process");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), None, "no signal, so no core dump");
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "a worker panic ends the process"
+        );
+        assert!(stderr.contains("panic"), "the panic is reported: {stderr}");
+        assert!(
+            !stderr.contains("hunter") && !stderr.contains('\u{e9}'),
+            "the report names no text the panic was holding: {stderr}"
+        );
+    }
+
+    #[test]
+    fn an_empty_enter_before_the_first_question_never_reaches_pam() {
+        let answered: Rc<RefCell<Vec<String>>> = Rc::default();
+        let mut track: AuthTrack<FakeAttempt> = AuthTrack::new();
+        let probe = answered.clone();
+        track.start(|_| FakeAttempt {
+            answered: probe,
+            ..FakeAttempt::default()
+        });
+        track.respond(String::new());
+        track.respond("hunter2".into());
+        assert_eq!(*answered.borrow(), ["hunter2"]);
     }
 
     #[test]
