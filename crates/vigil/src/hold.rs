@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
@@ -72,45 +71,6 @@ fn now_ms() -> u64 {
     ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
 }
 
-struct Line {
-    buf: [u8; 240],
-    len: usize,
-}
-
-impl Line {
-    fn new() -> Self {
-        Line {
-            buf: [0; 240],
-            len: 0,
-        }
-    }
-    fn emit(mut self) {
-        if self.len < self.buf.len() {
-            self.buf[self.len] = b'\n';
-            self.len += 1;
-        }
-        unsafe { libc::write(2, self.buf.as_ptr().cast(), self.len) };
-    }
-}
-
-impl std::fmt::Write for Line {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let room = self.buf.len() - 1 - self.len;
-        let n = s.len().min(room);
-        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
-        self.len += n;
-        Ok(())
-    }
-}
-
-macro_rules! say {
-    ($($arg:tt)*) => {{
-        let mut l = Line::new();
-        let _ = write!(l, $($arg)*);
-        l.emit();
-    }};
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Released {
     HandedOver,
@@ -150,7 +110,7 @@ fn watch(devices: &[Device], timeout: Duration) -> Released {
     let left = &mut left[..total.min(64)];
     loop {
         let r = poll_once(devices, left, &mut crtc_fb, |_, crtc, fb, now| {
-            say!(
+            vigil_log::say!(
                 "vigil-hold: [+{}ms] crtc {crtc} moved from fb {fb} to fb {now}: next owner has it",
                 now_ms() - start
             );
@@ -218,12 +178,12 @@ pub fn start(devices: &[Device], timeout: Duration) -> Result<i32, String> {
     }
     for d in &held {
         match drop_master(d.fd) {
-            Ok(Dropped::Yes) => eprintln!("vigil: hold: dropped DRM master on fd {}", d.fd),
-            Ok(Dropped::NotMaster) => eprintln!(
+            Ok(Dropped::Yes) => vigil_log::say!("vigil: hold: dropped DRM master on fd {}", d.fd),
+            Ok(Dropped::NotMaster) => vigil_log::say!(
                 "vigil: hold: fd {} was not master (already released); nothing to drop",
                 d.fd
             ),
-            Ok(Dropped::SeatManaged(e)) => eprintln!(
+            Ok(Dropped::SeatManaged(e)) => vigil_log::say!(
                 "vigil: hold: fd {} master is managed by the seat manager (errno {e}); holding the fd open, the seat manager drops master when it releases this session",
                 d.fd
             ),
@@ -258,7 +218,7 @@ pub fn start(devices: &[Device], timeout: Duration) -> Result<i32, String> {
             }
             close_others(&keep);
             let crtcs: usize = held.iter().map(|d| d.crtcs.len()).sum();
-            say!(
+            vigil_log::say!(
                 "vigil-hold: pid {} holding {crtcs} crtc(s) on {} device(s), timeout {} ms",
                 unsafe { libc::getpid() },
                 held.len(),
@@ -266,12 +226,14 @@ pub fn start(devices: &[Device], timeout: Duration) -> Result<i32, String> {
             );
             let why = watch(&held, timeout);
             match why {
-                Released::HandedOver => say!("vigil-hold: released, handed over"),
-                Released::TimedOut => say!(
+                Released::HandedOver => vigil_log::say!("vigil-hold: released, handed over"),
+                Released::TimedOut => vigil_log::say!(
                     "vigil-hold: released, no next owner within {} ms; the screens go dark as they would have",
                     timeout.as_millis()
                 ),
-                Released::DeviceError(e) => say!("vigil-hold: released, device error {e}"),
+                Released::DeviceError(e) => {
+                    vigil_log::say!("vigil-hold: released, device error {e}")
+                }
             }
             unsafe { libc::_exit(0) }
         }

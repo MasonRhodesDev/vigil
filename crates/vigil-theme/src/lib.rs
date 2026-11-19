@@ -84,7 +84,7 @@ impl Theme {
         if let Some(path) = path {
             match compile_path(path) {
                 Ok(theme) => return theme,
-                Err(error) => eprintln!(
+                Err(error) => vigil_log::say!(
                     "failed to load theme {}: {error}; using default",
                     path.display()
                 ),

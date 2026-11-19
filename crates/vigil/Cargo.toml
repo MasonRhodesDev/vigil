@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 slint-idle-runtime.workspace = true
 vigil-core.workspace = true
 vigil-config.workspace = true

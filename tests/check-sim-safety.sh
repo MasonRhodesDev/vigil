@@ -6,6 +6,7 @@ vigil-sim
 vigil-config
 vigil-core
 vigil-flow
+vigil-log
 vigil-theme
 vigil-ui
 vigil-warning

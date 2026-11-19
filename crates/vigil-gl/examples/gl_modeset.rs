@@ -70,7 +70,7 @@ fn main() {
         .expect("no connected connector with a mode");
     let (w, h) = mode.size();
     let (w, h) = (w as u32, h as u32);
-    println!(
+    vigil_log::out!(
         "connector {:?}: {w}x{h}@{}",
         connector.interface(),
         mode.vrefresh()
@@ -94,7 +94,7 @@ fn main() {
     let source = include_str!("../../../themes/default/theme.slint");
     let result = spin_on(compiler.build_from_source(source.into(), Default::default()));
     for diagnostic in result.diagnostics() {
-        eprintln!("theme: {diagnostic}");
+        vigil_log::say!("theme: {diagnostic}");
     }
     let definition = result.component("DefaultTheme").expect("DefaultTheme");
     let instance = definition.create().expect("instantiate");
@@ -116,12 +116,12 @@ fn main() {
     instance.show().expect("show");
 
     window.render().expect("render");
-    println!("rendered the default theme through femtovg: ok");
+    vigil_log::out!("rendered the default theme through femtovg: ok");
 
     let bo = unsafe { gbm.lock_front_buffer() }.expect("lock front buffer");
     let buffer = GbmBuffer::from_bo(bo, true);
     let fb = framebuffer_from_bo(&drm.0, &buffer, false).expect("drm framebuffer");
-    println!("drm framebuffer from the gbm buffer: ok");
+    vigil_log::out!("drm framebuffer from the gbm buffer: ok");
 
     drm.set_crtc(
         crtc,
@@ -131,14 +131,14 @@ fn main() {
         Some(mode),
     )
     .expect("set_crtc");
-    println!("MODESET OK: a GL frame is on the CRTC");
+    vigil_log::out!("MODESET OK: a GL frame is on the CRTC");
 
     let hold = std::env::var("VIGIL_GL_HOLD_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1500);
     std::thread::sleep(std::time::Duration::from_millis(hold));
-    println!("DONE");
+    vigil_log::out!("DONE");
 }
 
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {

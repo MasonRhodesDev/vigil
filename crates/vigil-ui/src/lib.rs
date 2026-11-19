@@ -779,7 +779,7 @@ fn parse_fit(value: Option<&str>, context: &str) -> Option<BackgroundFit> {
     let value = value?;
     let parsed = BackgroundFit::parse(value);
     if parsed.is_none() {
-        eprintln!("vigil-ui: config: unknown fit `{value}` ({context})");
+        vigil_log::say!("vigil-ui: config: unknown fit `{value}` ({context})");
     }
     parsed
 }
@@ -1118,7 +1118,7 @@ impl RenderBackend for SoftwareBackend {
 
     fn render(&mut self, view: &SceneView, canvas: CoreCanvas<'_>) -> bool {
         let CoreCanvas::Cpu(target) = canvas else {
-            eprintln!("vigil-ui: software backend given a GL canvas");
+            vigil_log::say!("vigil-ui: software backend given a GL canvas");
             return false;
         };
         let (scene_w, scene_h) = view.scene_size;
@@ -1129,7 +1129,7 @@ impl RenderBackend for SoftwareBackend {
             || target.buffer.len() < target.stride.saturating_mul(target.height as usize)
         {
             if debug {
-                eprintln!(
+                vigil_log::say!(
                     "vigil-ui: target mismatch: got {}x{} stride {} len {}, want {}x{}",
                     target.width,
                     target.height,

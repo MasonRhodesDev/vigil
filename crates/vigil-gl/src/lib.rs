@@ -426,7 +426,7 @@ impl vigil_core::RenderBackend for GlBackend {
 
     fn render(&mut self, view: &vigil_core::SceneView, canvas: vigil_core::Canvas<'_>) -> bool {
         if !matches!(canvas, vigil_core::Canvas::Gl { .. }) {
-            eprintln!("vigil-gl: GL backend given a CPU canvas");
+            vigil_log::say!("vigil-gl: GL backend given a CPU canvas");
             return false;
         }
         let scene_dirty = self.window.take_needs_redraw();
@@ -435,7 +435,7 @@ impl vigil_core::RenderBackend for GlBackend {
             key.pointer = (0.0, 0.0);
         }
         if std::env::var_os("VIGIL_DEBUG_FRAMES").is_some() {
-            eprintln!(
+            vigil_log::say!(
                 "vigil-gl: dirty={scene_dirty} force={} view_changed={}",
                 self.force,
                 self.last != Some(key)
@@ -445,7 +445,7 @@ impl vigil_core::RenderBackend for GlBackend {
             return false;
         }
         if let Err(e) = self.window.render() {
-            eprintln!("vigil-gl: render: {e}");
+            vigil_log::say!("vigil-gl: render: {e}");
             return false;
         }
         self.last = Some(key);

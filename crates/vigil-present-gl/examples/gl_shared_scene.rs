@@ -95,21 +95,21 @@ fn main() {
     }
 
     assert!(presented > 0, "nothing was ever presented");
-    println!("{presented}/{FRAMES} frames presented through the shared scene");
+    vigil_log::out!("{presented}/{FRAMES} frames presented through the shared scene");
 
     let idle = presenter
         .with_frame(&mut |canvas| window.render(canvas))
         .expect("idle frame");
     assert!(!idle, "an unchanged scene must not keep presenting");
-    println!("idle scene does not present: ok");
+    vigil_log::out!("idle scene does not present: ok");
 
-    println!("MODESET OK: a GL frame is on the CRTC");
+    vigil_log::out!("MODESET OK: a GL frame is on the CRTC");
     let hold = std::env::var("VIGIL_GL_HOLD_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1500);
     std::thread::sleep(std::time::Duration::from_millis(hold));
-    println!("SHARED SCENE OK");
+    vigil_log::out!("SHARED SCENE OK");
 }
 
 fn wait_for_flip(device: &DrmDevice, frame: usize) {

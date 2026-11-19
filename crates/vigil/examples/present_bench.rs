@@ -327,7 +327,7 @@ fn run(output: &Output, presents: usize, map: Map, in_frame: bool, platform: &Vi
         for series in [&mut samples.draw, &mut samples.out, &mut samples.total] {
             series.sort();
         }
-        println!(
+        vigil_log::out!(
             "output={} scenario={name} presents={} skipped={} \
              total_us_min={} total_us_p50={} total_us_p95={} total_us_max={} \
              draw_us_p50={} out_us_p50={} out_us_p95={} frame_hash={:016x}",
@@ -379,7 +379,7 @@ fn main() {
             other => panic!("unknown argument {other}"),
         }
     }
-    println!(
+    vigil_log::out!(
         "present_bench map={} cursor={cursor} presents={presents}",
         map.0
     );

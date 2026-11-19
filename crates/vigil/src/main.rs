@@ -69,7 +69,7 @@ fn profiles_dir_fingerprint(dir: &std::path::Path) -> u64 {
 }
 
 fn log_user(user: Option<&str>, why: &str, list: usize) {
-    eprintln!(
+    vigil_log::say!(
         "vigil: user -> {} ({why}), list={list}",
         user.unwrap_or("<other>")
     );
@@ -387,17 +387,17 @@ fn apply_profile(
         .collect();
     let outputs: Vec<ConnectedOutput> = connected.iter().map(|(_, c)| c.clone()).collect();
     let Some(profile) = monitor_profiles::select(&signature, profiles) else {
-        eprintln!("vigil: no monitor profile matches {signature:?}");
+        vigil_log::say!("vigil: no monitor profile matches {signature:?}");
         return (Vec::new(), Vec::new());
     };
     let resolved = monitor_profiles::resolve(profile, &outputs);
     for w in &resolved.warnings {
-        eprintln!("vigil: profile {}: {w}", profile.name);
+        vigil_log::say!("vigil: profile {}: {w}", profile.name);
     }
     for u in &resolved.unmatched {
-        eprintln!("vigil: profile {}: no output for {u}", profile.name);
+        vigil_log::say!("vigil: profile {}: no output for {u}", profile.name);
     }
-    eprintln!("vigil: monitor profile {}", profile.name);
+    vigil_log::say!("vigil: monitor profile {}", profile.name);
     let mut disabled = Vec::new();
     for out in &resolved.outputs {
         let Some((id, _)) = connected.iter().find(|(_, c)| c.name == out.name) else {
@@ -412,7 +412,7 @@ fn apply_profile(
             if let Some(gpu) = gpus.get_mut((id.0 >> 24) as usize).and_then(Option::as_mut)
                 && let Err(e) = gpu.set_mode(*id, want)
             {
-                eprintln!("vigil: profile {}: {e}; using preferred mode", profile.name);
+                vigil_log::say!("vigil: profile {}: {e}; using preferred mode", profile.name);
             }
         }
     }
@@ -432,7 +432,7 @@ fn splash_bringup(
     for gpu in gpus.iter_mut().flatten() {
         match gpu.scan() {
             Ok(batch) => events.extend(batch),
-            Err(e) => eprintln!("vigil: initial scan failed: {e}"),
+            Err(e) => vigil_log::say!("vigil: initial scan failed: {e}"),
         }
     }
     let mut out = EarlySplash::default();
@@ -479,7 +479,7 @@ fn splash_bringup(
         {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("vigil: {}: splash claim failed: {e}", info.connector);
+                vigil_log::say!("vigil: {}: splash claim failed: {e}", info.connector);
                 continue;
             }
         };
@@ -515,7 +515,7 @@ fn splash_bringup(
             .map(|h| h.join().expect("splash builder panicked"))
             .collect()
     });
-    eprintln!(
+    vigil_log::say!(
         "vigil: [t+{}ms] splash built for {} output(s) in {} ms",
         vigil_core::uptime_ms(),
         claimed.len(),
@@ -547,14 +547,14 @@ fn splash_bringup(
     let mut failed_gpus = Vec::new();
     for (c, sp, tag) in parts.iter_mut() {
         if let Err(e) = draw(&mut c.presenter, sp, tag) {
-            eprintln!("vigil: {}: splash first frame: {e}", c.connector);
+            vigil_log::say!("vigil: {}: splash first frame: {e}", c.connector);
         }
     }
     for (c, _, _) in parts.iter_mut() {
         match c.presenter.commit_staged() {
             Ok(true) => {
                 c.shown = true;
-                eprintln!(
+                vigil_log::say!(
                     "vigil: [t+{}ms] splash first frame on {}x{} ({})",
                     vigil_core::uptime_ms(),
                     c.presenter.size().0,
@@ -569,7 +569,7 @@ fn splash_bringup(
             }
             Ok(false) => {}
             Err(e) => {
-                eprintln!("vigil: {}: splash first frame: {e}", c.connector);
+                vigil_log::say!("vigil: {}: splash first frame: {e}", c.connector);
                 if keep_state && !failed_gpus.contains(&c.ns) {
                     failed_gpus.push(c.ns);
                 }
@@ -577,11 +577,11 @@ fn splash_bringup(
         }
     }
     for ns in failed_gpus {
-        eprintln!("vigil: gpu {ns}: kept display state refused; resetting it");
+        vigil_log::say!("vigil: gpu {ns}: kept display state refused; resetting it");
         if let Some(gpu) = gpus.get_mut(ns).and_then(Option::as_mut)
             && let Err(e) = gpu.reset_display_state()
         {
-            eprintln!("vigil: gpu {ns}: reset failed: {e}");
+            vigil_log::say!("vigil: gpu {ns}: reset failed: {e}");
         }
         for (c, sp, tag) in parts.iter_mut().filter(|(c, _, _)| c.ns == ns) {
             c.presenter.invalidate();
@@ -594,7 +594,7 @@ fn splash_bringup(
             });
             match shown {
                 Ok(done) => c.shown = done,
-                Err(e) => eprintln!("vigil: {}: splash first frame: {e}", c.connector),
+                Err(e) => vigil_log::say!("vigil: {}: splash first frame: {e}", c.connector),
             }
         }
     }
@@ -615,7 +615,7 @@ fn splash_bringup(
 impl keys::KeySink for App {
     fn change_vt(&mut self, vt: i32) {
         if let Err(e) = self.session.change_vt(vt) {
-            eprintln!("vigil: change vt {vt}: {e}");
+            vigil_log::say!("vigil: change vt {vt}: {e}");
         }
     }
 
@@ -687,7 +687,7 @@ impl App {
             SessionEvent::Activate => {
                 self.active = true;
                 if let Err(e) = self.input.resume() {
-                    eprintln!("vigil: {e}");
+                    vigil_log::say!("vigil: {e}");
                 }
                 for gpu in self.outputs.iter_mut().flatten() {
                     let _ = gpu.activate();
@@ -702,7 +702,7 @@ impl App {
                     if !self.entries.iter().any(|e| e.id == id)
                         && let Err(e) = self.add_output(id)
                     {
-                        eprintln!("vigil: rebuilding output {id:?}: {e}");
+                        vigil_log::say!("vigil: rebuilding output {id:?}: {e}");
                     }
                 }
                 self.rebuild_row();
@@ -762,7 +762,7 @@ impl App {
         }
         let (profiles, diags) = monitor_profiles::load_dir(dir);
         for d in diags {
-            eprintln!("vigil: profile {}: {}", d.source, d.message);
+            vigil_log::say!("vigil: profile {}: {}", d.source, d.message);
         }
         self.profiles = profiles;
         self.profiles_fingerprint = fingerprint;
@@ -783,10 +783,10 @@ impl App {
             let Some(gpu) = slot else { continue };
             match gpu.scan() {
                 Ok(batch) => events.extend(batch),
-                Err(e) if gpu.alive() => eprintln!("vigil: hotplug scan failed: {e}"),
+                Err(e) if gpu.alive() => vigil_log::say!("vigil: hotplug scan failed: {e}"),
                 Err(_) => {
                     let ns = gpu.namespace();
-                    eprintln!("vigil: gpu {ns} vanished; dropping its outputs");
+                    vigil_log::say!("vigil: gpu {ns} vanished; dropping its outputs");
                     events.extend(
                         self.entries
                             .iter()
@@ -803,12 +803,12 @@ impl App {
             match event {
                 OutputEvent::Added(id, _) => {
                     if disabled.contains(&id) {
-                        eprintln!("vigil: output {id:?} disabled by profile");
+                        vigil_log::say!("vigil: output {id:?} disabled by profile");
                         continue;
                     }
                     match self.add_output(id) {
                         Ok(()) => added = true,
-                        Err(e) => eprintln!("vigil: skipping output {id:?}: {e}"),
+                        Err(e) => vigil_log::say!("vigil: skipping output {id:?}: {e}"),
                     }
                 }
                 OutputEvent::Removed(id) => self.remove_output(id),
@@ -953,7 +953,7 @@ impl App {
             .find(|o| o.name == info.connector)
             .map_or(0, |o| o.transform);
         if transform > 3 {
-            eprintln!(
+            vigil_log::say!(
                 "vigil: {}: flipped transform {transform} not supported,                  rotating without the flip",
                 info.connector
             );
@@ -973,7 +973,7 @@ impl App {
             match self.gl_output(id, scale, transform, atomic, &mut surface_slot, device_fd) {
                 Ok(built) => Some(built),
                 Err(e) => {
-                    eprintln!(
+                    vigil_log::say!(
                         "vigil: {}: GL unavailable ({e}); using software",
                         info.connector
                     );
@@ -987,7 +987,7 @@ impl App {
 
         let (mut window, presenter) = match gl {
             Some(built) => {
-                eprintln!(
+                vigil_log::say!(
                     "vigil: {}: rendering with GL (hardware cursor)",
                     info.connector
                 );
@@ -1012,11 +1012,11 @@ impl App {
                     }
                 };
                 match presenter.claim_cursor(scale, transform) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => vigil_log::say!(
                         "vigil: {}: rendering in software (hardware cursor)",
                         info.connector
                     ),
-                    Err(why) => eprintln!(
+                    Err(why) => vigil_log::say!(
                         "vigil: {}: rendering in software (cursor drawn in the frame: {why})",
                         info.connector
                     ),
@@ -1069,7 +1069,7 @@ impl App {
         let queue = self.queue.clone();
         window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
 
-        eprintln!(
+        vigil_log::say!(
             "vigil: output {} {}x{} scale {scale} (gpu {}){}",
             info.connector,
             info.width,
@@ -1151,9 +1151,9 @@ impl App {
             .collect();
         let row = layout::Row::place(&geometry);
         if row != self.row {
-            eprintln!("vigil: layout {row}");
+            vigil_log::say!("vigil: layout {row}");
             for overlap in row.overlaps() {
-                eprintln!("vigil: layout: {overlap}");
+                vigil_log::say!("vigil: layout: {overlap}");
             }
         }
         let settled = layout::settle(&self.row, &row, self.panel, self.cursor);
@@ -1170,7 +1170,7 @@ impl App {
 
     fn log_panel(&self, reason: layout::PanelReason) {
         if let Some(connector) = self.panel.and_then(|id| self.row.connector(id)) {
-            eprintln!("vigil: panel -> {connector} ({reason})");
+            vigil_log::say!("vigil: panel -> {connector} ({reason})");
         }
     }
 
@@ -1269,7 +1269,7 @@ impl App {
                 snapshot: &mut self.snapshot,
             };
             if let Err(e) = self.auth.handle(msg, &mut fan) {
-                eprintln!("vigil: auth: {e}");
+                vigil_log::say!("vigil: auth: {e}");
             }
             self.store_what_auth_learned();
             if !asking_name
@@ -1309,7 +1309,7 @@ impl App {
         let now = Instant::now();
         self.leaving = Some(now);
         self.timeline = None;
-        eprintln!(
+        vigil_log::say!(
             "vigil: [t+{}ms] login accepted; easing to the rest frame, exiting once shown",
             vigil_core::uptime_ms()
         );
@@ -1390,7 +1390,7 @@ impl App {
                 match shown {
                     Ok(true) => {
                         let draw = drawn.unwrap_or_default();
-                        eprintln!(
+                        vigil_log::say!(
                             "vigil: [t+{}ms] leave frame on {connector}: draw {} ms, commit {} ms, progress {progress:.2}",
                             vigil_core::uptime_ms(),
                             draw.as_millis(),
@@ -1402,7 +1402,7 @@ impl App {
                         }
                     }
                     Ok(false) => {}
-                    Err(e) => eprintln!("vigil: hand-off to rest: {e}"),
+                    Err(e) => vigil_log::say!("vigil: hand-off to rest: {e}"),
                 }
             }
             if cover.final_shown() {
@@ -1413,7 +1413,7 @@ impl App {
         }
         let waited = started.elapsed();
         if expired || !pending || waited >= deadline {
-            eprintln!(
+            vigil_log::say!(
                 "vigil: [t+{}ms] exiting (rest frame shown, {} ms after login)",
                 vigil_core::uptime_ms(),
                 waited.as_millis()
@@ -1440,17 +1440,17 @@ impl App {
         let t0 = vigil_core::uptime_ms();
         match hold::start(&devices, timeout) {
             Ok(pid) => {
-                use std::io::Write as _;
-                let line = format!(
-                    "vigil: [t+{}ms] hold: child {pid} keeps the last frame on {} screen(s) for up to {} ms ({} ms to set up)\n",
+                vigil_log::say!(
+                    "vigil: [t+{}ms] hold: child {pid} keeps the last frame on {} screen(s) for up to {} ms ({} ms to set up)",
                     vigil_core::uptime_ms(),
                     devices.iter().map(|d| d.crtcs.len()).sum::<usize>(),
                     timeout.as_millis(),
                     vigil_core::uptime_ms().saturating_sub(t0)
                 );
-                let _ = std::io::stderr().write_all(line.as_bytes());
             }
-            Err(e) => eprintln!("vigil: hold: not holding the last frame, exiting normally: {e}"),
+            Err(e) => {
+                vigil_log::say!("vigil: hold: not holding the last frame, exiting normally: {e}")
+            }
         }
     }
 
@@ -1460,14 +1460,14 @@ impl App {
             PowerAction::Poweroff => "poweroff",
         };
         if !self.power_enabled {
-            eprintln!("vigil: power action inhibited: systemctl {arg}");
+            vigil_log::say!("vigil: power action inhibited: systemctl {arg}");
             return;
         }
-        eprintln!("vigil: power: systemctl {arg}");
+        vigil_log::say!("vigil: power: systemctl {arg}");
         match std::process::Command::new("systemctl").arg(arg).status() {
             Ok(status) if status.success() => {}
-            Ok(status) => eprintln!("vigil: systemctl {arg} exited {status}"),
-            Err(e) => eprintln!("vigil: systemctl {arg}: {e}"),
+            Ok(status) => vigil_log::say!("vigil: systemctl {arg} exited {status}"),
+            Err(e) => vigil_log::say!("vigil: systemctl {arg}: {e}"),
         }
     }
 
@@ -1493,7 +1493,7 @@ impl App {
             snapshot: &mut self.snapshot,
         };
         if let Err(e) = self.auth.select_user(user.as_deref(), &mut fan) {
-            eprintln!("vigil: select user: {e}");
+            vigil_log::say!("vigil: select user: {e}");
         }
     }
 
@@ -1517,7 +1517,7 @@ impl App {
             .map(appearance_profiles::Registry::load_published)
             .transpose()
             .unwrap_or_else(|e| {
-                eprintln!("vigil: appearance registry: {e}");
+                vigil_log::say!("vigil: appearance registry: {e}");
                 None
             })
             .unwrap_or_default();
@@ -1626,7 +1626,7 @@ impl App {
                                             .as_deref()
                                             .and_then(|p| vigil_ui::bgcache::read(p, width, height))
                                         {
-                                            eprintln!(
+                                            vigil_log::say!(
                                                 "vigil: [t+{}ms] background cache hit {width}x{height}",
                                                 vigil_core::uptime_ms()
                                             );
@@ -1660,7 +1660,7 @@ impl App {
                     .map(|handle| handle.join().expect("background renderer panicked"))
                     .collect()
             });
-            eprintln!(
+            vigil_log::say!(
                 "vigil: [t+{}ms] backgrounds ready ({} ms of work)",
                 vigil_core::uptime_ms(),
                 started.elapsed().as_millis()
@@ -1697,23 +1697,23 @@ impl App {
             }
             match decoded {
                 Ok(Some(BackgroundBitmap::Rgba(rgba, width, height))) => {
-                    eprintln!("vigil: background applied to {:?}", id);
+                    vigil_log::say!("vigil: background applied to {:?}", id);
                     entry.window.set_background(rgba, width, height)
                 }
                 Ok(Some(BackgroundBitmap::Xrgb(xrgb, width, height))) => {
                     if entry.window.set_native_background_xrgb(xrgb, width, height) {
-                        eprintln!("vigil: native background applied to {:?}", id);
+                        vigil_log::say!("vigil: native background applied to {:?}", id);
                     } else {
-                        eprintln!("vigil: native background unsupported for {:?}", id);
+                        vigil_log::say!("vigil: native background unsupported for {:?}", id);
                         entry.window.clear_background();
                     }
                 }
                 Ok(None) => {
-                    eprintln!("vigil: no background resolved for {:?}; using theme", id);
+                    vigil_log::say!("vigil: no background resolved for {:?}; using theme", id);
                     entry.window.clear_background()
                 }
                 Err(error) => {
-                    eprintln!("vigil: background: {error}");
+                    vigil_log::say!("vigil: background: {error}");
                     entry.window.clear_background();
                 }
             }
@@ -1791,14 +1791,14 @@ impl App {
         }
         if !timeline.is_ready() && covered.all(splash::Cover::is_ready) {
             timeline.mark_ready(now);
-            eprintln!(
+            vigil_log::say!(
                 "vigil: [t+{}ms] greeter ready on every output; easing the glow out",
                 vigil_core::uptime_ms()
             );
         }
         let phase = timeline.phase(now, scene::monotonic_s(), &self.scene);
         if phase == splash::Phase::Done {
-            eprintln!(
+            vigil_log::say!(
                 "vigil: [t+{}ms] splash to greeter fade done",
                 vigil_core::uptime_ms()
             );
@@ -1870,7 +1870,7 @@ impl App {
                                 Ok(true) => c.presented(now, level),
                                 Ok(false) => {}
                                 Err(PresentError::DeviceLost) => dead.push(i),
-                                Err(e) => eprintln!("vigil: splash present: {e}"),
+                                Err(e) => vigil_log::say!("vigil: splash present: {e}"),
                             }
                         }
                         if self
@@ -1900,7 +1900,7 @@ impl App {
                     Err(PresentError::DeviceLost) => dead.push(i),
                     Err(e) => {
                         if *present_failures % PRESENT_LOG_EVERY == 0 {
-                            eprintln!("vigil: cursor flip: {e} (retrying)");
+                            vigil_log::say!("vigil: cursor flip: {e} (retrying)");
                         }
                         *present_failures = present_failures.saturating_add(1);
                     }
@@ -1950,7 +1950,7 @@ impl App {
                 if drew && debug_frames {
                     let row = &target.buffer[mid..mid + row_len];
                     let sum: u64 = row.iter().map(|&b| b as u64).sum();
-                    eprintln!("vigil: frame drawn, mid-row byte sum {sum}");
+                    vigil_log::say!("vigil: frame drawn, mid-row byte sum {sum}");
                 }
                 drew
             }) {
@@ -1961,7 +1961,7 @@ impl App {
                         self.metrics.record_commit();
                         if let Some(line) = budget.record(drawn, started.elapsed(), Instant::now())
                         {
-                            eprintln!("vigil: {connector}: {line}");
+                            vigil_log::say!("vigil: {connector}: {line}");
                         }
                     }
                     self.present_retry.remove(&entry.id);
@@ -1975,7 +1975,7 @@ impl App {
                     self.present_retry
                         .insert(entry.id, (Instant::now() + delay, *present_failures));
                     if *present_failures % PRESENT_LOG_EVERY == 0 {
-                        eprintln!("vigil: present: {e} (retrying)");
+                        vigil_log::say!("vigil: present: {e} (retrying)");
                     }
                     *present_failures = present_failures.saturating_add(1);
                 }
@@ -1984,7 +1984,7 @@ impl App {
         let lost = !dead.is_empty();
         for i in dead.into_iter().rev() {
             let id = self.entries[i].id;
-            eprintln!("vigil: output {id:?} lost; awaiting rescan");
+            vigil_log::say!("vigil: output {id:?} lost; awaiting rescan");
             self.entries.remove(i);
         }
         if lost {
@@ -2008,7 +2008,7 @@ impl App {
             return;
         }
         self.first_frame_hook_done = true;
-        eprintln!(
+        vigil_log::say!(
             "vigil: [t+{}ms] first frame presented on every output",
             vigil_core::uptime_ms()
         );
@@ -2029,7 +2029,7 @@ impl App {
                     let _ = child.wait();
                 });
             }
-            Err(e) => eprintln!("vigil: on_first_frame: {e}"),
+            Err(e) => vigil_log::say!("vigil: on_first_frame: {e}"),
         }
     }
 }
@@ -2062,11 +2062,11 @@ fn run() -> Result<i32, String> {
         VigilPlatform::install().map_err(|e| e.to_string())?;
         return match vigil_theme::check(path) {
             Ok(()) => {
-                println!("{}: ok", path.display());
+                vigil_log::out!("{}: ok", path.display());
                 Ok(0)
             }
             Err(e) => {
-                eprintln!("{}: {e}", path.display());
+                vigil_log::say!("{}: {e}", path.display());
                 Ok(1)
             }
         };
@@ -2080,7 +2080,7 @@ fn run() -> Result<i32, String> {
         Some(dir) => {
             let (profiles, diags) = monitor_profiles::load_dir(dir);
             for d in diags {
-                eprintln!("vigil: profile {}: {}", d.source, d.message);
+                vigil_log::say!("vigil: profile {}: {}", d.source, d.message);
             }
             let fingerprint = profiles_dir_fingerprint(dir);
             (profiles, fingerprint)
@@ -2088,7 +2088,7 @@ fn run() -> Result<i32, String> {
         None => (Vec::new(), 0),
     };
 
-    eprintln!(
+    vigil_log::say!(
         "vigil: renderer requested: {} (per-output result logged below)",
         if config.render.backend.is_empty() {
             "software"
@@ -2117,7 +2117,7 @@ fn run() -> Result<i32, String> {
                 outputs.push(Some(manager));
                 drm_notifiers.push((namespace, drm_notifier));
             }
-            Err(e) => eprintln!("vigil: skipping GPU {}: {e}", path.display()),
+            Err(e) => vigil_log::say!("vigil: skipping GPU {}: {e}", path.display()),
         }
     }
     if outputs.is_empty() {
@@ -2142,7 +2142,7 @@ fn run() -> Result<i32, String> {
         !want_gl,
     );
     if !early.outputs.is_empty() {
-        eprintln!(
+        vigil_log::say!(
             "vigil: [t+{}ms] splash up on {} output(s)",
             vigil_core::uptime_ms(),
             early.outputs.len()
@@ -2346,7 +2346,7 @@ fn run() -> Result<i32, String> {
         };
         let pause_notice = match verdict {
             autologin::Verdict::Pause { streak, last_secs } => {
-                eprintln!(
+                vigil_log::say!(
                     "vigil: [t+{}ms] automatic login paused: {streak} session(s) in a row ended within {} s of starting",
                     vigil_core::uptime_ms(),
                     autologin::SHORT_SESSION_SECS
@@ -2415,7 +2415,7 @@ fn run() -> Result<i32, String> {
         handle
             .insert_source(notifier, move |event, _, app: &mut App| match event {
                 vigil_outputs::DrmEvent::VBlank(crtc) => app.vblank(namespace, crtc.into()),
-                vigil_outputs::DrmEvent::Error(e) => eprintln!("vigil: drm event: {e}"),
+                vigil_outputs::DrmEvent::Error(e) => vigil_log::say!("vigil: drm event: {e}"),
             })
             .map_err(|e| format!("drm notifier source: {e}"))?;
     }
@@ -2426,7 +2426,7 @@ fn run() -> Result<i32, String> {
             |_, _, app: &mut App| {
                 let events = app.input.dispatch();
                 if std::env::var_os("VIGIL_DEBUG_FRAMES").is_some() && !events.is_empty() {
-                    eprintln!("vigil: input ready: {} event(s)", events.len());
+                    vigil_log::say!("vigil: input ready: {} event(s)", events.len());
                 }
                 let had_events = !events.is_empty();
                 app.route(events);
@@ -2455,7 +2455,7 @@ fn main() {
     match run() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("vigil: {e}");
+            vigil_log::say!("vigil: {e}");
             std::process::exit(1);
         }
     }

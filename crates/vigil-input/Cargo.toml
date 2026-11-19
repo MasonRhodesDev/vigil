@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 vigil-core.workspace = true
 smithay = { workspace = true, features = ["backend_libinput"] }
 input = { version = "0.9", default-features = false, features = ["udev"] }

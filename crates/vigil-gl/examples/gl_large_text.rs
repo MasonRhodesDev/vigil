@@ -54,7 +54,7 @@ fn main() {
     let compiler = slint_interpreter::Compiler::default();
     let result = spin_on(compiler.build_from_source(SCENE.into(), Default::default()));
     for diagnostic in result.diagnostics() {
-        eprintln!("scene: {diagnostic}");
+        vigil_log::say!("scene: {diagnostic}");
     }
     let instance = result
         .component("Probe")
@@ -79,13 +79,13 @@ fn main() {
 
     let runs = row.windows(2).filter(|w| !w[0] && w[1]).count() + usize::from(row[0]);
     let picture: String = row.iter().map(|&ink| if ink { '#' } else { '.' }).collect();
-    println!("middle row: {picture}");
+    vigil_log::out!("middle row: {picture}");
     assert!(
         runs == 2,
         "a 160px \"0\" should cross ink twice through its middle, crossed it {runs} times \
          (once means the glyph was filled as a box: no stencil buffer)"
     );
-    println!("LARGE TEXT OK");
+    vigil_log::out!("LARGE TEXT OK");
 }
 
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {

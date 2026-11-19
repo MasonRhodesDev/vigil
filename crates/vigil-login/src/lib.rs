@@ -30,7 +30,9 @@ impl LoginSession {
         match Self::try_connect() {
             Ok(session) => Some(session),
             Err(e) => {
-                eprintln!("{component}: logind unavailable ({e}); no logind hints or signals");
+                vigil_log::say!(
+                    "{component}: logind unavailable ({e}); no logind hints or signals"
+                );
                 None
             }
         }
@@ -57,7 +59,7 @@ impl LoginSession {
                 .await
         });
         if let Err(e) = result {
-            eprintln!("vigil-lock: SetLockedHint({locked}): {e}");
+            vigil_log::say!("vigil-lock: SetLockedHint({locked}): {e}");
         }
     }
 
@@ -139,7 +141,11 @@ impl Source {
                 let signals = match self.signals().await {
                     Ok(signals) => signals,
                     Err(e) => {
-                        eprintln!("vigil: {} signals from {}: {e}", self.interface, self.name);
+                        vigil_log::say!(
+                            "vigil: {} signals from {}: {e}",
+                            self.interface,
+                            self.name
+                        );
                         return;
                     }
                 };
@@ -176,7 +182,9 @@ impl AppearanceWatcher {
         match block_on(Connection::session()) {
             Ok(conn) => Some(Self { conn }),
             Err(e) => {
-                eprintln!("vigil-lock: settings portal unavailable ({e}); theme defaults kept");
+                vigil_log::say!(
+                    "vigil-lock: settings portal unavailable ({e}); theme defaults kept"
+                );
                 None
             }
         }
@@ -242,7 +250,7 @@ mod tests {
     #[test]
     fn logind_session_resolves_read_only() {
         let Some(session) = LoginSession::connect() else {
-            eprintln!("skipped: no system bus or no logind session");
+            vigil_log::say!("skipped: no system bus or no logind session");
             return;
         };
         assert!(
@@ -267,7 +275,7 @@ mod tests {
     #[test]
     fn portal_read_initial_is_harmless() {
         let Some(watcher) = AppearanceWatcher::connect() else {
-            eprintln!("skipped: no session bus");
+            vigil_log::say!("skipped: no session bus");
             return;
         };
         let (tx, rx) = mpsc::channel();
