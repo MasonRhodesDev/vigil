@@ -271,6 +271,7 @@ echo "A9: the compositor dies"
 lock --grace 0 || fail "A9: lock failed"
 pid=$(locker)
 kill -KILL "$SWAY_PID"
+wait "$SWAY_PID" 2>/dev/null || true
 SWAY_PID=
 gone "$pid" || fail "A9: the lock client outlived its compositor"
 flock -n "$LOCKFILE" true 2>/dev/null || fail "A9: the singleton is still held"
