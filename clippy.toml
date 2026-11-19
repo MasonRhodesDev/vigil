@@ -1,0 +1,7 @@
+disallowed-macros = [
+    { path = "std::eprintln", reason = "use vigil_log::say!, which never panics or blocks on a broken stderr" },
+    { path = "std::eprint", reason = "use vigil_log::say!, which never panics or blocks on a broken stderr" },
+    { path = "std::println", reason = "use vigil_log::out!, which never panics on a broken stdout" },
+    { path = "std::print", reason = "use vigil_log::out!, which never panics on a broken stdout" },
+    { path = "std::dbg", reason = "dbg! panics on a broken stderr; use vigil_log::say!" },
+]
