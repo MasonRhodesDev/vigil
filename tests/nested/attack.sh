@@ -27,9 +27,20 @@ PROBE=$TARGET/debug/examples/lock_probe
 # No account by this name exists, so no keystroke here counts against one.
 GHOST=vigil-attack-ghost
 WORK=$(mktemp -d)
+# `--wait` re-runs the locker under setsid, so neither its process group nor
+# its path tells this run's lockers from one the user runs from the same
+# build. The environment they inherit does.
+export VIGIL_ATTACK_RUN="$WORK"
+ours() {
+    for pid in $(pgrep -x vigil-lock); do
+        tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null |
+            grep -qxF "VIGIL_ATTACK_RUN=$WORK" && echo "$pid"
+    done
+    return 0
+}
 SWAY_PID=
 cleanup() {
-    pkill -KILL -f "$VLOCK" 2>/dev/null || true
+    for pid in $(ours); do kill -KILL "$pid" 2>/dev/null || true; done
     [ -n "$SWAY_PID" ] && kill "$SWAY_PID" 2>/dev/null || true
     if [ -n "${VIGIL_NESTED_KEEP:-}" ]; then
         echo "workdir kept: $WORK"
@@ -43,7 +54,9 @@ trap cleanup EXIT INT TERM
 ulimit -c 0
 
 # The lock client and the host's PAM modules talk D-Bus. Neither may reach
-# the host's buses, so both addresses name a socket nobody listens on.
+# the host's D-Bus, so both addresses name a socket nobody listens on. The
+# run is not sealed off the host otherwise: NSS looks the ghost user up
+# through /run/systemd/userdb, and PAM modules write to /dev/log.
 export DBUS_SYSTEM_BUS_ADDRESS=unix:path=$WORK/no-system-bus
 export DBUS_SESSION_BUS_ADDRESS=unix:path=$WORK/no-session-bus
 export XDG_RUNTIME_DIR=$WORK/run
@@ -110,7 +123,7 @@ still_locked() {
     sleep 1
     desktop_is_hidden "$1" || fail "$1: the session unlocked a second later"
 }
-locker() { pgrep -f "^$VLOCK " | head -n 1; }
+locker() { ours | head -n 1; }
 gone() {
     i=0
     while kill -0 "$1" 2>/dev/null; do
@@ -260,16 +273,11 @@ for after in 0 0.1 0.3 0.6 1.0 1.4 1.8; do
     lock --grace 0 && second=0 || second=$?
     gone "$first" || fail "A8 (${after}s): the unlocking client never exited"
     sleep 0.5
-    if [ "$second" = 0 ]; then
-        held_by_a_live_client ||
-            fail "A8 (${after}s): the second lock reported success and the session is unlocked"
-        still_locked "A8 (${after}s)"
-        echo "  ${after}s after the key: locked again"
-    else
-        desktop_is_hidden "A8 (${after}s)" &&
-            fail "A8 (${after}s): the second lock exited $second with the session locked"
-        echo "  ${after}s after the key: the second lock reported failure ($second)"
-    fi
+    [ "$second" = 0 ] || fail "A8 (${after}s): the second lock exited $second"
+    held_by_a_live_client ||
+        fail "A8 (${after}s): the second lock reported success and the session is unlocked"
+    still_locked "A8 (${after}s)"
+    echo "  ${after}s after the key: locked again"
     release "A8 (${after}s)"
 done
 pass "A8"

@@ -66,7 +66,11 @@ crash, minimise it with `cargo fuzz tmin <target> <artifact>`, add it to
 `vigil-lock` and the `lock_probe` example. It signs in as a user that
 does not exist, so it never counts a failure against a real account. Both
 D-Bus addresses name a socket nobody listens on, so neither the lock
-client nor a PAM module reaches the buses of the machine it runs on.
+client nor a PAM module reaches the host's D-Bus. The run is otherwise
+not sealed off the host: NSS looks the ghost user up through
+`/run/systemd/userdb`, and PAM modules write to `/dev/log`. The script
+kills only lockers that carry its own `VIGIL_ATTACK_RUN`, so a locker the
+user runs from the same build survives it.
 
 Not covered yet: a VT switch away from a locked session. Headless sway
 has no seat session, so there is no VT to switch. The test needs sway on
