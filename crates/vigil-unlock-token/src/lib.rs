@@ -304,6 +304,33 @@ mod tests {
     }
 
     #[test]
+    fn prepare_issue_admit_revoke_round_trip() {
+        let base = std::env::temp_dir().join(format!("vigil-token-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).expect("create the base directory");
+        let dir = base.join("vigil").join("unlock");
+        prepare(&dir).expect("create both levels");
+        prepare(&dir).expect("prepare again");
+        for level in [dir.parent().expect("parent"), dir.as_path()] {
+            let mode = fs::stat(level).expect("stat").st_mode & 0o7777;
+            assert_eq!(mode, DIR_MODE, "{}", level.display());
+        }
+        let me = rustix::process::getuid().as_raw();
+        let now = Moment::now().expect("this boot");
+        issue(&dir, me, "c1", &now).expect("issue");
+        assert_eq!(admit(&dir, me, "c1", &now), Ok(()));
+        revoke(&dir, "c1").expect("revoke");
+        revoke(&dir, "c1").expect("revoke again");
+        assert_eq!(admit(&dir, me, "c1", &now), Err(Refusal::NoToken));
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("list").count(),
+            0,
+            "a temporary file stayed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn session_ids_that_could_name_a_path_are_not_valid() {
         for id in ["", ".", "..", "a/b", "c1\n", ".c1", "c 1"] {
             assert!(!valid_session(id), "{id:?}");

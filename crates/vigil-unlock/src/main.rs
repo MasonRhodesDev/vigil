@@ -41,7 +41,13 @@ fn run(args: &[String]) -> i32 {
         say!("vigil-unlock: run as root; vigil-lock obeys an Unlock only when root asked for it");
         return 1;
     }
-    match block_on(unlock(target)) {
+    let unlocked = block_on(async {
+        let conn = Connection::system()
+            .await
+            .map_err(|e| format!("logind: {e}"))?;
+        unlock(&conn, target, Path::new(DIR), ROOT).await
+    });
+    match unlocked {
         Ok(true) => 0,
         Ok(false) => 1,
         Err(e) => {
@@ -59,10 +65,9 @@ fn choose<'a>(sessions: &'a [Listed], target: &str) -> Vec<&'a Listed> {
     sessions.iter().filter(|s| s.2 == target).collect()
 }
 
-async fn unlock(target: &str) -> Result<bool, String> {
+async fn unlock(conn: &Connection, target: &str, dir: &Path, owner: u32) -> Result<bool, String> {
     let bus = |e: zbus::Error| format!("logind: {e}");
-    let conn = Connection::system().await.map_err(bus)?;
-    let manager = Proxy::new(&conn, LOGIN1, MANAGER_PATH, MANAGER_IFACE)
+    let manager = Proxy::new(conn, LOGIN1, MANAGER_PATH, MANAGER_IFACE)
         .await
         .map_err(bus)?;
     let sessions: Vec<Listed> = manager.call("ListSessions", &()).await.map_err(bus)?;
@@ -71,27 +76,30 @@ async fn unlock(target: &str) -> Result<bool, String> {
         return Err(format!("no session or user named {target:?}"));
     }
     let at = Moment::now().map_err(|e| format!("this boot: {e}"))?;
-    let dir = Path::new(DIR);
-    vigil_unlock_token::prepare(dir).map_err(|e| format!("{DIR}: {e}"))?;
+    vigil_unlock_token::prepare(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let wanted = chosen.len();
-    let mut issued = Vec::new();
+    let mut written = Vec::new();
+    let mut asked = Vec::new();
     for (id, _, user, _, path) in chosen {
-        if let Err(e) = vigil_unlock_token::issue(dir, ROOT, id, &at) {
+        if let Err(e) = vigil_unlock_token::issue(dir, owner, id, &at) {
             say!("vigil-unlock: session {id} ({user}): token: {e}");
             continue;
         }
+        written.push(id);
         match manager.call::<_, _, ()>("UnlockSession", &(id,)).await {
-            Ok(()) => issued.push((id, user, path)),
+            Ok(()) => asked.push((id, user, path)),
             Err(e) => say!("vigil-unlock: session {id} ({user}): UnlockSession: {e}"),
         }
     }
     std::thread::sleep(SETTLE);
-    let mut unlocked = issued.len() == wanted;
-    for (id, user, path) in issued {
+    for id in written {
         if let Err(e) = vigil_unlock_token::revoke(dir, id) {
             say!("vigil-unlock: session {id}: remove the token: {e}");
         }
-        let locked = match Proxy::new(&conn, LOGIN1, path.as_str(), SESSION_IFACE).await {
+    }
+    let mut unlocked = asked.len() == wanted;
+    for (id, user, path) in asked {
+        let locked = match Proxy::new(conn, LOGIN1, path.as_str(), SESSION_IFACE).await {
             Ok(session) => session.get_property::<bool>("LockedHint").await.ok(),
             Err(_) => None,
         };
@@ -109,6 +117,9 @@ async fn unlock(target: &str) -> Result<bool, String> {
     }
     Ok(unlocked)
 }
+
+#[cfg(test)]
+mod fake_logind;
 
 #[cfg(test)]
 mod tests {

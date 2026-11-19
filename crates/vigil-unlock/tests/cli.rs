@@ -12,20 +12,22 @@ fn run(args: &[&str]) -> Output {
 }
 
 #[test]
-fn a_user_is_refused_before_anything_is_touched() {
-    if rustix::process::geteuid().is_root() {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "this test needs a user other than root"
-        );
-        vigil_log::say!("skipped: running as root");
-        return;
-    }
+fn only_root_reaches_logind() {
     let output = run(&["c1"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("run as root"), "{stderr}");
-    assert!(!stderr.contains("logind"), "it reached the bus: {stderr}");
+    if rustix::process::geteuid().is_root() {
+        assert!(
+            stderr.contains("logind:"),
+            "root goes on to the bus: {stderr}"
+        );
+    } else {
+        assert!(stderr.contains("run as root"), "{stderr}");
+        assert!(
+            !stderr.contains("logind:"),
+            "a user reached the bus: {stderr}"
+        );
+    }
 }
 
 #[test]
