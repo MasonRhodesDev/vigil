@@ -1,5 +1,19 @@
 use vigil_core::OutputId;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Geometry {
+    pub id: OutputId,
+    pub position: Option<(i32, i32)>,
+    pub scene: (u32, u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hit {
+    pub id: OutputId,
+    pub x: f64,
+    pub y: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Span {
     id: OutputId,
@@ -34,30 +48,28 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn rebuild(&mut self, outputs: &[(OutputId, i32, i32, u32, u32)]) {
-        self.spans = outputs
+    pub fn place(outputs: &[Geometry]) -> Self {
+        let profiled = outputs.iter().any(|output| output.position.is_some());
+        let mut next = 0;
+        let spans = outputs
             .iter()
-            .map(|&(id, x, y, w, h)| Span {
-                id,
-                x: f64::from(x),
-                y: f64::from(y),
-                width: f64::from(w),
-                height: f64::from(h),
+            .map(|output| {
+                let (x, y) = if profiled {
+                    output.position.unwrap_or((0, 0))
+                } else {
+                    (next, 0)
+                };
+                next += output.scene.0 as i32;
+                Span {
+                    id: output.id,
+                    x: f64::from(x),
+                    y: f64::from(y),
+                    width: f64::from(output.scene.0),
+                    height: f64::from(output.scene.1),
+                }
             })
             .collect();
-    }
-
-    pub fn rebuild_scan_order(&mut self, outputs: &[(OutputId, u32, u32)]) {
-        let mut x = 0i32;
-        let placed: Vec<_> = outputs
-            .iter()
-            .map(|&(id, w, h)| {
-                let at = (id, x, 0, w, h);
-                x += w as i32;
-                at
-            })
-            .collect();
-        self.rebuild(&placed);
+        Self { spans }
     }
 
     fn bounds(&self) -> (f64, f64, f64, f64) {
@@ -111,18 +123,18 @@ impl Row {
         best.nearest(x, y)
     }
 
-    pub fn locate(&self, x: f64, y: f64) -> Option<(usize, f64, f64)> {
-        if self.spans.is_empty() {
-            return None;
-        }
+    pub fn locate(&self, x: f64, y: f64) -> Option<Hit> {
         let (cx, cy) = self.clamp(x, y);
-        let idx = self
+        let span = self
             .spans
             .iter()
-            .position(|s| s.contains(cx, cy))
-            .unwrap_or(0);
-        let span = &self.spans[idx];
-        Some((idx, cx - span.x, cy - span.y))
+            .find(|s| s.contains(cx, cy))
+            .or(self.spans.first())?;
+        Some(Hit {
+            id: span.id,
+            x: cx - span.x,
+            y: cy - span.y,
+        })
     }
 
     pub fn denormalize(&self, nx: f64, ny: f64) -> (f64, f64) {
@@ -141,23 +153,52 @@ impl Row {
 mod tests {
     use super::*;
 
+    fn unlisted(id: u32, scene: (u32, u32)) -> Geometry {
+        Geometry {
+            id: OutputId(id),
+            position: None,
+            scene,
+        }
+    }
+
+    fn listed(id: u32, position: (i32, i32), scene: (u32, u32)) -> Geometry {
+        Geometry {
+            id: OutputId(id),
+            position: Some(position),
+            scene,
+        }
+    }
+
+    fn hit(id: u32, x: f64, y: f64) -> Option<Hit> {
+        Some(Hit {
+            id: OutputId(id),
+            x,
+            y,
+        })
+    }
+
     fn row() -> Row {
-        let mut row = Row::default();
-        row.rebuild_scan_order(&[
-            (OutputId(1), 1920, 1080),
-            (OutputId(2), 2560, 1440),
-            (OutputId(3), 1280, 800),
-        ]);
-        row
+        Row::place(&[
+            unlisted(1, (1920, 1080)),
+            unlisted(2, (2560, 1440)),
+            unlisted(3, (1280, 800)),
+        ])
+    }
+
+    fn two(first: (i32, i32), second: (i32, i32)) -> Row {
+        Row::place(&[
+            listed(1, first, (1920, 1080)),
+            listed(2, second, (1920, 1080)),
+        ])
     }
 
     #[test]
     fn scan_order_matches_pre_profile_behavior() {
         let row = row();
         assert_eq!(row.total_width(), 5760.0);
-        assert_eq!(row.locate(100.0, 50.0), Some((0, 100.0, 50.0)));
-        assert_eq!(row.locate(1920.0, 0.0), Some((1, 0.0, 0.0)));
-        assert_eq!(row.locate(5000.0, 0.0), Some((2, 5000.0 - 4480.0, 0.0)));
+        assert_eq!(row.locate(100.0, 50.0), hit(1, 100.0, 50.0));
+        assert_eq!(row.locate(1920.0, 0.0), hit(2, 0.0, 0.0));
+        assert_eq!(row.locate(5000.0, 0.0), hit(3, 5000.0 - 4480.0, 0.0));
     }
 
     #[test]
@@ -174,44 +215,28 @@ mod tests {
 
     #[test]
     fn clamp_in_a_gap_picks_nearest_rect() {
-        let mut row = Row::default();
-        row.rebuild(&[
-            (OutputId(1), 0, 0, 1920, 1080),
-            (OutputId(2), 3000, 0, 1920, 1080),
-        ]);
+        let row = two((0, 0), (3000, 0));
         assert_eq!(row.clamp(2000.0, 500.0), (1919.0, 500.0));
         assert_eq!(row.clamp(2900.0, 500.0), (3000.0, 500.0));
     }
 
     #[test]
     fn clamp_gap_tie_goes_to_lowest_index() {
-        let mut row = Row::default();
-        row.rebuild(&[
-            (OutputId(1), 0, 0, 1920, 1080),
-            (OutputId(2), 3000, 0, 1920, 1080),
-        ]);
+        let row = two((0, 0), (3000, 0));
         assert_eq!(row.clamp(2460.0, 500.0), (1919.0, 500.0));
     }
 
     #[test]
     fn stacked_rows_locate_by_y() {
-        let mut row = Row::default();
-        row.rebuild(&[
-            (OutputId(1), 0, 0, 1920, 1080),
-            (OutputId(2), 0, 1080, 1920, 1080),
-        ]);
-        assert_eq!(row.locate(10.0, 1090.0), Some((1, 10.0, 10.0)));
+        let row = two((0, 0), (0, 1080));
+        assert_eq!(row.locate(10.0, 1090.0), hit(2, 10.0, 10.0));
     }
 
     #[test]
     fn negative_origin_layout() {
-        let mut row = Row::default();
-        row.rebuild(&[
-            (OutputId(1), -1920, 0, 1920, 1080),
-            (OutputId(2), 0, 0, 1920, 1080),
-        ]);
+        let row = two((-1920, 0), (0, 0));
         assert_eq!(row.total_width(), 3840.0);
-        assert_eq!(row.locate(-100.0, 10.0), Some((0, 1820.0, 10.0)));
+        assert_eq!(row.locate(-100.0, 10.0), hit(1, 1820.0, 10.0));
         assert_eq!(row.denormalize(0.0, 0.0), (-1920.0, 0.0));
     }
 

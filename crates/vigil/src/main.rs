@@ -1080,35 +1080,20 @@ impl App {
     }
 
     fn rebuild_row(&mut self) {
-        if self.layout.is_empty() {
-            let spans: Vec<_> = self
-                .entries
-                .iter()
-                .map(|e| (e.id, e.width, e.height))
-                .collect();
-            self.row.rebuild_scan_order(&spans);
-        } else {
-            let spans: Vec<_> = self
-                .entries
-                .iter()
-                .map(|e| {
-                    let connector = self
-                        .outputs
-                        .get((e.id.0 >> 24) as usize)
-                        .and_then(Option::as_ref)
-                        .and_then(|gpu| gpu.info(e.id))
-                        .map(|i| i.connector.clone())
-                        .unwrap_or_default();
-                    let (x, y) = self
-                        .layout
-                        .iter()
-                        .find(|o| o.name == connector)
-                        .map_or((0, 0), |o| o.position);
-                    (e.id, x, y, e.width, e.height)
-                })
-                .collect();
-            self.row.rebuild(&spans);
-        }
+        let geometry: Vec<_> = self
+            .entries
+            .iter()
+            .map(|e| layout::Geometry {
+                id: e.id,
+                position: self
+                    .layout
+                    .iter()
+                    .find(|o| o.name == e.connector)
+                    .map(|o| o.position),
+                scene: (e.width, e.height),
+            })
+            .collect();
+        self.row = layout::Row::place(&geometry);
         let (cx, cy) = self.row.clamp(self.cursor.0, self.cursor.1);
         self.cursor = (cx, cy);
         if let Some(origin) = self.layout.iter().find(|output| output.position == (0, 0))
@@ -1187,19 +1172,21 @@ impl App {
     fn move_cursor(&mut self, x: f64, y: f64) {
         let (cx, cy) = self.row.clamp(x, y);
         self.cursor = (cx, cy);
-        let Some((idx, lx, ly)) = self.row.locate(cx, cy) else {
+        let Some(hit) = self.row.locate(cx, cy) else {
+            return;
+        };
+        let Some(idx) = self.entries.iter().position(|e| e.id == hit.id) else {
             return;
         };
         if idx != self.panel {
             self.panel = idx;
             self.apply_panel();
         }
-        if let Some(e) = self.entries.get_mut(idx) {
-            e.window
-                .dispatch(InputEvent::PointerAbsolute { x: lx, y: ly });
-            if e.hw_cursor {
-                e.presenter.set_cursor(Some((lx as i32, ly as i32)));
-            }
+        let e = &mut self.entries[idx];
+        e.window
+            .dispatch(InputEvent::PointerAbsolute { x: hit.x, y: hit.y });
+        if e.hw_cursor {
+            e.presenter.set_cursor(Some((hit.x as i32, hit.y as i32)));
         }
     }
 
