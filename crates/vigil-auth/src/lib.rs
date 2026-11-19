@@ -71,6 +71,7 @@ pub struct AuthMachine {
     fixed_user: bool,
     typed: bool,
     asked: bool,
+    unprompted: Option<String>,
     first_question: Option<(String, Prompt)>,
     stage: String,
     stage_key: String,
@@ -95,6 +96,7 @@ impl AuthMachine {
             fixed_user: false,
             typed: false,
             asked: false,
+            unprompted: None,
             first_question: None,
             stage: String::new(),
             stage_key: String::new(),
@@ -108,6 +110,18 @@ impl AuthMachine {
 
     pub fn set_default_user(&mut self, user: Option<String>) {
         self.default_user = user;
+    }
+
+    pub fn set_unprompted(&mut self, user: Option<String>) {
+        self.unprompted = user;
+    }
+
+    pub fn unprompted(&self) -> Option<&str> {
+        self.unprompted.as_deref()
+    }
+
+    pub fn asked(&self) -> bool {
+        self.asked
     }
 
     pub fn user(&self) -> Option<&str> {
@@ -1372,6 +1386,95 @@ mod tests {
         assert_eq!(
             machine.stage(),
             "user=alice prompt=\"Password\" secret local"
+        );
+    }
+
+    #[test]
+    fn a_user_whose_last_sign_in_asked_nothing_is_signed_in_unasked() {
+        let Some((server, requests)) = scripted(vec![Response::Success, Response::Success]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.begin(Some("alice"), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "start"]);
+        assert!(machine.is_complete());
+        assert!(!machine.asked());
+    }
+
+    #[test]
+    fn enter_at_the_name_stage_signs_the_unprompted_default_user_in() {
+        let Some((server, requests)) = scripted(vec![Response::Success, Response::Success]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_default_user(Some("alice".into()));
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.begin(None, &mut ui);
+        assert_eq!(sent(&requests), [""; 0]);
+        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "start"]);
+        assert!(machine.is_complete());
+    }
+
+    #[test]
+    fn a_question_put_to_the_unprompted_user_starts_with_an_empty_field() {
+        let Some((server, _requests)) = scripted(vec![secret_prompt()]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(fields(&ui), ["reset", "Password", "reset", "Password:"]);
+    }
+
+    #[test]
+    fn only_the_unprompted_user_is_opened_unasked() {
+        let Some((server, requests)) = scripted(vec![Response::Success, Response::Success]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("bob"), &mut ui);
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Password".into(), true))
+        );
+        drop(machine);
+        drop(server);
+        assert_eq!(sent(&requests), [""; 0]);
+    }
+
+    #[test]
+    fn a_question_withdraws_the_expectation_of_an_unasked_sign_in() {
+        let Some((server, requests)) =
+            scripted(vec![secret_prompt(), Response::Success, secret_prompt()])
+        else {
+            return;
+        };
+        let mut machine = machine(&server);
+        machine.set_unprompted(Some("alice".into()));
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Password:".into(), true))
+        );
+        assert_eq!(machine.unprompted(), None);
+        assert!(machine.asked());
+        let _ = machine.handle(UiMessage::Cancel, &mut ui);
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        drop(machine);
+        drop(server);
+        assert_eq!(
+            sent(&requests),
+            ["create alice", "cancel"],
+            "the second selection waits for a submit"
         );
     }
 }
