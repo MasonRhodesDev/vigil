@@ -225,7 +225,7 @@ pub const FAMILIES: &[(&str, usize, Family)] = &[
         gradient("focal", "reflect", STOPS, n)
     }),
     ("focal repeat, the review's C2", 114, focal_repeat),
-    ("50 stops reflected", 3000, many_stops),
+    ("50 stops reflected", 300, many_stops),
     ("gradient stops", 9000, |n| {
         let stops: String = (0..n)
             .map(|i| {

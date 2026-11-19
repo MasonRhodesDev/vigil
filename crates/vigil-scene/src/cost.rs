@@ -4,15 +4,18 @@ use crate::Error;
 
 // Work is counted in nanoseconds of single-core tiny-skia time. Each rate was
 // fitted to release timings of the inputs in tests/budget.rs at the largest
-// edge, and errs high.
+// edge, and errs high. Per pixel, an opaque colour measured 0.36 ns, a
+// translucent one 4.3 to 7.3, and every gradient kind and spread 9 to 18
+// with three stops and up to 22 with fifty.
 const WORK_BUDGET: f64 = 1e9;
 const MEMORY_BUDGET: f64 = (256 << 20) as f64;
 const EDGE_PAIR_NS: f64 = 0.7;
 const EDGE_ROW_NS: f64 = 180.0;
 const STROKE_EDGES: f64 = 3.0;
 const SOLID_NS: f64 = 0.5;
-const GRADIENT_NS: f64 = 1.0;
-const STOP_NS: f64 = 0.3;
+const ALPHA_NS: f64 = 8.0;
+const GRADIENT_NS: f64 = 24.0;
+const STOP_NS: f64 = 0.2;
 const LAYER_NS: f64 = 20.0;
 const CLIP_NS: f64 = 20.0;
 const MASK_NS: f64 = 30.0;
@@ -138,9 +141,10 @@ fn edges(path: &usvg::tiny_skia_path::Path, ts: Transform, height: f64, pad: f64
     e
 }
 
-fn paint_ns(paint: &usvg::Paint) -> Result<f64, Error> {
+fn paint_ns(paint: &usvg::Paint, opacity: usvg::Opacity) -> Result<f64, Error> {
     match paint {
-        usvg::Paint::Color(_) => Ok(SOLID_NS),
+        usvg::Paint::Color(_) if opacity.get() >= 1.0 => Ok(SOLID_NS),
+        usvg::Paint::Color(_) => Ok(ALPHA_NS),
         usvg::Paint::LinearGradient(g) => Ok(GRADIENT_NS + STOP_NS * g.stops().len() as f64),
         usvg::Paint::RadialGradient(g) => Ok(GRADIENT_NS + STOP_NS * g.stops().len() as f64),
         usvg::Paint::Pattern(_) => Err(Error::Refused("a pattern paint".into())),
@@ -210,7 +214,7 @@ impl Walk {
             self.add(
                 EDGE_PAIR_NS * e.count * e.count
                     + EDGE_ROW_NS * e.rows
-                    + area * paint_ns(fill.paint())?,
+                    + area * paint_ns(fill.paint(), fill.opacity())?,
             )?;
         }
         if let Some(stroke) = stroke {
@@ -223,7 +227,7 @@ impl Walk {
             self.add(
                 EDGE_PAIR_NS * count * count
                     + EDGE_ROW_NS * rows
-                    + area * paint_ns(stroke.paint())?,
+                    + area * paint_ns(stroke.paint(), stroke.opacity())?,
             )?;
         }
         Ok(())
