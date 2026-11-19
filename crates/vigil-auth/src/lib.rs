@@ -48,6 +48,7 @@ enum State {
     Idle,
     AwaitingUser,
     AwaitingPrompt,
+    AwaitingRetry,
     Complete,
 }
 
@@ -62,6 +63,7 @@ pub struct AuthMachine {
     user: Option<String>,
     default_user: Option<String>,
     fixed_user: bool,
+    answered: bool,
 }
 
 impl AuthMachine {
@@ -81,6 +83,7 @@ impl AuthMachine {
             user: None,
             default_user: None,
             fixed_user: false,
+            answered: false,
         })
     }
 
@@ -146,6 +149,22 @@ impl AuthMachine {
         self.state = State::AwaitingUser;
     }
 
+    fn await_retry(&mut self, ui: &mut dyn AuthUi, error: &str) {
+        ui.show_prompt(RETRY_PROMPT, true);
+        ui.show_error(error);
+        self.state = State::AwaitingRetry;
+    }
+
+    fn restart(&mut self, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+        match self.user.clone() {
+            Some(user) => self.start(&user, ui),
+            None => {
+                self.prompt_username(ui);
+                Ok(())
+            }
+        }
+    }
+
     pub fn start(&mut self, user: &str, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         if self.state == State::Complete {
             return Err(AuthError("session has already started".into()));
@@ -154,6 +173,7 @@ impl AuthMachine {
             self.cancel(ui)?;
         }
         self.user = Some(user.to_owned());
+        self.answered = false;
 
         let response = self.transact(
             &Request::CreateSession {
@@ -178,6 +198,7 @@ impl AuthMachine {
                 self.start(username, ui)
             }
             UiMessage::Respond(response) if self.state == State::AwaitingPrompt => {
+                self.answered = true;
                 let response = self.transact(
                     &Request::PostAuthMessageResponse {
                         response: Some(response),
@@ -186,20 +207,22 @@ impl AuthMachine {
                 )?;
                 self.process_response(response, ui)
             }
-            UiMessage::Cancel if self.state == State::AwaitingPrompt => {
-                self.cancel(ui)?;
-                if !self.fixed_user {
-                    self.prompt_username(ui);
-                }
+            UiMessage::Respond(_) if self.state == State::AwaitingRetry => self.restart(ui),
+            UiMessage::Cancel if matches!(self.state, State::AwaitingUser | State::Complete) => {
                 Ok(())
+            }
+            UiMessage::Cancel => {
+                if self.state == State::AwaitingPrompt {
+                    self.cancel(ui)?;
+                }
+                if self.fixed_user {
+                    self.restart(ui)
+                } else {
+                    self.prompt_username(ui);
+                    Ok(())
+                }
             }
             UiMessage::Respond(_) => Err(AuthError("no authentication prompt is pending".into())),
-            UiMessage::Cancel => {
-                if self.state == State::Idle && !self.fixed_user {
-                    self.prompt_username(ui);
-                }
-                Ok(())
-            }
             UiMessage::SelectSession(_) | UiMessage::SelectUser(_) => Ok(()),
             UiMessage::Power(_) => Err(AuthError("power actions are not authentication".into())),
         }
@@ -278,8 +301,9 @@ impl AuthMachine {
                             return Ok(());
                         }
                         Response::Error { description, .. } => {
-                            show_greetd_error(ui, &description);
-                            self.state = State::Idle;
+                            let text = show_greetd_error(ui, &description);
+                            let _ = self.transact(&Request::CancelSession, ui);
+                            self.await_retry(ui, &text);
                             return Ok(());
                         }
                         Response::AuthMessage { .. } => {
@@ -292,11 +316,12 @@ impl AuthMachine {
                 }
                 Response::Error { description, .. } => {
                     let text = show_greetd_error(ui, &description);
-                    self.state = State::Idle;
-                    let Some(user) = self.user.clone() else {
+                    let _ = self.transact(&Request::CancelSession, ui);
+                    let Some(user) = self.user.clone().filter(|_| self.answered) else {
+                        self.await_retry(ui, &text);
                         return Ok(());
                     };
-                    let _ = self.transact(&Request::CancelSession, ui);
+                    self.answered = false;
                     pending_error = Some(text);
                     response = self.transact(&Request::CreateSession { username: user }, ui)?;
                 }
