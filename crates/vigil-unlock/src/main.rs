@@ -4,16 +4,17 @@ use std::path::Path;
 use std::time::Duration;
 
 use vigil_log::{out, say};
-use vigil_unlock_token::{DIR, Moment, ROOT};
+use vigil_unlock_token::{DIR, Moment, Owners};
 use zbus::{Connection, OwnedObjectPath, Proxy, block_on};
 
 const LOGIN1: &str = "org.freedesktop.login1";
 const MANAGER_PATH: &str = "/org/freedesktop/login1";
 const MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
 const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
+const NOT_SUPPORTED: &str = "org.freedesktop.DBus.Error.NotSupported";
 const USAGE: &str = "usage: vigil-unlock <session-id|user>";
 const HELP: &str = "Unlocks a session that vigil-lock holds. Run it as root.\n\
-A session id names one session. A user name names every session of that user.\n\
+A session id names one session. A user name names every session of that user that can lock.\n\
 vigil-lock ignores a logind Unlock that root did not ask for, so plain\n\
 `loginctl unlock-session` no longer unlocks it.";
 // The lock reads the token on its own event loop after logind's signal reaches it, so the
@@ -45,7 +46,7 @@ fn run(args: &[String]) -> i32 {
         let conn = Connection::system()
             .await
             .map_err(|e| format!("logind: {e}"))?;
-        unlock(&conn, target, Path::new(DIR), ROOT).await
+        unlock(&conn, target, Path::new(DIR), Owners::ROOT).await
     });
     match unlocked {
         Ok(true) => 0,
@@ -57,37 +58,93 @@ fn run(args: &[String]) -> i32 {
     }
 }
 
-fn choose<'a>(sessions: &'a [Listed], target: &str) -> Vec<&'a Listed> {
-    let by_id: Vec<_> = sessions.iter().filter(|s| s.0 == target).collect();
-    if !by_id.is_empty() {
-        return by_id;
-    }
-    sessions.iter().filter(|s| s.2 == target).collect()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Named {
+    Session,
+    User,
 }
 
-async fn unlock(conn: &Connection, target: &str, dir: &Path, owner: u32) -> Result<bool, String> {
+fn choose<'a>(sessions: &'a [Listed], target: &str) -> (Named, Vec<&'a Listed>) {
+    let by_id: Vec<_> = sessions.iter().filter(|s| s.0 == target).collect();
+    if !by_id.is_empty() {
+        return (Named::Session, by_id);
+    }
+    (
+        Named::User,
+        sessions.iter().filter(|s| s.2 == target).collect(),
+    )
+}
+
+// logind locks only user sessions; a user also has a user@.service session of class manager.
+// A logind older than CanLock has no such class, so a session it lists can lock.
+async fn can_lock(conn: &Connection, path: &OwnedObjectPath) -> bool {
+    match Proxy::new(conn, LOGIN1, path.as_str(), SESSION_IFACE).await {
+        Ok(session) => session
+            .get_property::<bool>("CanLock")
+            .await
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+fn not_supported(e: &zbus::Error) -> bool {
+    match e {
+        zbus::Error::MethodError(name, _, _) => name.as_str() == NOT_SUPPORTED,
+        zbus::Error::FDO(e) => matches!(**e, zbus::fdo::Error::NotSupported(_)),
+        _ => false,
+    }
+}
+
+async fn unlock(
+    conn: &Connection,
+    target: &str,
+    dir: &Path,
+    owners: Owners,
+) -> Result<bool, String> {
     let bus = |e: zbus::Error| format!("logind: {e}");
     let manager = Proxy::new(conn, LOGIN1, MANAGER_PATH, MANAGER_IFACE)
         .await
         .map_err(bus)?;
     let sessions: Vec<Listed> = manager.call("ListSessions", &()).await.map_err(bus)?;
-    let chosen = choose(&sessions, target);
+    let (named, chosen) = choose(&sessions, target);
     if chosen.is_empty() {
         return Err(format!("no session or user named {target:?}"));
     }
-    let at = Moment::now().map_err(|e| format!("this boot: {e}"))?;
+    let mut lockable = Vec::new();
+    for listed in chosen {
+        if can_lock(conn, &listed.4).await {
+            lockable.push(listed);
+        } else if named == Named::Session {
+            return Err(format!(
+                "session {target} cannot lock; logind locks only user sessions"
+            ));
+        }
+    }
+    if lockable.is_empty() {
+        return Err(format!("{target} has no session that can lock"));
+    }
     vigil_unlock_token::prepare(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let wanted = chosen.len();
+    let swept = Moment::now().map_err(|e| format!("this boot: {e}"))?;
+    vigil_unlock_token::sweep(dir, owners, &swept)
+        .map_err(|e| format!("{}: clear old tokens: {e}", dir.display()))?;
+    let mut wanted = lockable.len();
     let mut written = Vec::new();
     let mut asked = Vec::new();
-    for (id, _, user, _, path) in chosen {
-        if let Err(e) = vigil_unlock_token::issue(dir, owner, id, &at) {
+    for (id, _, user, _, path) in lockable {
+        let issued = Moment::now().map_err(|e| e.to_string()).and_then(|at| {
+            vigil_unlock_token::issue(dir, owners, id, &at).map_err(|e| e.to_string())
+        });
+        if let Err(e) = issued {
             say!("vigil-unlock: session {id} ({user}): token: {e}");
             continue;
         }
         written.push(id);
         match manager.call::<_, _, ()>("UnlockSession", &(id,)).await {
             Ok(()) => asked.push((id, user, path)),
+            Err(e) if named == Named::User && not_supported(&e) => {
+                out!("session {id} ({user}): has no lock screen, skipped");
+                wanted -= 1;
+            }
             Err(e) => say!("vigil-unlock: session {id} ({user}): UnlockSession: {e}"),
         }
     }
@@ -97,7 +154,7 @@ async fn unlock(conn: &Connection, target: &str, dir: &Path, owner: u32) -> Resu
             say!("vigil-unlock: session {id}: remove the token: {e}");
         }
     }
-    let mut unlocked = asked.len() == wanted;
+    let mut unlocked = wanted > 0 && asked.len() == wanted;
     for (id, user, path) in asked {
         let locked = match Proxy::new(conn, LOGIN1, path.as_str(), SESSION_IFACE).await {
             Ok(session) => session.get_property::<bool>("LockedHint").await.ok(),
@@ -145,6 +202,7 @@ mod tests {
         ];
         let ids = |target| -> Vec<&str> {
             choose(&sessions, target)
+                .1
                 .iter()
                 .map(|s| s.0.as_str())
                 .collect()
@@ -153,5 +211,7 @@ mod tests {
         assert_eq!(ids("alice"), ["2", "c1"]);
         assert_eq!(ids("bob"), ["3"]);
         assert!(ids("carol").is_empty());
+        assert_eq!(choose(&sessions, "c1").0, Named::Session);
+        assert_eq!(choose(&sessions, "alice").0, Named::User);
     }
 }
