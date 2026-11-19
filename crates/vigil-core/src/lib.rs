@@ -264,6 +264,7 @@ pub trait AuthUi {
     fn show_info(&mut self, text: &str);
     fn show_error(&mut self, text: &str);
     fn set_busy(&mut self, busy: bool);
+    fn reset_input(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
