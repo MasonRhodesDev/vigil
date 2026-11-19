@@ -17,6 +17,8 @@ const ROOM: usize = MAX_LINE - 1 - TRUNCATED.len();
 /// does not block, except in one race on a pipe that /proc cannot reopen,
 /// described at `write_if_room`. Control characters are escaped as `\n`,
 /// `\xNN` or, past ASCII, `\u{NN}`, so a message cannot start a second line.
+/// A backslash is escaped as `\\`, so a literal `\n` in a message reads
+/// differently from an escaped newline.
 /// A line longer than 2048 bytes is cut and ends in ` trunc=1`.
 #[macro_export]
 macro_rules! say {
@@ -89,6 +91,7 @@ impl Line {
         let mut cursor = &mut escape[..];
         let _ = match c {
             '\n' => cursor.write_all(b"\\n"),
+            '\\' => cursor.write_all(b"\\\\"),
             c if c.is_ascii() => write!(cursor, "\\x{:02x}", u32::from(c)),
             c => write!(cursor, "\\u{{{:x}}}", u32::from(c)),
         };
@@ -117,7 +120,7 @@ impl Line {
 
 impl fmt::Write for Line {
     fn write_str(&mut self, mut s: &str) -> fmt::Result {
-        while let Some((at, c)) = s.char_indices().find(|(_, c)| c.is_control()) {
+        while let Some((at, c)) = s.char_indices().find(|(_, c)| c.is_control() || *c == '\\') {
             self.push_text(&s[..at]);
             self.push_escape(c);
             s = &s[at + c.len_utf8()..];
@@ -384,6 +387,15 @@ mod tests {
             line_through_a_pipe(format_args!("pam: {}", "a\nb")),
             "pam: a\\nb\n"
         );
+    }
+
+    #[test]
+    fn a_literal_backslash_n_and_a_real_newline_make_different_lines() {
+        let literal = line_through_a_pipe(format_args!("pam: {}", "a\\nb"));
+        let newline = line_through_a_pipe(format_args!("pam: {}", "a\nb"));
+        assert_eq!(literal, "pam: a\\\\nb\n");
+        assert_eq!(newline, "pam: a\\nb\n");
+        assert_ne!(literal, newline);
     }
 
     #[test]
