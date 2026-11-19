@@ -18,6 +18,7 @@ use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use monitor_profiles::{ConnectedOutput, Profile, ResolvedOutput};
 use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
+use users::OTHER_USER;
 use vigil_auth::AuthMachine;
 use vigil_config::Config;
 use vigil_core::{
@@ -36,8 +37,6 @@ const BANNER_POLL: Duration = Duration::from_secs(1);
 const BANNER_MAX: usize = 200;
 
 const PRESENT_LOG_EVERY: u32 = 60;
-
-const OTHER_USER: &str = "Other…";
 
 fn profiles_dir_fingerprint(dir: &std::path::Path) -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -63,6 +62,13 @@ fn profiles_dir_fingerprint(dir: &std::path::Path) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn log_user(user: Option<&str>, why: &str, list: usize) {
+    eprintln!(
+        "vigil: user -> {} ({why}), list={list}",
+        user.unwrap_or("<other>")
+    );
 }
 
 fn clock_interval(format: &str) -> Duration {
@@ -1232,12 +1238,19 @@ impl App {
                 self.power(action);
                 continue;
             }
+            let asking_name = self.auth.awaiting_username();
             let mut fan = FanUi {
                 entries: &mut self.entries,
                 snapshot: &mut self.snapshot,
             };
             if let Err(e) = self.auth.handle(msg, &mut fan) {
                 eprintln!("vigil: auth: {e}");
+            }
+            if !asking_name
+                && self.auth.awaiting_username()
+                && let Some(row) = users::username_stage_row(&self.users, self.selected_user)
+            {
+                self.show_user(row, "cancel");
             }
             if self.auth.is_complete() {
                 self.finish_login(false);
@@ -1440,11 +1453,33 @@ impl App {
     }
 
     fn select_user(&mut self, index: usize) {
-        let Some(name) = self.users.get(index).cloned() else {
+        if !self.show_user(index, "picker") {
             return;
+        }
+        let user = self.listed_user();
+        let mut fan = FanUi {
+            entries: &mut self.entries,
+            snapshot: &mut self.snapshot,
         };
+        if let Err(e) = self.auth.select_user(user.as_deref(), &mut fan) {
+            eprintln!("vigil: select user: {e}");
+        }
+    }
+
+    fn listed_user(&self) -> Option<String> {
+        self.users
+            .get(self.selected_user)
+            .filter(|name| name.as_str() != OTHER_USER)
+            .cloned()
+    }
+
+    fn show_user(&mut self, index: usize, why: &str) -> bool {
+        if index >= self.users.len() {
+            return false;
+        }
         self.selected_user = index;
-        let default = (name != OTHER_USER).then(|| name.clone());
+        let default = self.listed_user();
+        log_user(default.as_deref(), why, self.users.len());
         self.auth.set_default_user(default.clone());
         self.appearance_registry = default
             .as_deref()
@@ -1466,13 +1501,7 @@ impl App {
             e.window.set_user_index(index);
             e.window.set_user_name(&label);
         }
-        let mut fan = FanUi {
-            entries: &mut self.entries,
-            snapshot: &mut self.snapshot,
-        };
-        if let Err(e) = self.auth.select_user(default.as_deref(), &mut fan) {
-            eprintln!("vigil: select user: {e}");
-        }
+        true
     }
 
     fn refresh_backgrounds_async(&mut self) {
@@ -2280,8 +2309,10 @@ fn run() -> Result<i32, String> {
             autologin::Verdict::Allow { .. } => None,
         };
         if pause_notice.is_some() {
+            log_user(None, "automatic login paused", app.users.len());
             app.auth.begin(None, &mut fan)
         } else if let Some(user) = resolved.user.as_deref() {
+            log_user(Some(user), "fixed", app.users.len());
             app.auth.begin(Some(user), &mut fan)
         } else if !app.users.is_empty() {
             let selected = app
@@ -2289,8 +2320,15 @@ fn run() -> Result<i32, String> {
                 .get(app.selected_user)
                 .filter(|name| name.as_str() != OTHER_USER)
                 .cloned();
+            let why = if selected.is_some() && selected == app.remembered_user {
+                "remembered"
+            } else {
+                "default"
+            };
+            log_user(selected.as_deref(), why, app.users.len());
             app.auth.select_user(selected.as_deref(), &mut fan)
         } else {
+            log_user(None, "no user list", app.users.len());
             app.auth.begin(None, &mut fan)
         }
         .map_err(|e| e.to_string())?;
