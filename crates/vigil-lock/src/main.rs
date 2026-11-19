@@ -1389,6 +1389,9 @@ fn main() {
 }
 
 #[cfg(test)]
+mod logind_forgery;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn clock_text_matches_what_date_would_have_printed() {
