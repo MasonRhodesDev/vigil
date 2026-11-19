@@ -914,6 +914,53 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_first_question_that_is_not_the_password_gets_no_typed_text() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Security token PIN: "),
+            refusal("pam_authenticate: AUTH_ERR"),
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(
+            sent(&requests),
+            ["create alice"],
+            "a password typed under the Password field is not a token PIN"
+        );
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Security token PIN: ".into(), true))
+        );
+    }
+
+    #[test]
+    fn a_localized_password_question_is_shown_before_it_is_answered() {
+        let Some((server, requests)) = scripted(vec![
+            auth_message(AuthMessageType::Secret, "Mot de passe : "),
+            Response::Success,
+            Response::Success,
+        ]) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let mut ui = RecordingUi::default();
+        let _ = machine.select_user(Some("alice"), &mut ui);
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice"]);
+        assert_eq!(
+            shown(&ui).last(),
+            Some(&&UiCall::Prompt("Mot de passe : ".into(), true))
+        );
+        let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+        assert_eq!(sent(&requests), ["create alice", "answer hunter2", "start"]);
+        assert!(machine.is_complete());
+    }
+
+    #[test]
     fn displays_info_and_error_mid_conversation() {
         let Some(server) = FakeServer::spawn(|stream| {
             assert_create(request(stream), "alice");
