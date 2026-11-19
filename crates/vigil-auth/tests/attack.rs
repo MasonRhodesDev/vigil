@@ -752,6 +752,43 @@ fn attack(greetd: &Greetd, name: &str, conforming: bool, cases: u32) -> bool {
     }
 }
 
+fn pinned() -> Vec<(&'static str, Case)> {
+    vec![(
+        "a failed unasked open leaves the previous user's field on screen",
+        Case {
+            conforming: false,
+            default_user: Some(0),
+            unprompted: Some(1),
+            remembered: vec![(1, "Password:".into(), false)],
+            ops: vec![
+                Op::Begin(Some(0)),
+                Op::Pick(Some(1)),
+                Op::Type(format!("{MARK}0000")),
+            ],
+            replies: vec![
+                Reply::Frame(Vec::new()),
+                Reply::Message(Kind::Visible, "Password:".into()),
+            ],
+            starts: Vec::new(),
+            refuse_cancels: false,
+        },
+    )]
+}
+
+fn replay(greetd: &Greetd) -> bool {
+    let mut held = true;
+    for (name, case) in pinned() {
+        match check(&case, &drive(greetd, &case)) {
+            Ok(()) => println!("attack: pinned: {name}: held"),
+            Err(why) => {
+                println!("attack: pinned: {name}: FAILED\n{why}");
+                held = false;
+            }
+        }
+    }
+    held
+}
+
 fn main() {
     let greetd = match Greetd::bind() {
         Ok(greetd) => greetd,
@@ -765,7 +802,8 @@ fn main() {
         .ok()
         .and_then(|cases| cases.parse().ok())
         .unwrap_or(1500);
-    let held = attack(&greetd, "a greetd that follows the protocol", true, cases)
+    let held = replay(&greetd)
+        & attack(&greetd, "a greetd that follows the protocol", true, cases)
         & attack(&greetd, "a greetd that answers anything", false, cases);
     drop(greetd);
     std::process::exit(i32::from(!held));
