@@ -1358,11 +1358,14 @@ fn adopt_ready_fd(arg: &str) -> Result<OwnedFd, String> {
 }
 
 fn main() {
+    vigil_secret::exit_on_panic();
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
-    vigil_secret::abort_on_worker_panic();
     if let Err(e) = vigil_secret::deny_memory_dumps() {
-        eprintln!("vigil-lock: could not keep memory out of core dumps: {e}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "vigil-lock: could not keep memory out of core dumps: {e}"
+        );
     }
     let parsed = parse_cli();
     tracing_subscriber::registry()

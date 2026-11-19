@@ -1600,61 +1600,64 @@ impl App {
                         let prepared = prepared.clone();
                         let source = path.as_ref().map(|path| (path, &sources[path]));
                         scope.spawn(move || {
-                            let decoded = if let Some(prepared) = prepared {
-                                appearance_profiles::read_prepared_asset(&prepared)
-                                    .map(|asset| {
-                                        Some(match asset.format {
-                                            appearance_profiles::PixelFormat::Rgba8 => {
-                                                BackgroundBitmap::Rgba(asset.bytes, width, height)
-                                            }
-                                            appearance_profiles::PixelFormat::Xrgb8888Le => {
-                                                BackgroundBitmap::Xrgb(
-                                                    asset.bytes.into(),
-                                                    width,
-                                                    height,
-                                                )
-                                            }
-                                        })
-                                    })
-                                    .map_err(|error| error.to_string())
-                            } else {
-                                source
-                                    .map(|(path, source)| {
-                                        let entry = cache_dir.and_then(|dir| {
-                                            vigil_ui::bgcache::entry_path(
-                                                dir, path, fit, width, height,
-                                            )
-                                        });
-                                        if let Some(rgba) = entry
-                                            .as_deref()
-                                            .and_then(|p| vigil_ui::bgcache::read(p, width, height))
-                                        {
-                                            eprintln!(
-                                                "vigil: [t+{}ms] background cache hit {width}x{height}",
-                                                vigil_core::uptime_ms()
-                                            );
-                                            return Ok(BackgroundBitmap::Rgba(rgba, width, height));
-                                        }
-                                        let source = source.get_or_init(|| {
-                                            vigil_ui::load_background(path).map(Arc::new)
-                                        });
-                                        source
-                                            .as_ref()
-                                            .map_err(Clone::clone)
-                                            .and_then(|source| {
-                                                vigil_ui::render_background(
-                                                    source, fit, width, height,
-                                                )
-                                            })
-                                            .map(|rgba| {
-                                                if let Some(p) = entry.as_deref() {
-                                                    vigil_ui::bgcache::write(p, &rgba);
+                            let decoded = vigil_secret::cosmetic(|| {
+                                if let Some(prepared) = prepared {
+                                    appearance_profiles::read_prepared_asset(&prepared)
+                                        .map(|asset| {
+                                            Some(match asset.format {
+                                                appearance_profiles::PixelFormat::Rgba8 => {
+                                                    BackgroundBitmap::Rgba(asset.bytes, width, height)
                                                 }
-                                                BackgroundBitmap::Rgba(rgba, width, height)
+                                                appearance_profiles::PixelFormat::Xrgb8888Le => {
+                                                    BackgroundBitmap::Xrgb(
+                                                        asset.bytes.into(),
+                                                        width,
+                                                        height,
+                                                    )
+                                                }
                                             })
-                                    })
-                                    .transpose()
-                            };
+                                        })
+                                        .map_err(|error| error.to_string())
+                                } else {
+                                    source
+                                        .map(|(path, source)| {
+                                            let entry = cache_dir.and_then(|dir| {
+                                                vigil_ui::bgcache::entry_path(
+                                                    dir, path, fit, width, height,
+                                                )
+                                            });
+                                            if let Some(rgba) = entry
+                                                .as_deref()
+                                                .and_then(|p| vigil_ui::bgcache::read(p, width, height))
+                                            {
+                                                eprintln!(
+                                                    "vigil: [t+{}ms] background cache hit {width}x{height}",
+                                                    vigil_core::uptime_ms()
+                                                );
+                                                return Ok(BackgroundBitmap::Rgba(rgba, width, height));
+                                            }
+                                            let source = source.get_or_init(|| {
+                                                vigil_ui::load_background(path).map(Arc::new)
+                                            });
+                                            source
+                                                .as_ref()
+                                                .map_err(Clone::clone)
+                                                .and_then(|source| {
+                                                    vigil_ui::render_background(
+                                                        source, fit, width, height,
+                                                    )
+                                                })
+                                                .map(|rgba| {
+                                                    if let Some(p) = entry.as_deref() {
+                                                        vigil_ui::bgcache::write(p, &rgba);
+                                                    }
+                                                    BackgroundBitmap::Rgba(rgba, width, height)
+                                                })
+                                        })
+                                        .transpose()
+                                }
+                            })
+                            .unwrap_or_else(|| Err("background render panicked".to_owned()));
                             (id, decoded)
                         })
                     })
@@ -2455,9 +2458,13 @@ fn run() -> Result<i32, String> {
 }
 
 fn main() {
-    vigil_secret::abort_on_worker_panic();
+    vigil_secret::exit_on_panic();
+    use std::io::Write as _;
     if let Err(e) = vigil_secret::deny_memory_dumps() {
-        eprintln!("vigil: could not keep memory out of core dumps: {e}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "vigil: could not keep memory out of core dumps: {e}"
+        );
     }
     match run() {
         Ok(code) => std::process::exit(code),

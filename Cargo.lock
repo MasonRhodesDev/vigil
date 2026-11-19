@@ -5209,6 +5209,7 @@ dependencies = [
 name = "vigil-secret"
 version = "0.4.3"
 dependencies = [
+ "libc",
  "rustix 1.1.6",
  "serde",
  "zeroize",
@@ -5236,6 +5237,7 @@ dependencies = [
  "vigil-config",
  "vigil-core",
  "vigil-flow",
+ "vigil-secret",
  "vigil-theme",
  "vigil-ui",
  "winit",

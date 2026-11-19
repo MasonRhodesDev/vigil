@@ -1304,6 +1304,13 @@ fn render_scenario_frame(simulator: &mut Simulator) -> Result<(), String> {
 }
 
 fn main() {
+    vigil_secret::exit_on_panic();
+    if let Err(e) = vigil_secret::deny_memory_dumps() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "vigil-sim: could not keep memory out of core dumps: {e}"
+        );
+    }
     let args = SimArgs::parse();
     let preview = args.config.as_deref().map(load_preview_config);
     let platform = VigilPlatform::install().expect("install Vigil Slint platform");

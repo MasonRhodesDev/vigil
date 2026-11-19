@@ -28,6 +28,8 @@ fence	crates/vigil-present-gl/src/lib.rs	unsafe	1
 fence	crates/vigil-secret/examples/lint_canary.rs	expose	1
 fence	crates/vigil-secret/examples/lint_canary.rs	unsafe	3
 fence	crates/vigil-secret/src/lib.rs	expose	1
+fence	crates/vigil-secret/src/lib.rs	lint-allow	1
+fence	crates/vigil-secret/src/lib.rs	unsafe	1
 fence	crates/vigil-ui/src/lib.rs	lint-allow	4
 fence	crates/vigil-ui/src/lib.rs	unsafe	4
 fence	crates/vigil-wayland/src/hyprland_surface.rs	lint-allow	1
