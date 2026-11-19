@@ -1828,6 +1828,103 @@ mod tests {
         drop(guard);
     }
 
+    fn step(
+        ipc: &Mutex<LockIpcState>,
+        flow: &mut vigil_flow::LockFlow,
+        ms: u64,
+        event: FlowEvent,
+    ) -> bool {
+        flow.step(vigil_flow::Now::at(Duration::from_millis(ms)), event)
+            .iter()
+            .fold(false, |confirmed, cmd| follow_flow(ipc, cmd) | confirmed)
+    }
+
+    fn locked_flow(ipc: &Mutex<LockIpcState>) -> vigil_flow::LockFlow {
+        let (mut flow, _) = vigil_flow::LockFlow::new(
+            vigil_flow::Now::at(Duration::ZERO),
+            &vigil_config::Lock::default(),
+            Some(0),
+        );
+        step(ipc, &mut flow, 400, FlowEvent::Tick);
+        assert!(step(ipc, &mut flow, 410, FlowEvent::LockConfirmed));
+        flow
+    }
+
+    /// What a join hears once this client exits.
+    fn join_until_exit(path: PathBuf, ipc: &Mutex<LockIpcState>) -> Result<bool, String> {
+        let join = std::thread::spawn(move || join_lock_at(&path));
+        for _ in 0..200 {
+            if join.is_finished() || !ipc.lock().unwrap().joiners.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(std::mem::take(&mut ipc.lock().unwrap().joiners));
+        join.join().unwrap()
+    }
+
+    fn ipc_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("vigil-lock-ipc-{name}-{}.sock", std::process::id()))
+    }
+
+    #[test]
+    fn a_join_before_a_confirm_that_unlocks_is_not_told_the_session_is_locked() {
+        let path = ipc_path("latched");
+        let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
+        let (mut flow, _) = vigil_flow::LockFlow::new(
+            vigil_flow::Now::at(Duration::ZERO),
+            &vigil_config::Lock::default(),
+            Some(0),
+        );
+        step(&ipc, &mut flow, 100, FlowEvent::LogindUnlock);
+        step(&ipc, &mut flow, 400, FlowEvent::Tick);
+        let join = std::thread::spawn(move || join_lock_at(&path));
+        for _ in 0..200 {
+            if !ipc.lock().unwrap().joiners.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !step(&ipc, &mut flow, 410, FlowEvent::LockConfirmed),
+            "readiness was signalled for a lock that unlocks at once"
+        );
+        drop(std::mem::take(&mut ipc.lock().unwrap().joiners));
+        assert!(
+            !matches!(join.join().unwrap(), Ok(true)),
+            "a joiner was told locked by a client that unlocks at once"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn a_join_after_the_compositor_drops_the_lock_is_not_told_the_session_is_locked() {
+        let path = ipc_path("invalidated");
+        let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
+        let mut flow = locked_flow(&ipc);
+        step(&ipc, &mut flow, 500, FlowEvent::LockInvalidated);
+        assert!(
+            !matches!(join_until_exit(path, &ipc), Ok(true)),
+            "a client whose lock the compositor dropped told a joiner locked"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn a_join_after_a_signal_is_told_the_held_lock_stays() {
+        let path = ipc_path("terminated");
+        let (guard, ipc) = start_lock_ipc_at(path.clone()).unwrap();
+        let mut flow = locked_flow(&ipc);
+        step(
+            &ipc,
+            &mut flow,
+            500,
+            FlowEvent::Terminate(vigil_flow::Signal::Terminate),
+        );
+        assert_eq!(join_until_exit(path, &ipc), Ok(true));
+        drop(guard);
+    }
+
     #[test]
     fn stale_socket_from_a_dead_owner_is_reclaimed() {
         let path = std::env::temp_dir().join(format!(
