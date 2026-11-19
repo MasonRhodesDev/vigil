@@ -293,7 +293,8 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
     let svg = mark();
     let req = request(&svg, Layer::Logo);
     let need = req.bytes().unwrap();
-    let cases: [(&str, String, fn(&Error) -> bool); 6] = [
+    type Expect = fn(&Error) -> bool;
+    let cases: [(&str, String, Expect); 6] = [
         (
             "spins",
             "while :; do :; done".into(),
