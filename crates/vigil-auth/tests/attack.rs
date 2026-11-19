@@ -12,7 +12,6 @@ use std::time::Instant;
 use greetd_ipc::codec::SyncCodec;
 use greetd_ipc::{AuthMessageType, ErrorType, Request, Response};
 use proptest::prelude::*;
-use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
 use vigil_auth::{AuthMachine, Prompt};
 use vigil_core::{AuthUi, UiMessage};
@@ -791,10 +790,14 @@ fn runner(cases: u32, seed: u64) -> TestRunner {
 
 fn replays(seed: u64) -> bool {
     let draw = || {
-        let mut runner = runner(1, seed);
-        (0..20)
-            .map(|_| format!("{:?}", case(false).new_tree(&mut runner).unwrap().current()))
-            .collect::<Vec<_>>()
+        let seen = std::cell::RefCell::new(Vec::new());
+        runner(20, seed)
+            .run(&case(false), |case| {
+                seen.borrow_mut().push(format!("{case:?}"));
+                Ok(())
+            })
+            .unwrap();
+        seen.into_inner()
     };
     let held = draw() == draw();
     if !held {

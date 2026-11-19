@@ -1186,8 +1186,6 @@ struct LockIpcState {
     waker: Option<WakeHandle>,
 }
 
-/// Moves the hold as the flow commands and answers the joiners a confirmed
-/// lock releases. True when `cmd` confirmed the lock.
 fn follow_flow(ipc: &Mutex<LockIpcState>, cmd: &FlowCmd) -> bool {
     let joiners = {
         let mut state = ipc.lock().expect("lock IPC poisoned");
@@ -1855,7 +1853,6 @@ mod tests {
         flow
     }
 
-    /// What a join hears once this client exits.
     fn join_until_exit(path: PathBuf, ipc: &Mutex<LockIpcState>) -> Result<bool, String> {
         let join = std::thread::spawn(move || join_lock_at(&path));
         for _ in 0..200 {
