@@ -350,12 +350,7 @@ fn input_up_to(cap: u64) -> Result<Vec<u8>, Error> {
         .take(cap + 1)
         .read_to_end(&mut data)
         .map_err(|e| Error::Io(e.to_string()))?;
-    if let Some(notice) = lock_down()? {
-        let _ = record(
-            rustix::stdio::stderr(),
-            format!("{NOTICE}{notice}\n").as_bytes(),
-        );
-    }
+    lock_down()?;
     if data.len() as u64 > cap {
         return Err(Error::TooLarge(format!("the input is over {cap} bytes")));
     }
@@ -439,7 +434,12 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
             .num::<u64>("deadline-ms")
             .map_err(Error::Helper)?
             .ok_or_else(|| Error::Helper("--deadline-ms is required".into()))?;
-        confine(Duration::from_millis(deadline))?;
+        if let Some(notice) = confine(Duration::from_millis(deadline))? {
+            let _ = record(
+                rustix::stdio::stderr(),
+                format!("{NOTICE}{notice}\n").as_bytes(),
+            );
+        }
         let pixels = match job {
             "mask" => mask_job(&args)?,
             _ => layer_job(&args)?,

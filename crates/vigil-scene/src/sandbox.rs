@@ -23,8 +23,16 @@ pub const NOTICE: &str = "vigil-scene: notice: ";
 /// past the deadline, 1 GiB of address space, no descriptors beyond stdio,
 /// output no bigger than the largest frame, no core dumps and no children.
 /// It dies with the thread that started it and can never gain privileges.
-/// A soft or hard limit already lower is kept.
-pub fn confine(deadline: Duration) -> Result<(), Error> {
+/// A soft or hard limit already lower is kept. First, where the kernel has
+/// Landlock, it denies itself every file and network access, since a
+/// ruleset is a descriptor and none can be made past the limit. Landlock is
+/// best effort, and a kernel without it is returned as a notice.
+pub fn confine(deadline: Duration) -> Result<Option<String>, Error> {
+    let notice = match landlock() {
+        Ok(RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced) => None,
+        Ok(RulesetStatus::NotEnforced) => Some("this kernel has no Landlock".to_owned()),
+        Err(e) => Some(format!("Landlock: {e}")),
+    };
     let cpu = u64::try_from(deadline.as_millis().div_ceil(1000))
         .unwrap_or(u64::MAX)
         .saturating_add(1);
@@ -49,30 +57,24 @@ pub fn confine(deadline: Duration) -> Result<(), Error> {
     }
     set_parent_process_death_signal(Some(Signal::KILL))
         .and_then(|()| rustix::thread::set_no_new_privs(true))
-        .map_err(|e| Error::Helper(format!("confining the helper: {e}")))
+        .map_err(|e| Error::Helper(format!("confining the helper: {e}")))?;
+    Ok(notice)
 }
 
 /// What the helper does once it holds all its input and before it parses a
 /// byte of it, so a bug in a parser or a decoder gains nothing beyond the
 /// drawing itself. The process stops being dumpable, so neither ptrace nor
-/// /proc/<pid>/mem reaches into it. A seccomp filter kills the process at any system call
-/// outside what drawing, writing the result and dying need: it cannot open
-/// a file, reach a socket, signal or trace another process, or map
-/// executable memory. Landlock, where the kernel has it, denies every file
-/// and network access as a second layer. The filter is required; Landlock
-/// is best effort, and a kernel without it is returned as a notice.
-pub fn lock_down() -> Result<Option<String>, Error> {
+/// /proc/<pid>/mem reaches into it. A seccomp filter, which is required,
+/// kills the process at any system call outside what drawing, writing the
+/// result and dying need: it cannot open a file, reach a socket, signal or
+/// trace another process, or map executable memory. Landlock, applied by
+/// `confine`, is the second layer.
+pub fn lock_down() -> Result<(), Error> {
     set_dumpable_behavior(DumpableBehavior::NotDumpable)
         .map_err(|e| Error::Helper(format!("making the helper undumpable: {e}")))?;
-    let notice = match landlock() {
-        Ok(RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced) => None,
-        Ok(RulesetStatus::NotEnforced) => Some("this kernel has no Landlock".to_owned()),
-        Err(e) => Some(format!("Landlock: {e}")),
-    };
     let filter = allowlist().map_err(|e| Error::Helper(format!("building the filter: {e}")))?;
     seccompiler::apply_filter_all_threads(&filter)
-        .map_err(|e| Error::Helper(format!("installing the filter: {e}")))?;
-    Ok(notice)
+        .map_err(|e| Error::Helper(format!("installing the filter: {e}")))
 }
 
 fn landlock() -> Result<RulesetStatus, landlock::RulesetError> {
