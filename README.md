@@ -154,8 +154,10 @@ when its contract changes.
 
 `vigil-lock --wait` detaches and returns success only after the compositor has
 confirmed that the session is locked (`--daemonize` remains a compatibility
-alias). `vigil-lock --warn 10` presents a cancelable, capture-free idle warning before
-locking. It requests `ext-background-effect-v1` blur when available and uses a
+alias). It exits 1 when a logind unlock lands before the compositor confirms
+the lock, and also when the compositor invalidates the lock, so a caller told
+the session is locked never sees it unlock first. `vigil-lock --warn 10`
+presents a cancelable, capture-free idle warning before locking. It requests `ext-background-effect-v1` blur when available and uses a
 tint-only fallback otherwise. Activity before commitment exits 3. `--no-warn`,
 manual lock, and suspend paths run a short **non-cancelable** frost transition
 instead (`[lock.transition]`, default 400 ms; input is ignored and hotplug
