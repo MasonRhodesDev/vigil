@@ -147,6 +147,43 @@ scan order with a DPI-derived scale from the monitor's EDID. A profile that is
 unreadable, unmatched, or nonsensical degrades the same way — a layout file
 must never be what keeps someone from logging in.
 
+## Security tests
+
+The greeter and the lock are attacked by tests that run in CI. Each one
+can be run alone.
+
+| What is attacked | Run it |
+|---|---|
+| `AuthMachine` against a scripted greetd, by generated message and input sequences | `cargo test -p vigil-auth --test attack` |
+| The greetd reply decoder, the state file and the config overlay, by fuzzing | `fuzz/run.sh 300` |
+| The PAM conversation callback, by a hostile module under AddressSanitizer | `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p vigil-pam --target x86_64-unknown-linux-gnu` |
+| The pure Rust half of `vigil-pam`, under Miri | `MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p vigil-pam` |
+| A locked session: signals, memory starvation, input flood, unlock race, compositor death | `tests/nested/attack.sh` |
+
+`VIGIL_ATTACK_CASES` sets how many sequences the `AuthMachine` attack
+generates per greetd model (default 1500). A failure prints the
+shortest sequence that breaks an invariant; add it to `pinned()` in
+`crates/vigil-auth/tests/attack.rs` before fixing it.
+
+`fuzz/run.sh [seconds] [target...]` needs `cargo install cargo-fuzz
+--locked` and a toolchain that accepts `-Z` flags: a rustup nightly, or
+a stable toolchain that ships the sanitizer runtimes. CI runs every
+target for 30 seconds. Seeds live in `fuzz/seeds`; the working corpus in
+`fuzz/corpus` and crashes in `fuzz/artifacts` are untracked. To keep a
+crash, minimise it with `cargo fuzz tmin <target> <artifact>`, add it to
+`fuzz/seeds/<target>` and write a regression test for it.
+
+`tests/nested/attack.sh` needs sway, wtype and the debug builds of
+`vigil-lock` and the `lock_probe` example. It signs in as a user that
+does not exist, so it never counts a failure against a real account.
+
+Not covered yet: a VT switch away from a locked session. Headless sway
+has no seat session, so there is no VT to switch. The test needs sway on
+a DRM device inside the QEMU guest that `tests/e2e` boots, with
+`vigil-lock` holding the lock, `chvt` to a second VT and back, and a
+framebuffer capture on each VT to show that the session contents never
+reach the screen.
+
 ## License
 
 [GPL-3.0](LICENSE). Slint is used under its GPLv3 license option.

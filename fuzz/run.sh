@@ -24,5 +24,5 @@ for target; do
     echo "fuzz: $target for ${seconds}s"
     mkdir -p "corpus/$target"
     $cargo fuzz run "$target" "corpus/$target" "seeds/$target" -- \
-        -max_total_time="$seconds" -timeout=10 -print_final_stats=1
+        -max_total_time="$seconds" -timeout=10 -verbosity=0 -print_final_stats=1
 done
