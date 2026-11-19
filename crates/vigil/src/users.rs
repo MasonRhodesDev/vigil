@@ -64,10 +64,10 @@ mod tests {
     fn filter_users_keeps_only_login_capable() {
         let fixture = "root:x:0:0::/root:/bin/bash\n\
 greeter:x:968:966::/var/lib/greetd:/sbin/nologin\n\
-mason:x:1000:1000::/home/mason:/bin/bash\n\
+alice:x:1000:1000::/home/alice:/bin/bash\n\
 nixbld1:x:30001:30000::/var/empty:/sbin/nologin\n\
 svc:x:1500:1500::/srv:/bin/false\n";
-        assert_eq!(filter_users(fixture, 1000, 60000), ["mason"]);
+        assert_eq!(filter_users(fixture, 1000, 60000), ["alice"]);
     }
 
     #[test]
