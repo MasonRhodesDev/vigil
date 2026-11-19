@@ -474,6 +474,33 @@ fn a_helper_that_would_write_another_size_writes_nothing() {
     assert!(out.stdout.is_empty(), "{} bytes written", out.stdout.len());
 }
 
+#[test]
+fn a_long_refusal_on_a_small_job_still_exits_as_a_refusal() {
+    let selector = "g ".repeat(8 * 1024);
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><style>{selector}{{fill:red}}</style></svg>"#
+    );
+    let stderr =
+        File::from(rustix::fs::memfd_create("stderr", rustix::fs::MemfdFlags::CLOEXEC).unwrap());
+    let mut child = Command::new(BIN)
+        .args(["mask", "--format", "svg", "--edge", "8", "--out-len", "64"])
+        .args(["--deadline-ms", "5000", "--abi", vigil_scene::HELPER_ABI])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(stderr.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), svg.as_bytes()).unwrap();
+    let status = child.wait().unwrap();
+    let said = stderr.metadata().unwrap().len();
+    assert_eq!(
+        status.code(),
+        Some(12),
+        "{status:?} after {said} bytes of message"
+    );
+    assert!(said <= 4096, "{said} bytes of message");
+}
+
 // A script this process opened for writing cannot be run while any child
 // forked by another test thread still holds that descriptor, and a rename
 // keeps the inode, so a short-lived shell writes it instead.
