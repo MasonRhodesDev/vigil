@@ -13,9 +13,12 @@ pub const VIGIL_SCENE_OK: i32 = 0;
 pub const VIGIL_SCENE_ERR_ARGUMENT: i32 = -1;
 pub const VIGIL_SCENE_ERR_TOO_LARGE: i32 = -2;
 /// The logo or the scene is refused: drawing it would pass the limits on
-/// time, memory or features. The same request is refused again on every
-/// call, so a caller should remember it, keyed by a hash of the logo and the
-/// spec, and draw the ground-only scene instead.
+/// time, memory or features, it crashed the helper's parser, or it timed out
+/// `VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL` times. The same request is refused
+/// again on every call, so a caller should remember it, keyed by a hash of
+/// the logo and the spec, and draw the ground-only scene instead. Remember it
+/// for the life of the process only: a refusal for timeouts may come from a
+/// loaded host.
 pub const VIGIL_SCENE_ERR_REFUSED: i32 = -3;
 pub const VIGIL_SCENE_ERR_INVALID: i32 = -4;
 pub const VIGIL_SCENE_ERR_BUFFER: i32 = -5;

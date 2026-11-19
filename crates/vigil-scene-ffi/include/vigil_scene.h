@@ -17,9 +17,12 @@
 
 /**
  * The logo or the scene is refused: drawing it would pass the limits on
- * time, memory or features. The same request is refused again on every
- * call, so a caller should remember it, keyed by a hash of the logo and the
- * spec, and draw the ground-only scene instead.
+ * time, memory or features, it crashed the helper's parser, or it timed out
+ * `VIGIL_SCENE_TIMEOUTS_BEFORE_REFUSAL` times. The same request is refused
+ * again on every call, so a caller should remember it, keyed by a hash of
+ * the logo and the spec, and draw the ground-only scene instead. Remember it
+ * for the life of the process only: a refusal for timeouts may come from a
+ * loaded host.
  */
 #define VIGIL_SCENE_ERR_REFUSED -3
 

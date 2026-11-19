@@ -73,7 +73,8 @@ static PLAIN_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::
 /// and ext-session-lock keeps the session locked when its client dies. The report names only
 /// the place, since a panic message can quote typed text. It goes out through `vigil_log::say!`,
 /// which allocates nothing and never blocks or panics, so a broken stderr cannot hold up the
-/// exit. Only work run through [`cosmetic`] survives its own panic.
+/// exit. Only work run through [`cosmetic`] survives its own panic. After [`crash_plainly`] the
+/// hook instead writes the place with one write(2) and exits with the status given there.
 pub fn exit_on_panic() {
     #[expect(clippy::disallowed_methods, reason = "this is the one panic hook")]
     std::panic::set_hook(Box::new(|info| {
