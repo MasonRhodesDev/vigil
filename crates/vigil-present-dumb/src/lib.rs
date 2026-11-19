@@ -1,16 +1,54 @@
+use std::ptr::NonNull;
+
 use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::buffer::{Buffer as _, DrmFourcc};
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
 use smithay::reexports::drm::control::{Device as ControlDevice, framebuffer};
+use smithay::reexports::rustix;
 use smithay::utils::{Rectangle, Transform};
 use vigil_core::{Canvas, FrameTarget, PresentError, Presenter};
 
 const BPP: u32 = 32;
 const DEPTH: u32 = 24;
 
+struct Mapping {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// The mapped bytes are owned and reached only through `&mut self`, as with a `Box<[u8]>`.
+unsafe impl Send for Mapping {}
+unsafe impl Sync for Mapping {}
+
+impl Mapping {
+    fn new(surface: &DrmSurface, buffer: &DumbBuffer) -> std::io::Result<Self> {
+        let mut handle = *buffer;
+        let mut mapped = surface.map_dumb_buffer(&mut handle)?;
+        let bytes: &mut [u8] = mapped.as_mut();
+        let mapping = Self {
+            ptr: NonNull::from(&mut *bytes).cast(),
+            len: bytes.len(),
+        };
+        // drm-rs unmaps when its guard drops; this type owns the unmap instead.
+        std::mem::forget(mapped);
+        Ok(mapping)
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        let _ = unsafe { rustix::mm::munmap(self.ptr.as_ptr().cast(), self.len) };
+    }
+}
+
 struct Slot {
     buffer: DumbBuffer,
     fb: framebuffer::Handle,
+    mapping: Mapping,
 }
 
 pub struct DumbBufferPresenter {
@@ -30,7 +68,6 @@ fn backend(e: impl std::fmt::Display) -> PresentError {
 
 fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
     use smithay::backend::drm::DrmError;
-    use smithay::reexports::rustix;
     match e {
         DrmError::DeviceInactive => PresentError::DeviceLost,
         DrmError::Access(ref a)
@@ -47,15 +84,6 @@ fn present_error(e: smithay::backend::drm::DrmError) -> PresentError {
     }
 }
 
-fn io_present_error(e: std::io::Error) -> PresentError {
-    use smithay::reexports::rustix;
-    if rustix::io::Errno::from_io_error(&e) == Some(rustix::io::Errno::NODEV) {
-        PresentError::DeviceLost
-    } else {
-        backend(e)
-    }
-}
-
 impl DumbBufferPresenter {
     pub fn new(surface: DrmSurface) -> Result<Self, PresentError> {
         let mode = surface.pending_mode();
@@ -69,7 +97,12 @@ impl DumbBufferPresenter {
             let fb = surface
                 .add_framebuffer(&buffer, DEPTH, BPP)
                 .map_err(backend)?;
-            Ok(Slot { buffer, fb })
+            let mapping = Mapping::new(&surface, &buffer).map_err(backend)?;
+            Ok(Slot {
+                buffer,
+                fb,
+                mapping,
+            })
         };
         let slots = [mk_slot()?, mk_slot()?];
 
@@ -142,12 +175,8 @@ impl Presenter for DumbBufferPresenter {
     ) -> Result<bool, PresentError> {
         let slot = &mut self.slots[self.back];
         let stride = slot.buffer.pitch() as usize;
-        let mut mapping = self
-            .surface
-            .map_dumb_buffer(&mut slot.buffer)
-            .map_err(io_present_error)?;
         let drew = draw(Canvas::Cpu(FrameTarget {
-            buffer: mapping.as_mut(),
+            buffer: slot.mapping.bytes(),
             width: self.width,
             height: self.height,
             stride,

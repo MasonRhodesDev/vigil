@@ -343,7 +343,7 @@ fn run(output: &Output, presents: usize, map: Map, platform: &VigilPlatform) {
 
 fn main() {
     let mut presents = 120;
-    let mut map = ("per-frame", Map::PerFrame);
+    let mut map = ("persistent", Map::Persistent);
     let mut only = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
