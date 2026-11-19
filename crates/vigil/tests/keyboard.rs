@@ -648,3 +648,53 @@ fn holding_alt_f8_shows_the_password_once() {
         "key repeat on Alt+F8 toggled the password back to hidden"
     );
 }
+
+#[test]
+fn tab_then_enter_submits_instead_of_showing_the_password() {
+    let mut g = Greeter::new();
+    let mut buf = vec![0u8; (W * H * 4) as usize];
+    g.type_text("aaaa");
+    let masked = field_row(&mut g.window, &mut buf);
+    g.tap(TAB);
+    g.tap(RETURN);
+    assert_eq!(g.take(), [Sent::Respond("aaaa".into())]);
+    g.type_text("aaaa");
+    assert_eq!(masked, field_row(&mut g.window, &mut buf), "still hidden");
+}
+
+fn settled_row(g: &mut Greeter, buf: &mut [u8]) -> Vec<(u8, u8, u8)> {
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    field_row(&mut g.window, buf)
+}
+
+fn a_shown_password_hides_again_after(event: impl FnOnce(&mut Greeter)) {
+    let mut g = Greeter::new();
+    let mut buf = vec![0u8; (W * H * 4) as usize];
+    g.type_text("aaaa");
+    let masked = settled_row(&mut g, &mut buf);
+    g.chord(ALT_L, F8, None);
+    assert_ne!(masked, field_row(&mut g.window, &mut buf), "Alt+F8 shows it");
+    event(&mut g);
+    assert_eq!(masked, settled_row(&mut g, &mut buf));
+}
+
+#[test]
+fn a_shown_password_hides_again_after_a_submit() {
+    a_shown_password_hides_again_after(|g| {
+        g.tap(RETURN);
+        g.type_text("aaaa");
+    });
+}
+
+#[test]
+fn a_shown_password_hides_again_after_a_failure() {
+    a_shown_password_hides_again_after(|g| g.window.show_error("Authentication failure"));
+}
+
+#[test]
+fn a_shown_password_hides_again_after_a_panel_move() {
+    a_shown_password_hides_again_after(|g| {
+        g.window.set_panel_visible(false);
+        g.window.set_panel_visible(true);
+    });
+}
