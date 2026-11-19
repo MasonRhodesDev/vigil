@@ -327,6 +327,18 @@ fn the_shipped_helper_draws_under_its_syscall_filter() {
     let (status, environ) = seen.expect("the helper ran under a new seccomp filter");
     assert_eq!(filters(&status), ours + 1);
     assert!(status.contains("NoNewPrivs:\t1"), "{status}");
+    let caught = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigCgt:"))
+        .map(|v| u64::from_str_radix(v.trim(), 16).unwrap())
+        .unwrap();
+    for signal in [libc::SIGSEGV, libc::SIGBUS] {
+        assert_eq!(
+            caught & 1 << (signal - 1),
+            0,
+            "signal {signal} still has a handler that makes calls the filter kills"
+        );
+    }
     if !rustix::process::getuid().is_root() {
         let denied = environ.expect_err("a helper that is not dumpable hides its environ");
         assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
@@ -498,7 +510,8 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
     let req = request(&svg, Layer::Logo);
     let need = req.bytes().unwrap();
     type Expect = fn(&Error) -> bool;
-    let cases: [(&str, String, Expect); 7] = [
+    let crash = |e: &Error| matches!(e, Error::Refused(m) if m.contains("signal"));
+    let cases: [(&str, String, Expect); 12] = [
         (
             "spins",
             "while :; do :; done".into(),
@@ -509,6 +522,11 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
             "kill -9 $$".into(),
             |e| matches!(e, Error::Refused(m) if m.contains("signal 9")),
         ),
+        ("segv", "ulimit -c 0; kill -s SEGV $$".into(), crash),
+        ("bus", "ulimit -c 0; kill -s BUS $$".into(), crash),
+        ("abort", "ulimit -c 0; kill -s ABRT $$".into(), crash),
+        ("ill", "ulimit -c 0; kill -s ILL $$".into(), crash),
+        ("fpe", "ulimit -c 0; kill -s FPE $$".into(), crash),
         (
             "forbidden",
             "ulimit -c 0; kill -s SYS $$".into(),
