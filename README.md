@@ -34,6 +34,55 @@ is its own display backend, so the login path depends only on the kernel,
 libseat, libinput, xkbcommon, and greetd — none of which a desktop upgrade
 touches.
 
+## Security tests
+
+The greeter and the lock are attacked by tests that run in CI. Each one
+can be run alone.
+
+| What is attacked | Run it |
+|---|---|
+| `AuthMachine` against a scripted greetd, by generated message and input sequences | `cargo test -p vigil-auth --test attack` |
+| The greetd reply decoder, the state file, the config overlay, the keyboard state and the theme loader, by fuzzing | `fuzz/run.sh 300` |
+| The PAM conversation callback, by a hostile module under AddressSanitizer | `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p vigil-pam --target x86_64-unknown-linux-gnu` |
+| The pure Rust half of `vigil-pam`, under Miri | `MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p vigil-pam` |
+| A locked session: signals, memory starvation, input flood, unlock race, compositor death | `tests/nested/attack.sh` |
+
+`VIGIL_ATTACK_CASES` sets how many sequences the `AuthMachine` attack
+generates per greetd model (default 1500). Each run draws a new seed and
+prints it first. `VIGIL_ATTACK_SEED=<seed>` with the same case count
+draws the same sequences again, so a red CI run replays locally. A
+failure prints the shortest sequence that breaks an invariant; add it to
+`pinned()` in `crates/vigil-auth/tests/attack.rs` before fixing it.
+
+`fuzz/run.sh [seconds] [target...]` needs `cargo install cargo-fuzz
+--locked` and a toolchain that accepts `-Z` flags: a rustup nightly, or
+a stable toolchain that ships the sanitizer runtimes. CI runs every
+target for 30 seconds. Seeds live in `fuzz/seeds`; the working corpus in
+`fuzz/corpus` and crashes in `fuzz/artifacts` are untracked. To keep a
+crash, minimise it with `cargo fuzz tmin <target> <artifact>`, add it to
+`fuzz/seeds/<target>` and write a regression test for it.
+
+`tests/nested/attack.sh` needs sway, wtype and the debug builds of
+`vigil-lock` and the `lock_probe` example. It signs in as a user that
+does not exist, so it never counts a failure against a real account. Both
+D-Bus addresses name a socket nobody listens on, so neither the lock
+client nor a PAM module reaches the host's D-Bus. The run is otherwise
+not sealed off the host: NSS looks the ghost user up through
+`/run/systemd/userdb`, and PAM modules write to `/dev/log`. The script
+kills only lockers that carry its own `VIGIL_ATTACK_RUN`, so a locker the
+user runs from the same build survives it.
+
+Not covered yet: a VT switch away from a locked session. Headless sway
+has no seat session, so there is no VT to switch. The test needs sway on
+a DRM device inside the QEMU guest that `tests/e2e` boots, with
+`vigil-lock` holding the lock, `chvt` to a second VT and back, and a
+framebuffer capture on each VT to show that the session contents never
+reach the screen.
+
+Not covered yet: a compositor that restarts in place. Headless sway
+cannot restart without ending its session, so A9 shows only that the
+lock client exits with its compositor and frees the singleton.
+
 ## Installation
 
 Arch, from the [mason] pacman repo:
@@ -113,8 +162,10 @@ when its contract changes.
 
 `vigil-lock --wait` detaches and returns success only after the compositor has
 confirmed that the session is locked (`--daemonize` remains a compatibility
-alias). `vigil-lock --warn 10` presents a cancelable, capture-free idle warning before
-locking. It requests `ext-background-effect-v1` blur when available and uses a
+alias). It exits 1 when a logind unlock lands before the compositor confirms
+the lock, and also when the compositor invalidates the lock, so a caller told
+the session is locked never sees it unlock first. `vigil-lock --warn 10`
+presents a cancelable, capture-free idle warning before locking. It requests `ext-background-effect-v1` blur when available and uses a
 tint-only fallback otherwise. Activity before commitment exits 3. `--no-warn`,
 manual lock, and suspend paths run a short **non-cancelable** frost transition
 instead (`[lock.transition]`, default 400 ms; input is ignored and hotplug
@@ -154,6 +205,68 @@ No profiles installed is a supported state, not an error: vigil falls back to
 scan order with a DPI-derived scale from the monitor's EDID. A profile that is
 unreadable, unmatched, or nonsensical degrades the same way — a layout file
 must never be what keeps someone from logging in.
+
+## Safety gates
+
+vigil handles passwords, so CI rejects unsafe patterns instead of trusting
+review to catch them. `tests/check.sh` runs the checks of CI's check job in
+the same order, so a failure shows up before a push.
+
+- **Fence.** `python3 -I tests/gates/gate.py fence` reads every file under
+  `crates/` and counts, per file, the word `unsafe` (comments included), the
+  word `expose`, and each `allow`, `expect` or `warn` that names an unsafe
+  lint, a clippy lint, `warnings`, or a rustc lint group that holds a denied
+  lint, such as `rust_2024_compatibility`. `tests/gates/baseline.tsv` records
+  those counts per file. A count above its row, or a file with no row, fails.
+  After removing some, run `python3 -I tests/gates/gate.py fence --update`
+  and commit the smaller baseline. Growing a row takes `--update
+  --allow-growth`, and the pull request must say why.
+- **Rejected outright.** `include!`, `#[path]`, a build script or proc macro
+  in any path package, a path dependency that is not a workspace member under
+  `crates/` (a `[patch]` to a path included), a `cfg` on `clippy`, `unsafe`
+  inside `macro_rules!`, a symlink under `crates/`, any `clippy.toml`,
+  `.cargo/` or `rust-toolchain` file except the root `clippy.toml`, a crate
+  that does not take `[lints] workspace = true`, a workspace lint below
+  `deny`, `unsafe_op_in_unsafe_fn` below `forbid`, and a binary whose `main`
+  does not begin with `vigil_secret::exit_on_panic()`. Line 1 of every crate
+  root, examples and tests included, is `#![forbid(unsafe_code)]`, or
+  `#![deny(unsafe_code)]` when its module tree holds fenced unsafe code.
+- **New dependencies.** The fence lists every registry or git package in
+  `Cargo.lock` that the base branch's lock does not have, and marks new
+  crates, build scripts and proc macros. It reports them for the reviewer and
+  does not fail on them.
+- **What the fence cannot see.** It counts per file, so removing one unsafe
+  block and adding another in the same file keeps the count. A credential
+  that never enters a `Secret` never meets the `expose` ban. Code under
+  another target's `cfg`, such as `cfg(target_os = "freebsd")`, is counted
+  but never linted, since CI builds only for Linux. Code a dependency's macro
+  generates is not read.
+- **Canary.** `crates/vigil-secret/examples/lint_canary.rs` breaks every
+  unsafe and plaintext rule. `gate.py canary` runs clippy on it and fails
+  unless each lint still rejects it, so drift in the lint configuration fails
+  loudly.
+- **Credentials.** Typed text travels as `vigil_secret::Secret`, which wipes
+  itself on drop and never prints. `clippy.toml` disallows `Secret::expose`,
+  and `crates/vigil-secret/tests/api.rs` fails to compile if `Secret` gains a
+  trait that hands out its text. The few adapters that hand plaintext to
+  greetd or PAM carry `#[expect(clippy::disallowed_methods)]`.
+- **Process.** Every binary's `main` first installs
+  `vigil_secret::exit_on_panic()`, then sets `RLIMIT_CORE` to 0 and clears
+  `PR_SET_DUMPABLE`, which keeps its memory out of core dumps and away from
+  same-user ptrace. A panic on any thread ends the process at once with
+  status 101, so a dead worker cannot leave a live locker that no longer
+  authenticates, and the session lock stays held. The report names only the
+  file and line, since a panic message can quote typed text. Work wrapped in
+  `vigil_secret::cosmetic`, such as a wallpaper render, loses only its result
+  when it panics.
+- **Dependencies.** `gate.py advisories` parses `deny.toml` and requires every
+  advisory ignore to be a table with an `id` and a reason that starts
+  `expires YYYY-MM-DD:`, at most 183 days out.
+- **Who judges.** On a pull request, CI runs the base branch's copy of the
+  gates against the pull request, then the pull request's own copy. A change
+  to a gate, the lint configuration, `deny.toml`, the `Secret` crate or a
+  baseline row is an ordinary edit. The pull request must justify it, and it
+  passes the usual independent review.
 
 ## License
 

@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![forbid(unsafe_code)]
 
 const OPEN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">"#;
 

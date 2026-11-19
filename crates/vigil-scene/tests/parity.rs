@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use vigil_scene::Scene;
 
 #[test]

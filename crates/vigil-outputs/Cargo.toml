@@ -11,3 +11,6 @@ repository.workspace = true
 vigil-core.workspace = true
 smithay = { workspace = true, features = ["backend_drm", "backend_gbm", "backend_udev"] }
 smithay-drm-extras.workspace = true
+
+[lints]
+workspace = true

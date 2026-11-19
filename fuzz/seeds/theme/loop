@@ -1,0 +1,1 @@
+export component T { property <int> a: b; property <int> b: a; }

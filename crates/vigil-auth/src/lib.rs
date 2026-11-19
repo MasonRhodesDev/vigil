@@ -1,10 +1,14 @@
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 use std::env;
+use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
-use greetd_ipc::codec::SyncCodec;
 use greetd_ipc::{AuthMessageType, Request, Response};
-use vigil_core::{AuthUi, UiMessage};
+use vigil_core::{AuthUi, Secret, UiMessage};
+use vigil_secret::{Zeroize, Zeroizing};
 
 #[derive(Debug)]
 pub struct AuthError(pub String);
@@ -37,11 +41,40 @@ pub fn friendly_error(description: &str) -> String {
     text.to_string()
 }
 
-fn show_greetd_error(ui: &mut dyn AuthUi, description: &str) -> String {
-    let text = friendly_error(description);
-    eprintln!("vigil: auth: greetd error: {description}");
-    ui.show_error(&text);
-    text
+// A reply carries one PAM message or one error line, and libpam caps a
+// message at 512 bytes, so anything near this size is not a reply.
+pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
+
+#[derive(Debug)]
+pub enum ResponseError {
+    Oversized(usize),
+    Io(std::io::Error),
+    Malformed(serde_json::Error),
+}
+
+impl std::fmt::Display for ResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Oversized(len) => write!(
+                f,
+                "a {len} byte response exceeds the {MAX_RESPONSE_BYTES} byte limit"
+            ),
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Malformed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+pub fn read_response(stream: &mut impl Read) -> Result<Response, ResponseError> {
+    let mut len = [0; 4];
+    stream.read_exact(&mut len).map_err(ResponseError::Io)?;
+    let len = u32::from_ne_bytes(len) as usize;
+    if len > MAX_RESPONSE_BYTES {
+        return Err(ResponseError::Oversized(len));
+    }
+    let mut body = vec![0; len];
+    stream.read_exact(&mut body).map_err(ResponseError::Io)?;
+    serde_json::from_slice(&body).map_err(ResponseError::Malformed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +125,7 @@ impl Prompt {
 }
 
 struct Submitted {
-    text: String,
+    text: Secret,
     field: Prompt,
 }
 
@@ -216,10 +249,22 @@ impl AuthMachine {
         eprintln!("vigil: auth stage {}", self.stage);
     }
 
+    // Escaped, so text from greetd cannot start a journal line of its own,
+    // and hidden when it repeats a typed name, which may be a password.
+    fn journaled(&self, text: &str) -> String {
+        match &self.user {
+            Some(name) if self.typed && text.contains(name.as_str()) => "<hidden>".to_owned(),
+            _ => format!("{text:?}"),
+        }
+    }
+
     fn show_error(&mut self, ui: &mut dyn AuthUi, description: &str) -> String {
         self.stage.clear();
         self.stage_key.clear();
-        show_greetd_error(ui, description)
+        let text = friendly_error(description);
+        eprintln!("vigil: auth: greetd error: {}", self.journaled(description));
+        ui.show_error(&text);
+        text
     }
 
     pub fn begin(&mut self, user: Option<&str>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
@@ -255,7 +300,9 @@ impl AuthMachine {
         if self.unprompted.as_deref() == Some(user) {
             eprintln!("vigil: auth unasked user={}", self.logged_user());
             ui.reset_input();
-            return self.open(None, ui);
+            // The next submit is matched against this user's question, so a
+            // failed open must not leave the previous user's field up.
+            return self.open(None, ui).inspect_err(|_| self.offer(ui));
         }
         self.offer(ui);
         Ok(())
@@ -306,7 +353,11 @@ impl AuthMachine {
         match msg {
             UiMessage::Respond(text) => match self.state {
                 State::AwaitingUser => {
-                    let name = text.trim();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "credential adapter: the username field shares Respond"
+                    )]
+                    let name = text.expose().trim();
                     if name.is_empty() {
                         let default = self.default_user.clone();
                         self.choose(default.as_deref(), false, ui)
@@ -320,12 +371,7 @@ impl AuthMachine {
                     self.open((!text.is_empty()).then_some(Submitted { text, field }), ui)
                 }
                 State::AwaitingPrompt => {
-                    let response = self.transact(
-                        &Request::PostAuthMessageResponse {
-                            response: Some(text),
-                        },
-                        ui,
-                    )?;
+                    let response = self.answer(&text, ui)?;
                     self.process_response(response, None, ui)
                 }
                 State::Idle | State::Complete => {
@@ -361,7 +407,10 @@ impl AuthMachine {
         match response {
             Response::Success => Ok(()),
             Response::Error { description, .. } => {
-                eprintln!("vigil: auth: greetd refused the cancel: {description}");
+                eprintln!(
+                    "vigil: auth: greetd refused the cancel: {}",
+                    self.journaled(&description)
+                );
                 Ok(())
             }
             Response::AuthMessage { .. } => Err(AuthError(
@@ -417,12 +466,7 @@ impl AuthMachine {
                     self.heard();
                     match submitted.take() {
                         Some(submitted) if prompt.is_the_question_under(&submitted.field) => {
-                            response = self.transact(
-                                &Request::PostAuthMessageResponse {
-                                    response: Some(submitted.text),
-                                },
-                                ui,
-                            )?;
+                            response = self.answer(&submitted.text, ui)?;
                             continue;
                         }
                         Some(_) => {
@@ -490,15 +534,70 @@ impl AuthMachine {
         }
     }
 
+    fn answer(&mut self, answer: &Secret, ui: &mut dyn AuthUi) -> Result<Response, AuthError> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "credential adapter: greetd_ipc's request owns the answer as a String"
+        )]
+        let plain = answer.expose().to_owned();
+        let mut request = Request::PostAuthMessageResponse {
+            response: Some(plain),
+        };
+        let result = self.transact(&request, ui);
+        if let Request::PostAuthMessageResponse {
+            response: Some(plain),
+        } = &mut request
+        {
+            plain.zeroize();
+        }
+        result
+    }
+
     fn transact(&mut self, request: &Request, ui: &mut dyn AuthUi) -> Result<Response, AuthError> {
         ui.set_busy(true);
-        let result = request
-            .write_to(&mut self.stream)
-            .and_then(|()| Response::read_from(&mut self.stream))
-            .map_err(|error| AuthError(format!("greetd IPC: {error}")));
+        let result = write_request(&mut self.stream, request)
+            .map_err(|error| AuthError(format!("greetd IPC: {error}")))
+            .and_then(|()| {
+                read_response(&mut self.stream).map_err(|error| {
+                    if matches!(error, ResponseError::Oversized(_)) {
+                        // The body was never read, so the stream has lost its framing.
+                        let _ = self.stream.shutdown(Shutdown::Both);
+                    }
+                    // A decode error quotes the reply it could not read.
+                    AuthError(format!("greetd IPC: {}", error.to_string().escape_debug()))
+                })
+            });
         ui.set_busy(false);
         result
     }
+}
+
+// greetd_ipc's own write_to serializes into a Vec it drops unwiped. This
+// frames the request the same way into a buffer sized up front, so no
+// reallocation leaves a copy of an answer behind, and wipes it after the write.
+fn write_request(
+    stream: &mut impl Write,
+    request: &Request,
+) -> Result<(), greetd_ipc::codec::Error> {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, request)?;
+    let mut body = Zeroizing::new(Vec::with_capacity(count.0));
+    serde_json::to_writer(&mut *body, request)?;
+    let len =
+        u32::try_from(body.len()).map_err(|_| std::io::Error::other("greetd request too large"))?;
+    stream.write_all(&len.to_ne_bytes())?;
+    stream.write_all(&body)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -512,6 +611,7 @@ mod tests {
     use std::thread;
 
     use greetd_ipc::ErrorType;
+    use greetd_ipc::codec::SyncCodec;
 
     use super::*;
 
@@ -552,6 +652,14 @@ mod tests {
         thread: Option<thread::JoinHandle<()>>,
     }
 
+    fn skip(error: &std::io::Error) -> Option<FakeServer> {
+        assert!(
+            env::var_os("CI").is_none(),
+            "unix sockets are refused, so this test would pass without running: {error}"
+        );
+        None
+    }
+
     impl FakeServer {
         fn spawn(script: impl FnOnce(&mut UnixStream) + Send + 'static) -> Option<Self> {
             let id = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
@@ -569,7 +677,7 @@ mod tests {
             if let Err(error) = probe {
                 fs::remove_dir_all(&dir).unwrap();
                 if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    return None;
+                    return skip(&error);
                 }
                 panic!("probe fake greetd socket: {error}");
             }
@@ -579,7 +687,7 @@ mod tests {
                 Ok(listener) => listener,
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                     fs::remove_dir_all(&dir).unwrap();
-                    return None;
+                    return skip(&error);
                 }
                 Err(error) => panic!("bind fake greetd socket: {error}"),
             };
@@ -739,6 +847,37 @@ mod tests {
         assert_eq!(shown(&ui), [&UiCall::Prompt("Password".into(), true)]);
     }
 
+    // Minimised from fuzz/artifacts/greetd_response: ee ff ff ff.
+    #[test]
+    fn a_reply_that_claims_four_gibibytes_is_refused_without_waiting_for_it() {
+        let Some(server) = FakeServer::spawn(|stream| {
+            assert_create(request(stream), "alice");
+            stream.write_all(&0xffff_ffee_u32.to_ne_bytes()).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(4)))
+                .unwrap();
+            let _ = stream.read(&mut [0]);
+        }) else {
+            return;
+        };
+        let mut machine = machine(&server);
+        let (done, outcome) = std::sync::mpsc::channel();
+        let greeter = thread::spawn(move || {
+            let mut ui = RecordingUi::default();
+            machine.select_user(Some("alice"), &mut ui).unwrap();
+            let result = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
+            let _ = done.send(result.map_err(|error| error.to_string()));
+        });
+        let result = outcome
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the greeter froze waiting for a reply no greetd sends");
+        assert!(
+            result.unwrap_err().contains("exceeds"),
+            "an oversized reply must be refused by its size"
+        );
+        greeter.join().unwrap();
+    }
+
     #[test]
     fn pam_codes_become_short_messages() {
         assert_eq!(
@@ -882,7 +1021,7 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         assert_eq!(sent(&requests), ["create alice"]);
         assert_eq!(
             shown(&ui).last(),
@@ -906,7 +1045,7 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         let _ = machine.handle(UiMessage::Respond("alice@example.com".into()), &mut ui);
         let _ = machine.handle(UiMessage::Respond("secret".into()), &mut ui);
         assert_eq!(
@@ -1055,7 +1194,7 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         let _ = machine.handle(UiMessage::Respond("111111".into()), &mut ui);
         let _ = machine.handle(UiMessage::Respond("222222".into()), &mut ui);
         let _ = machine.handle(UiMessage::Respond("333333".into()), &mut ui);
@@ -1395,11 +1534,11 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         let _ = machine.handle(UiMessage::Cancel, &mut ui);
         assert_eq!(sent(&requests), ["create alice", "cancel"]);
         let _ = machine.select_user(Some("bob"), &mut ui);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         assert!(!machine.is_complete());
         assert_eq!(sent(&requests), ["create alice", "cancel", "create bob"]);
         assert_eq!(ui.0.last(), Some(&UiCall::Prompt("Code:".into(), false)));
@@ -1592,7 +1731,7 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         let _ = machine.handle(UiMessage::Cancel, &mut ui);
         assert!(machine.awaiting_username());
         let _ = machine.handle(UiMessage::Respond("bob".into()), &mut ui);
@@ -1647,7 +1786,7 @@ mod tests {
         let mut machine = machine(&server);
         let mut ui = RecordingUi::default();
         let _ = machine.select_user(Some("alice"), &mut ui);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
         assert_eq!(fields(&ui), ["reset", "Password", "Password:", "Code:"]);
     }
@@ -1664,7 +1803,7 @@ mod tests {
             machine.stage(),
             "user=alice prompt=\"Password\" secret local"
         );
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         assert_eq!(machine.stage(), "user=alice prompt=\"Password:\" secret");
         let _ = machine.handle(UiMessage::Cancel, &mut ui);
         assert_eq!(
@@ -1686,7 +1825,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let _ = machine.begin(None, &mut ui);
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         assert!(!machine.stage().contains("hunter2"), "{}", machine.stage());
         assert_eq!(machine.stage(), "user=<typed> prompt=<hidden> secret");
         let _ = machine.handle(UiMessage::Respond("wrong".into()), &mut ui);
@@ -1730,7 +1869,7 @@ mod tests {
         machine.set_default_user(Some("alice".into()));
         let mut ui = RecordingUi::default();
         let _ = machine.begin(None, &mut ui);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         assert_eq!(
             machine.stage(),
             "user=alice prompt=\"Password\" secret local"
@@ -1762,7 +1901,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let _ = machine.begin(None, &mut ui);
         assert_eq!(sent(&requests), [""; 0]);
-        let _ = machine.handle(UiMessage::Respond(String::new()), &mut ui);
+        let _ = machine.handle(UiMessage::Respond(Secret::default()), &mut ui);
         assert_eq!(sent(&requests), ["create alice", "start"]);
         assert!(machine.is_complete());
     }

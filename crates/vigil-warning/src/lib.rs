@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::time::Duration;
 
 use vigil_config::{LockWarning, WarningAnimation, WarningEasing, WarningKeyframe};

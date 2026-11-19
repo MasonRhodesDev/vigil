@@ -1,0 +1,11 @@
+[package]
+name = "vigil-scene-corpus"
+description = "Hostile SVG logos that the vigil-scene tests feed to every renderer"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

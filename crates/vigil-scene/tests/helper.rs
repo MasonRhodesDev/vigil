@@ -1,4 +1,6 @@
-mod common;
+#![deny(unsafe_code)]
+
+use vigil_scene_corpus as common;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};

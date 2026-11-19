@@ -20,6 +20,9 @@ BuildRequires:  mesa-libgbm-devel
 BuildRequires:  pam-devel
 BuildRequires:  clang-devel
 BuildRequires:  fontconfig-devel
+%if %{with check}
+BuildRequires:  /usr/bin/dbus-daemon
+%endif
 Requires:       greetd
 Requires:       hwdata
 Requires(pre):  shadow-utils

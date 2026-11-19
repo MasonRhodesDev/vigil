@@ -1,6 +1,9 @@
+#![forbid(unsafe_code)]
+
 mod damage;
 
 pub use damage::{BufferDamage, Damage, FrameDamage, Rect, next_frame_serial};
+pub use vigil_secret::Secret;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OutputId(pub u32);
@@ -263,11 +266,44 @@ pub struct KeymapSettings {
     pub options: String,
 }
 
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct KeyText(String);
+
+impl KeyText {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for KeyText {
+    fn from(text: String) -> Self {
+        Self(text)
+    }
+}
+
+impl From<&str> for KeyText {
+    fn from(text: &str) -> Self {
+        Self(text.to_owned())
+    }
+}
+
+impl Drop for KeyText {
+    fn drop(&mut self) {
+        vigil_secret::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for KeyText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeyText(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent {
     Key {
         keysym: u32,
-        utf8: Option<String>,
+        utf8: Option<KeyText>,
         pressed: bool,
     },
     PointerMotion {
@@ -298,9 +334,9 @@ pub enum PowerAction {
     Poweroff,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum UiMessage {
-    Respond(String),
+    Respond(Secret),
     Cancel,
     SelectSession(usize),
     SelectUser(usize),
@@ -421,6 +457,25 @@ impl BackgroundFit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_text_reads_back_and_never_prints() {
+        let event = InputEvent::Key {
+            keysym: 0x7a,
+            utf8: Some(KeyText::from("zq")),
+            pressed: true,
+        };
+        let InputEvent::Key {
+            utf8: Some(text), ..
+        } = &event
+        else {
+            unreachable!()
+        };
+        assert_eq!(text.as_str(), "zq");
+        let rendered = format!("{event:?}");
+        assert!(!rendered.contains("zq"), "{rendered}");
+        assert_eq!(text.clone(), KeyText::from(String::from("zq")));
+    }
 
     #[test]
     fn transform_90_rotates_the_scene_counter_clockwise() {

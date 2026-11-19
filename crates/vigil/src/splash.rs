@@ -423,10 +423,6 @@ fn splash(cfg: &SplashConfig, spec: &Scene, scene: (u32, u32), transform: u8) ->
 }
 
 #[cfg(test)]
-#[path = "../../vigil-scene/tests/common/mod.rs"]
-mod scene_inputs;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -687,7 +683,7 @@ mod tests {
             return;
         };
         let index: usize = index.to_str().unwrap().parse().unwrap();
-        let (what, text) = &super::scene_inputs::review_inputs()[index];
+        let (what, text) = &vigil_scene_corpus::review_inputs()[index];
         let cfg = cfg_with_svg(&format!("review{index}"), text);
         let spec = Scene::default();
         let helper = test_helper(vigil_scene::DEFAULT_DEADLINE);
@@ -708,7 +704,7 @@ mod tests {
 
     #[test]
     fn every_review_input_leaves_the_splash_on_time() {
-        for i in 0..super::scene_inputs::review_inputs().len() {
+        for i in 0..vigil_scene_corpus::review_inputs().len() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",

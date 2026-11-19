@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 slint-idle-runtime.workspace = true
 vigil-core.workspace = true
+vigil-secret.workspace = true
 vigil-scene = { path = "../vigil-scene" }
 vigil-config.workspace = true
 monitor-profiles.workspace = true
@@ -32,9 +33,13 @@ font8x8.workspace = true
 bytemuck = "1.25"
 
 [dev-dependencies]
+vigil-scene-corpus = { path = "../vigil-scene-corpus" }
 image.workspace = true
 greetd_ipc.workspace = true
 
 [features]
 default = ["gl"]
 gl = ["dep:vigil-gl", "dep:vigil-present-gl"]
+
+[lints]
+workspace = true

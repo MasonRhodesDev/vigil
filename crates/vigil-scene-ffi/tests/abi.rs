@@ -1,5 +1,6 @@
-#[path = "../../vigil-scene/tests/common/mod.rs"]
-mod common;
+#![deny(unsafe_code)]
+
+use vigil_scene_corpus as common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

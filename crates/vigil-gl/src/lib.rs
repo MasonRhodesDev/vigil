@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::ffi::{CStr, c_void};
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
@@ -45,8 +47,13 @@ impl GlContext {
         Self::from_fd(Arc::new(OwnedFd::from(file)))
     }
 
+    #[allow(unsafe_code)]
     pub fn from_fd(fd: Arc<OwnedFd>) -> Result<Self, GlError> {
         let device = GbmDevice::new(fd).map_err(|e| GlError(format!("gbm device: {e}")))?;
+        #[expect(
+            clippy::undocumented_unsafe_blocks,
+            reason = "unjustified: holds only while nothing else in the process creates or terminates EGL displays"
+        )]
         let display =
             unsafe { EGLDisplay::new(device.clone()) }.map_err(|e| GlError(format!("egl: {e}")))?;
         let context =
@@ -62,10 +69,14 @@ impl GlContext {
         &self.device
     }
 
+    #[allow(unsafe_code)]
     pub fn make_current(&self) -> Result<(), GlError> {
+        // SAFETY: a context still current on another thread makes eglMakeCurrent
+        // fail with EGL_BAD_ACCESS, which is returned here, rather than bind twice.
         unsafe { self.context.make_current() }.map_err(|e| GlError(format!("make current: {e}")))
     }
 
+    #[allow(unsafe_code)]
     fn config_for(&self, fourcc: u32) -> Result<ChosenConfig, GlError> {
         let handle = self.display.get_display_handle();
         let attrs = [
@@ -77,15 +88,17 @@ impl GlContext {
             MIN_STENCIL_BITS as ffi::egl::types::EGLint,
             ffi::egl::NONE as ffi::egl::types::EGLint,
         ];
-        let mut configs = [std::ptr::null(); 64];
+        let mut configs: [ffi::egl::types::EGLConfig; 64] = [std::ptr::null(); 64];
         let mut found: ffi::egl::types::EGLint = 0;
+        // SAFETY: the display handle is live for `self`, `attrs` is EGL_NONE
+        // terminated, and EGL writes at most `configs.len()` entries and one count.
         let ok = unsafe {
             ffi::egl::ChooseConfig(
                 handle.handle,
                 attrs.as_ptr(),
-                configs.as_mut_ptr() as *mut _,
+                configs.as_mut_ptr(),
                 configs.len() as ffi::egl::types::EGLint,
-                &mut found,
+                &raw mut found,
             )
         };
         if ok == 0 || found == 0 {
@@ -93,12 +106,14 @@ impl GlContext {
         }
         let attrib = |config: ffi::egl::types::EGLConfig, name: ffi::egl::types::EGLenum| {
             let mut value: ffi::egl::types::EGLint = 0;
+            // SAFETY: `config` came from ChooseConfig on this live display, and
+            // EGL writes one EGLint into `value`.
             let ok = unsafe {
                 ffi::egl::GetConfigAttrib(
                     handle.handle,
                     config,
                     name as ffi::egl::types::EGLint,
-                    &mut value,
+                    &raw mut value,
                 )
             };
             (ok != 0).then_some(value)
@@ -136,20 +151,29 @@ struct ChosenConfig {
 #[derive(Clone)]
 pub struct GbmWindow(Arc<gbm::Surface<()>>);
 
+#[allow(unsafe_code)]
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "unjustified: a cloned GbmWindow on two threads can race gbm_surface calls"
+)]
 unsafe impl Send for GbmWindow {}
-unsafe impl Sync for GbmWindow {}
 
+// SAFETY: `create` hands EGL the gbm_surface this Arc keeps alive for as long
+// as the EGLSurface holds a clone of the window.
+#[allow(unsafe_code)]
 unsafe impl EGLNativeSurface for GbmWindow {
     unsafe fn create(
         &self,
         display: &Arc<EGLDisplayHandle>,
         config_id: ffi::egl::types::EGLConfig,
     ) -> Result<*const c_void, smithay::backend::egl::EGLError> {
+        // SAFETY: the caller guarantees `config_id` is a valid config for
+        // `display`, and the gbm_surface pointer is live for `self`.
         smithay::backend::egl::wrap_egl_call_ptr(|| unsafe {
             ffi::egl::CreatePlatformWindowSurfaceEXT(
                 display.handle,
                 config_id,
-                self.0.as_raw() as *mut _,
+                self.0.as_raw().cast_mut().cast(),
                 std::ptr::null(),
             )
         })
@@ -164,7 +188,9 @@ impl GbmWindow {
     /// # Safety
     /// Only valid after a swap, and the returned buffer must be released back
     /// to the surface.
+    #[allow(unsafe_code)]
     pub unsafe fn lock_front_buffer(&self) -> Result<gbm::BufferObject<()>, GlError> {
+        // SAFETY: forwarded; the caller upholds gbm's once-per-swap contract.
         unsafe { self.0.lock_front_buffer() }
             .map_err(|e| GlError(format!("lock front buffer: {e}")))
     }
@@ -197,6 +223,7 @@ impl GlSurface {
         Err(last)
     }
 
+    #[allow(unsafe_code)]
     fn with_format(
         context: &Rc<GlContext>,
         width: u32,
@@ -225,6 +252,7 @@ impl GlSurface {
             multisampling: None,
             srgb: false,
         };
+        // SAFETY: `chosen.config` came from ChooseConfig on this same display.
         let surface = unsafe {
             EGLSurface::new(
                 &context.display,
@@ -247,8 +275,13 @@ impl GlSurface {
     }
 }
 
+// SAFETY: get_proc_address forwards to eglGetProcAddress, whose pointers are
+// context independent under EGL 1.5 and live as long as libEGL stays loaded.
+#[allow(unsafe_code)]
 unsafe impl OpenGLInterface for GlSurface {
     fn ensure_current(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // SAFETY: a context still current on another thread makes eglMakeCurrent
+        // fail with EGL_BAD_ACCESS, which is returned here, rather than bind twice.
         unsafe {
             self.context
                 .context
@@ -273,6 +306,8 @@ unsafe impl OpenGLInterface for GlSurface {
 
     fn get_proc_address(&self, name: &CStr) -> *const c_void {
         match name.to_str() {
+            // SAFETY: `self` owns a GlContext, so libEGL is loaded, and EGL 1.5
+            // function pointers do not depend on which context is current.
             Ok(name) => unsafe { get_proc_address(name) },
             Err(_) => std::ptr::null(),
         }
@@ -281,6 +316,9 @@ unsafe impl OpenGLInterface for GlSurface {
 
 struct Surfaceless(GlContext);
 
+// SAFETY: get_proc_address forwards to eglGetProcAddress, whose pointers are
+// context independent under EGL 1.5 and live as long as libEGL stays loaded.
+#[allow(unsafe_code)]
 unsafe impl OpenGLInterface for Surfaceless {
     fn ensure_current(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.0
@@ -302,6 +340,8 @@ unsafe impl OpenGLInterface for Surfaceless {
 
     fn get_proc_address(&self, name: &CStr) -> *const c_void {
         match name.to_str() {
+            // SAFETY: `self` owns a GlContext, so libEGL is loaded, and EGL 1.5
+            // function pointers do not depend on which context is current.
             Ok(name) => unsafe { get_proc_address(name) },
             Err(_) => std::ptr::null(),
         }

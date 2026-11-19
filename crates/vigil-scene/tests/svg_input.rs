@@ -1,4 +1,6 @@
-mod common;
+#![forbid(unsafe_code)]
+
+use vigil_scene_corpus as common;
 
 use std::time::{Duration, Instant};
 

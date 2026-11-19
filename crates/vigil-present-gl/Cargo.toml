@@ -19,3 +19,6 @@ vigil-ui = { path = "../vigil-ui" }
 vigil-theme = { path = "../vigil-theme" }
 slint = { workspace = true }
 slint-interpreter.workspace = true
+
+[lints]
+workspace = true

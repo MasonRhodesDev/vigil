@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -21,7 +23,8 @@ use slint_idle_runtime::{DirtySet, Metrics, RedrawHandle, WakeHandle};
 use slint_interpreter::{ComponentInstance, Value};
 use slint_kit::TokenSet;
 use vigil_core::{
-    AuthUi, BackgroundFit, Damage, FrameTarget, InputEvent, OutputId, PowerAction, Rect, UiMessage,
+    AuthUi, BackgroundFit, Damage, FrameTarget, InputEvent, KeyText, OutputId, PowerAction, Rect,
+    UiMessage,
 };
 use vigil_core::{Canvas as CoreCanvas, RenderBackend, SceneView};
 
@@ -480,7 +483,7 @@ impl OutputWindow {
         let s = sink.clone();
         let r = self.component.set_callback("submit", move |args| {
             if let Some(Value::String(text)) = args.first() {
-                s(UiMessage::Respond(text.to_string()));
+                s(UiMessage::Respond(text.as_str().into()));
             }
             Value::Void
         });
@@ -660,7 +663,11 @@ impl AuthUi for OutputWindow {
 #[repr(transparent)]
 struct Xrgb8888(u32);
 
+// SAFETY: a transparent u32, so all zero bytes is a valid value.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Zeroable for Xrgb8888 {}
+// SAFETY: a transparent Copy u32, so it has no padding and every bit pattern is valid.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Pod for Xrgb8888 {}
 
 impl TargetPixel for Xrgb8888 {
@@ -681,7 +688,11 @@ impl TargetPixel for Xrgb8888 {
 #[repr(transparent)]
 struct Argb8888(u32);
 
+// SAFETY: a transparent u32, so all zero bytes is a valid value.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Zeroable for Argb8888 {}
+// SAFETY: a transparent Copy u32, so it has no padding and every bit pattern is valid.
+#[allow(unsafe_code)]
 unsafe impl bytemuck::Pod for Argb8888 {}
 
 impl TargetPixel for Argb8888 {
@@ -717,7 +728,7 @@ fn pointer_button(button: u32) -> PointerEventButton {
     }
 }
 
-fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
+fn key_text(keysym: u32, utf8: Option<KeyText>) -> Option<slint::SharedString> {
     let key = match keysym {
         0xff0d => Key::Return,
         0xff08 => Key::Backspace,
@@ -732,8 +743,10 @@ fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
         0xff57 => Key::End,
         _ => {
             return utf8
-                .filter(|text| !text.is_empty() && !text.chars().all(char::is_control))
-                .map(Into::into);
+                .filter(|text| {
+                    !text.as_str().is_empty() && !text.as_str().chars().all(char::is_control)
+                })
+                .map(|text| text.as_str().into());
         }
     };
     Some(key.into())

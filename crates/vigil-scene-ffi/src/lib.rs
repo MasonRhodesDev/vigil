@@ -1,10 +1,4 @@
 #![deny(unsafe_code)]
-#![deny(
-    unsafe_op_in_unsafe_fn,
-    clippy::undocumented_unsafe_blocks,
-    clippy::multiple_unsafe_ops_per_block,
-    clippy::missing_safety_doc
-)]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;

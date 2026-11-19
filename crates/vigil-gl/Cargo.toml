@@ -18,3 +18,6 @@ gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 image.workspace = true
 slint-interpreter.workspace = true
 drm = "0.14"
+
+[lints]
+workspace = true

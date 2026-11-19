@@ -1,5 +1,4 @@
 #![deny(unsafe_code)]
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -427,6 +426,7 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    vigil_secret::exit_on_panic();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = match argv.first().map(String::as_str) {
         Some(job @ ("mask" | "layer")) => return helper(job, &argv[1..]),

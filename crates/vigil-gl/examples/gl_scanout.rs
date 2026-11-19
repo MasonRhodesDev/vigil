@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -23,6 +24,7 @@ impl Platform for GlPlatform {
     }
 }
 
+#[allow(unsafe_code)]
 fn main() {
     let node = std::env::var("VIGIL_GL_NODE").unwrap_or_else(|_| "/dev/dri/card0".into());
 
@@ -61,6 +63,7 @@ fn main() {
     window.render().expect("render");
     println!("rendered the default theme through femtovg: ok");
 
+    // SAFETY: window.render() above swapped this surface exactly once.
     let bo = unsafe { gbm.lock_front_buffer() }.expect("lock front buffer");
     println!(
         "front buffer: {}x{} stride={} format={:?}",
@@ -75,6 +78,7 @@ fn main() {
     println!("SCANOUT PATH OK (everything but the CRTC commit)");
 }
 
+#[allow(unsafe_code)]
 fn spin_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -82,6 +86,8 @@ fn spin_on<F: std::future::Future>(future: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: every vtable entry ignores the null data pointer, and clone hands
+    // back the same no-op waker.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);
