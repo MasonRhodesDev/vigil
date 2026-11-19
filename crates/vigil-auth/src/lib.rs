@@ -47,13 +47,19 @@ fn show_greetd_error(ui: &mut dyn AuthUi, description: &str) -> String {
 enum State {
     Idle,
     AwaitingUser,
+    AwaitingCommit,
     AwaitingPrompt,
-    AwaitingRetry,
     Complete,
 }
 
 pub const USERNAME_PROMPT: &str = "Username";
-pub const RETRY_PROMPT: &str = "Press Enter to try again";
+pub const PASSWORD_PROMPT: &str = "Password";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Prompt {
+    text: String,
+    secret: bool,
+}
 
 pub struct AuthMachine {
     stream: UnixStream,
@@ -63,8 +69,9 @@ pub struct AuthMachine {
     user: Option<String>,
     default_user: Option<String>,
     fixed_user: bool,
-    answered: bool,
     typed: bool,
+    asked: bool,
+    first_question: Option<(String, Prompt)>,
     stage: String,
     stage_key: String,
 }
@@ -86,8 +93,9 @@ impl AuthMachine {
             user: None,
             default_user: None,
             fixed_user: false,
-            answered: false,
             typed: false,
+            asked: false,
+            first_question: None,
             stage: String::new(),
             stage_key: String::new(),
         })
@@ -126,18 +134,21 @@ impl AuthMachine {
         }
     }
 
-    fn log_stage(&mut self, user: &str, prompt: &str, secret: bool) {
-        let kind = if secret { "secret" } else { "visible" };
-        let key = format!("user={user} prompt={prompt:?} {kind}");
+    fn log_stage(&mut self, prompt: &Prompt, local: bool) {
+        let kind = if prompt.secret { "secret" } else { "visible" };
+        let origin = if local { " local" } else { "" };
+        let user = self.logged_user().to_owned();
+        let key = format!("user={user} prompt={:?} {kind}{origin}", prompt.text);
         if key == self.stage_key {
             return;
         }
-        let shown = if self.typed && prompt != RETRY_PROMPT && prompt != USERNAME_PROMPT {
+        let own = prompt.text == USERNAME_PROMPT || prompt.text == PASSWORD_PROMPT;
+        let shown = if self.typed && !own {
             "<hidden>".to_owned()
         } else {
-            format!("{prompt:?}")
+            format!("{:?}", prompt.text)
         };
-        self.stage = format!("user={user} prompt={shown} {kind}");
+        self.stage = format!("user={user} prompt={shown} {kind}{origin}");
         self.stage_key = key;
         eprintln!("vigil: auth stage {}", self.stage);
     }
@@ -149,17 +160,9 @@ impl AuthMachine {
     }
 
     pub fn begin(&mut self, user: Option<&str>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
-        match user {
-            Some(user) => {
-                self.fixed_user = true;
-                self.start(user, ui)
-            }
-            None => {
-                self.fixed_user = false;
-                self.prompt_username(ui);
-                Ok(())
-            }
-        }
+        self.fixed_user = user.is_some();
+        self.choose(user, false, ui);
+        Ok(())
     }
 
     pub fn select_user(
@@ -171,119 +174,118 @@ impl AuthMachine {
             return Err(AuthError("session has already started".into()));
         }
         self.fixed_user = false;
-        if self.state == State::AwaitingPrompt {
-            self.cancel(ui)?;
-        }
+        self.close(ui)?;
+        self.choose(user, false, ui);
+        Ok(())
+    }
+
+    fn choose(&mut self, user: Option<&str>, typed: bool, ui: &mut dyn AuthUi) {
         match user {
-            Some(user) => self.start(user, ui),
-            None => {
-                self.user = None;
-                self.prompt_username(ui);
-                Ok(())
+            Some(user) => {
+                self.user = Some(user.to_owned());
+                self.typed = typed;
+                self.offer(ui);
             }
+            None => self.prompt_username(ui),
         }
     }
 
     fn prompt_username(&mut self, ui: &mut dyn AuthUi) {
+        self.user = None;
         self.typed = false;
         ui.reset_input();
         ui.show_prompt(USERNAME_PROMPT, false);
         self.state = State::AwaitingUser;
-        self.log_stage("<none>", USERNAME_PROMPT, false);
+        let prompt = Prompt {
+            text: USERNAME_PROMPT.into(),
+            secret: false,
+        };
+        self.log_stage(&prompt, true);
     }
 
-    fn await_retry(&mut self, ui: &mut dyn AuthUi, error: &str) {
-        ui.reset_input();
-        ui.show_prompt(RETRY_PROMPT, true);
-        ui.show_error(error);
-        self.state = State::AwaitingRetry;
-        let user = self.logged_user().to_owned();
-        self.log_stage(&user, RETRY_PROMPT, true);
-    }
-
-    fn restart(&mut self, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
-        match self.user.clone() {
-            Some(user) => self.create(&user, self.typed, ui),
-            None => {
-                self.prompt_username(ui);
-                Ok(())
-            }
-        }
-    }
-
-    pub fn start(&mut self, user: &str, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
-        self.create(user, false, ui)
-    }
-
-    fn create(&mut self, user: &str, typed: bool, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
-        if self.state == State::Complete {
-            return Err(AuthError("session has already started".into()));
-        }
-        ui.reset_input();
-        if self.state == State::AwaitingPrompt {
-            self.cancel(ui)?;
-        }
-        self.user = Some(user.to_owned());
-        self.typed = typed;
-        self.answered = false;
-
-        let response = self.transact(
-            &Request::CreateSession {
-                username: user.to_owned(),
+    fn offered(&self) -> Prompt {
+        match (&self.first_question, &self.user) {
+            (Some((user, prompt)), Some(current)) if user == current => prompt.clone(),
+            _ => Prompt {
+                text: PASSWORD_PROMPT.into(),
+                secret: true,
             },
-            ui,
-        )?;
-        self.process_response(response, ui)
+        }
+    }
+
+    fn offer(&mut self, ui: &mut dyn AuthUi) {
+        let prompt = self.offered();
+        ui.reset_input();
+        ui.show_prompt(&prompt.text, prompt.secret);
+        self.state = State::AwaitingCommit;
+        self.log_stage(&prompt, true);
+    }
+
+    // greetd can end a conversation that has asked a question only with an
+    // answer or with a failure PAM counts, so none is opened before a submit.
+    fn open(&mut self, answer: Option<String>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+        let Some(user) = self.user.clone() else {
+            self.prompt_username(ui);
+            return Ok(());
+        };
+        eprintln!("vigil: auth open user={}", self.logged_user());
+        self.asked = false;
+        let response = self.transact(&Request::CreateSession { username: user }, ui)?;
+        self.process_response(response, answer, ui)
     }
 
     pub fn handle(&mut self, msg: UiMessage, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
         match msg {
-            UiMessage::Respond(username) if self.state == State::AwaitingUser => {
-                let username = username.trim();
-                if username.is_empty() {
-                    if let Some(default) = self.default_user.clone() {
-                        return self.start(&default, ui);
+            UiMessage::Respond(text) => match self.state {
+                State::AwaitingUser => {
+                    let name = text.trim();
+                    if name.is_empty() {
+                        let default = self.default_user.clone();
+                        self.choose(default.as_deref(), false, ui);
+                    } else {
+                        let typed = self.default_user.as_deref() != Some(name);
+                        self.choose(Some(name), typed, ui);
                     }
-                    self.prompt_username(ui);
-                    return Ok(());
+                    Ok(())
                 }
-                let typed = self.default_user.as_deref() != Some(username);
-                self.create(username, typed, ui)
-            }
-            UiMessage::Respond(response) if self.state == State::AwaitingPrompt => {
-                self.answered = true;
-                let response = self.transact(
-                    &Request::PostAuthMessageResponse {
-                        response: Some(response),
-                    },
-                    ui,
-                )?;
-                self.process_response(response, ui)
-            }
-            UiMessage::Respond(_) if self.state == State::AwaitingRetry => self.restart(ui),
+                State::AwaitingCommit => self.open(Some(text).filter(|text| !text.is_empty()), ui),
+                State::AwaitingPrompt => {
+                    let response = self.transact(
+                        &Request::PostAuthMessageResponse {
+                            response: Some(text),
+                        },
+                        ui,
+                    )?;
+                    self.process_response(response, None, ui)
+                }
+                State::Idle | State::Complete => {
+                    Err(AuthError("no authentication prompt is pending".into()))
+                }
+            },
             UiMessage::Cancel if matches!(self.state, State::AwaitingUser | State::Complete) => {
                 Ok(())
             }
             UiMessage::Cancel => {
-                if self.state == State::AwaitingPrompt {
-                    self.cancel(ui)?;
-                }
+                self.close(ui)?;
                 if self.fixed_user {
                     eprintln!("vigil: auth cancel -> restart user={}", self.logged_user());
-                    self.restart(ui)
+                    self.offer(ui);
                 } else {
                     eprintln!("vigil: auth cancel -> username");
                     self.prompt_username(ui);
-                    Ok(())
                 }
+                Ok(())
             }
-            UiMessage::Respond(_) => Err(AuthError("no authentication prompt is pending".into())),
             UiMessage::SelectSession(_) | UiMessage::SelectUser(_) => Ok(()),
             UiMessage::Power(_) => Err(AuthError("power actions are not authentication".into())),
         }
     }
 
-    fn cancel(&mut self, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+    fn close(&mut self, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
+        if self.state != State::AwaitingPrompt {
+            return Ok(());
+        }
+        eprintln!("vigil: auth close user={} unanswered", self.logged_user());
         let response = self.transact(&Request::CancelSession, ui)?;
         self.state = State::Idle;
         match response {
@@ -298,26 +300,46 @@ impl AuthMachine {
         }
     }
 
+    fn fail(&mut self, ui: &mut dyn AuthUi, description: &str) {
+        let text = self.show_error(ui, description);
+        let _ = self.transact(&Request::CancelSession, ui);
+        self.offer(ui);
+        ui.show_error(&text);
+    }
+
     fn process_response(
         &mut self,
         mut response: Response,
+        mut answer: Option<String>,
         ui: &mut dyn AuthUi,
     ) -> Result<(), AuthError> {
-        let mut pending_error: Option<String> = None;
         loop {
             match response {
                 Response::AuthMessage {
                     auth_message_type: kind @ (AuthMessageType::Visible | AuthMessageType::Secret),
                     auth_message,
                 } => {
-                    let secret = matches!(kind, AuthMessageType::Secret);
-                    ui.show_prompt(&auth_message, secret);
-                    if let Some(error) = pending_error.take() {
-                        ui.show_error(&error);
+                    let prompt = Prompt {
+                        text: auth_message,
+                        secret: matches!(kind, AuthMessageType::Secret),
+                    };
+                    let offered = self.offered();
+                    if !std::mem::replace(&mut self.asked, true) {
+                        self.first_question = self.user.clone().map(|user| (user, prompt.clone()));
                     }
+                    if let Some(answer) = answer.take().filter(|_| prompt.secret == offered.secret)
+                    {
+                        response = self.transact(
+                            &Request::PostAuthMessageResponse {
+                                response: Some(answer),
+                            },
+                            ui,
+                        )?;
+                        continue;
+                    }
+                    ui.show_prompt(&prompt.text, prompt.secret);
                     self.state = State::AwaitingPrompt;
-                    let user = self.logged_user().to_owned();
-                    self.log_stage(&user, &auth_message, secret);
+                    self.log_stage(&prompt, false);
                     return Ok(());
                 }
                 Response::AuthMessage {
@@ -351,9 +373,7 @@ impl AuthMachine {
                             return Ok(());
                         }
                         Response::Error { description, .. } => {
-                            let text = self.show_error(ui, &description);
-                            let _ = self.transact(&Request::CancelSession, ui);
-                            self.await_retry(ui, &text);
+                            self.fail(ui, &description);
                             return Ok(());
                         }
                         Response::AuthMessage { .. } => {
@@ -365,15 +385,8 @@ impl AuthMachine {
                     }
                 }
                 Response::Error { description, .. } => {
-                    let text = self.show_error(ui, &description);
-                    let _ = self.transact(&Request::CancelSession, ui);
-                    let Some(user) = self.user.clone().filter(|_| self.answered) else {
-                        self.await_retry(ui, &text);
-                        return Ok(());
-                    };
-                    self.answered = false;
-                    pending_error = Some(text);
-                    response = self.transact(&Request::CreateSession { username: user }, ui)?;
+                    self.fail(ui, &description);
+                    return Ok(());
                 }
             }
         }
