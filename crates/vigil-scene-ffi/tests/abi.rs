@@ -496,6 +496,8 @@ fn a_logo_that_times_out_at_the_longest_deadline_is_too_slow_not_refused() {
     let (_, at) = render_by(&spin, &req, &mut []);
     let mut out = vec![0u8; at.stride * at.height as usize];
     assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TIMEOUT);
+    assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TIMEOUT);
+    std::thread::sleep(Duration::from_millis(VIGIL_SCENE_STRIKES_APART_MS.into()));
     assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TOO_SLOW);
     let start = Instant::now();
     assert_eq!(render_by(&spin, &req, &mut out).0, VIGIL_SCENE_ERR_TOO_SLOW);

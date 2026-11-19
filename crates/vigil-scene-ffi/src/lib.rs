@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use vigil_scene::{
     DEFAULT_DEADLINE, Error, Helper, Layer, MAX_DEADLINE, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Request,
-    STRIKING_DEADLINE, TIMEOUTS_BEFORE_TOO_SLOW,
+    STRIKES_APART, STRIKING_DEADLINE, TIMEOUTS_BEFORE_TOO_SLOW,
 };
 
 pub const VIGIL_SCENE_OK: i32 = 0;
@@ -57,14 +57,19 @@ pub const VIGIL_SCENE_STRIKING_DEADLINE_MS: u32 = 4500;
 /// After this many counted timeouts for one logo and spec at one size class
 /// and layer, each within ten minutes of the one before, the library returns
 /// `VIGIL_SCENE_ERR_TOO_SLOW` for them there. The size class is the log2 of
-/// the mode's area. Timeouts of calls that overlap count once, and a drawing
-/// of that logo and spec at that size class and layer clears the count.
+/// the mode's area. A timeout counts only if its call began at least
+/// `VIGIL_SCENE_STRIKES_APART_MS` after the last counted one ended, so a
+/// stall that times out one output after another counts once. A drawing of
+/// that logo and spec at that size class and layer clears the count.
 pub const VIGIL_SCENE_TIMEOUTS_BEFORE_TOO_SLOW: u32 = 2;
+/// How long after a counted timeout ended the next must begin to count.
+pub const VIGIL_SCENE_STRIKES_APART_MS: u32 = 60_000;
 
 const _: () = assert!(VIGIL_SCENE_DEFAULT_DEADLINE_MS as u128 == DEFAULT_DEADLINE.as_millis());
 const _: () = assert!(VIGIL_SCENE_MAX_DEADLINE_MS as u128 == MAX_DEADLINE.as_millis());
 const _: () = assert!(VIGIL_SCENE_STRIKING_DEADLINE_MS as u128 == STRIKING_DEADLINE.as_millis());
 const _: () = assert!(VIGIL_SCENE_TIMEOUTS_BEFORE_TOO_SLOW == TIMEOUTS_BEFORE_TOO_SLOW);
+const _: () = assert!(VIGIL_SCENE_STRIKES_APART_MS as u128 == STRIKES_APART.as_millis());
 
 /// What to draw. `svg` and `spec_json` are each null with a length of 0, or
 /// point to that many bytes. Without `spec_json` the built-in scene is used.
@@ -182,8 +187,9 @@ unsafe fn bytes<'a>(ptr: *const u8, len: usize, cap: usize) -> Result<Option<&'a
 /// about 55 ms in a release build. On `VIGIL_SCENE_ERR_TIMEOUT`, draw the
 /// ground-only scene and retry once with `VIGIL_SCENE_MAX_DEADLINE_MS`, so a
 /// loaded host still gets the logo. A logo that keeps timing out at that
-/// deadline is `VIGIL_SCENE_ERR_TOO_SLOW` for about an hour, so a spinning
-/// logo costs two long deadlines an hour per size. Remember
+/// deadline a minute apart is `VIGIL_SCENE_ERR_TOO_SLOW` for about an hour,
+/// so a spinning logo costs a long deadline for each retry in its first
+/// minute and one more after it, then none for the hour. Remember
 /// `VIGIL_SCENE_ERR_REFUSED` per logo, so a refused logo costs one call at
 /// most, but never `VIGIL_SCENE_ERR_TIMEOUT`, `VIGIL_SCENE_ERR_TOO_SLOW` or
 /// `VIGIL_SCENE_ERR_HELPER`: the first two may come from a loaded host and

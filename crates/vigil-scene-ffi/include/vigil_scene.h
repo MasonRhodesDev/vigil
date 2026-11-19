@@ -95,10 +95,17 @@
  * After this many counted timeouts for one logo and spec at one size class
  * and layer, each within ten minutes of the one before, the library returns
  * `VIGIL_SCENE_ERR_TOO_SLOW` for them there. The size class is the log2 of
- * the mode's area. Timeouts of calls that overlap count once, and a drawing
- * of that logo and spec at that size class and layer clears the count.
+ * the mode's area. A timeout counts only if its call began at least
+ * `VIGIL_SCENE_STRIKES_APART_MS` after the last counted one ended, so a
+ * stall that times out one output after another counts once. A drawing of
+ * that logo and spec at that size class and layer clears the count.
  */
 #define VIGIL_SCENE_TIMEOUTS_BEFORE_TOO_SLOW 2
+
+/**
+ * How long after a counted timeout ended the next must begin to count.
+ */
+#define VIGIL_SCENE_STRIKES_APART_MS 60000
 
 /**
  * What to draw. `svg` and `spec_json` are each null with a length of 0, or
@@ -162,8 +169,9 @@ extern "C" {
  * about 55 ms in a release build. On `VIGIL_SCENE_ERR_TIMEOUT`, draw the
  * ground-only scene and retry once with `VIGIL_SCENE_MAX_DEADLINE_MS`, so a
  * loaded host still gets the logo. A logo that keeps timing out at that
- * deadline is `VIGIL_SCENE_ERR_TOO_SLOW` for about an hour, so a spinning
- * logo costs two long deadlines an hour per size. Remember
+ * deadline a minute apart is `VIGIL_SCENE_ERR_TOO_SLOW` for about an hour,
+ * so a spinning logo costs a long deadline for each retry in its first
+ * minute and one more after it, then none for the hour. Remember
  * `VIGIL_SCENE_ERR_REFUSED` per logo, so a refused logo costs one call at
  * most, but never `VIGIL_SCENE_ERR_TIMEOUT`, `VIGIL_SCENE_ERR_TOO_SLOW` or
  * `VIGIL_SCENE_ERR_HELPER`: the first two may come from a loaded host and

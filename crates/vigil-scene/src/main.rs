@@ -418,9 +418,25 @@ fn layer_job(args: &Args) -> Result<Vec<u8>, Error> {
     .draw()
 }
 
+// Read before anything else in the command line, so a library of another
+// HELPER_ABI that sends an argument or a job this helper does not know
+// hears the version, not the argument.
+fn another_abi(argv: &[String]) -> Option<Error> {
+    let at = argv.iter().position(|a| a == "--abi")?;
+    let abi = argv.get(at + 1).map_or("", String::as_str);
+    (abi != HELPER_ABI.to_string()).then(|| {
+        Error::Helper(format!(
+            "this helper is version {HELPER_ABI}, the library {abi}"
+        ))
+    })
+}
+
 fn helper(job: &str, argv: &[String]) -> ExitCode {
     let run = || -> Result<(), Error> {
         close_inherited()?;
+        if let Some(e) = another_abi(argv) {
+            return Err(e);
+        }
         let allowed: &[&str] = match job {
             "mask" => &["format", "edge", "deadline-ms", "out-len", "abi"],
             _ => &[
@@ -436,12 +452,7 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
             ],
         };
         let args = Args::parse(argv, allowed).map_err(Error::Helper)?;
-        let abi = args.need("abi").map_err(Error::Helper)?;
-        if abi != HELPER_ABI.to_string() {
-            return Err(Error::Helper(format!(
-                "this helper is version {HELPER_ABI}, the library {abi}"
-            )));
-        }
+        args.need("abi").map_err(Error::Helper)?;
         let deadline = args
             .num::<u64>("deadline-ms")
             .map_err(Error::Helper)?
@@ -470,14 +481,16 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
     };
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            say_within(
-                &format!("vigil-scene: {e}"),
-                MAX_MESSAGE as usize - NOTICE_ROOM,
-            );
-            ExitCode::from(e.exit_code())
-        }
+        Err(e) => helper_failed(&e),
     }
+}
+
+fn helper_failed(e: &Error) -> ExitCode {
+    say_within(
+        &format!("vigil-scene: {e}"),
+        MAX_MESSAGE as usize - NOTICE_ROOM,
+    );
+    ExitCode::from(e.exit_code())
 }
 
 fn main() -> ExitCode {
@@ -491,6 +504,7 @@ fn main() -> ExitCode {
             vigil_log::out!("{USAGE}");
             return ExitCode::SUCCESS;
         }
+        _ if let Some(e) = another_abi(&argv) => return helper_failed(&e),
         _ => {
             vigil_log::say!(
                 "usage: vigil-scene render|spec|mask|layer ...; see vigil-scene --help"

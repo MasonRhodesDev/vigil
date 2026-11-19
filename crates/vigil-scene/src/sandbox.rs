@@ -75,7 +75,12 @@ pub fn confine(deadline: Duration, output: u64) -> Result<Option<String>, Error>
 /// `confine`, is the second layer. A panic or a fault once the filter is on
 /// is the input's doing, so it ends the process as a refusal or by its own
 /// signal, never by SIGSYS, which says the allowlist has a gap. A panic
-/// before then is the helper's own fault and exits 101.
+/// before then is the helper's own fault and exits 101, a `Helper` error. A
+/// fault before then also dies by its own signal, through std's handler
+/// before `die_of_faults` or by default after it, so the library reads it
+/// as a refusal although no byte of the logo has been parsed. The code up
+/// to here is safe Rust over argv and a bounded read, so such a fault is a
+/// bug in the helper or a dependency, not something a logo can cause.
 pub fn lock_down() -> Result<(), Error> {
     vigil_secret::die_of_faults()
         .map_err(|e| Error::Helper(format!("readying the helper to die of faults: {e}")))?;

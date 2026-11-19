@@ -50,8 +50,9 @@ macro_rules! installed_helper {
 /// logo does, a call returns within the deadline, plus the kernel's teardown
 /// of a killed helper and the copy of the result, and the caller's memory
 /// grows by the result alone. A logo and spec that time out at a striking
-/// deadline `TIMEOUTS_BEFORE_TOO_SLOW` times at one size class and layer are
-/// `Error::TooSlow` there for `TOO_SLOW_LASTS`.
+/// deadline `TIMEOUTS_BEFORE_TOO_SLOW` times at one size class and layer,
+/// each `STRIKES_APART` after the last, are `Error::TooSlow` there for
+/// `TOO_SLOW_LASTS`.
 #[derive(Debug, Clone)]
 pub struct Helper {
     path: PathBuf,
@@ -212,24 +213,7 @@ impl Helper {
         match status.map(|s| (s.code(), s.signal())) {
             Some((Some(0), _)) => {}
             Some((Some(code), _)) => return Err(Error::from_exit(code, message(&stderr))),
-            Some((None, Some(libc::SIGSYS))) => {
-                return Err(Error::Helper(
-                    "the helper's sandbox stopped it at a forbidden system call".into(),
-                ));
-            }
-            // The OOM killer sends SIGKILL, and the helper is single-threaded,
-            // so its CPU limit fires only after the wall deadline would have.
-            Some((None, Some(signal @ (libc::SIGKILL | libc::SIGXCPU)))) => {
-                return Err(Error::Helper(format!(
-                    "the helper was killed by signal {signal}, which says nothing about the logo"
-                )));
-            }
-            Some((None, signal)) => {
-                return Err(Error::Refused(format!(
-                    "the helper was killed by signal {}",
-                    signal.unwrap_or(0)
-                )));
-            }
+            Some((None, signal)) => return Err(killed_by(signal.unwrap_or(0))),
             None => {
                 let why = message(&stderr);
                 if !why.is_empty() {
@@ -250,6 +234,28 @@ impl Helper {
             ONCE.call_once(|| vigil_log::say!("vigil-scene: the helper says: {notice}"));
         }
         Ok(())
+    }
+}
+
+fn killed_by(signal: i32) -> Error {
+    match signal {
+        libc::SIGSYS => {
+            Error::Helper("the helper's sandbox stopped it at a forbidden system call".into())
+        }
+        // What drawing a logo can raise: a fault, an abort, a bad
+        // instruction or division, or the output size limit.
+        libc::SIGSEGV
+        | libc::SIGBUS
+        | libc::SIGABRT
+        | libc::SIGILL
+        | libc::SIGFPE
+        | libc::SIGXFSZ => Error::Refused(format!("the helper was killed by signal {signal}")),
+        // Among the rest, the OOM killer sends SIGKILL, a session teardown
+        // SIGTERM or SIGHUP, and the helper is single-threaded, so its CPU
+        // limit fires only after the wall deadline would have.
+        _ => Error::Helper(format!(
+            "the helper was killed by signal {signal}, which says nothing about the logo"
+        )),
     }
 }
 
@@ -302,4 +308,33 @@ fn message(stderr: &File) -> String {
         .trim()
         .trim_start_matches("vigil-scene: ")
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_signal_the_logo_can_raise_is_a_refusal() {
+        let refused = [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGABRT,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGXFSZ,
+        ];
+        for signal in 1..=libc::SIGRTMAX() {
+            let got = killed_by(signal);
+            assert_eq!(
+                matches!(got, Error::Refused(_)),
+                refused.contains(&signal),
+                "signal {signal}: {got:?}"
+            );
+            assert!(
+                matches!(got, Error::Refused(_) | Error::Helper(_)),
+                "signal {signal}: {got:?}"
+            );
+        }
+    }
 }

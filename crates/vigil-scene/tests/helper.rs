@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use vigil_scene::{
     DEFAULT_DEADLINE, Error, Format, HELPER_ABI, Helper, Layer, Logo, MAX_DEADLINE, MAX_EDGE,
-    Plate, Request, Scene,
+    Plate, Request, STRIKES_APART, Scene,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_vigil-scene");
@@ -502,6 +502,26 @@ fn a_library_of_the_last_protocol_hears_the_helper_version() {
 }
 
 #[test]
+fn a_newer_library_with_a_new_argument_hears_the_version_not_the_argument() {
+    for job in [&["mask", "--format", "svg", "--edge", "8"][..], &["sprite"]] {
+        let out = Command::new(BIN)
+            .args(job)
+            .args(["--future-flag", "x", "--deadline-ms", "1000"])
+            .args(["--abi", &(HELPER_ABI + 1).to_string()])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(14), "{job:?}: {said}");
+        assert!(
+            said.contains(&format!("this helper is version {HELPER_ABI}"))
+                && !said.contains("unknown argument"),
+            "{job:?}: {said}"
+        );
+    }
+}
+
+#[test]
 fn child_counts_no_timeout_at_a_brief_deadline() {
     if std::env::var_os(CHILD).is_none() {
         return;
@@ -644,7 +664,7 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
     let need = req.bytes().unwrap();
     type Expect = fn(&Error) -> bool;
     let crash = |e: &Error| matches!(e, Error::Refused(m) if m.contains("signal"));
-    let cases: [(&str, String, Expect); 12] = [
+    let cases: [(&str, String, Expect); 15] = [
         (
             "killed",
             "kill -9 $$".into(),
@@ -660,6 +680,17 @@ fn whatever_the_helper_does_the_caller_gets_pixels_or_an_error_in_time() {
         ("abort", "ulimit -c 0; kill -s ABRT $$".into(), crash),
         ("ill", "ulimit -c 0; kill -s ILL $$".into(), crash),
         ("fpe", "ulimit -c 0; kill -s FPE $$".into(), crash),
+        ("xfsz", "ulimit -c 0; kill -s XFSZ $$".into(), crash),
+        (
+            "terminated",
+            "kill -s TERM $$".into(),
+            |e| matches!(e, Error::Helper(m) if m.contains("signal 15")),
+        ),
+        (
+            "pipe",
+            "kill -s PIPE $$".into(),
+            |e| matches!(e, Error::Helper(m) if m.contains("signal 13")),
+        ),
         (
             "forbidden",
             "ulimit -c 0; kill -s SYS $$".into(),
@@ -727,6 +758,11 @@ fn child_finds_a_logo_too_slow_at_the_longest_deadline() {
         burst.into_iter().all(timeout),
         "an overlapping burst is one strike"
     );
+    assert!(
+        timeout(draw(&spin, &uhd)),
+        "a timeout right after a strike is the same slow moment"
+    );
+    std::thread::sleep(STRIKES_APART);
     assert!(too_slow(draw(&spin, &uhd)), "the second strike");
     let start = Instant::now();
     let missing = Helper::new("/nonexistent/vigil-scene", MAX_DEADLINE);

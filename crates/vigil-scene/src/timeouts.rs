@@ -10,13 +10,17 @@ use crate::{Error, Format, Request};
 
 /// How many timeouts at a striking deadline one logo and spec may cost at
 /// one size class and layer before the library answers `Error::TooSlow` for them,
-/// without running the helper. A timeout of a call that began before the
-/// last strike is the same slow moment and does not count again.
+/// without running the helper. A timeout of a call that began less than
+/// `STRIKES_APART` after the last strike ended is the same slow moment, such
+/// as a stall on resume that times out one output after another, and does
+/// not count again.
 pub const TIMEOUTS_BEFORE_TOO_SLOW: u32 = 2;
 /// The shortest deadline whose timeout counts as a strike. A timeout at a
 /// shorter one says only that the caller chose a short deadline.
 pub const STRIKING_DEADLINE: Duration =
     Duration::from_millis(MAX_DEADLINE.as_millis() as u64 * 9 / 10);
+/// How long after a strike ended the next timeout must start to count.
+pub const STRIKES_APART: Duration = Duration::from_secs(60);
 /// A strike this old no longer counts.
 pub const STRIKES_LAST: Duration = Duration::from_secs(10 * 60);
 /// How long a logo found too slow is skipped before the helper tries it again.
@@ -132,7 +136,9 @@ impl Table {
         if !entry.live(now) {
             *entry = fresh;
         }
-        if !entry.too_slow(now) && started >= entry.last {
+        if !entry.too_slow(now)
+            && (entry.strikes == 0 || started >= entry.last.saturating_add(STRIKES_APART))
+        {
             entry.strikes += 1;
             entry.last = now;
             if entry.strikes >= TIMEOUTS_BEFORE_TOO_SLOW {
@@ -225,19 +231,48 @@ mod tests {
         matches!(got, Err(Error::TooSlow(_)))
     }
 
+    // The second strike of a logo whose first began at 0.
+    const AGAIN: Duration = LONGEST.saturating_add(STRIKES_APART);
+
     #[test]
-    fn two_timeouts_at_the_longest_deadline_make_a_logo_too_slow() {
+    fn two_timeouts_at_the_longest_deadline_a_minute_apart_make_a_logo_too_slow() {
         let mut t = Table::default();
         assert!(is_timeout(time_out(&mut t, logo(1), LONGEST, secs(0))));
-        assert!(is_too_slow(time_out(&mut t, logo(1), LONGEST, secs(10))));
+        assert!(is_too_slow(time_out(&mut t, logo(1), LONGEST, AGAIN)));
         assert!(
-            is_too_slow(t.check(logo(1), secs(20))),
+            is_too_slow(t.check(logo(1), AGAIN + secs(10))),
             "skipped without a run"
         );
         assert!(
-            t.check(logo(2), secs(20)).is_ok(),
+            t.check(logo(2), AGAIN + secs(10)).is_ok(),
             "another logo is its own"
         );
+    }
+
+    #[test]
+    fn a_stall_across_two_outputs_after_resume_is_one_strike() {
+        let mut t = Table::default();
+        let brief_then_longest = |t: &mut Table, at: Duration| {
+            assert!(is_timeout(time_out(t, logo(1), BRIEF, at)));
+            time_out(t, logo(1), LONGEST, at + BRIEF)
+        };
+        assert!(is_timeout(brief_then_longest(&mut t, secs(0))), "output A");
+        let b = BRIEF + LONGEST + Duration::from_millis(10);
+        assert!(is_timeout(brief_then_longest(&mut t, b)), "output B");
+        assert!(t.check(logo(1), b + secs(6)).is_ok(), "still tried");
+    }
+
+    #[test]
+    fn a_slow_logo_retried_within_the_gap_is_still_marked_after_it() {
+        let mut t = Table::default();
+        assert!(is_timeout(time_out(&mut t, logo(1), LONGEST, secs(0))));
+        for at in [10, 30, 50, 64] {
+            assert!(
+                is_timeout(time_out(&mut t, logo(1), LONGEST, secs(at))),
+                "{at} s is within the gap"
+            );
+        }
+        assert!(is_too_slow(time_out(&mut t, logo(1), LONGEST, AGAIN)));
     }
 
     #[test]
@@ -284,12 +319,17 @@ mod tests {
             Key::new(&[b"svg", b"x"], 7680 * 4320),
         );
         assert!(is_timeout(time_out(&mut t, huge, LONGEST, secs(0))));
-        assert!(is_too_slow(time_out(&mut t, huge, LONGEST, secs(10))));
+        assert!(is_too_slow(time_out(&mut t, huge, LONGEST, AGAIN)));
         assert!(
-            t.check(small, secs(20)).is_ok(),
+            t.check(small, AGAIN + secs(10)).is_ok(),
             "the 8K strikes spare 1080p"
         );
-        assert!(is_timeout(time_out(&mut t, small, LONGEST, secs(20))));
+        assert!(is_timeout(time_out(
+            &mut t,
+            small,
+            LONGEST,
+            AGAIN + secs(10)
+        )));
     }
 
     #[test]
@@ -304,11 +344,11 @@ mod tests {
         t.settle(small, LONGEST, secs(10), secs(11), Ok(()))
             .unwrap();
         assert!(
-            is_timeout(time_out(&mut t, small, LONGEST, secs(20))),
+            is_timeout(time_out(&mut t, small, LONGEST, AGAIN)),
             "cleared"
         );
         assert!(
-            is_too_slow(time_out(&mut t, huge, LONGEST, secs(20))),
+            is_too_slow(time_out(&mut t, huge, LONGEST, AGAIN)),
             "not cleared"
         );
     }
@@ -328,7 +368,9 @@ mod tests {
                 timeout()
             )));
         }
-        assert!(is_too_slow(time_out(&mut t, logo(1), LONGEST, secs(8))));
+        assert!(is_timeout(time_out(&mut t, logo(1), LONGEST, secs(8))));
+        let again = secs(5) + STRIKES_APART;
+        assert!(is_too_slow(time_out(&mut t, logo(1), LONGEST, again)));
     }
 
     #[test]
@@ -341,7 +383,7 @@ mod tests {
             &mut t,
             logo(1),
             LONGEST,
-            later + secs(60)
+            later + AGAIN
         )));
     }
 
@@ -349,8 +391,8 @@ mod tests {
     fn a_logo_found_too_slow_is_tried_again_after_an_hour() {
         let mut t = Table::default();
         assert!(is_timeout(time_out(&mut t, logo(1), LONGEST, secs(0))));
-        assert!(is_too_slow(time_out(&mut t, logo(1), LONGEST, secs(10))));
-        let found = secs(15);
+        assert!(is_too_slow(time_out(&mut t, logo(1), LONGEST, AGAIN)));
+        let found = AGAIN + LONGEST;
         assert!(is_too_slow(
             t.check(logo(1), found + TOO_SLOW_LASTS - secs(1))
         ));
@@ -367,19 +409,22 @@ mod tests {
         let mut t = Table::default();
         for n in 0..8 {
             assert!(is_timeout(time_out(&mut t, logo(n), LONGEST, secs(0))));
-            assert!(is_too_slow(time_out(&mut t, logo(n), LONGEST, secs(10))));
+            assert!(is_too_slow(time_out(&mut t, logo(n), LONGEST, AGAIN)));
         }
         for n in 8..=REMEMBERED as u8 + 8 {
             assert!(is_timeout(time_out(
                 &mut t,
                 logo(n),
                 LONGEST,
-                secs(20 + u64::from(n))
+                AGAIN + secs(10 + u64::from(n))
             )));
         }
         assert!(t.entries.len() <= REMEMBERED);
         for n in 0..8 {
-            assert!(is_too_slow(t.check(logo(n), secs(200))), "logo {n} kept");
+            assert!(
+                is_too_slow(t.check(logo(n), AGAIN + secs(200))),
+                "logo {n} kept"
+            );
         }
     }
 
