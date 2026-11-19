@@ -1,0 +1,35 @@
+name: Gate guard
+
+# pull_request_target runs this file and the gate script from the base branch,
+# so a pull request cannot change the check that judges it.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: gate-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GATE_PR: ${{ github.event.pull_request.number }}
+          GATE_HEAD: ${{ github.event.pull_request.head.sha }}
+        # the pull request's commits are fetched and compared as data, and never checked out or run
+        run: |
+          git fetch --no-tags origin "$GATE_HEAD"
+          python3 -I tests/gates/gate.py guard --base HEAD

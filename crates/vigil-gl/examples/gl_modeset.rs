@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;

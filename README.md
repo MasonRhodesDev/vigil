@@ -153,22 +153,43 @@ vigil handles passwords, so CI rejects unsafe patterns instead of trusting
 review to catch them. `tests/check.sh` runs the checks of CI's check job in
 the same order, so a failure shows up before a push.
 
-- **Unsafe code.** The workspace denies `unsafe_code`. Crates with no unsafe
-  forbid it, and the rest allow it only on named FFI and OS items, with a
-  `// SAFETY:` line on every unsafe block. `tests/check-unsafe-fence.sh` pins
-  the count in each file to `tests/unsafe-baseline.txt` and fails a pull
-  request whose totals exceed the base branch's. After removing unsafe code,
-  run `./tests/check-unsafe-fence.sh --write` and commit the smaller baseline.
+- **Fence.** `python3 -I tests/gates/gate.py fence` reads every file under
+  `crates/` and counts, per file, the word `unsafe` (comments included), the
+  word `expose`, and each `allow`, `expect` or `warn` that names an unsafe
+  lint, a clippy lint or `warnings`. `tests/gates/baseline.tsv` records those
+  counts per file. A count above its row, or a file with no row, fails. After
+  removing some, run `python3 -I tests/gates/gate.py fence --update` and
+  commit the smaller baseline.
+- **Rejected outright.** `include!`, `#[path]`, build scripts, proc-macro
+  crates, a `cfg` on `clippy`, `unsafe` inside `macro_rules!`, a symlink under
+  `crates/`, any `clippy.toml`, `.cargo/` or `rust-toolchain` file except the
+  root `clippy.toml`, a crate that does not take `[lints] workspace = true`,
+  and a workspace lint below `deny`. Line 1 of every crate root, examples and
+  tests included, is `#![forbid(unsafe_code)]`, or `#![deny(unsafe_code)]`
+  when its module tree holds fenced unsafe code.
+- **Canary.** `crates/vigil-secret/examples/lint_canary.rs` breaks every
+  unsafe and plaintext rule. `gate.py canary` runs clippy on it and fails
+  unless each lint still rejects it, so drift in the lint configuration fails
+  loudly.
 - **Credentials.** Typed text travels as `vigil_secret::Secret`, which wipes
-  itself on drop and never prints. `clippy.toml` disallows `Secret::expose`.
-  The few adapters that hand plaintext to greetd or PAM carry
-  `#[expect(clippy::disallowed_methods)]` and count in the same baseline.
+  itself on drop and never prints. `clippy.toml` disallows `Secret::expose`,
+  and `crates/vigil-secret/tests/api.rs` fails to compile if `Secret` gains a
+  trait that hands out its text. The few adapters that hand plaintext to
+  greetd or PAM carry `#[expect(clippy::disallowed_methods)]`.
 - **Process.** The greeter and the locker start by setting `RLIMIT_CORE` to 0
   and clearing `PR_SET_DUMPABLE`, which keeps their memory out of core dumps
-  and away from same-user ptrace.
-- **Dependencies.** Every advisory ignore in `deny.toml` starts its reason
-  with `expires YYYY-MM-DD:`, at most 183 days out.
-  `tests/check-advisory-expiry.sh` fails once that date passes.
+  and away from same-user ptrace. A panic on any thread but the main one
+  aborts the process, so a dead worker cannot leave a live locker that no
+  longer authenticates.
+- **Dependencies.** `gate.py advisories` parses `deny.toml` and requires every
+  advisory ignore to be a table with an `id` and a reason that starts
+  `expires YYYY-MM-DD:`, at most 183 days out.
+- **Who judges.** On a pull request, CI runs the base branch's copy of the
+  gates against the pull request, then the pull request's own copy. The
+  `Gate guard` workflow runs from the base branch and fails a pull request
+  that changes a gate, the workflows, `Cargo.toml`, `clippy.toml`,
+  `deny.toml`, the `Secret` crate, or grows a baseline row, unless the
+  repository owner added the `owner-approved` label after the last push.
 
 ## License
 

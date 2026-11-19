@@ -11,5 +11,15 @@ repository.workspace = true
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 
+[dev-dependencies]
+serde.workspace = true
+
+[features]
+lint-canary = []
+
+[[example]]
+name = "lint_canary"
+required-features = ["lint-canary"]
+
 [lints]
 workspace = true

@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
