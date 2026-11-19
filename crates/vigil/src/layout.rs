@@ -143,10 +143,8 @@ impl Row {
                 .spans
                 .iter()
                 .map(|span| (span.x + span.width, span.y))
-                .fold(
-                    (0.0, 0.0),
-                    |best, edge| if edge.0 > best.0 { edge } else { best },
-                );
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .unwrap_or((0.0, 0.0));
             row.spans
                 .push(Span::sized(output, Placed::Auto, right.ceil(), top));
         }
@@ -389,6 +387,15 @@ mod tests {
             listed(2, "OUT-O", (0, 0), (1920, 1080)),
         ]);
         assert_eq!(above.home(), Some(OutputId(2)));
+    }
+
+    #[test]
+    fn an_unlisted_output_stays_level_with_a_profile_left_of_the_origin() {
+        let row = Row::place(&[
+            listed(1, "OUT-L", (-1920, -1200), (1920, 1080)),
+            unlisted(2, "OUT-Z", (1920, 1080)),
+        ]);
+        assert_eq!(row.locate(0.0, -1200.0), hit(2, 0.0, 0.0));
     }
 
     #[test]

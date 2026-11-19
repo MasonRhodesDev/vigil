@@ -66,6 +66,7 @@ pub struct AuthMachine {
     answered: bool,
     typed: bool,
     stage: String,
+    stage_key: String,
 }
 
 impl AuthMachine {
@@ -88,6 +89,7 @@ impl AuthMachine {
             answered: false,
             typed: false,
             stage: String::new(),
+            stage_key: String::new(),
         })
     }
 
@@ -126,20 +128,23 @@ impl AuthMachine {
 
     fn log_stage(&mut self, user: &str, prompt: &str, secret: bool) {
         let kind = if secret { "secret" } else { "visible" };
-        let shown = if self.typed && prompt != RETRY_PROMPT {
-            format!("<{} chars>", prompt.chars().count())
+        let key = format!("user={user} prompt={prompt:?} {kind}");
+        if key == self.stage_key {
+            return;
+        }
+        let shown = if self.typed && prompt != RETRY_PROMPT && prompt != USERNAME_PROMPT {
+            "<hidden>".to_owned()
         } else {
             format!("{prompt:?}")
         };
-        let stage = format!("user={user} prompt={shown} {kind}");
-        if stage != self.stage {
-            eprintln!("vigil: auth stage {stage}");
-            self.stage = stage;
-        }
+        self.stage = format!("user={user} prompt={shown} {kind}");
+        self.stage_key = key;
+        eprintln!("vigil: auth stage {}", self.stage);
     }
 
     fn show_error(&mut self, ui: &mut dyn AuthUi, description: &str) -> String {
         self.stage.clear();
+        self.stage_key.clear();
         show_greetd_error(ui, description)
     }
 
@@ -180,12 +185,15 @@ impl AuthMachine {
     }
 
     fn prompt_username(&mut self, ui: &mut dyn AuthUi) {
+        self.typed = false;
+        ui.reset_input();
         ui.show_prompt(USERNAME_PROMPT, false);
         self.state = State::AwaitingUser;
         self.log_stage("<none>", USERNAME_PROMPT, false);
     }
 
     fn await_retry(&mut self, ui: &mut dyn AuthUi, error: &str) {
+        ui.reset_input();
         ui.show_prompt(RETRY_PROMPT, true);
         ui.show_error(error);
         self.state = State::AwaitingRetry;
@@ -211,6 +219,7 @@ impl AuthMachine {
         if self.state == State::Complete {
             return Err(AuthError("session has already started".into()));
         }
+        ui.reset_input();
         if self.state == State::AwaitingPrompt {
             self.cancel(ui)?;
         }
@@ -1148,7 +1157,7 @@ mod tests {
         let _ = machine.begin(None, &mut ui);
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
         assert!(!machine.stage().contains("hunter2"), "{}", machine.stage());
-        assert_eq!(machine.stage(), "user=<typed> prompt=<19 chars> secret");
+        assert_eq!(machine.stage(), "user=<typed> prompt=<hidden> secret");
     }
 
     #[test]
@@ -1167,7 +1176,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let _ = machine.begin(None, &mut ui);
         let _ = machine.handle(UiMessage::Respond("hunter2".into()), &mut ui);
-        assert_eq!(machine.stage(), "user=<typed> prompt=<9 chars> secret");
+        assert_eq!(machine.stage(), "user=<typed> prompt=<hidden> secret");
         let _ = machine.handle(UiMessage::Respond("again".into()), &mut ui);
         assert_eq!(
             machine.stage(),

@@ -261,6 +261,11 @@ impl AuthUi for FanUi<'_> {
             e.window.show_prompt(text, secret);
         }
     }
+    fn reset_input(&mut self) {
+        for e in self.entries.iter_mut() {
+            e.window.reset_input();
+        }
+    }
     fn show_info(&mut self, text: &str) {
         self.snapshot.info = text.to_owned();
         for e in self.entries.iter_mut() {
