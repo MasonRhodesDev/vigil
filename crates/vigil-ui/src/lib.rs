@@ -172,7 +172,13 @@ pub struct OutputWindow {
     focus: Focus,
     held: u8,
     down: Option<u32>,
+    reveal_timer: slint::Timer,
+    reveal_idle: Duration,
 }
+
+// Long enough to read back a typed password, short enough that a shown one
+// does not stay on an unattended screen. Any key or click restarts it.
+pub const REVEAL_IDLE: Duration = Duration::from_secs(10);
 
 pub struct SoftwareBackend {
     shadow: Vec<u8>,
@@ -231,6 +237,8 @@ impl OutputWindow {
             focus: Focus::default(),
             held: 0,
             down: None,
+            reveal_timer: slint::Timer::default(),
+            reveal_idle: REVEAL_IDLE,
         };
         window.publish_focus();
         Ok(window)
@@ -288,6 +296,8 @@ impl OutputWindow {
             focus: Focus::default(),
             held: 0,
             down: None,
+            reveal_timer: slint::Timer::default(),
+            reveal_idle: REVEAL_IDLE,
         };
         window.publish_focus();
         Ok(window)
@@ -390,6 +400,24 @@ impl OutputWindow {
     pub fn field_focused(&self) -> bool {
         self.card()
             .is_none_or(|card| self.focus.settle(&card).stop == Stop::Field)
+    }
+
+    pub fn set_reveal_idle(&mut self, idle: Duration) {
+        self.reveal_idle = idle;
+    }
+
+    fn watch_reveal(&self) {
+        if !matches!(self.component.get_property("reveal"), Ok(Value::Bool(true))) {
+            self.reveal_timer.stop();
+            return;
+        }
+        let component = self.component.as_weak();
+        self.reveal_timer
+            .start(slint::TimerMode::SingleShot, self.reveal_idle, move || {
+                if let Some(component) = component.upgrade() {
+                    let _ = component.set_property("reveal", Value::Bool(false));
+                }
+            });
     }
 
     fn hide_password(&self) {
@@ -610,12 +638,16 @@ impl OutputWindow {
                     WindowEvent::PointerReleased { position, button }
                 };
                 window.dispatch_event(event);
+                self.watch_reveal();
             }
             InputEvent::Key {
                 keysym,
                 utf8,
                 pressed,
-            } => self.key(keysym, utf8, pressed),
+            } => {
+                self.key(keysym, utf8, pressed);
+                self.watch_reveal();
+            }
         }
     }
 
