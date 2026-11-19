@@ -1,12 +1,12 @@
 use std::ptr::NonNull;
 
-use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
+use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneDamageClips, PlaneState};
 use smithay::reexports::drm::buffer::{Buffer as _, DrmFourcc};
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
 use smithay::reexports::drm::control::{Device as ControlDevice, framebuffer};
 use smithay::reexports::rustix;
 use smithay::utils::{Rectangle, Transform};
-use vigil_core::{BufferDamage, Canvas, FrameTarget, PresentError, Presenter};
+use vigil_core::{BufferDamage, Canvas, Damage, FrameTarget, PresentError, Presenter};
 
 const BPP: u32 = 32;
 const DEPTH: u32 = 24;
@@ -120,7 +120,35 @@ impl DumbBufferPresenter {
         })
     }
 
-    fn plane_state(&self, fb: framebuffer::Handle) -> PlaneState<'_> {
+    fn damage_clips(&self) -> Option<PlaneDamageClips> {
+        let shown = self.damage.behind(self.back ^ 1);
+        if *shown == Damage::Full {
+            return None;
+        }
+        let rects = shown
+            .rects(self.width, self.height)
+            .into_iter()
+            .map(|rect| {
+                Rectangle::new(
+                    (rect.x as i32, rect.y as i32).into(),
+                    (rect.w as i32, rect.h as i32).into(),
+                )
+            });
+        PlaneDamageClips::from_damage(
+            self.surface.device_fd(),
+            Rectangle::from_size((self.width as f64, self.height as f64).into()),
+            Rectangle::from_size((self.width as i32, self.height as i32).into()),
+            rects,
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn plane_state<'a>(
+        &self,
+        fb: framebuffer::Handle,
+        clips: Option<&'a PlaneDamageClips>,
+    ) -> PlaneState<'a> {
         PlaneState {
             handle: self.surface.plane(),
             config: Some(PlaneConfig {
@@ -128,7 +156,7 @@ impl DumbBufferPresenter {
                 dst: Rectangle::from_size((self.width as i32, self.height as i32).into()),
                 transform: Transform::Normal,
                 alpha: 1.0,
-                damage_clips: None,
+                damage_clips: clips.map(PlaneDamageClips::blob),
                 fb,
                 fence: None,
             }),
@@ -196,7 +224,8 @@ impl Presenter for DumbBufferPresenter {
             return Ok(false);
         }
         let fb = self.slots[self.back].fb;
-        let state = self.plane_state(fb);
+        let clips = self.modeset_done.then(|| self.damage_clips()).flatten();
+        let state = self.plane_state(fb, clips.as_ref());
         let result = if self.modeset_done {
             self.surface.page_flip([state], true)
         } else {
