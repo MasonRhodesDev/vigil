@@ -609,6 +609,14 @@ mod tests {
         thread: Option<thread::JoinHandle<()>>,
     }
 
+    fn skip(error: &std::io::Error) -> Option<FakeServer> {
+        assert!(
+            env::var_os("CI").is_none(),
+            "unix sockets are refused, so this test would pass without running: {error}"
+        );
+        None
+    }
+
     impl FakeServer {
         fn spawn(script: impl FnOnce(&mut UnixStream) + Send + 'static) -> Option<Self> {
             let id = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
@@ -626,7 +634,7 @@ mod tests {
             if let Err(error) = probe {
                 fs::remove_dir_all(&dir).unwrap();
                 if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    return None;
+                    return skip(&error);
                 }
                 panic!("probe fake greetd socket: {error}");
             }
@@ -636,7 +644,7 @@ mod tests {
                 Ok(listener) => listener,
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                     fs::remove_dir_all(&dir).unwrap();
-                    return None;
+                    return skip(&error);
                 }
                 Err(error) => panic!("bind fake greetd socket: {error}"),
             };
