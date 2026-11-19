@@ -145,8 +145,9 @@ two-tone ring marks the focused control once you press Tab. Arrow keys
 inside the field keep editing the text, so they never switch users.
 Picking a user or a session by keyboard is the same local change as a
 click. No PAM conversation opens until you press Enter in the field,
-with one exception. A user whose last sign-in asked no question signs
-in as soon as you pick them, by key or by click.
+with one exception. Picking a user whose last sign-in asked no question
+opens their sign-in at once, by key or by click. If PAM again asks
+nothing, that user is signed in.
 
 Enter, keypad Enter and Esc act once per press. Holding a key on a
 control acts once, so key repeat never cycles through users and never
