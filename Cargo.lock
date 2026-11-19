@@ -5127,6 +5127,7 @@ dependencies = [
  "image",
  "libc",
  "monitor-profiles",
+ "rustix 1.1.5",
  "singleton-guard",
  "slint-idle-runtime",
  "span-lines",

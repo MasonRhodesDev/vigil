@@ -1314,14 +1314,34 @@ fn exit_on_panic() {
             .location()
             .map(|at| format!("{}:{}", at.file(), at.line()))
             .unwrap_or_default();
-        eprintln!("vigil-lock: panic at {place}; exiting");
+        let _ = writeln!(std::io::stderr(), "vigil-lock: panic at {place}; exiting");
         unsafe { libc::_exit(101) };
     }));
+}
+
+// RLIMIT_CORE survives exec but PR_SET_DUMPABLE resets on it, so every exec'd binary calls this itself.
+fn deny_memory_dumps() -> std::io::Result<()> {
+    use rustix::process::{DumpableBehavior, Resource, Rlimit, set_dumpable_behavior, setrlimit};
+    let core = setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    );
+    let dumpable = set_dumpable_behavior(DumpableBehavior::NotDumpable);
+    core.and(dumpable).map_err(std::io::Error::from)
 }
 
 fn main() {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
+    if let Err(e) = deny_memory_dumps() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "vigil-lock: could not keep memory out of core dumps: {e}"
+        );
+    }
     exit_on_panic();
     tracing_subscriber::registry()
         .with(span_lines::tracing_layer::install(&["vigil"]))
@@ -1622,6 +1642,29 @@ mod tests {
             !stderr.contains("hunter") && !stderr.contains('\u{e9}'),
             "the report names no text the panic was holding: {stderr}"
         );
+    }
+
+    #[test]
+    fn the_lock_keeps_its_memory_out_of_core_dumps() {
+        if std::env::var_os("VIGIL_LOCK_DUMP_PROBE").is_some() {
+            deny_memory_dumps().unwrap();
+            let core = rustix::process::getrlimit(rustix::process::Resource::Core);
+            let dumpable = rustix::process::dumpable_behavior().unwrap();
+            let denied = (core.current, core.maximum) == (Some(0), Some(0))
+                && dumpable == rustix::process::DumpableBehavior::NotDumpable;
+            std::process::exit(if denied { 0 } else { 3 });
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::the_lock_keeps_its_memory_out_of_core_dumps",
+                "--test-threads=1",
+            ])
+            .env("VIGIL_LOCK_DUMP_PROBE", "1")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "no core limit, not dumpable");
     }
 
     #[test]
