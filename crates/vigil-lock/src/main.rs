@@ -1289,7 +1289,7 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
                             waker.wake();
                         }
                     }
-                    // Left unanswered: this client's exit closes the stream,
+                    // Never answered. This client's exit closes the stream,
                     // and the joiner then takes the singleton and locks afresh.
                     Hold::Releasing => state.joiners.push(stream),
                 }

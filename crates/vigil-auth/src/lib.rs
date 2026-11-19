@@ -293,8 +293,8 @@ impl AuthMachine {
         if self.unprompted.as_deref() == Some(user) {
             eprintln!("vigil: auth unasked user={}", self.logged_user());
             ui.reset_input();
-            // A failed open must not leave the previous user's field up:
-            // the next submit is matched against this user's question.
+            // The next submit is matched against this user's question, so a
+            // failed open must not leave the previous user's field up.
             return self.open(None, ui).inspect_err(|_| self.offer(ui));
         }
         self.offer(ui);

@@ -50,7 +50,7 @@ CFG=$WORK/vigil.toml
 : >"$CFG"
 
 # sway runs a plain binding only while the session is unlocked and a
-# --locked binding always: F9 is the canary, F10 proves the key arrived.
+# --locked binding always. F9 is the canary, F10 proves the key arrived.
 cat >"$WORK/sway.cfg" <<EOF
 xwayland disable
 default_border none
