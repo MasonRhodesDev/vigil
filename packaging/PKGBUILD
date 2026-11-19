@@ -26,6 +26,9 @@ build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release --workspace
+  # check() rebuilds the C ABI library with a test helper path, so package()
+  # only ever reads this copy.
+  install -Dm755 target/release/libvigil_scene_ffi.so "$srcdir/ffi/libvigil_scene_ffi.so"
 }
 
 check() {
@@ -37,10 +40,15 @@ check() {
 package() {
   cd "$pkgname-$pkgver"
 
+  # Debug info names the source tree, so only the target dir, where the
+  # test helper lives, is forbidden.
+  packaging/check-ffi-helper-path "$srcdir/ffi/libvigil_scene_ffi.so" "$PWD/target"
+
   install -Dm755 target/release/vigil "$pkgdir/usr/bin/vigil"
   install -Dm755 target/release/vigil-lock "$pkgdir/usr/bin/vigil-lock"
   install -Dm755 target/release/vigil-sim "$pkgdir/usr/bin/vigil-sim"
 
+  install -Dm755 target/release/vigil-scene "$pkgdir/usr/lib/vigil/vigil-scene"
   install -Dm755 dist/setup-greetd "$pkgdir/usr/lib/vigil/setup-greetd"
   install -Dm644 dist/vigil.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/vigil.conf"
   install -Dm644 dist/vigil-lock.pam "$pkgdir/etc/pam.d/vigil-lock"

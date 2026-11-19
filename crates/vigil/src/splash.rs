@@ -4,6 +4,8 @@ use font8x8::{BASIC_FONTS, UnicodeFonts};
 use vigil_config::Splash as SplashConfig;
 use vigil_core::{FrameTarget, scene_to_panel};
 
+use vigil_scene::{DEFAULT_DEADLINE, Helper, Plate, read_logo};
+
 use crate::scene::{Scene, ease};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,23 +41,9 @@ pub fn resolve_scene(cfg: &SplashConfig) -> Scene {
     scene
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Rect {
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-}
-
 pub struct Splash {
-    panel: (u32, u32),
-    ground: [u8; 3],
-    accent: [u8; 3],
-    mark: [u8; 3],
+    plate: Plate,
     rest: Vec<u8>,
-    glow_rect: Rect,
-    glow_alpha: Vec<u8>,
-    mark_alpha: Vec<u8>,
 }
 
 fn put(buf: &mut [u8], stride: usize, x: usize, y: usize, rgb: [u8; 3]) {
@@ -66,314 +54,56 @@ fn put(buf: &mut [u8], stride: usize, x: usize, y: usize, rgb: [u8; 3]) {
     buf[o + 3] = 0xff;
 }
 
-fn mask(path: &std::path::Path, edge: u32) -> Result<Vec<u8>, String> {
-    let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    let is_svg = path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
-    let mut alpha = if is_svg {
-        let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default())
-            .map_err(|e| e.to_string())?;
-        let size = tree.size();
-        let s = edge as f32 / size.width().max(size.height());
-        let ox = (edge as f32 - size.width() * s) / 2.0;
-        let oy = (edge as f32 - size.height() * s) / 2.0;
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(edge, edge).ok_or("empty logo box")?;
-        resvg::render(
-            &tree,
-            resvg::tiny_skia::Transform::from_row(s, 0.0, 0.0, s, ox, oy),
-            &mut pixmap.as_mut(),
-        );
-        let (pixels, _partial) = pixmap.data().as_chunks::<4>();
-        pixels.iter().map(|p| p[3]).collect::<Vec<u8>>()
-    } else {
-        let img = image::load_from_memory(&data)
-            .map_err(|e| e.to_string())?
-            .into_rgba8();
-        let ratio = (f64::from(edge) / f64::from(img.width().max(img.height()))).min(f64::MAX);
-        let (w, h) = (
-            ((f64::from(img.width()) * ratio).round() as u32).max(1),
-            ((f64::from(img.height()) * ratio).round() as u32).max(1),
-        );
-        let img = if (w, h) == img.dimensions() {
-            img
-        } else {
-            image::imageops::resize(&img, w, h, image::imageops::FilterType::Lanczos3)
-        };
-        let mut out = vec![0u8; (edge * edge) as usize];
-        let (ox, oy) = ((edge - w.min(edge)) / 2, (edge - h.min(edge)) / 2);
-        for (x, y, p) in img.enumerate_pixels() {
-            if x < edge && y < edge && ox + x < edge && oy + y < edge {
-                out[((oy + y) * edge + ox + x) as usize] = p[3];
-            }
-        }
-        out
-    };
-    drop_specks(&mut alpha, edge as usize, edge as usize, 0.02);
-    Ok(alpha)
-}
-
-fn drop_specks(alpha: &mut [u8], w: usize, h: usize, keep: f64) {
-    let mut seen = vec![false; w * h];
-    let mut shapes: Vec<Vec<usize>> = Vec::new();
-    for start in 0..w * h {
-        if alpha[start] == 0 || seen[start] {
-            continue;
-        }
-        let mut pts = Vec::new();
-        let mut stack = vec![start];
-        seen[start] = true;
-        while let Some(i) = stack.pop() {
-            pts.push(i);
-            let (x, y) = (i % w, i / w);
-            let mut visit = |n: usize| {
-                if alpha[n] != 0 && !seen[n] {
-                    seen[n] = true;
-                    stack.push(n);
-                }
-            };
-            if x + 1 < w {
-                visit(i + 1);
-            }
-            if x > 0 {
-                visit(i - 1);
-            }
-            if y + 1 < h {
-                visit(i + w);
-            }
-            if y > 0 {
-                visit(i - w);
-            }
-        }
-        shapes.push(pts);
-    }
-    let biggest = shapes.iter().map(Vec::len).max().unwrap_or(0) as f64;
-    for shape in shapes.iter().filter(|s| (s.len() as f64) < keep * biggest) {
-        for &i in shape {
-            alpha[i] = 0;
-        }
-    }
-}
-
-fn blur(src: &[u8], w: usize, h: usize, sigma: f64) -> Vec<u8> {
-    if sigma < 0.3 {
-        return src.to_vec();
-    }
-    let radius = (sigma * 3.0).ceil() as i64;
-    let mut k: Vec<f64> = (-radius..=radius)
-        .map(|i| (-(i * i) as f64 / (2.0 * sigma * sigma)).exp())
-        .collect();
-    let total: f64 = k.iter().sum();
-    k.iter_mut().for_each(|v| *v /= total);
-    let mut tmp = vec![0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0.0;
-            for (j, kv) in k.iter().enumerate() {
-                let sx = (x as i64 + j as i64 - radius).clamp(0, w as i64 - 1) as usize;
-                acc += kv * f64::from(src[y * w + sx]);
-            }
-            tmp[y * w + x] = acc as f32;
-        }
-    }
-    let mut out = vec![0u8; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0.0;
-            for (j, kv) in k.iter().enumerate() {
-                let sy = (y as i64 + j as i64 - radius).clamp(0, h as i64 - 1) as usize;
-                acc += kv * f64::from(tmp[sy * w + x]);
-            }
-            out[y * w + x] = acc.round().clamp(0.0, 255.0) as u8;
-        }
-    }
-    out
-}
-
-fn shrink(src: &[u8], n: usize, f: usize) -> (Vec<u8>, usize) {
-    let q = n.div_ceil(f);
-    let mut out = vec![0u8; q * q];
-    for qy in 0..q {
-        for qx in 0..q {
-            let (mut sum, mut cnt) = (0u32, 0u32);
-            for y in qy * f..((qy + 1) * f).min(n) {
-                for x in qx * f..((qx + 1) * f).min(n) {
-                    sum += u32::from(src[y * n + x]);
-                    cnt += 1;
-                }
-            }
-            out[qy * q + qx] = (sum / cnt.max(1)) as u8;
-        }
-    }
-    (out, q)
-}
-
-fn enlarge(src: &[u8], q: usize, n: usize) -> Vec<u8> {
-    let mut out = vec![0u8; n * n];
-    let scale = q as f64 / n as f64;
-    for y in 0..n {
-        let fy = ((y as f64 + 0.5) * scale - 0.5).clamp(0.0, (q - 1) as f64);
-        let (y0, ty) = (fy.floor() as usize, fy.fract());
-        let y1 = (y0 + 1).min(q - 1);
-        for x in 0..n {
-            let fx = ((x as f64 + 0.5) * scale - 0.5).clamp(0.0, (q - 1) as f64);
-            let (x0, tx) = (fx.floor() as usize, fx.fract());
-            let x1 = (x0 + 1).min(q - 1);
-            let at = |xx: usize, yy: usize| f64::from(src[yy * q + xx]);
-            let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
-            let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
-            out[y * n + x] = (top + (bottom - top) * ty).round() as u8;
-        }
-    }
-    out
-}
-
-const GLOW_DOWN: usize = 4;
-
-fn glow_mask(logo: &[u8], edge: usize, ge: usize, sigma: f64) -> Vec<u8> {
-    let mut big = vec![0u8; ge * ge];
-    let off = ge.saturating_sub(edge) / 2;
-    for y in 0..edge.min(ge) {
-        for x in 0..edge.min(ge) {
-            big[(y + off) * ge + x + off] = logo[y * edge + x];
-        }
-    }
-    let (small, q) = shrink(&big, ge, GLOW_DOWN);
-    let blurred = blur(&small, q, q, sigma / GLOW_DOWN as f64);
-    enlarge(&blurred, q, ge)
-}
-
 impl Splash {
     pub fn new(cfg: &SplashConfig, spec: &Scene, scene: (u32, u32), transform: u8) -> Self {
-        let transform = transform % 4;
-        let (sw, sh) = (scene.0 as usize, scene.1 as usize);
-        let (pw, ph) = if transform % 2 == 1 {
-            (sh, sw)
-        } else {
-            (sw, sh)
-        };
-        let g = spec.geometry(scene.0, scene.1);
-        let (edge, ge) = (g.logo as usize, g.glow as usize);
+        let helper = Helper::new(vigil_scene::installed_helper!(), DEFAULT_DEADLINE);
+        Self::with_helper(cfg, spec, scene, transform, &helper)
+    }
 
-        let logo = match cfg.logo.as_ref().filter(|p| !p.as_os_str().is_empty()) {
-            Some(path) => match mask(path, g.logo) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    vigil_log::say!("vigil: splash logo {}: {e}", path.display());
-                    None
-                }
-            },
-            None => None,
-        };
-        let sigma = f64::from(g.logo / spec.glow_blur_div);
-        let glow = logo
+    pub fn with_helper(
+        cfg: &SplashConfig,
+        spec: &Scene,
+        scene: (u32, u32),
+        transform: u8,
+        helper: &Helper,
+    ) -> Self {
+        let plate = cfg
+            .logo
             .as_ref()
-            .map(|l| glow_mask(l, edge, ge, sigma))
-            .unwrap_or_default();
-
-        let (x0, y0) = (g.glow_x.max(0) as usize, g.glow_y.max(0) as usize);
-        let x1 = ((g.glow_x + ge as i64).max(0) as usize).min(sw);
-        let y1 = ((g.glow_y + ge as i64).max(0) as usize).min(sh);
-        let rect = if x1 > x0 && y1 > y0 {
-            let a = scene_to_panel(transform, sw, sh, x0, y0);
-            let b = scene_to_panel(transform, sw, sh, x1 - 1, y1 - 1);
-            Rect {
-                x: a.0.min(b.0),
-                y: a.1.min(b.1),
-                w: a.0.max(b.0) - a.0.min(b.0) + 1,
-                h: a.1.max(b.1) - a.1.min(b.1) + 1,
-            }
-        } else {
-            Rect {
-                x: 0,
-                y: 0,
-                w: 0,
-                h: 0,
-            }
-        };
-        let mut glow_alpha = vec![0u8; rect.w * rect.h];
-        let mut mark_alpha = vec![0u8; rect.w * rect.h];
-        if let Some(logo) = &logo {
-            for sy in y0..y1 {
-                for sx in x0..x1 {
-                    let (bx, by) = (sx as i64 - g.glow_x, sy as i64 - g.glow_y);
-                    let (px, py) = scene_to_panel(transform, sw, sh, sx, sy);
-                    let i = (py - rect.y) * rect.w + (px - rect.x);
-                    glow_alpha[i] = glow[by as usize * ge + bx as usize];
-                    let (lx, ly) = (sx as i64 - g.logo_x, sy as i64 - g.logo_y);
-                    if (0..edge as i64).contains(&lx) && (0..edge as i64).contains(&ly) {
-                        mark_alpha[i] = logo[ly as usize * edge + lx as usize];
-                    }
-                }
-            }
-        }
-
-        let mut splash = Self {
-            panel: (pw as u32, ph as u32),
-            ground: spec.bg,
-            accent: spec.accent,
-            mark: spec.mark,
-            rest: Vec::new(),
-            glow_rect: rect,
-            glow_alpha,
-            mark_alpha,
-        };
-        let mut rest = vec![0u8; pw * ph * 4];
-        let (pixels, _partial) = rest.as_chunks_mut::<4>();
-        for px in pixels {
-            *px = [spec.bg[2], spec.bg[1], spec.bg[0], 0xff];
-        }
-        let mut frame = FrameTarget {
-            buffer: &mut rest,
-            width: pw as u32,
-            height: ph as u32,
-            stride: pw * 4,
-            damage: None,
-        };
-        splash.draw_glow_rect(&mut frame, 0.0);
-        splash.rest = rest;
-        splash
+            .filter(|p| !p.as_os_str().is_empty())
+            .and_then(|path| {
+                read_logo(path)
+                    .and_then(|(logo, format)| {
+                        Plate::from_helper(spec, helper, (&logo, format), scene, transform)
+                    })
+                    .inspect_err(|e| vigil_log::say!("vigil: splash logo {}: {e}", path.display()))
+                    .ok()
+            })
+            .unwrap_or_else(|| Plate::ground_only(spec, scene, transform));
+        let rest = plate.frame(0.0);
+        Self { plate, rest }
     }
 
     fn fits(&self, target: &FrameTarget<'_>) -> bool {
-        target.width == self.panel.0
-            && target.height == self.panel.1
-            && target.stride >= target.width as usize * 4
-            && target.buffer.len() >= target.stride * target.height as usize
-    }
-
-    fn draw_glow_rect(&self, target: &mut FrameTarget<'_>, level: f64) {
-        let r = self.glow_rect;
-        let lvl = (level.clamp(0.0, 1.0) * 256.0).round() as u32;
-        let mix =
-            |from: u32, to: u32, a: u32| -> u8 { ((from * (255 - a) + to * a + 127) / 255) as u8 };
-        for ry in 0..r.h {
-            let row = (r.y + ry) * target.stride + r.x * 4;
-            let alpha = ry * r.w;
-            for rx in 0..r.w {
-                let ga = (u32::from(self.glow_alpha[alpha + rx]) * lvl) >> 8;
-                let la = u32::from(self.mark_alpha[alpha + rx]);
-                let o = row + rx * 4;
-                for (c, off) in [(2usize, 0usize), (1, 1), (0, 2)] {
-                    let under = mix(u32::from(self.ground[c]), u32::from(self.accent[c]), ga);
-                    target.buffer[o + off] = mix(u32::from(under), u32::from(self.mark[c]), la);
-                }
-                target.buffer[o + 3] = 0xff;
-            }
-        }
+        self.plate.fits(
+            target.width,
+            target.height,
+            target.stride,
+            target.buffer.len(),
+        )
     }
 
     pub fn draw_full(&self, target: &mut FrameTarget<'_>, level: f64) -> bool {
         if !self.fits(target) {
             return false;
         }
-        let row = self.panel.0 as usize * 4;
-        for y in 0..self.panel.1 as usize {
+        let row = self.plate.panel().0 as usize * 4;
+        for y in 0..self.plate.panel().1 as usize {
             target.buffer[y * target.stride..y * target.stride + row]
                 .copy_from_slice(&self.rest[y * row..(y + 1) * row]);
         }
         if level > 0.0 {
-            self.draw_glow_rect(target, level);
+            self.plate.draw_rect(target.buffer, target.stride, level);
         }
         true
     }
@@ -382,7 +112,7 @@ impl Splash {
         if !self.fits(target) {
             return false;
         }
-        self.draw_glow_rect(target, level);
+        self.plate.draw_rect(target.buffer, target.stride, level);
         true
     }
 
@@ -391,8 +121,8 @@ impl Splash {
             return;
         }
         let a = (alpha.min(1.0) * 256.0) as u32;
-        let row = self.panel.0 as usize * 4;
-        for y in 0..self.panel.1 as usize {
+        let row = self.plate.panel().0 as usize * 4;
+        for y in 0..self.plate.panel().1 as usize {
             let dst = &mut target.buffer[y * target.stride..y * target.stride + row];
             let src = &self.rest[y * row..(y + 1) * row];
             for (d, s) in dst.iter_mut().zip(src) {
@@ -647,6 +377,52 @@ impl Default for Cover {
 }
 
 #[cfg(test)]
+fn test_helper(deadline: std::time::Duration) -> vigil_scene::Helper {
+    static BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let bin = BIN.get_or_init(|| {
+        let profile = if cfg!(debug_assertions) {
+            "dev"
+        } else {
+            "release"
+        };
+        let out = std::process::Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--frozen",
+                "--message-format=json",
+                "--profile",
+                profile,
+            ])
+            .args(["-p", "vigil-scene", "--bin", "vigil-scene"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "cargo build: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find_map(|m| m["executable"].as_str().map(std::path::PathBuf::from))
+            .expect("cargo names the helper it built")
+    });
+    vigil_scene::Helper::new(bin, deadline)
+}
+
+#[cfg(test)]
+fn splash(cfg: &SplashConfig, spec: &Scene, scene: (u32, u32), transform: u8) -> Splash {
+    Splash::with_helper(
+        cfg,
+        spec,
+        scene,
+        transform,
+        &test_helper(std::time::Duration::from_secs(300)),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -716,7 +492,7 @@ mod tests {
             let want = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
 
             let (pw, ph) = if transform == 1 { (h, w) } else { (w, h) };
-            let s = Splash::new(&cfg, &spec, (w, h), transform);
+            let s = splash(&cfg, &spec, (w, h), transform);
             let mut buf = Vec::new();
             let mut t = target(&mut buf, pw, ph);
             assert!(s.draw_full(&mut t, 0.0));
@@ -735,7 +511,7 @@ mod tests {
     fn rest_frame_is_ground_and_mark_only() {
         let spec = Scene::default();
         let cfg = cfg_with_logo("rest");
-        let s = Splash::new(&cfg, &spec, (800, 500), 0);
+        let s = splash(&cfg, &spec, (800, 500), 0);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 800, 500);
         assert!(s.draw_full(&mut t, 0.0));
@@ -751,7 +527,7 @@ mod tests {
     fn glow_tints_the_ground_under_the_mark_and_scales_with_level() {
         let spec = Scene::default();
         let cfg = cfg_with_logo("glow");
-        let s = Splash::new(&cfg, &spec, (800, 500), 0);
+        let s = splash(&cfg, &spec, (800, 500), 0);
         let g = spec.geometry(800, 500);
         let at = |level: f64| {
             let mut buf = Vec::new();
@@ -781,7 +557,7 @@ mod tests {
     fn rotated_panel_gets_the_same_picture_turned() {
         let spec = Scene::default();
         let cfg = cfg_with_logo("rot");
-        let s = Splash::new(&cfg, &spec, (400, 800), 3);
+        let s = splash(&cfg, &spec, (400, 800), 3);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 800, 400);
         assert!(s.draw_full(&mut t, 0.2));
@@ -794,7 +570,7 @@ mod tests {
     #[test]
     fn no_logo_is_just_the_ground() {
         let spec = Scene::default();
-        let s = Splash::new(&SplashConfig::default(), &spec, (200, 100), 0);
+        let s = splash(&SplashConfig::default(), &spec, (200, 100), 0);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 200, 100);
         assert!(s.draw_full(&mut t, 0.4));
@@ -806,7 +582,7 @@ mod tests {
     #[test]
     fn blend_moves_from_target_to_rest() {
         let spec = Scene::default();
-        let s = Splash::new(&SplashConfig::default(), &spec, (4, 4), 0);
+        let s = splash(&SplashConfig::default(), &spec, (4, 4), 0);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 4, 4);
         t.buffer.fill(200);
@@ -890,9 +666,129 @@ mod tests {
         assert!(c.needs_full());
     }
 
+    const CHILD: &str = "VIGIL_SPLASH_TEST";
+
+    fn peak_rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap()
+    }
+
+    #[test]
+    fn child_builds_a_splash_over_one_review_input() {
+        let Some(index) = std::env::var_os(CHILD) else {
+            return;
+        };
+        let index: usize = index.to_str().unwrap().parse().unwrap();
+        let (what, text) = &vigil_scene_corpus::review_inputs()[index];
+        let cfg = cfg_with_svg(&format!("review{index}"), text);
+        let spec = Scene::default();
+        let helper = test_helper(vigil_scene::DEFAULT_DEADLINE);
+        let base = peak_rss_kib();
+        let start = Instant::now();
+        let s = Splash::with_helper(&cfg, &spec, (1920, 1080), 0, &helper);
+        let took = start.elapsed();
+        let grew = peak_rss_kib().saturating_sub(base);
+        vigil_log::out!("SPLASH {what}: {took:?}, parent grew {grew} KiB");
+        assert!(
+            took < vigil_scene::DEFAULT_DEADLINE + Duration::from_millis(500),
+            "{what}: {took:?}"
+        );
+        assert!(grew < 32 * 1024, "{what}: the parent grew by {grew} KiB");
+        let mut buf = Vec::new();
+        assert!(s.draw_full(&mut target(&mut buf, 1920, 1080), 0.0));
+    }
+
+    #[test]
+    fn every_review_input_leaves_the_splash_on_time() {
+        for i in 0..vigil_scene_corpus::review_inputs().len() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "splash::tests::child_builds_a_splash_over_one_review_input",
+                ])
+                .args(["--nocapture", "--test-threads", "1"])
+                .env(CHILD, i.to_string())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            for line in stdout
+                .lines()
+                .filter_map(|l| l.find("SPLASH ").map(|i| &l[i..]))
+            {
+                vigil_log::out!("{line}");
+            }
+        }
+    }
+
     #[test]
     fn parses_colors_and_keeps_fallback() {
         assert_eq!(parse_color("#0b0d10", [1, 2, 3]), [0x0b, 0x0d, 0x10]);
         assert_eq!(parse_color("nope", [1, 2, 3]), [1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod goldens {
+    use super::*;
+
+    fn case(name: &str) -> Option<(u32, u32, u8, f64, u32)> {
+        let rest = name.strip_prefix("splash-")?.strip_suffix(".png")?;
+        let mut it = rest.split('-');
+        let (w, h) = it.next()?.split_once('x')?;
+        let t = it.next()?.strip_prefix('t')?.parse().ok()?;
+        let l: u32 = it.next()?.strip_prefix('l')?.parse().ok()?;
+        let r = it.next()?.strip_prefix('r')?.parse().ok()?;
+        Some((w.parse().ok()?, h.parse().ok()?, t, f64::from(l) / 100.0, r))
+    }
+
+    #[test]
+    fn splash_draws_every_scene_golden_exactly() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cfg = SplashConfig {
+            logo: Some(root.join("tests/fixtures/mark.svg")),
+            ..SplashConfig::default()
+        };
+        let mut checked = 0;
+        for entry in std::fs::read_dir(root.join("tests/golden/scene")).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let Some((pw, ph, transform, level, reference)) = case(&name) else {
+                continue;
+            };
+            let spec = Scene {
+                ref_short_side: (reference > 0).then_some(reference),
+                ..Scene::default()
+            };
+            let scene = if transform % 2 == 1 {
+                (ph, pw)
+            } else {
+                (pw, ph)
+            };
+            let s = splash(&cfg, &spec, scene, transform);
+            let mut buf = vec![0u8; (pw * ph * 4) as usize];
+            let mut t = FrameTarget {
+                buffer: &mut buf,
+                width: pw,
+                height: ph,
+                stride: pw as usize * 4,
+                damage: None,
+            };
+            assert!(s.draw_full(&mut t, level));
+            let got: Vec<u8> = buf.chunks(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            let want = image::open(&path).unwrap().into_rgb8().into_raw();
+            let off = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            assert_eq!(off, 0, "{name}: {off} channel values differ");
+            checked += 1;
+        }
+        assert!(checked >= 7, "only {checked} goldens found");
     }
 }

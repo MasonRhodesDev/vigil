@@ -29,6 +29,16 @@ fence	crates/vigil-present-gl/examples/gl_frames.rs	lint-allow	1
 fence	crates/vigil-present-gl/examples/gl_frames.rs	unsafe	1
 fence	crates/vigil-present-gl/src/lib.rs	lint-allow	2
 fence	crates/vigil-present-gl/src/lib.rs	unsafe	1
+fence	crates/vigil-scene-ffi/src/lib.rs	lint-allow	3
+fence	crates/vigil-scene-ffi/src/lib.rs	unsafe	11
+fence	crates/vigil-scene-ffi/tests/abi.rs	lint-allow	2
+fence	crates/vigil-scene-ffi/tests/abi.rs	unsafe	4
+fence	crates/vigil-scene/src/main.rs	lint-allow	1
+fence	crates/vigil-scene/src/main.rs	unsafe	1
+fence	crates/vigil-scene/tests/helper.rs	lint-allow	1
+fence	crates/vigil-scene/tests/helper.rs	unsafe	1
+fence	crates/vigil-scene/tests/sandbox.rs	lint-allow	1
+fence	crates/vigil-scene/tests/sandbox.rs	unsafe	1
 fence	crates/vigil-secret/examples/lint_canary.rs	expose	1
 fence	crates/vigil-secret/examples/lint_canary.rs	unsafe	3
 fence	crates/vigil-secret/src/lib.rs	expose	1

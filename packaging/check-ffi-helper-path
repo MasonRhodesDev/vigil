@@ -1,0 +1,19 @@
+#!/bin/sh
+# usage: check-ffi-helper-path LIBRARY BUILD_DIR
+#
+# The C ABI tests rebuild libvigil_scene_ffi.so in place with a helper from
+# the build tree. A library fit to ship runs the installed helper
+# (VIGIL_SCENE_HELPER when the build set it) and names nothing under
+# BUILD_DIR.
+set -eu
+library=$1
+build=$2
+installed=${VIGIL_SCENE_HELPER:-/usr/lib/vigil/vigil-scene}
+if ! grep -aqF "$installed" "$library"; then
+    echo "$library does not run $installed" >&2
+    exit 1
+fi
+if grep -aqF "$build" "$library"; then
+    echo "$library names a path under $build; package a copy taken before the tests" >&2
+    exit 1
+fi
