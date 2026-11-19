@@ -8,6 +8,9 @@ use pam_client::{Context, ConversationHandler, ErrorCode, Flag};
 use vigil_core::{AuthError, AuthEvent};
 
 pub mod faillock;
+// Miri cannot call into libpam.
+#[cfg(all(test, not(miri)))]
+mod hostile_module;
 
 pub fn service_name() -> &'static str {
     if Path::new("/etc/pam.d/vigil-lock").exists() {
@@ -243,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "leaves a parked thread behind by design")]
     fn drop_never_waits_on_a_wedged_worker() {
         let (tx, _rx) = mpsc::channel();
         let attempt = PamAttempt {

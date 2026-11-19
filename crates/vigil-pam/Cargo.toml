@@ -10,3 +10,6 @@ repository.workspace = true
 [dependencies]
 vigil-core.workspace = true
 pam-client.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

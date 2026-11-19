@@ -5239,6 +5239,7 @@ dependencies = [
 name = "vigil-pam"
 version = "0.4.3"
 dependencies = [
+ "libc",
  "pam-client",
  "vigil-core",
 ]
