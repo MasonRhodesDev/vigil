@@ -896,3 +896,63 @@ mod tests {
         assert_eq!(parse_color("nope", [1, 2, 3]), [1, 2, 3]);
     }
 }
+
+#[cfg(test)]
+mod bless_pre_extraction {
+    use super::*;
+    use image::ImageEncoder;
+
+    #[test]
+    #[ignore = "writes tests/golden/scene from the splash as it stands"]
+    fn bless() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cfg = SplashConfig {
+            logo: Some(root.join("tests/fixtures/mark.svg")),
+            ..SplashConfig::default()
+        };
+        let out = root.join("tests/golden/scene");
+        std::fs::create_dir_all(&out).unwrap();
+        for (pw, ph, transform, level, reference) in [
+            (1920u32, 1080u32, 0u8, 0.0f64, 0u32),
+            (1920, 1080, 0, 0.42, 0),
+            (3840, 2160, 0, 0.42, 0),
+            (3840, 2160, 1, 0.42, 0),
+            (1366, 768, 0, 0.42, 0),
+            (1201, 799, 3, 0.25, 0),
+            (1920, 1080, 0, 0.42, 1440),
+        ] {
+            let spec = Scene {
+                ref_short_side: (reference > 0).then_some(reference),
+                ..Scene::default()
+            };
+            let scene = if transform % 2 == 1 {
+                (ph, pw)
+            } else {
+                (pw, ph)
+            };
+            let s = Splash::new(&cfg, &spec, scene, transform);
+            let mut buf = vec![0u8; (pw * ph * 4) as usize];
+            let mut t = FrameTarget {
+                buffer: &mut buf,
+                width: pw,
+                height: ph,
+                stride: pw as usize * 4,
+                damage: None,
+            };
+            assert!(s.draw_full(&mut t, level));
+            let rgb: Vec<u8> = buf.chunks(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            let name = format!(
+                "splash-{pw}x{ph}-t{transform}-l{:03}-r{reference}.png",
+                (level * 100.0).round() as u32
+            );
+            let file = std::fs::File::create(out.join(name)).unwrap();
+            image::codecs::png::PngEncoder::new_with_quality(
+                file,
+                image::codecs::png::CompressionType::Best,
+                image::codecs::png::FilterType::Adaptive,
+            )
+            .write_image(&rgb, pw, ph, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        }
+    }
+}
