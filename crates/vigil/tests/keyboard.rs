@@ -38,9 +38,14 @@ struct Greeter {
 
 impl Greeter {
     fn with_theme(platform: VigilPlatform, theme: &Theme) -> Self {
+        Self::sized(platform, theme, W, H)
+    }
+
+    fn sized(platform: VigilPlatform, theme: &Theme, width: u32, height: u32) -> Self {
         let component = theme.instantiate().expect("instantiate");
         let adapter = platform.claim_last_adapter().expect("adapter");
-        let window = OutputWindow::new(OutputId(1), W, H, 1.0, adapter, component).expect("window");
+        let window =
+            OutputWindow::new(OutputId(1), width, height, 1.0, adapter, component).expect("window");
         let log: Rc<RefCell<Vec<UiMessage>>> = Rc::default();
         let sink = log.clone();
         window.on_ui_message(Rc::new(move |message| sink.borrow_mut().push(message)));
@@ -716,4 +721,61 @@ fn a_shown_password_hides_again_after_idle_but_not_while_typing() {
     assert_ne!(masked, field_row(&mut g.window, &mut buf), "typing keeps it shown");
     std::thread::sleep(idle * 2);
     assert_eq!(masked, field_row(&mut g.window, &mut buf), "idle hides it");
+}
+
+fn click(g: &mut Greeter, x: f64, y: f64) {
+    g.window.dispatch(InputEvent::PointerAbsolute { x, y });
+    for pressed in [true, false] {
+        g.window.dispatch(InputEvent::PointerButton {
+            button: 0x110,
+            pressed,
+        });
+    }
+    g.settle();
+}
+
+fn a_double_click_on_power_never_acts(width: u32, height: u32) {
+    let platform = VigilPlatform::install().expect("platform");
+    let mut g = Greeter::sized(platform, &Theme::load_or_default(None), width, height);
+    let y = f64::from(height - 28 - 36 / 2);
+    for x in (width / 2..width - 28).step_by(4) {
+        click(&mut g, f64::from(x), y);
+        click(&mut g, f64::from(x), y);
+        g.tap(ESCAPE);
+        let sent = g.take();
+        assert!(
+            !sent.iter().any(|s| matches!(s, Sent::Power(_))),
+            "a double click at x {x} of {width}x{height} sent {sent:?}"
+        );
+    }
+
+    g.tap(ESCAPE);
+    for _ in 0..3 {
+        g.tap(TAB);
+    }
+    g.tap(RETURN);
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    vigil_ui::advance_timers();
+    let sent = (width / 2..width - 28)
+        .rev()
+        .step_by(4)
+        .find_map(|x| {
+            click(&mut g, f64::from(x), y);
+            g.take().pop()
+        });
+    assert_eq!(
+        sent,
+        Some(Sent::Power(PowerAction::Poweroff)),
+        "a deliberate click on an open confirm still shuts down"
+    );
+}
+
+#[test]
+fn a_double_click_on_power_never_acts_in_landscape() {
+    a_double_click_on_power_never_acts(W, H);
+}
+
+#[test]
+fn a_double_click_on_power_never_acts_in_portrait() {
+    a_double_click_on_power_never_acts(H, W);
 }
