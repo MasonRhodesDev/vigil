@@ -698,3 +698,22 @@ fn a_shown_password_hides_again_after_a_panel_move() {
         g.window.set_panel_visible(true);
     });
 }
+
+#[test]
+fn a_shown_password_hides_again_after_idle_but_not_while_typing() {
+    let idle = std::time::Duration::from_millis(300);
+    let mut g = Greeter::new();
+    let mut buf = vec![0u8; (W * H * 4) as usize];
+    g.window.set_reveal_idle(idle);
+    g.type_text("aaaa");
+    let masked = settled_row(&mut g, &mut buf);
+    g.chord(ALT_L, F8, None);
+    for _ in 0..3 {
+        std::thread::sleep(idle / 2);
+        g.type_text("a");
+        g.tap(0xff08);
+    }
+    assert_ne!(masked, field_row(&mut g.window, &mut buf), "typing keeps it shown");
+    std::thread::sleep(idle * 2);
+    assert_eq!(masked, field_row(&mut g.window, &mut buf), "idle hides it");
+}
