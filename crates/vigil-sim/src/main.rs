@@ -137,8 +137,9 @@ fn usage(error: &str) -> ! {
         vigil_log::say!("error: {error}");
     }
     vigil_log::say!(
-        "usage: vigil-sim [login|lock|warning] [--paused] [--at-ms MS] [--state-file PATH] [--config PATH] [--control-socket PATH]\n       vigil-sim scenario FIXTURE.toml"
+        "usage: vigil-sim [login|lock|warning] [--paused] [--at-ms MS] [--state-file PATH] [--config PATH] [--control-socket PATH]"
     );
+    vigil_log::say!("       vigil-sim scenario FIXTURE.toml");
     std::process::exit(if error.is_empty() { 0 } else { 2 });
 }
 
