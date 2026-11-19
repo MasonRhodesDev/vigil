@@ -14,5 +14,8 @@ vigil-unlock-token = { path = "../vigil-unlock-token" }
 zbus.workspace = true
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 
+[dev-dependencies]
+vigil-log = { workspace = true }
+
 [lints]
 workspace = true
