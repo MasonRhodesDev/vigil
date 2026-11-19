@@ -1569,6 +1569,29 @@ mod tests {
     }
 
     #[test]
+    fn a_panic_on_any_thread_ends_the_lock_at_once_without_a_core() {
+        use std::os::unix::process::ExitStatusExt;
+        if std::env::var_os("VIGIL_LOCK_PANIC_PROBE").is_some() {
+            exit_on_panic();
+            let _ = std::thread::spawn(|| panic!("probe")).join();
+            std::process::exit(0);
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_panic_on_any_thread_ends_the_lock_at_once_without_a_core",
+                "--test-threads=1",
+            ])
+            .env("VIGIL_LOCK_PANIC_PROBE", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), None, "no signal, so no core dump");
+        assert_eq!(status.code(), Some(101), "a worker panic ends the process");
+    }
+
+    #[test]
     fn a_rejected_credential_is_still_shown_and_reprompted() {
         assert_eq!(
             done_outcome(
