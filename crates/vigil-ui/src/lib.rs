@@ -524,7 +524,12 @@ impl OutputWindow {
     }
 
     fn send_key(&self, keysym: u32, utf8: Option<String>, pressed: bool) {
-        if let Some(text) = key_text(keysym, utf8) {
+        let text = if self.modifiers().1 {
+            control_text(keysym)
+        } else {
+            key_text(keysym, utf8)
+        };
+        if let Some(text) = text {
             let event = if pressed {
                 WindowEvent::KeyPressed { text }
             } else {
@@ -911,18 +916,18 @@ fn key_text(keysym: u32, utf8: Option<String>) -> Option<slint::SharedString> {
         0xffff => Key::Delete,
         0xff50 => Key::Home,
         0xff57 => Key::End,
-        _ => {
-            return utf8
-                .filter(|text| printable(text))
-                .map(Into::into)
-                .or_else(|| {
-                    (0x20..0x7f)
-                        .contains(&keysym)
-                        .then(|| char::from(keysym as u8).to_string().into())
-                });
-        }
+        _ => return utf8.filter(|text| printable(text)).map(Into::into),
     };
     Some(key.into())
+}
+
+// Slint maps Ctrl plus a letter to Undo, Redo, Copy, Cut and Paste, and its
+// undo history outlives a field the theme clears, so only Select All passes.
+fn control_text(keysym: u32) -> Option<slint::SharedString> {
+    match keysym {
+        0x61 => Some("a".into()),
+        _ => key_text(keysym, None),
+    }
 }
 
 pub struct Looks {
