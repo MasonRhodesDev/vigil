@@ -93,6 +93,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "monitor-profiles"
+version = "0.1.0"
+source = "git+https://github.com/MasonRhodesDev/monitor-profiles?rev=64d5d1ed079582a2014ebf23c403a3ca03ee9c64#64d5d1ed079582a2014ebf23c403a3ca03ee9c64"
+dependencies = [
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -254,6 +263,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
+name = "vigil-auth"
+version = "0.4.3"
+dependencies = [
+ "greetd_ipc",
+ "serde_json",
+ "vigil-core",
+]
+
+[[package]]
 name = "vigil-config"
 version = "0.4.3"
 dependencies = [
@@ -263,12 +281,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vigil-core"
+version = "0.4.3"
+dependencies = [
+ "monitor-profiles",
+]
+
+[[package]]
 name = "vigil-fuzz"
 version = "0.0.0"
 dependencies = [
- "greetd_ipc",
  "libfuzzer-sys",
  "toml",
+ "vigil-auth",
  "vigil-config",
 ]
 

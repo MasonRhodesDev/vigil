@@ -32,6 +32,7 @@ enum Reply {
     Success,
     Refuse(String),
     Frame(Vec<u8>),
+    Claim(u32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -276,6 +277,7 @@ fn send(stream: &mut UnixStream, reply: Reply) -> std::io::Result<()> {
             stream.write_all(&(body.len() as u32).to_ne_bytes())?;
             return stream.write_all(&body);
         }
+        Reply::Claim(len) => return stream.write_all(&len.to_ne_bytes()),
     };
     response.write_to(stream).map_err(std::io::Error::other)
 }
@@ -490,7 +492,7 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                 ack_due = false;
                 granted = false;
                 match (reply, &last_request) {
-                    (Reply::Frame(_), _) => {}
+                    (Reply::Frame(_) | Reply::Claim(_), _) => {}
                     (Reply::Message(kind, text), _) if conversing => {
                         heard.push(text.clone());
                         waiting = None;
@@ -658,7 +660,13 @@ fn reply(conforming: bool) -> BoxedStrategy<Reply> {
     if conforming {
         spoken.boxed()
     } else {
-        prop_oneof![5 => spoken, 1 => frame().prop_map(Reply::Frame)].boxed()
+        let oversized = vigil_auth::MAX_RESPONSE_BYTES as u32 + 1..=u32::MAX;
+        prop_oneof![
+            10 => spoken,
+            2 => frame().prop_map(Reply::Frame),
+            1 => oversized.prop_map(Reply::Claim),
+        ]
+        .boxed()
     }
 }
 

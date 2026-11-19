@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::io::Read;
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
 use greetd_ipc::codec::SyncCodec;
@@ -35,6 +37,42 @@ pub fn friendly_error(description: &str) -> String {
         _ => "Sign-in failed",
     };
     text.to_string()
+}
+
+// A reply carries one PAM message or one error line, and libpam caps a
+// message at 512 bytes, so anything near this size is not a reply.
+pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
+
+#[derive(Debug)]
+pub enum ResponseError {
+    Oversized(usize),
+    Io(std::io::Error),
+    Malformed(serde_json::Error),
+}
+
+impl std::fmt::Display for ResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Oversized(len) => write!(
+                f,
+                "a {len} byte response exceeds the {MAX_RESPONSE_BYTES} byte limit"
+            ),
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Malformed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+pub fn read_response(stream: &mut impl Read) -> Result<Response, ResponseError> {
+    let mut len = [0; 4];
+    stream.read_exact(&mut len).map_err(ResponseError::Io)?;
+    let len = u32::from_ne_bytes(len) as usize;
+    if len > MAX_RESPONSE_BYTES {
+        return Err(ResponseError::Oversized(len));
+    }
+    let mut body = vec![0; len];
+    stream.read_exact(&mut body).map_err(ResponseError::Io)?;
+    serde_json::from_slice(&body).map_err(ResponseError::Malformed)
 }
 
 fn show_greetd_error(ui: &mut dyn AuthUi, description: &str) -> String {
@@ -496,8 +534,16 @@ impl AuthMachine {
         ui.set_busy(true);
         let result = request
             .write_to(&mut self.stream)
-            .and_then(|()| Response::read_from(&mut self.stream))
-            .map_err(|error| AuthError(format!("greetd IPC: {error}")));
+            .map_err(|error| AuthError(format!("greetd IPC: {error}")))
+            .and_then(|()| {
+                read_response(&mut self.stream).map_err(|error| {
+                    if matches!(error, ResponseError::Oversized(_)) {
+                        // The body was never read, so the stream has lost its framing.
+                        let _ = self.stream.shutdown(Shutdown::Both);
+                    }
+                    AuthError(format!("greetd IPC: {error}"))
+                })
+            });
         ui.set_busy(false);
         result
     }

@@ -12,8 +12,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-greetd_ipc = { version = "0.10", features = ["sync-codec"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+vigil-auth = { path = "../crates/vigil-auth" }
 vigil-config = { path = "../crates/vigil-config" }
 
 [[bin]]
