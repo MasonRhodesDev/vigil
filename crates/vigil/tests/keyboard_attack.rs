@@ -366,14 +366,14 @@ fn hostile_keys_never_power_off_or_answer_without_a_fresh_enter() {
             }
         }
     }
-    let cases = std::env::var("VIGIL_ATTACK_CASES")
+    let cases = std::env::var("VIGIL_KEYBOARD_ATTACK_CASES")
         .ok()
         .and_then(|cases| cases.parse().ok())
         .unwrap_or(400);
-    let seed = match std::env::var("VIGIL_ATTACK_SEED") {
+    let seed = match std::env::var("VIGIL_KEYBOARD_ATTACK_SEED") {
         Ok(seed) => seed
             .parse()
-            .unwrap_or_else(|_| panic!("VIGIL_ATTACK_SEED is not a u64: {seed}")),
+            .unwrap_or_else(|_| panic!("VIGIL_KEYBOARD_ATTACK_SEED is not a u64: {seed}")),
         Err(_) => RandomState::new().hash_one(()),
     };
     let started = Instant::now();
@@ -386,7 +386,9 @@ fn hostile_keys_never_power_off_or_answer_without_a_fresh_enter() {
             started.elapsed()
         ),
         Err(failure) => {
-            vigil_log::out!("keyboard attack: FAILED with VIGIL_ATTACK_SEED={seed}\n{failure}");
+            vigil_log::out!(
+                "keyboard attack: FAILED with VIGIL_KEYBOARD_ATTACK_SEED={seed}\n{failure}"
+            );
             held = false;
         }
     }

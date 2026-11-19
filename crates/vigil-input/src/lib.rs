@@ -345,6 +345,7 @@ pub mod fuzzing {
                 compose.reset();
             }
             self.state.repeat = None;
+            self.state.held = HeldKeys::default();
         }
 
         pub fn key(&mut self, evdev_keycode: u16, pressed: bool) -> Option<InputEvent> {
