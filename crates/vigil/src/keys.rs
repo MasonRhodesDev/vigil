@@ -111,9 +111,22 @@ mod tests {
         window: OutputWindow,
         queue: Rc<RefCell<VecDeque<UiMessage>>>,
         auth: AuthMachine,
+        users: Vec<String>,
     }
 
     impl Rig {
+        fn with_pickers(greetd: &Greetd) -> Self {
+            let mut rig = Self::new(greetd);
+            rig.users = vec!["alice".into(), "bob".into()];
+            rig.window.set_users(&rig.users);
+            rig.window.set_user_index(0);
+            rig.window.set_user_name("alice");
+            rig.window
+                .set_sessions(&["Hyprland".into(), "Shell".into()]);
+            rig.window.set_session_index(0);
+            rig
+        }
+
         fn new(greetd: &Greetd) -> Self {
             let platform = VigilPlatform::install().expect("platform");
             let component = Theme::load_or_default(None)
@@ -132,6 +145,7 @@ mod tests {
                 window,
                 queue,
                 auth,
+                users: Vec::new(),
             }
         }
 
@@ -139,7 +153,20 @@ mod tests {
             loop {
                 let message = self.queue.borrow_mut().pop_front();
                 let Some(message) = message else { break };
-                let _ = self.auth.handle(message, &mut self.window);
+                match message {
+                    UiMessage::SelectUser(index) => {
+                        self.window.set_user_index(index);
+                        let user = self.users.get(index).cloned();
+                        self.auth
+                            .select_user(user.as_deref(), &mut self.window)
+                            .expect("select user");
+                    }
+                    UiMessage::SelectSession(index) => self.window.set_session_index(index),
+                    UiMessage::Power(action) => panic!("the drive powered off: {action:?}"),
+                    message => {
+                        let _ = self.auth.handle(message, &mut self.window);
+                    }
+                }
             }
         }
     }
@@ -257,5 +284,118 @@ mod tests {
         drop(rig);
         assert_eq!(greetd.finish(), ["create bob", "answer pw", "start"]);
         assert!(complete);
+    }
+
+    const TAB: u32 = 0xff09;
+    const SPACE: u32 = 0x20;
+    const RIGHT: u32 = 0xff53;
+    const F8: u32 = 0xffc5;
+    const SHIFT_L: u32 = 0xffe1;
+    const CONTROL_L: u32 = 0xffe3;
+    const ALT_L: u32 = 0xffe9;
+
+    fn press(keysym: u32) -> InputEvent {
+        InputEvent::Key {
+            keysym,
+            utf8: None,
+            pressed: true,
+        }
+    }
+
+    fn release(keysym: u32) -> InputEvent {
+        InputEvent::Key {
+            keysym,
+            utf8: None,
+            pressed: false,
+        }
+    }
+
+    fn every_control_by_keyboard() -> Vec<InputEvent> {
+        let mut drive = vec![press(SHIFT_L)];
+        drive.extend(tap(TAB, Some("\t")));
+        drive.push(release(SHIFT_L));
+        drive.extend(tap(RIGHT, None));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(SPACE, Some(" ")));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(RIGHT, None));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(RETURN, None));
+        drive.extend(tap(TAB, Some("\t")));
+        drive.extend(tap(ESCAPE, None));
+        drive.extend(tap(ESCAPE, None));
+        drive.push(press(ALT_L));
+        drive.extend(tap(F8, None));
+        drive.push(release(ALT_L));
+        drive.extend(text("pw"));
+        drive
+    }
+
+    #[test]
+    fn keyboard_switching_opens_no_conversation_before_enter() {
+        let Some(greetd) = Greetd::scripted("keyboard-local", vec![secret()]) else {
+            return;
+        };
+        let mut rig = Rig::with_pickers(&greetd);
+        rig.auth
+            .select_user(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        for event in every_control_by_keyboard() {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        drop(rig);
+        assert_eq!(greetd.finish(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_user_picked_by_keyboard_signs_in_on_enter() {
+        let Some(greetd) = Greetd::scripted(
+            "keyboard-pick",
+            vec![secret(), Response::Success, Response::Success],
+        ) else {
+            return;
+        };
+        let mut rig = Rig::with_pickers(&greetd);
+        rig.auth
+            .select_user(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        let mut drive = every_control_by_keyboard();
+        drive.extend(tap(RETURN, None));
+        for event in drive {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        let complete = rig.auth.is_complete();
+        drop(rig);
+        assert_eq!(greetd.finish(), ["create bob", "answer pw", "start"]);
+        assert!(complete);
+    }
+
+    #[test]
+    fn modifiers_held_across_a_vt_switch_do_not_stick() {
+        let Some(greetd) = Greetd::scripted(
+            "vt-modifiers",
+            vec![secret(), Response::Success, Response::Success],
+        ) else {
+            return;
+        };
+        let mut rig = Rig::new(&greetd);
+        rig.auth
+            .select_user(Some("alice"), &mut rig.window)
+            .expect("first prompt");
+        let mut drive = vec![press(CONTROL_L), press(ALT_L), press(VT_FIRST + 1)];
+        drive.extend(text("pw"));
+        drive.extend(tap(RETURN, None));
+        for event in drive {
+            route(&mut rig, event);
+        }
+        rig.tick();
+
+        drop(rig);
+        assert_eq!(greetd.finish(), ["create alice", "answer pw", "start"]);
     }
 }

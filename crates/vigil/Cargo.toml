@@ -33,6 +33,8 @@ image.workspace = true
 resvg = { version = "0.47", default-features = false }
 
 [dev-dependencies]
+slint.workspace = true
+slint-interpreter.workspace = true
 image.workspace = true
 greetd_ipc.workspace = true
 
