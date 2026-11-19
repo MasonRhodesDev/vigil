@@ -16,6 +16,8 @@ const MAX_NODES: u32 = 10_000;
 const MAX_DEPTH: usize = 64;
 const MAX_REF_DEPTH: usize = 128;
 const MAX_EXPANDED: usize = 20_000;
+const MAX_EXPANDED_DATA: usize = 4 << 20;
+const MAX_STYLE_RULES: usize = 64;
 const MAX_NUMBER: f64 = 1e6;
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const DRAWN: &[&str] = &[
@@ -290,6 +292,14 @@ fn screen(doc: &roxmltree::Document) -> Result<(), Error> {
             }
         }
         let name = n.tag_name();
+        if name.name() == "style" {
+            let sheet: String = n
+                .descendants()
+                .filter(roxmltree::Node::is_text)
+                .filter_map(|t| t.text())
+                .collect();
+            simple_sheet(&sheet)?;
+        }
         if name.namespace() == Some(SVG_NS) && !DRAWN.contains(&name.name()) {
             return Err(Error::Refused(format!(
                 "<{}> has no place in a logo silhouette",
@@ -309,16 +319,106 @@ fn screen(doc: &roxmltree::Document) -> Result<(), Error> {
         .filter_map(|n| n.text());
     for sheet in sheets {
         for target in expansion.targets(sheet) {
-            total += expansion.size(target, 0)?.saturating_mul(elements);
-            expansion.check(total)?;
+            total = total.plus(expansion.size(target, 0)?.times(elements));
+            total.check()?;
         }
     }
     Ok(())
 }
 
+// usvg matches every rule against every element, and its matcher backtracks
+// through combinators without bound, so a sheet may only hold rules on one
+// type, class or id. Each `}` ends a rule here, which can only split a sheet
+// into more selectors to check than the CSS parser sees.
+fn simple_sheet(sheet: &str) -> Result<(), Error> {
+    let refuse = |why: String| {
+        Err(Error::Refused(format!(
+            "a style sheet {why}; a logo's rules each name one type, class or id"
+        )))
+    };
+    let mut text = String::new();
+    let mut rest = sheet;
+    while let Some(at) = rest.find("/*") {
+        text.push_str(&rest[..at]);
+        rest = rest[at + 2..]
+            .split_once("*/")
+            .map_or("", |(_, after)| after);
+    }
+    text.push_str(rest);
+    if text.contains('@') {
+        return refuse("has an at-rule".into());
+    }
+    let mut rules = 0;
+    for rule in text.split('}') {
+        let Some((selectors, body)) = rule.split_once('{') else {
+            if rule.trim().is_empty() {
+                continue;
+            }
+            return refuse(format!("has text outside a rule: {:?}", rule.trim()));
+        };
+        if body.contains('{') {
+            return refuse("nests a block".into());
+        }
+        rules += 1;
+        if rules > MAX_STYLE_RULES {
+            return refuse(format!("has more than {MAX_STYLE_RULES} rules"));
+        }
+        for selector in selectors.split(',').map(str::trim) {
+            let name = selector.strip_prefix(['.', '#']).unwrap_or(selector);
+            let ident = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if !(ident || selector == "*") {
+                return refuse(format!("uses the selector {selector:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+// What a reference costs once usvg has copied it in: elements, and the path
+// data and point lists it parses again for every copy.
+#[derive(Debug, Clone, Copy)]
+struct Weight {
+    elements: usize,
+    data: usize,
+}
+
+impl Weight {
+    fn plus(self, o: Weight) -> Weight {
+        Weight {
+            elements: self.elements.saturating_add(o.elements),
+            data: self.data.saturating_add(o.data),
+        }
+    }
+
+    fn times(self, n: usize) -> Weight {
+        Weight {
+            elements: self.elements.saturating_mul(n),
+            data: self.data.saturating_mul(n),
+        }
+    }
+
+    fn check(self) -> Result<(), Error> {
+        if self.elements > MAX_EXPANDED {
+            return Err(Error::Refused(format!(
+                "the SVG expands to more than {MAX_EXPANDED} elements"
+            )));
+        }
+        if self.data > MAX_EXPANDED_DATA {
+            return Err(Error::Refused(format!(
+                "the SVG expands to more than {} MiB of path data",
+                MAX_EXPANDED_DATA >> 20
+            )));
+        }
+        Ok(())
+    }
+}
+
 struct Expansion<'a, 'input> {
     ids: HashMap<&'a str, roxmltree::Node<'a, 'input>>,
-    sizes: HashMap<roxmltree::NodeId, usize>,
+    sizes: HashMap<roxmltree::NodeId, Weight>,
     open: HashSet<roxmltree::NodeId>,
 }
 
@@ -352,16 +452,7 @@ impl<'a, 'input> Expansion<'a, 'input> {
             .collect()
     }
 
-    fn check(&self, total: usize) -> Result<(), Error> {
-        if total > MAX_EXPANDED {
-            return Err(Error::Refused(format!(
-                "the SVG expands to more than {MAX_EXPANDED} elements"
-            )));
-        }
-        Ok(())
-    }
-
-    fn size(&mut self, node: roxmltree::Node<'a, 'input>, depth: usize) -> Result<usize, Error> {
+    fn size(&mut self, node: roxmltree::Node<'a, 'input>, depth: usize) -> Result<Weight, Error> {
         if let Some(&n) = self.sizes.get(&node.id()) {
             return Ok(n);
         }
@@ -370,7 +461,12 @@ impl<'a, 'input> Expansion<'a, 'input> {
                 "the SVG references form a loop or a chain too deep to follow".into(),
             ));
         }
-        let mut total = 1usize;
+        let data = node
+            .attributes()
+            .filter(|a| a.namespace().is_none() && matches!(a.name(), "d" | "points"))
+            .map(|a| a.value().len())
+            .sum();
+        let mut total = Weight { elements: 1, data };
         let targets: Vec<_> = node
             .attributes()
             .flat_map(|a| self.targets(a.value()))
@@ -380,8 +476,8 @@ impl<'a, 'input> Expansion<'a, 'input> {
             .filter(roxmltree::Node::is_element)
             .chain(targets)
         {
-            total += self.size(next, depth + 1)?;
-            self.check(total)?;
+            total = total.plus(self.size(next, depth + 1)?);
+            total.check()?;
         }
         self.open.remove(&node.id());
         self.sizes.insert(node.id(), total);
