@@ -342,7 +342,7 @@ fn unlocks(cmds: &[FlowCmd]) -> bool {
 fn assert_still_locked(flow: &LockFlow, events: &[LoginEvent], cmds: &[FlowCmd]) {
     assert!(
         !unlocks(cmds) && flow.phase() == FlowPhase::Locked,
-        "a signal from a sender that is not logind changed the lock: \
+        "a signal vigil must ignore changed the lock: \
          events {events:?}, phase {:?}, commands {cmds:?}",
         flow.phase()
     );
@@ -453,6 +453,32 @@ fn no_owner(address: &str) {
 #[test]
 fn with_no_logind_owner_every_unlock_is_rejected() {
     on_private_bus("with_no_logind_owner_every_unlock_is_rejected", no_owner);
+}
+
+fn other_session(address: &str) {
+    let owner = logind(address);
+    let (_session, rx) = subscribed_session(&owner);
+    let mut flow = locked_flow();
+    block_on(owner.emit_signal(
+        None::<&str>,
+        "/org/freedesktop/login1/session/c2",
+        SESSION_IFACE,
+        "Unlock",
+        &(),
+    ))
+    .expect("emit Unlock for another session");
+    send(&owner, None, LoginEvent::Lock);
+    let events = until(&rx, LoginEvent::Lock);
+    let cmds = feed(&mut flow, &events, 1_000);
+    assert_still_locked(&flow, &events, &cmds);
+}
+
+#[test]
+fn unlock_for_another_session_leaves_this_one_locked() {
+    on_private_bus(
+        "unlock_for_another_session_leaves_this_one_locked",
+        other_session,
+    );
 }
 
 fn witness(address: &str) -> (Connection, Receiver<Message>) {
