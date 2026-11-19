@@ -9,11 +9,19 @@ vigil-unlock \- unlock a session that vigil-lock holds
 .SH DESCRIPTION
 vigil-lock obeys a logind Unlock only when root asked for it.
 logind lets the owner of a session unlock it without polkit, and the
-Unlock signal does not say who asked, so without this rule any process
-the user runs could unlock the screen without the password.
+Unlock signal does not say who asked.
+The rule closes that route: a process the user runs can no longer unlock
+the screen by asking logind.
 Plain
 .B loginctl unlock-session
 no longer unlocks vigil-lock, whoever runs it.
+.PP
+The rule covers logind only.
+A process running as the same user can still reach the compositor.
+On Hyprland with
+.B allow_session_lock_restore
+set, such a process could kill vigil-lock, take the session lock with a
+client of its own, and release it.
 .PP
 .B vigil-unlock
 is the recovery path, for example from another terminal or over SSH:
@@ -24,17 +32,31 @@ is the recovery path, for example from another terminal or over SSH:
 .RE
 .PP
 It must run as root.
-It writes a token for each chosen session to
+It first removes any token in
+.I /run/vigil/unlock
+that is no longer fresh.
+Then it writes a token for each chosen session to
 .IR /run/vigil/unlock/ <session-id>,
 calls logind's
 .B UnlockSession
 for it, waits two seconds, removes the token, and prints whether logind
 reports the session unlocked.
 .PP
-A session id names that session.
-Otherwise the argument is a user name and names every session of that user.
+A session id names that session, and it is an error when that session
+cannot lock.
+Otherwise the argument is a user name and names every session of that
+user that can lock.
+Sessions that cannot lock, such as the
+.B user@.service
+manager session, are skipped.
 .B loginctl list-sessions
 lists the ids.
+.PP
+If
+.B vigil-unlock
+is cut short before it removes a token, for example by Ctrl-C or a
+dropped SSH connection, the token lapses 10 seconds after it was
+written, and the next run removes it.
 .SH THE TOKEN
 vigil-lock reads the token through descriptors and accepts it only if
 all of these hold:
@@ -42,7 +64,8 @@ all of these hold:
 it is a regular file, not a symlink, with one link, owned by root, with
 mode 0644 or stricter;
 .IP \(bu 2
-its directory is owned by root and nobody else can write it;
+its directory and that directory's parent are owned by root, nobody
+else can write either, and neither is a symlink;
 .IP \(bu 2
 it names this session and this boot's id;
 .IP \(bu 2
@@ -60,8 +83,14 @@ at boot, root-owned with mode 0755.
 .B vigil-unlock
 creates it the same way when it is missing.
 .SH EXIT STATUS
-0 when every chosen session reports unlocked, 1 otherwise, and 2 on a
-usage error.
+0 when every chosen session that can lock reports unlocked, 1 otherwise,
+and 2 on a usage error.
+.PP
+The report comes from logind's
+.B LockedHint
+property, which the session's owner sets, so a process the user runs can
+make it say unlocked while the screen stays locked.
+Treat "unlocked" as advisory and look at the screen to be sure.
 .SH FILES
 .TP
 .I /run/vigil/unlock/

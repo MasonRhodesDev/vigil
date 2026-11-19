@@ -194,9 +194,15 @@ blur.
 
 vigil-lock obeys a logind Unlock only when root asked for it. logind
 lets the owner of a session unlock it without polkit, and the Unlock
-signal does not say who asked, so without this rule any process the user
-runs could unlock the screen without the password. Plain `loginctl
-unlock-session` no longer unlocks vigil-lock, whoever runs it.
+signal does not say who asked. The rule closes that route: a process the
+user runs can no longer unlock the screen by asking logind. Plain
+`loginctl unlock-session` no longer unlocks vigil-lock, whoever runs it.
+
+The rule covers logind only. A process running as the same user can
+still reach the compositor. On Hyprland with `allow_session_lock_restore`
+set, such a process could kill vigil-lock and take the session lock with
+a client of its own, then release it. Keeping the user's processes away
+from the screen lock needs a compositor that refuses that, not this rule.
 
 To unlock a session from another terminal or over SSH:
 
@@ -206,13 +212,22 @@ sudo vigil-unlock <session-id|user>
 
 `vigil-unlock` writes a token to `/run/vigil/unlock/<session-id>`, calls
 logind's `UnlockSession`, waits two seconds, and removes the token. A
-user name unlocks each of that user's sessions; `loginctl list-sessions`
-lists the ids. vigil-lock accepts the token only if it is a regular file
-with one link, owned by root, mode 0644 or stricter, in a root-owned
-directory nobody else can write, and names this session, this boot, and
-a `CLOCK_BOOTTIME` time at most 10 seconds old. Otherwise it logs
-`unlock ignored:` with the reason and stays locked. `man 8 vigil-unlock`
-has the details.
+user name unlocks each of that user's sessions that can lock and skips
+the rest, such as the `user@.service` manager session. A session id that
+cannot lock is an error. `loginctl list-sessions` lists the ids.
+
+vigil-lock accepts the token only if it is a regular file with one link,
+owned by root, mode 0644 or stricter, in a root-owned directory nobody
+else can write, under a root-owned parent nobody else can write, neither
+of them a symlink, and names this session, this boot, and a
+`CLOCK_BOOTTIME` time at most 10 seconds old. Otherwise it logs
+`unlock ignored:` with the reason and stays locked.
+
+If `vigil-unlock` is cut short before it removes a token, the token
+lapses 10 seconds after it was written, and the next run removes it.
+`vigil-unlock` reports a session unlocked from logind's `LockedHint`,
+which the session's owner can set, so that report is advisory. `man 8
+vigil-unlock` has the details.
 
 ## Keyboard
 
