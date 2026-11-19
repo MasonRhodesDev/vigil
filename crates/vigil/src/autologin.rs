@@ -165,9 +165,9 @@ mod tests {
 
     #[test]
     fn user_start_keeps_the_remembered_choice() {
-        let state = record_auto_start(&stored("mason"), 1_000, 1);
+        let state = record_auto_start(&stored("alice"), 1_000, 1);
         let after = record_user_start(&state);
-        assert_eq!(after.user, "mason");
+        assert_eq!(after.user, "alice");
         assert_eq!(after.session, "DE");
         assert_eq!(after.auto_started_at, None);
         assert_eq!(after.auto_streak, 0);

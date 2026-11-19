@@ -1476,7 +1476,7 @@ easing = \"linear\"
 scale = 2.0
 
 [profiles]
-dir = \"/home/mason/.config/monitor-profiles\"
+dir = \"/etc/vigil/monitor-profiles\"
 ",
         );
         assert_eq!(ignored, Vec::new());
@@ -1492,7 +1492,7 @@ dir = \"/home/mason/.config/monitor-profiles\"
         );
         assert_eq!(
             config.profiles.dir,
-            Some(PathBuf::from("/home/mason/.config/monitor-profiles"))
+            Some(PathBuf::from("/etc/vigil/monitor-profiles"))
         );
         assert_eq!(
             config.look.background,

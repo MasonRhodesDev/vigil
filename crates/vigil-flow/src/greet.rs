@@ -404,7 +404,7 @@ mod tests {
     fn config() -> GreetConfig {
         GreetConfig {
             fixed_user: None,
-            users: vec![Some("mason".into()), Some("guest".into()), None],
+            users: vec![Some("alice".into()), Some("guest".into()), None],
             selected_user: 0,
             sessions: vec![hyprland(), sway()],
             selected_session: 0,
@@ -452,7 +452,7 @@ mod tests {
         let fixed = config.fixed_user.is_some();
         let (mut flow, _) = GreetFlow::new(at(0), config);
         if !fixed {
-            flow.step(at(0), respond("mason"));
+            flow.step(at(0), respond("alice"));
         }
         flow.step(at(0), prompt("Password:", true));
         assert_eq!(flow.phase(), GreetPhase::AwaitingPrompt);
@@ -477,9 +477,9 @@ mod tests {
             }
         ));
         assert!(!boot.iter().any(|c| matches!(c, GreetCmd::CreateSession(_))));
-        let cmds = flow.step(at(0), respond("mason"));
-        assert!(has(&cmds, &GreetCmd::CreateSession("mason".into())));
-        assert_eq!(flow.user(), Some("mason"));
+        let cmds = flow.step(at(0), respond("alice"));
+        assert!(has(&cmds, &GreetCmd::CreateSession("alice".into())));
+        assert_eq!(flow.user(), Some("alice"));
     }
 
     #[test]
@@ -505,7 +505,7 @@ mod tests {
         flow.step(at(0), GreetEvent::Ui(UiMessage::SelectUser(2)));
         let (mut flow2, _) = GreetFlow::new(at(0), config());
         let cmds = flow2.step(at(0), respond("   "));
-        assert!(has(&cmds, &GreetCmd::CreateSession("mason".into())));
+        assert!(has(&cmds, &GreetCmd::CreateSession("alice".into())));
         let cmds = flow.step(at(0), respond(""));
         assert!(!cmds.iter().any(|c| matches!(c, GreetCmd::CreateSession(_))));
         assert_eq!(flow.phase(), GreetPhase::AwaitingUser);
@@ -733,7 +733,7 @@ mod tests {
             &GreetCmd::Exit(GreetOutcome::Fatal("broken pipe".into()))
         ));
         assert_eq!(flow.phase(), GreetPhase::Complete);
-        assert!(flow.step(at(0), respond("mason")).is_empty());
+        assert!(flow.step(at(0), respond("alice")).is_empty());
     }
 
     #[test]

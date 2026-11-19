@@ -1,5 +1,5 @@
 #!/bin/sh
-REPO=${VIGIL_REPO:-/home/mason/repos/vigil}
+REPO=${VIGIL_REPO:?}
 DIR=${VIGIL_E2E_DIR:-/tmp}
 BIN=${VIGIL_E2E_BIN:-$REPO/target/debug/vigil}
 LOG=$DIR/vigil.log
