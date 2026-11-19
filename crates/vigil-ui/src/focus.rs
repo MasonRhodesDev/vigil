@@ -202,7 +202,8 @@ impl Focus {
                 (to(stop), Effect::Session(card.sessions.next()))
             }
             (Stop::User | Stop::Session, Key::Enter) => (to(Stop::Field), Effect::Consume),
-            (Stop::Reveal, Key::Space | Key::Enter) => (to(stop), Effect::ToggleReveal),
+            (Stop::Reveal, Key::Space) => (to(stop), Effect::ToggleReveal),
+            (Stop::Reveal, Key::Enter) => (to(Stop::Field), Effect::Forward),
             (Stop::Power(action), Key::Space | Key::Enter) => {
                 (to(Stop::Cancel(action)), Effect::Arm(action))
             }

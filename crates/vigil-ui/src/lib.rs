@@ -375,6 +375,7 @@ impl OutputWindow {
             self.held = 0;
             self.down = None;
             self.reset_focus();
+            self.hide_password();
         }
         self.set_property("panel-visible", Value::Bool(visible));
     }
@@ -389,6 +390,10 @@ impl OutputWindow {
     pub fn field_focused(&self) -> bool {
         self.card()
             .is_none_or(|card| self.focus.settle(&card).stop == Stop::Field)
+    }
+
+    fn hide_password(&self) {
+        self.set_optional_property("reveal", Value::Bool(false));
     }
 
     fn reset_focus(&mut self) {
@@ -659,7 +664,11 @@ impl OutputWindow {
 
     pub fn on_ui_message(&self, sink: std::rc::Rc<dyn Fn(UiMessage)>) {
         let s = sink.clone();
+        let component = self.component.as_weak();
         let r = self.component.set_callback("submit", move |args| {
+            if let Some(component) = component.upgrade() {
+                let _ = component.set_property("reveal", Value::Bool(false));
+            }
             if let Some(Value::String(text)) = args.first() {
                 s(UiMessage::Respond(text.to_string()));
             }
@@ -810,6 +819,7 @@ pub fn apply_kit_tokens_from_system(window: &mut OutputWindow, mode: &str) {
 
 impl AuthUi for OutputWindow {
     fn show_prompt(&mut self, text: &str, secret: bool) {
+        self.hide_password();
         self.set_property("prompt-text", Value::String(text.into()));
         self.set_property("prompt-is-secret", Value::Bool(secret));
         self.set_property("info-message", Value::String("".into()));
@@ -817,6 +827,7 @@ impl AuthUi for OutputWindow {
         self.set_property("auth-state", Value::String("prompting".into()));
     }
     fn reset_input(&mut self) {
+        self.hide_password();
         if let Ok(Value::Number(serial)) = self.component.get_property("prompt-serial") {
             self.set_optional_property("prompt-serial", Value::Number(serial + 1.0));
         }
@@ -825,6 +836,7 @@ impl AuthUi for OutputWindow {
         self.set_property("info-message", Value::String(text.into()));
     }
     fn show_error(&mut self, text: &str) {
+        self.hide_password();
         self.set_property("error-message", Value::String(text.into()));
         self.set_property("auth-state", Value::String("error".into()));
         if let Ok(Value::Number(serial)) = self.component.get_property("error-serial") {
