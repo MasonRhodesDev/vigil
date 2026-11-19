@@ -1751,8 +1751,8 @@ impl App {
         }
         self.pump_login();
         self.pump_messages();
-        let dirty = self.dirty.take_all();
-        self.render(&dirty);
+        self.dirty.take_all();
+        self.render();
     }
 
     fn refresh_banner(&mut self) {
@@ -1799,7 +1799,7 @@ impl App {
         Some(phase)
     }
 
-    fn render(&mut self, dirty: &[OutputId]) {
+    fn render(&mut self) {
         if !self.active {
             return;
         }
@@ -1810,7 +1810,6 @@ impl App {
         let mut dead = Vec::new();
         let now = Instant::now();
         let phase = self.cover_phase(now);
-        let _ = dirty;
         for (i, entry) in self.entries.iter_mut().enumerate() {
             let Entry {
                 id,
