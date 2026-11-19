@@ -395,6 +395,20 @@ fn keyboard_left<S: LockSession>(held: &mut vigil_core::HeldKeys, session: &mut 
     session.keyboard_left();
 }
 
+// The window that saw an Enter pressed drops its repeats, but a panel that
+// moves to another output while Enter is held would take them as presses.
+fn repeated_key(held: &vigil_core::HeldKeys, code: u32, keysym: u32) -> Option<InputEvent> {
+    let (keysym, utf8) = held.pressed(code).unwrap_or((keysym, None));
+    if vigil_core::ONE_SHOT_KEYSYMS.contains(&keysym) {
+        return None;
+    }
+    Some(InputEvent::Key {
+        keysym,
+        utf8,
+        pressed: true,
+    })
+}
+
 fn exit_session<S: LockSession>(
     session: &mut S,
     slot: &mut Option<LockOutcome>,
@@ -1566,15 +1580,9 @@ impl<S: LockSession> KeyboardHandler for App<S> {
         _: u32,
         event: KeyEvent,
     ) {
-        let (keysym, utf8) = self
-            .held_keys
-            .pressed(event.raw_code)
-            .unwrap_or((event.keysym.raw(), None));
-        self.deliver_input(InputEvent::Key {
-            keysym,
-            utf8,
-            pressed: true,
-        });
+        if let Some(event) = repeated_key(&self.held_keys, event.raw_code, event.keysym.raw()) {
+            self.deliver_input(event);
+        }
     }
     fn release_key(
         &mut self,
@@ -1881,6 +1889,31 @@ mod tests {
         assert!(
             cmds.contains(&FlowCmd::DetachAuth),
             "the leave was not input, so grace is still there for a key: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_held_enter_or_escape_never_repeats_into_the_lock() {
+        let mut held = vigil_core::HeldKeys::default();
+        held.press(36, 0xff0d, Some("\r".into()));
+        held.press(104, 0xff8d, Some("\r".into()));
+        held.press(9, 0xff1b, None);
+        held.press(38, 0x61, Some("a".into()));
+        for (code, keysym) in [(36, 0xff0d), (104, 0xff8d), (9, 0xff1b), (200, 0xff0d)] {
+            assert_eq!(
+                super::repeated_key(&held, code, keysym),
+                None,
+                "a repeat of keysym {keysym:#x} reached the panel as a fresh press"
+            );
+        }
+        assert_eq!(
+            super::repeated_key(&held, 38, 0x61),
+            Some(vigil_core::InputEvent::Key {
+                keysym: 0x61,
+                utf8: Some("a".into()),
+                pressed: true,
+            }),
+            "a held letter still repeats"
         );
     }
 
