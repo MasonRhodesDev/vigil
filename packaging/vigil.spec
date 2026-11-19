@@ -49,6 +49,7 @@ install -Dpm0755 target/rpm/vigil %{buildroot}%{_bindir}/vigil
 install -Dpm0755 target/rpm/vigil-lock %{buildroot}%{_bindir}/vigil-lock
 install -Dpm0755 target/rpm/vigil-sim %{buildroot}%{_bindir}/vigil-sim
 
+install -Dpm0755 target/rpm/vigil-scene %{buildroot}%{_prefix}/lib/vigil/vigil-scene
 install -Dpm0755 dist/setup-greetd %{buildroot}%{_prefix}/lib/vigil/setup-greetd
 install -Dpm0644 dist/vigil.tmpfiles %{buildroot}%{_tmpfilesdir}/vigil.conf
 sed -i 's/ :greeter :greeter / :greetd :greetd /' %{buildroot}%{_tmpfilesdir}/vigil.conf
@@ -76,6 +77,7 @@ getent group monitor-profiles >/dev/null || groupadd -r monitor-profiles || :
 %{_bindir}/vigil
 %{_bindir}/vigil-lock
 %{_bindir}/vigil-sim
+%{_prefix}/lib/vigil/vigil-scene
 %{_prefix}/lib/vigil/setup-greetd
 %{_tmpfilesdir}/vigil.conf
 %config(noreplace) %{_sysconfdir}/pam.d/vigil-lock

@@ -41,6 +41,7 @@ package() {
   install -Dm755 target/release/vigil-lock "$pkgdir/usr/bin/vigil-lock"
   install -Dm755 target/release/vigil-sim "$pkgdir/usr/bin/vigil-sim"
 
+  install -Dm755 target/release/vigil-scene "$pkgdir/usr/lib/vigil/vigil-scene"
   install -Dm755 dist/setup-greetd "$pkgdir/usr/lib/vigil/setup-greetd"
   install -Dm644 dist/vigil.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/vigil.conf"
   install -Dm644 dist/vigil-lock.pam "$pkgdir/etc/pam.d/vigil-lock"

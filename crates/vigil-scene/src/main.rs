@@ -1,6 +1,8 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -8,8 +10,8 @@ use std::time::Duration;
 
 use image::ImageEncoder;
 use vigil_scene::{
-    Error, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE, MAX_SPEC_BYTES, Plate, Scene, Sprite,
-    emit_spec, read_bounded,
+    Error, Format, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE, MAX_SPEC_BYTES, Plate,
+    Request, Scene, Sprite, confine, emit_spec, read_bounded,
 };
 
 const USAGE: &str = "usage:
@@ -17,6 +19,9 @@ const USAGE: &str = "usage:
                      [--ref-short-side N] [--scene FILE] [--logo SVG]
                      [--level 0..1] [--progress 0..1] [--edge N]
   vigil-scene spec --out FILE [--scene FILE] [--ref-short-side N]
+  vigil-scene mask --format svg|raster --edge N --deadline-ms N
+  vigil-scene layer --mode WxH --transform 0-3 --layer frame|logo|glow|bar
+                    --value 0..1 --svg-len N --spec-len N --deadline-ms N
 
 stages:
   grub-menu     the mark sprite at its place on the mode (RGBA, straight alpha)
@@ -27,7 +32,11 @@ stages:
   icon          the mark alone, --edge pixels square (RGBA, straight alpha)
 
 --mode is the output's mode as the panel scans it out; --transform turns the
-scene on it as wl_output does. Sprites print their placement as JSON.";
+scene on it as wl_output does. Sprites print their placement as JSON.
+
+mask and layer are the helper the library runs for untrusted logos. Each
+confines itself, reads the logo (and for layer, the spec after it) from
+stdin, and writes raw pixels to stdout.";
 
 const RENDER_LIMIT: Duration = Duration::from_secs(30);
 
@@ -291,9 +300,136 @@ fn spec(argv: &[String]) -> Result<(), String> {
     std::fs::write(out, text).map_err(|e| format!("{out}: {e}"))
 }
 
+// Descriptors the caller leaked into this process, a compositor's among
+// them, are closed before the input is read.
+#[allow(unsafe_code)]
+fn close_inherited() -> Result<(), Error> {
+    // SAFETY: close_range takes no pointers. It runs first in main, before
+    // this process has made any descriptor above 2, so nothing here owns one
+    // it closes.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3 as libc::c_uint,
+            libc::c_uint::MAX,
+            0 as libc::c_uint,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::Helper(format!(
+            "close_range: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn stdin_up_to(cap: u64) -> Result<Vec<u8>, Error> {
+    let mut data = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(cap + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| Error::Io(e.to_string()))?;
+    if data.len() as u64 > cap {
+        return Err(Error::TooLarge(format!("the input is over {cap} bytes")));
+    }
+    Ok(data)
+}
+
+fn mask_job(args: &Args) -> Result<Vec<u8>, Error> {
+    let format = Format::parse(args.need("format").map_err(Error::Helper)?)
+        .ok_or_else(|| Error::Helper("--format is svg or raster".into()))?;
+    let edge = args
+        .num::<u32>("edge")
+        .map_err(Error::Helper)?
+        .ok_or_else(|| Error::Helper("--edge is required".into()))?;
+    let data = stdin_up_to(format.cap())?;
+    Ok(Logo::parse(&data, format)?.mask(edge)?.into_alpha())
+}
+
+fn layer_job(args: &Args) -> Result<Vec<u8>, Error> {
+    let len = |key: &str, cap: u64| -> Result<usize, Error> {
+        let n = args
+            .num::<u64>(key)
+            .map_err(Error::Helper)?
+            .ok_or_else(|| Error::Helper(format!("--{key} is required")))?;
+        if n > cap {
+            return Err(Error::TooLarge(format!("--{key} {n} is over {cap}")));
+        }
+        Ok(n as usize)
+    };
+    let (svg_len, spec_len) = (
+        len("svg-len", MAX_LOGO_BYTES)?,
+        len("spec-len", MAX_SPEC_BYTES)?,
+    );
+    let data = stdin_up_to((svg_len + spec_len) as u64)?;
+    if data.len() != svg_len + spec_len {
+        return Err(Error::Invalid(format!(
+            "read {} bytes of input, not {}",
+            data.len(),
+            svg_len + spec_len
+        )));
+    }
+    let (svg, spec) = data.split_at(svg_len);
+    let layer = args.need("layer").map_err(Error::Helper)?;
+    Request {
+        svg: (svg_len > 0).then_some(svg),
+        spec: (spec_len > 0).then_some(spec),
+        mode: mode(args.need("mode").map_err(Error::Helper)?).map_err(Error::Helper)?,
+        transform: args
+            .num::<u8>("transform")
+            .map_err(Error::Helper)?
+            .unwrap_or(0),
+        layer: Layer::parse(layer).ok_or_else(|| Error::Helper(format!("no layer {layer}")))?,
+        value: args.unit("value", 0.0).map_err(Error::Helper)?,
+    }
+    .draw()
+}
+
+fn helper(job: &str, argv: &[String]) -> ExitCode {
+    let run = || -> Result<(), Error> {
+        close_inherited()?;
+        let allowed: &[&str] = match job {
+            "mask" => &["format", "edge", "deadline-ms"],
+            _ => &[
+                "mode",
+                "transform",
+                "layer",
+                "value",
+                "svg-len",
+                "spec-len",
+                "deadline-ms",
+            ],
+        };
+        let args = Args::parse(argv, allowed).map_err(Error::Helper)?;
+        let deadline = args
+            .num::<u64>("deadline-ms")
+            .map_err(Error::Helper)?
+            .ok_or_else(|| Error::Helper("--deadline-ms is required".into()))?;
+        confine(Duration::from_millis(deadline))?;
+        let pixels = match job {
+            "mask" => mask_job(&args)?,
+            _ => layer_job(&args)?,
+        };
+        let mut out = std::io::stdout().lock();
+        out.write_all(&pixels)
+            .and_then(|()| out.flush())
+            .map_err(|e| Error::Io(e.to_string()))
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vigil-scene: {e}");
+            ExitCode::from(e.exit_code())
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = match argv.first().map(String::as_str) {
+        Some(job @ ("mask" | "layer")) => return helper(job, &argv[1..]),
         Some("render") => render(&argv[1..]),
         Some("spec") => spec(&argv[1..]),
         Some("--help" | "-h" | "help") => {

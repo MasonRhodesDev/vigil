@@ -5220,7 +5220,9 @@ name = "vigil-scene"
 version = "0.4.3"
 dependencies = [
  "image",
+ "libc",
  "resvg",
+ "rustix 1.1.5",
  "serde_json",
 ]
 

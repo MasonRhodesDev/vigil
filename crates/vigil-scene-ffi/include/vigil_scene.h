@@ -24,6 +24,12 @@
 #define VIGIL_SCENE_ERR_PANIC -6
 
 /**
+ * The helper could not be started: it is missing from its installed path,
+ * or it is not the version this library was built with.
+ */
+#define VIGIL_SCENE_ERR_HELPER -7
+
+/**
  * The whole frame, XRGB8888: bytes B, G, R, 0xff per pixel.
  */
 #define VIGIL_SCENE_LAYER_FRAME 0
@@ -44,10 +50,22 @@
 #define VIGIL_SCENE_LAYER_BAR 3
 
 /**
+ * The deadline a request with `deadline_ms` 0 gets.
+ */
+#define VIGIL_SCENE_DEFAULT_DEADLINE_MS 1500
+
+/**
+ * The longest deadline a request may ask for.
+ */
+#define VIGIL_SCENE_MAX_DEADLINE_MS 5000
+
+/**
  * What to draw. `svg` and `spec_json` are each null with a length of 0, or
  * point to that many bytes. Without `spec_json` the built-in scene is used.
  * The mode is the panel's, and `transform` (0 to 3) turns the scene on it as
- * `wl_output.transform` does.
+ * `wl_output.transform` does. `deadline_ms` bounds the drawing of a logo:
+ * 0 asks for `VIGIL_SCENE_DEFAULT_DEADLINE_MS`, and more than
+ * `VIGIL_SCENE_MAX_DEADLINE_MS` is refused.
  */
 typedef struct VigilSceneRequest {
   const uint8_t *svg;
@@ -59,6 +77,7 @@ typedef struct VigilSceneRequest {
   uint32_t transform;
   uint32_t layer;
   double value;
+  uint32_t deadline_ms;
 } VigilSceneRequest;
 
 /**
@@ -81,10 +100,18 @@ extern "C" {
  * Draws one layer of the scene into `out` and says where it goes.
  *
  * Returns `VIGIL_SCENE_OK`, or a negative `VIGIL_SCENE_ERR_*`. With `out`
- * null and `out_len` 0 it only fills `placement`, without drawing, so a
- * caller can size the buffer; the bytes needed are `placement.stride * placement.height`. When
- * `out_len` is too small it fills `placement` and returns
- * `VIGIL_SCENE_ERR_BUFFER`.
+ * null and `out_len` 0 it only fills `placement`, from the spec and the mode,
+ * without reading the logo, so a caller can size the buffer; the bytes
+ * needed are `placement.stride * placement.height`. When `out_len` is too
+ * small it fills `placement` and returns `VIGIL_SCENE_ERR_BUFFER`.
+ *
+ * A request with a logo is drawn by the helper process installed with this
+ * library, and the call returns within `deadline_ms` plus the copy of the
+ * layer into `out`, whatever the logo holds. A request without one is drawn
+ * in the calling process. On any error `out` is left unwritten, and a caller
+ * should draw the ground-only scene by asking again without the logo. The
+ * same logo is refused again on the next call, so a caller that remembers
+ * the refusal stalls for one deadline at most.
  *
  * # Safety
  *

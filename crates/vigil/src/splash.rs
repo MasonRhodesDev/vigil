@@ -4,7 +4,7 @@ use font8x8::{BASIC_FONTS, UnicodeFonts};
 use vigil_config::Splash as SplashConfig;
 use vigil_core::{FrameTarget, scene_to_panel};
 
-use vigil_scene::{Logo, Plate};
+use vigil_scene::{DEFAULT_DEADLINE, Helper, Plate, read_logo};
 
 use crate::scene::{Scene, ease};
 
@@ -56,13 +56,26 @@ fn put(buf: &mut [u8], stride: usize, x: usize, y: usize, rgb: [u8; 3]) {
 
 impl Splash {
     pub fn new(cfg: &SplashConfig, spec: &Scene, scene: (u32, u32), transform: u8) -> Self {
+        let helper = Helper::new(vigil_scene::installed_helper!(), DEFAULT_DEADLINE);
+        Self::with_helper(cfg, spec, scene, transform, &helper)
+    }
+
+    pub fn with_helper(
+        cfg: &SplashConfig,
+        spec: &Scene,
+        scene: (u32, u32),
+        transform: u8,
+        helper: &Helper,
+    ) -> Self {
         let plate = cfg
             .logo
             .as_ref()
             .filter(|p| !p.as_os_str().is_empty())
             .and_then(|path| {
-                Logo::load(path)
-                    .and_then(|logo| Plate::new(spec, &logo, scene, transform))
+                read_logo(path)
+                    .and_then(|(logo, format)| {
+                        Plate::from_helper(spec, helper, (&logo, format), scene, transform)
+                    })
                     .inspect_err(|e| eprintln!("vigil: splash logo {}: {e}", path.display()))
                     .ok()
             })
@@ -364,6 +377,56 @@ impl Default for Cover {
 }
 
 #[cfg(test)]
+fn test_helper(deadline: std::time::Duration) -> vigil_scene::Helper {
+    static BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let bin = BIN.get_or_init(|| {
+        let profile = if cfg!(debug_assertions) {
+            "dev"
+        } else {
+            "release"
+        };
+        let out = std::process::Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--frozen",
+                "--message-format=json",
+                "--profile",
+                profile,
+            ])
+            .args(["-p", "vigil-scene", "--bin", "vigil-scene"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "cargo build: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find_map(|m| m["executable"].as_str().map(std::path::PathBuf::from))
+            .expect("cargo names the helper it built")
+    });
+    vigil_scene::Helper::new(bin, deadline)
+}
+
+#[cfg(test)]
+fn splash(cfg: &SplashConfig, spec: &Scene, scene: (u32, u32), transform: u8) -> Splash {
+    Splash::with_helper(
+        cfg,
+        spec,
+        scene,
+        transform,
+        &test_helper(std::time::Duration::from_secs(300)),
+    )
+}
+
+#[cfg(test)]
+#[path = "../../vigil-scene/tests/common/mod.rs"]
+mod scene_inputs;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -433,7 +496,7 @@ mod tests {
             let want = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
 
             let (pw, ph) = if transform == 1 { (h, w) } else { (w, h) };
-            let s = Splash::new(&cfg, &spec, (w, h), transform);
+            let s = splash(&cfg, &spec, (w, h), transform);
             let mut buf = Vec::new();
             let mut t = target(&mut buf, pw, ph);
             assert!(s.draw_full(&mut t, 0.0));
@@ -452,7 +515,7 @@ mod tests {
     fn rest_frame_is_ground_and_mark_only() {
         let spec = Scene::default();
         let cfg = cfg_with_logo("rest");
-        let s = Splash::new(&cfg, &spec, (800, 500), 0);
+        let s = splash(&cfg, &spec, (800, 500), 0);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 800, 500);
         assert!(s.draw_full(&mut t, 0.0));
@@ -468,7 +531,7 @@ mod tests {
     fn glow_tints_the_ground_under_the_mark_and_scales_with_level() {
         let spec = Scene::default();
         let cfg = cfg_with_logo("glow");
-        let s = Splash::new(&cfg, &spec, (800, 500), 0);
+        let s = splash(&cfg, &spec, (800, 500), 0);
         let g = spec.geometry(800, 500);
         let at = |level: f64| {
             let mut buf = Vec::new();
@@ -498,7 +561,7 @@ mod tests {
     fn rotated_panel_gets_the_same_picture_turned() {
         let spec = Scene::default();
         let cfg = cfg_with_logo("rot");
-        let s = Splash::new(&cfg, &spec, (400, 800), 3);
+        let s = splash(&cfg, &spec, (400, 800), 3);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 800, 400);
         assert!(s.draw_full(&mut t, 0.2));
@@ -511,7 +574,7 @@ mod tests {
     #[test]
     fn no_logo_is_just_the_ground() {
         let spec = Scene::default();
-        let s = Splash::new(&SplashConfig::default(), &spec, (200, 100), 0);
+        let s = splash(&SplashConfig::default(), &spec, (200, 100), 0);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 200, 100);
         assert!(s.draw_full(&mut t, 0.4));
@@ -523,7 +586,7 @@ mod tests {
     #[test]
     fn blend_moves_from_target_to_rest() {
         let spec = Scene::default();
-        let s = Splash::new(&SplashConfig::default(), &spec, (4, 4), 0);
+        let s = splash(&SplashConfig::default(), &spec, (4, 4), 0);
         let mut buf = Vec::new();
         let mut t = target(&mut buf, 4, 4);
         t.buffer.fill(200);
@@ -607,6 +670,69 @@ mod tests {
         assert!(c.needs_full());
     }
 
+    const CHILD: &str = "VIGIL_SPLASH_TEST";
+
+    fn peak_rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap()
+    }
+
+    #[test]
+    fn child_builds_a_splash_over_one_review_input() {
+        let Some(index) = std::env::var_os(CHILD) else {
+            return;
+        };
+        let index: usize = index.to_str().unwrap().parse().unwrap();
+        let (what, text) = &super::scene_inputs::review_inputs()[index];
+        let cfg = cfg_with_svg(&format!("review{index}"), text);
+        let spec = Scene::default();
+        let helper = test_helper(vigil_scene::DEFAULT_DEADLINE);
+        let base = peak_rss_kib();
+        let start = Instant::now();
+        let s = Splash::with_helper(&cfg, &spec, (1920, 1080), 0, &helper);
+        let took = start.elapsed();
+        let grew = peak_rss_kib().saturating_sub(base);
+        println!("SPLASH {what}: {took:?}, parent grew {grew} KiB");
+        assert!(
+            took < vigil_scene::DEFAULT_DEADLINE + Duration::from_millis(500),
+            "{what}: {took:?}"
+        );
+        assert!(grew < 32 * 1024, "{what}: the parent grew by {grew} KiB");
+        let mut buf = Vec::new();
+        assert!(s.draw_full(&mut target(&mut buf, 1920, 1080), 0.0));
+    }
+
+    #[test]
+    fn every_review_input_leaves_the_splash_on_time() {
+        for i in 0..super::scene_inputs::review_inputs().len() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "splash::tests::child_builds_a_splash_over_one_review_input",
+                ])
+                .args(["--nocapture", "--test-threads", "1"])
+                .env(CHILD, i.to_string())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            for line in stdout
+                .lines()
+                .filter_map(|l| l.find("SPLASH ").map(|i| &l[i..]))
+            {
+                println!("{line}");
+            }
+        }
+    }
+
     #[test]
     fn parses_colors_and_keeps_fallback() {
         assert_eq!(parse_color("#0b0d10", [1, 2, 3]), [0x0b, 0x0d, 0x10]);
@@ -651,7 +777,7 @@ mod goldens {
             } else {
                 (pw, ph)
             };
-            let s = Splash::new(&cfg, &spec, scene, transform);
+            let s = splash(&cfg, &spec, scene, transform);
             let mut buf = vec![0u8; (pw * ph * 4) as usize];
             let mut t = FrameTarget {
                 buffer: &mut buf,

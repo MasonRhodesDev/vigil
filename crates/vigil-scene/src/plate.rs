@@ -1,6 +1,6 @@
 use crate::glow::glow_mask;
 use crate::spec::{Geometry, Scene, rnd};
-use crate::{Error, Logo, MAX_EDGE, Mask};
+use crate::{Error, Format, Helper, Logo, MAX_EDGE, Mask};
 
 pub const MAX_SIDE: u32 = 16384;
 pub const MAX_PIXELS: u64 = 8192 * 8192;
@@ -219,19 +219,28 @@ pub struct Plate {
 }
 
 impl Plate {
+    /// Draws the logo in this process, so only for a logo the caller trusts.
     pub fn new(
         spec: &Scene,
         logo: &Logo,
         scene: (u32, u32),
         transform: u8,
     ) -> Result<Plate, Error> {
-        let panel = if transform % 2 == 1 {
-            (scene.1, scene.0)
-        } else {
-            scene
-        };
-        let layout = Layout::new(spec, panel, transform)?;
+        let layout = Layout::new(spec, Layout::of(spec, scene, transform).panel, transform)?;
         let mask = logo.mask(layout.geometry.logo)?;
+        Ok(Plate::build(spec, Some(mask), layout))
+    }
+
+    /// Draws the logo's mask in the helper; the rest is drawn here.
+    pub fn from_helper(
+        spec: &Scene,
+        helper: &Helper,
+        (logo, format): (&[u8], Format),
+        scene: (u32, u32),
+        transform: u8,
+    ) -> Result<Plate, Error> {
+        let layout = Layout::new(spec, Layout::of(spec, scene, transform).panel, transform)?;
+        let mask = helper.mask(logo, format, layout.geometry.logo)?;
         Ok(Plate::build(spec, Some(mask), layout))
     }
 

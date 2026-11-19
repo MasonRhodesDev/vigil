@@ -115,7 +115,9 @@ fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
 
 impl Scene {
     pub fn load(path: &Path) -> Scene {
-        let text = match std::fs::read_to_string(path) {
+        let text = match crate::read_bounded(path, MAX_SPEC_BYTES).and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| Error::Invalid("not UTF-8".into()))
+        }) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!(

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use resvg::usvg::{self, roxmltree};
@@ -46,6 +47,45 @@ pub enum Logo {
     Raster(image::RgbaImage),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Svg,
+    Raster,
+}
+
+impl Format {
+    pub fn of(path: &Path) -> Format {
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
+        {
+            Format::Svg
+        } else {
+            Format::Raster
+        }
+    }
+
+    pub fn cap(self) -> u64 {
+        match self {
+            Format::Svg => MAX_LOGO_BYTES,
+            Format::Raster => MAX_RASTER_BYTES,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Svg => "svg",
+            Format::Raster => "raster",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Format> {
+        [Format::Svg, Format::Raster]
+            .into_iter()
+            .find(|f| f.name() == name)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mask {
     edge: u32,
@@ -61,6 +101,14 @@ impl Mask {
         &self.alpha
     }
 
+    pub(crate) fn from_alpha(edge: u32, alpha: Vec<u8>) -> Mask {
+        Mask { edge, alpha }
+    }
+
+    pub fn into_alpha(self) -> Vec<u8> {
+        self.alpha
+    }
+
     pub fn sprite(&self, rgb: [u8; 3]) -> Vec<u8> {
         self.alpha
             .iter()
@@ -69,8 +117,14 @@ impl Mask {
     }
 }
 
+// Opened without blocking, so a FIFO in place of a file is refused rather
+// than waited on.
 pub fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, Error> {
-    let file = std::fs::File::open(path).map_err(|e| Error::Io(e.to_string()))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(path)
+        .map_err(|e| Error::Io(e.to_string()))?;
     let meta = file.metadata().map_err(|e| Error::Io(e.to_string()))?;
     if !meta.is_file() {
         return Err(Error::Refused("not a regular file".into()));
@@ -85,15 +139,21 @@ pub fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, Error> {
     Ok(data)
 }
 
+pub fn read_logo(path: &Path) -> Result<(Vec<u8>, Format), Error> {
+    let format = Format::of(path);
+    Ok((read_bounded(path, format.cap())?, format))
+}
+
 impl Logo {
     pub fn load(path: &Path) -> Result<Logo, Error> {
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
-        {
-            Logo::svg(&read_bounded(path, MAX_LOGO_BYTES)?)
-        } else {
-            Logo::raster(&read_bounded(path, MAX_RASTER_BYTES)?)
+        let (data, format) = read_logo(path)?;
+        Logo::parse(&data, format)
+    }
+
+    pub fn parse(data: &[u8], format: Format) -> Result<Logo, Error> {
+        match format {
+            Format::Svg => Logo::svg(data),
+            Format::Raster => Logo::raster(data),
         }
     }
 
