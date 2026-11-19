@@ -121,6 +121,16 @@ from a checkout, or a distro that installs it elsewhere, sets
 `VIGIL_SCENE_HELPER=$PWD/target/release/vigil-scene cargo build --release`.
 Without the helper the splash draws the ground and no logo.
 
+A logo from config is untrusted, so the helper sandboxes itself. Before it
+reads a byte it caps its CPU time, memory, descriptors, output and children,
+and can never gain privileges. Once it holds all its input, and before it
+parses any, it stops being dumpable, denies itself every file and network
+access with Landlock where the kernel has it, and installs a seccomp filter
+that kills it at any system call outside allocating, writing its result and
+exiting. A bug in the SVG or image parsers then reaches no file, socket or
+other process. The allowlist and how it was derived are in
+`crates/vigil-scene/src/sandbox.rs`.
+
 For safe UI development inside a running session, use `vigil-sim login`,
 `vigil-sim lock`, or `vigil-sim warning`. The simulator has no PAM, logind,
 greetd, DRM, power, or session-lock dependencies; its hamburger drawer selects
@@ -255,7 +265,9 @@ the same order, so a failure shows up before a push.
   `PR_SET_DUMPABLE`, which keeps its memory out of core dumps and away from
   same-user ptrace. A panic on any thread ends the process at once with
   status 101, so a dead worker cannot leave a live locker that no longer
-  authenticates, and the session lock stays held. The report names only the
+  authenticates, and the session lock stays held. The `vigil-scene` helper
+  holds no credentials and stays dumpable until it has read its input, then
+  drops it with the rest of its sandbox. The report names only the
   file and line, since a panic message can quote typed text. Work wrapped in
   `vigil_secret::cosmetic`, such as a wallpaper render, loses only its result
   when it panics.

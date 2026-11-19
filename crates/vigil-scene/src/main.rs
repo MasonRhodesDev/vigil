@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use image::ImageEncoder;
 use vigil_scene::{
-    Error, Format, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE, MAX_SPEC_BYTES, Plate,
-    Request, Scene, Sprite, confine, emit_spec, read_bounded,
+    Error, Format, Layer, Layout, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_SIDE, MAX_SPEC_BYTES, NOTICE,
+    Plate, Request, Scene, Sprite, confine, emit_spec, lock_down, read_bounded,
 };
 
 const USAGE: &str = "usage:
@@ -323,13 +323,18 @@ fn close_inherited() -> Result<(), Error> {
     Ok(())
 }
 
-fn stdin_up_to(cap: u64) -> Result<Vec<u8>, Error> {
+// Reads all of stdin, then locks the process down before any of it is
+// parsed.
+fn input_up_to(cap: u64) -> Result<Vec<u8>, Error> {
     let mut data = Vec::new();
     std::io::stdin()
         .lock()
         .take(cap + 1)
         .read_to_end(&mut data)
         .map_err(|e| Error::Io(e.to_string()))?;
+    if let Some(notice) = lock_down()? {
+        eprintln!("{NOTICE}{notice}");
+    }
     if data.len() as u64 > cap {
         return Err(Error::TooLarge(format!("the input is over {cap} bytes")));
     }
@@ -343,7 +348,7 @@ fn mask_job(args: &Args) -> Result<Vec<u8>, Error> {
         .num::<u32>("edge")
         .map_err(Error::Helper)?
         .ok_or_else(|| Error::Helper("--edge is required".into()))?;
-    let data = stdin_up_to(format.cap())?;
+    let data = input_up_to(format.cap())?;
     Ok(Logo::parse(&data, format)?.mask(edge)?.into_alpha())
 }
 
@@ -362,7 +367,7 @@ fn layer_job(args: &Args) -> Result<Vec<u8>, Error> {
         len("svg-len", MAX_LOGO_BYTES)?,
         len("spec-len", MAX_SPEC_BYTES)?,
     );
-    let data = stdin_up_to((svg_len + spec_len) as u64)?;
+    let data = input_up_to((svg_len + spec_len) as u64)?;
     if data.len() != svg_len + spec_len {
         return Err(Error::Invalid(format!(
             "read {} bytes of input, not {}",

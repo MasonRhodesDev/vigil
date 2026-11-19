@@ -10,12 +10,9 @@ use std::time::{Duration, Instant};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::Errno;
-use rustix::process::{
-    Pid, PidfdFlags, Resource, Rlimit, Signal, getrlimit, pidfd_open, pidfd_send_signal,
-    set_parent_process_death_signal, setrlimit,
-};
+use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
-use crate::{Error, Format, MAX_EDGE, MAX_LOGO_BYTES, MAX_PIXELS, MAX_SPEC_BYTES, Mask, Request};
+use crate::{Error, Format, MAX_EDGE, MAX_LOGO_BYTES, MAX_SPEC_BYTES, Mask, NOTICE, Request};
 
 /// Where packages install the helper. A crate that calls it takes the path
 /// from `installed_helper!`, so a build can move it.
@@ -23,8 +20,7 @@ pub const INSTALLED_HELPER: &str = "/usr/lib/vigil/vigil-scene";
 pub const DEFAULT_DEADLINE: Duration = Duration::from_millis(1500);
 pub const MAX_DEADLINE: Duration = Duration::from_secs(5);
 
-const MEMORY: u64 = 1 << 30;
-const MESSAGE: u64 = 4096;
+pub(crate) const MESSAGE: u64 = 4096;
 
 /// The helper's installed path, fixed when the calling crate is built: the
 /// `VIGIL_SCENE_HELPER` build variable, else `INSTALLED_HELPER`. It is never
@@ -203,7 +199,12 @@ impl Helper {
                 out.len()
             )));
         }
-        stdout.read_exact_at(out, 0).map_err(io)
+        stdout.read_exact_at(out, 0).map_err(io)?;
+        if let Some(notice) = notice(&stderr) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("vigil-scene: the helper says: {notice}"));
+        }
+        Ok(())
     }
 }
 
@@ -233,44 +234,27 @@ fn wait(pidfd: &OwnedFd, by: Instant) -> Result<bool, Error> {
     }
 }
 
-fn message(stderr: &File) -> String {
+fn stderr_text(stderr: &File) -> String {
     let len = stderr.metadata().map_or(0, |m| m.len()).min(MESSAGE);
     let mut buf = vec![0u8; len as usize];
     let read = stderr.read_at(&mut buf, 0).unwrap_or(0);
-    String::from_utf8_lossy(&buf[..read])
+    String::from_utf8_lossy(&buf[..read]).into_owned()
+}
+
+fn notice(stderr: &File) -> Option<String> {
+    stderr_text(stderr)
+        .lines()
+        .find_map(|l| l.strip_prefix(NOTICE).map(str::to_owned))
+}
+
+// What the helper said about its failure; notices do not count.
+fn message(stderr: &File) -> String {
+    stderr_text(stderr)
+        .lines()
+        .filter(|l| !l.starts_with(NOTICE))
+        .collect::<Vec<_>>()
+        .join("\n")
         .trim()
         .trim_start_matches("vigil-scene: ")
         .to_owned()
-}
-
-/// What the helper does to itself before it reads its input: CPU time just
-/// past the deadline, 1 GiB of address space, no descriptors beyond stdio,
-/// output no bigger than the largest frame, no core dumps and no children.
-/// It dies with the thread that started it and can never gain privileges.
-/// A limit already lower is kept.
-pub fn confine(deadline: Duration) -> Result<(), Error> {
-    let cpu = u64::try_from(deadline.as_millis().div_ceil(1000))
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    for (resource, want) in [
-        (Resource::Cpu, cpu),
-        (Resource::As, MEMORY),
-        (Resource::Nofile, 3),
-        (Resource::Fsize, MAX_PIXELS * 4 + MESSAGE),
-        (Resource::Core, 0),
-        (Resource::Nproc, 0),
-    ] {
-        let limit = getrlimit(resource).maximum.map_or(want, |m| m.min(want));
-        setrlimit(
-            resource,
-            Rlimit {
-                current: Some(limit),
-                maximum: Some(limit),
-            },
-        )
-        .map_err(|e| Error::Helper(format!("limiting {resource:?}: {e}")))?;
-    }
-    set_parent_process_death_signal(Some(Signal::KILL))
-        .and_then(|()| rustix::thread::set_no_new_privs(true))
-        .map_err(|e| Error::Helper(format!("confining the helper: {e}")))
 }

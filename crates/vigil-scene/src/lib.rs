@@ -6,9 +6,10 @@ mod helper;
 mod layer;
 mod logo;
 mod plate;
+mod sandbox;
 mod spec;
 
-pub use helper::{DEFAULT_DEADLINE, Helper, INSTALLED_HELPER, MAX_DEADLINE, confine};
+pub use helper::{DEFAULT_DEADLINE, Helper, INSTALLED_HELPER, MAX_DEADLINE};
 pub use layer::{Layer, Request};
 pub use logo::{
     Format, Logo, MAX_EDGE, MAX_LOGO_BYTES, MAX_RASTER_BYTES, Mask, read_bounded, read_logo,
@@ -16,6 +17,7 @@ pub use logo::{
 pub use plate::{
     Layout, MAX_GLOW, MAX_PIXELS, MAX_SIDE, Placement, Plate, Rect, Sprite, mix, to_panel,
 };
+pub use sandbox::{NOTICE, confine, lock_down};
 pub use spec::{
     DEFAULT_SPEC, Geometry, MAX_SPEC_BYTES, Scene, TagGeometry, ease, emit_spec, parse_color,
 };
