@@ -298,29 +298,32 @@ pub struct Settled {
 }
 
 pub fn settle(
-    _old: &Row,
+    old: &Row,
     new: &Row,
     panel: Option<OutputId>,
     cursor: (f64, f64),
 ) -> Option<Settled> {
-    let origin = new
-        .spans
-        .iter()
-        .find(|span| span.placed == Placed::Profile && span.x == 0.0 && span.y == 0.0);
-    if let Some(origin) = origin {
+    if let Some(panel) = panel.filter(|&id| new.contains(id)) {
+        let kept = old
+            .locate(cursor.0, cursor.1)
+            .filter(|hit| hit.id == panel)
+            .and_then(|hit| new.point(panel, hit.x, hit.y))
+            .filter(|&(x, y)| new.locate(x, y).is_some_and(|hit| hit.id == panel));
         return Some(Settled {
-            panel: origin.id,
-            cursor: origin.centre(),
-            moved: (panel != Some(origin.id)).then_some(PanelReason::Origin),
+            panel,
+            cursor: kept.or_else(|| new.centre(panel))?,
+            moved: None,
         });
     }
-    let panel = panel
-        .filter(|&id| new.contains(id))
-        .or(new.spans.first().map(|span| span.id))?;
+    let home = new.home()?;
     Some(Settled {
-        panel,
-        cursor: new.clamp(cursor.0, cursor.1),
-        moved: None,
+        panel: home,
+        cursor: new.centre(home)?,
+        moved: Some(if panel.is_some() {
+            PanelReason::Removed
+        } else {
+            PanelReason::Origin
+        }),
     })
 }
 
