@@ -1,7 +1,8 @@
 #![deny(unsafe_code)]
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
+use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -277,7 +278,7 @@ fn render(argv: &[String]) -> Result<(), String> {
         }
         Picture::Sprite(s) => {
             write_png(&out, s.width, s.height, &s.rgba, true).map_err(fail)?;
-            println!(
+            vigil_log::out!(
                 "{}",
                 serde_json::json!({
                     "stage": stage_name,
@@ -325,6 +326,21 @@ fn close_inherited() -> Result<(), Error> {
     Ok(())
 }
 
+// The helper's stdout and stderr are the library's memfds, and once it is
+// locked down write(2) is its only way out: say!'s fstat and its reopen
+// through /proc are calls the sandbox kills.
+fn record(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<(), Error> {
+    while !bytes.is_empty() {
+        match rustix::io::write(fd, bytes) {
+            Ok(0) => return Err(Error::Io("the output takes no more bytes".into())),
+            Ok(n) => bytes = &bytes[n..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(Error::Io(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
 // Reads all of stdin, then locks the process down before any of it is
 // parsed.
 fn input_up_to(cap: u64) -> Result<Vec<u8>, Error> {
@@ -335,7 +351,10 @@ fn input_up_to(cap: u64) -> Result<Vec<u8>, Error> {
         .read_to_end(&mut data)
         .map_err(|e| Error::Io(e.to_string()))?;
     if let Some(notice) = lock_down()? {
-        eprintln!("{NOTICE}{notice}");
+        let _ = record(
+            rustix::stdio::stderr(),
+            format!("{NOTICE}{notice}\n").as_bytes(),
+        );
     }
     if data.len() as u64 > cap {
         return Err(Error::TooLarge(format!("the input is over {cap} bytes")));
@@ -425,15 +444,15 @@ fn helper(job: &str, argv: &[String]) -> ExitCode {
             "mask" => mask_job(&args)?,
             _ => layer_job(&args)?,
         };
-        let mut out = std::io::stdout().lock();
-        out.write_all(&pixels)
-            .and_then(|()| out.flush())
-            .map_err(|e| Error::Io(e.to_string()))
+        record(rustix::stdio::stdout(), &pixels)
     };
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("vigil-scene: {e}");
+            let _ = record(
+                rustix::stdio::stderr(),
+                format!("vigil-scene: {e}\n").as_bytes(),
+            );
             ExitCode::from(e.exit_code())
         }
     }
@@ -447,18 +466,20 @@ fn main() -> ExitCode {
         Some("render") => render(&argv[1..]),
         Some("spec") => spec(&argv[1..]),
         Some("--help" | "-h" | "help") => {
-            println!("{USAGE}");
+            vigil_log::out!("{USAGE}");
             return ExitCode::SUCCESS;
         }
         _ => {
-            eprintln!("{USAGE}");
+            vigil_log::say!(
+                "usage: vigil-scene render|spec|mask|layer ...; see vigil-scene --help"
+            );
             return ExitCode::from(2);
         }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("vigil-scene: {e}");
+            vigil_log::say!("vigil-scene: {e}");
             ExitCode::FAILURE
         }
     }

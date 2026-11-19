@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+vigil-log.workspace = true
 slint-idle-runtime.workspace = true
 singleton-guard.workspace = true
 span-lines.workspace = true
@@ -28,6 +29,7 @@ libc.workspace = true
 rustix = { version = "1.1", default-features = false, features = ["std", "stdio"] }
 
 [dev-dependencies]
+vigil-log = { workspace = true, features = ["testing"] }
 image.workspace = true
 zbus = { workspace = true, features = ["service"] }
 

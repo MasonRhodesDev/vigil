@@ -248,7 +248,7 @@ impl DumbBufferPresenter {
             self.cursor = Some(cursor);
             return Err(present_error(error));
         }
-        eprintln!(
+        vigil_log::say!(
             "vigil: crtc {:?}: giving up the cursor plane, a flip with it failed: {error}",
             self.surface.crtc()
         );

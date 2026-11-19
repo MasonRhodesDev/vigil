@@ -64,7 +64,7 @@ fn main() {
     let crtc = *resources.crtcs().first().expect("no crtc");
     let (w, h) = mode.size();
     let (w, h) = (w as u32, h as u32);
-    println!("connector {:?}: {w}x{h}", connector.interface());
+    vigil_log::out!("connector {:?}: {w}x{h}", connector.interface());
 
     let surface = device
         .create_surface(crtc, mode, &[connector.handle()])
@@ -86,7 +86,7 @@ fn main() {
     let source = include_str!("../../../themes/default/theme.slint");
     let result = spin_on(compiler.build_from_source(source.into(), Default::default()));
     for diagnostic in result.diagnostics() {
-        eprintln!("theme: {diagnostic}");
+        vigil_log::say!("theme: {diagnostic}");
     }
     let definition = result.component("DefaultTheme").expect("DefaultTheme");
     let instance = definition.create().expect("instantiate");
@@ -142,15 +142,15 @@ fn main() {
         }
     }
 
-    println!("{FRAMES} FRAMES OK (buffer pool held up)");
+    vigil_log::out!("{FRAMES} FRAMES OK (buffer pool held up)");
 
     let hold = std::env::var("VIGIL_GL_HOLD_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1500);
-    println!("MODESET OK: a GL frame is on the CRTC");
+    vigil_log::out!("MODESET OK: a GL frame is on the CRTC");
     std::thread::sleep(std::time::Duration::from_millis(hold));
-    println!("DONE");
+    vigil_log::out!("DONE");
 }
 
 #[allow(unsafe_code)]

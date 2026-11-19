@@ -117,13 +117,13 @@ fn apply_cli_to_config(cli: &Cli, config: &mut Config) {
         config.lock.transition = LockTransition::immediate();
     }
     if config.lock.warning.clamp() {
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: lock.warning.wallpaper_hold_max_ms clamped to {} ms",
             vigil_config::LockWarning::MAX_WALLPAPER_HOLD_MS
         );
     }
     if config.lock.transition.clamp() {
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: lock.transition ramps clamped to {} ms",
             LockTransition::MAX_RAMP_MS
         );
@@ -236,7 +236,7 @@ impl BackgroundWorker {
                                     }
                                 }
                             });
-                        eprintln!(
+                        vigil_log::say!(
                             "vigil-lock: prepared background read {}: {:?}",
                             prepared.asset.display(),
                             read_started.elapsed()
@@ -252,7 +252,7 @@ impl BackgroundWorker {
                     let source = source_cell.get_or_init(|| {
                         let decode_started = Instant::now();
                         let result = vigil_ui::load_background(&key.path).map(Arc::new);
-                        eprintln!(
+                        vigil_log::say!(
                             "vigil-lock: background decode {}: {:?}",
                             key.path.display(),
                             decode_started.elapsed()
@@ -264,7 +264,7 @@ impl BackgroundWorker {
                         let result =
                             vigil_ui::render_background(source, key.fit, key.width, key.height)
                                 .map(|rgba| BackgroundData::Rgba(Arc::new(rgba)));
-                        eprintln!(
+                        vigil_log::say!(
                             "vigil-lock: background resize {}x{}: {:?}",
                             key.width,
                             key.height,
@@ -493,7 +493,7 @@ impl Locker {
             .map(monitor_profiles::load_dir)
             .map(|(profiles, diagnostics)| {
                 for diagnostic in diagnostics {
-                    eprintln!("vigil-lock: monitor profile: {diagnostic:?}");
+                    vigil_log::say!("vigil-lock: monitor profile: {diagnostic:?}");
                 }
                 profiles
             })
@@ -501,7 +501,7 @@ impl Locker {
         let (background_tx, background_rx) = mpsc::channel();
         let appearance_bundle = appearance_profiles::PreparedBundle::load_published(&user)
             .unwrap_or_else(|error| {
-                eprintln!("vigil-lock: prepared appearance bundle: {error}");
+                vigil_log::say!("vigil-lock: prepared appearance bundle: {error}");
                 None
             });
         let locker = Self {
@@ -520,7 +520,7 @@ impl Locker {
             },
             appearance_registry: appearance_profiles::Registry::load_current_user().unwrap_or_else(
                 |e| {
-                    eprintln!("vigil-lock: appearance registry: {e}");
+                    vigil_log::say!("vigil-lock: appearance registry: {e}");
                     Default::default()
                 },
             ),
@@ -585,7 +585,7 @@ impl Locker {
     }
 
     fn signal_locked(&mut self) {
-        eprintln!("vigil-lock: session locked");
+        vigil_log::say!("vigil-lock: session locked");
         signal_ready_fd(self.ready_fd.take());
     }
 
@@ -643,17 +643,17 @@ impl Locker {
                 self.pending.push(FlowEvent::AuthErr(message));
             }
             DoneOutcome::LockedOut { message, remaining } => {
-                eprintln!("vigil-lock: account is faillocked ({message})");
+                vigil_log::say!("vigil-lock: account is faillocked ({message})");
                 self.auth.retire();
                 self.pending.push(FlowEvent::AuthLocked { remaining });
             }
             DoneOutcome::ReopenQuietly(message) => {
-                eprintln!("vigil-lock: PAM conversation lost ({message}); reopening");
+                vigil_log::say!("vigil-lock: PAM conversation lost ({message}); reopening");
                 self.auth.retire();
                 self.pending.push(FlowEvent::AuthConversationLost);
             }
             DoneOutcome::Surface(message) => {
-                eprintln!(
+                vigil_log::say!(
                     "vigil-lock: {} conversation failures in a row; surfacing the last ({message})",
                     self.conversation_losses
                 );
@@ -762,9 +762,11 @@ impl Locker {
                 continue;
             };
             if entry.window.scene_size() != (result.key.width, result.key.height) {
-                eprintln!(
+                vigil_log::say!(
                     "vigil-lock: discarding stale background for {} ({}x{})",
-                    entry.connector, result.key.width, result.key.height
+                    entry.connector,
+                    result.key.width,
+                    result.key.height
                 );
                 continue;
             }
@@ -773,7 +775,7 @@ impl Locker {
                     entry
                         .window
                         .set_background_pixels(&rgba, result.key.width, result.key.height);
-                    eprintln!(
+                    vigil_log::say!(
                         "vigil-lock: background ready for {} in {:?}{}",
                         entry.connector,
                         result.elapsed,
@@ -786,20 +788,20 @@ impl Locker {
                         result.key.width,
                         result.key.height,
                     ) {
-                        eprintln!(
+                        vigil_log::say!(
                             "vigil-lock: native background unsupported for {}; using fallback",
                             entry.connector
                         );
                         continue;
                     }
-                    eprintln!(
+                    vigil_log::say!(
                         "vigil-lock: native background ready for {} in {:?}{}",
                         entry.connector,
                         result.elapsed,
                         if result.cache_hit { " (cache hit)" } else { "" }
                     );
                 }
-                Err(error) => eprintln!("vigil-lock: background: {error}"),
+                Err(error) => vigil_log::say!("vigil-lock: background: {error}"),
             }
         }
     }
@@ -828,19 +830,19 @@ impl LockSession for Locker {
         let component = match component {
             Ok(component) => component,
             Err(e) => {
-                eprintln!("vigil-lock: skipping output {id:?}: {e}");
+                vigil_log::say!("vigil-lock: skipping output {id:?}: {e}");
                 return;
             }
         };
         let Some(adapter) = self.platform.claim_last_adapter() else {
-            eprintln!("vigil-lock: skipping output {id:?}: no adapter captured");
+            vigil_log::say!("vigil-lock: skipping output {id:?}: no adapter captured");
             return;
         };
         let mut window =
             match OutputWindow::new(id, info.width, info.height, info.scale, adapter, component) {
                 Ok(window) => window,
                 Err(e) => {
-                    eprintln!("vigil-lock: skipping output {id:?}: {e}");
+                    vigil_log::say!("vigil-lock: skipping output {id:?}: {e}");
                     return;
                 }
             };
@@ -863,9 +865,12 @@ impl LockSession for Locker {
         let native_background_supported = window.supports_native_background();
         let queue = self.queue.clone();
         window.on_ui_message(Rc::new(move |m| queue.borrow_mut().push_back(m)));
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: output {} {}x{}@{:.2}",
-            info.connector, info.width, info.height, info.scale
+            info.connector,
+            info.width,
+            info.height,
+            info.scale
         );
         self.entries.push(Entry {
             id,
@@ -875,7 +880,7 @@ impl LockSession for Locker {
         });
         self.focus_profile_origin();
         self.apply_panel();
-        eprintln!(
+        vigil_log::say!(
             "vigil-lock: scene ready for {} in {:?}",
             info.connector,
             scene_started.elapsed()
@@ -950,7 +955,7 @@ impl LockSession for Locker {
 
     fn output_gone(&mut self, id: OutputId) {
         if let Some(e) = self.entries.iter().find(|e| e.id == id) {
-            eprintln!("vigil-lock: output {} gone", e.connector);
+            vigil_log::say!("vigil-lock: output {} gone", e.connector);
         }
         self.entries.retain(|e| e.id != id);
         if self.panel >= self.entries.len() {
@@ -1176,7 +1181,7 @@ fn detach_and_wait_for_lock(ready_fd: Option<OwnedFd>) -> ! {
     match result {
         Ok(code) => span_lines::exit(code),
         Err(e) => {
-            eprintln!("vigil-lock: wait: {e}");
+            vigil_log::say!("vigil-lock: wait: {e}");
             span_lines::exit(1);
         }
     }
@@ -1232,7 +1237,9 @@ fn follow_flow(ipc: &Mutex<LockIpcState>, cmd: &FlowCmd) -> bool {
             // A signal leaves a held lock to the compositor, so it stays held.
             FlowCmd::Exit(outcome) if !matches!(outcome, LockOutcome::Terminated(_)) => {
                 if state.hold == Hold::Pending && *outcome == LockOutcome::Unlocked {
-                    eprintln!("vigil-lock: lock ended before it was confirmed: logind unlocked it");
+                    vigil_log::say!(
+                        "vigil-lock: lock ended before it was confirmed: logind unlocked it"
+                    );
                 }
                 state.hold = Hold::Releasing;
                 return false;
@@ -1335,7 +1342,7 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
                         let _ = stream.write_all(b"locked\n");
                     }
                     Hold::Pending => {
-                        eprintln!("vigil-lock: warning join requested immediate lock");
+                        vigil_log::say!("vigil-lock: warning join requested immediate lock");
                         state.commit_requested = true;
                         state.joiners.push(stream);
                         if let Some(waker) = state.waker.clone() {
@@ -1355,6 +1362,14 @@ fn start_lock_ipc_at(path: PathBuf) -> Result<(LockIpcSocket, Arc<Mutex<LockIpcS
 fn signal_ready_fd(ready_fd: Option<OwnedFd>) {
     if let Some(fd) = ready_fd {
         let _ = std::fs::File::from(fd).write_all(b"1");
+    }
+}
+
+struct StderrLines;
+
+impl span_lines::Sink for StderrLines {
+    fn write(&self, record: &[u8]) {
+        vigil_log::emit(record);
     }
 }
 
@@ -1397,11 +1412,9 @@ fn main() {
     vigil_secret::exit_on_panic();
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
+    let _ = span_lines::set_sink(StderrLines);
     if let Err(e) = vigil_secret::deny_memory_dumps() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "vigil-lock: could not keep memory out of core dumps: {e}"
-        );
+        vigil_log::say!("vigil-lock: could not keep memory out of core dumps: {e}");
     }
     let parsed = parse_cli();
     tracing_subscriber::registry()
@@ -1411,7 +1424,7 @@ fn main() {
     let mut cli = match parsed {
         Ok(cli) => cli,
         Err(e) => {
-            eprintln!("vigil-lock: {e}");
+            vigil_log::say!("vigil-lock: {e}");
             span_lines::exit(2);
         }
     };
@@ -1421,7 +1434,7 @@ fn main() {
     let mut config = Config::load_layered(cli.config.as_deref());
     apply_cli_to_config(&cli, &mut config);
     if let Err(error) = config.validate_warning() {
-        eprintln!("vigil-lock: {error}");
+        vigil_log::say!("vigil-lock: {error}");
         span_lines::exit(2);
     }
     let mut lock_policy = config.lock.clone();
@@ -1431,7 +1444,9 @@ fn main() {
             Ok(Some(guard)) => match start_lock_ipc() {
                 Ok((socket, state)) => break (guard, Some(socket), state),
                 Err(error) => {
-                    eprintln!("vigil-lock: lock IPC unavailable: {error}; locking immediately");
+                    vigil_log::say!(
+                        "vigil-lock: lock IPC unavailable: {error}; locking immediately"
+                    );
                     lock_policy.warning.duration_ms = 0;
                     break (guard, None, Arc::new(Mutex::new(LockIpcState::default())));
                 }
@@ -1445,11 +1460,11 @@ fn main() {
                             span_lines::exit(0);
                         }
                         Ok(false) => {}
-                        Err(error) => eprintln!("vigil-lock: {error}"),
+                        Err(error) => vigil_log::say!("vigil-lock: {error}"),
                     }
                     attempts += 1;
                     if attempts >= 20 {
-                        eprintln!(
+                        vigil_log::say!(
                             "vigil-lock: another locker owns the seat but never confirmed the lock; refusing to stack"
                         );
                         span_lines::exit(2);
@@ -1465,7 +1480,7 @@ fn main() {
                 continue;
             }
             Err(error) => {
-                eprintln!("vigil-lock: {error}");
+                vigil_log::say!("vigil-lock: {error}");
                 span_lines::exit(2);
             }
         }
@@ -1473,7 +1488,7 @@ fn main() {
     let locker = match Locker::new(cli, config, lock_ipc) {
         Ok(locker) => locker,
         Err(e) => {
-            eprintln!("vigil-lock: {e}");
+            vigil_log::say!("vigil-lock: {e}");
             span_lines::exit(1);
         }
     };
@@ -1481,15 +1496,17 @@ fn main() {
     let outcome = match vigil_wayland::run_with_lock(locker, &lock_policy, None) {
         Ok(outcome) => outcome,
         Err(e) => {
-            eprintln!("vigil-lock: {e}");
+            vigil_log::say!("vigil-lock: {e}");
             span_lines::exit(1);
         }
     };
     match outcome {
         LockOutcome::Unlocked | LockOutcome::Cancelled => {}
-        LockOutcome::Denied => eprintln!("vigil-lock: lock denied (another locker running?)"),
-        LockOutcome::Invalidated => eprintln!("vigil-lock: lock invalidated by the compositor"),
-        LockOutcome::Terminated(signal) => eprintln!(
+        LockOutcome::Denied => vigil_log::say!("vigil-lock: lock denied (another locker running?)"),
+        LockOutcome::Invalidated => {
+            vigil_log::say!("vigil-lock: lock invalidated by the compositor")
+        }
+        LockOutcome::Terminated(signal) => vigil_log::say!(
             "vigil-lock: {} received; exiting, a held session lock stays held by the compositor",
             signal.name()
         ),
@@ -1792,9 +1809,7 @@ mod tests {
             signal_ready_fd(cli.ready_fd);
             let opened = std::fs::File::open("Cargo.toml").unwrap();
             assert_ne!(std::os::fd::AsRawFd::as_raw_fd(&opened), 1);
-            let mut stdout = std::io::stdout();
-            stdout.write_all(b"stray").unwrap();
-            stdout.flush().unwrap();
+            rustix::io::write(rustix::stdio::stdout(), b"stray").unwrap();
             return;
         }
         let (mut parent, child) = UnixStream::pair().unwrap();
@@ -2094,7 +2109,7 @@ mod tests {
         ];
         if std::env::var_os(CHILD).is_some() {
             for (hold, outcome) in cases {
-                eprintln!("case {hold:?} {outcome:?}");
+                vigil_log::say!("case {hold:?} {outcome:?}");
                 let ipc = Mutex::new(LockIpcState {
                     hold,
                     ..LockIpcState::default()

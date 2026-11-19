@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
+vigil-log.workspace = true
 
 [dependencies]
 vigil-core.workspace = true

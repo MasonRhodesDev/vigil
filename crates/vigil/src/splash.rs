@@ -76,7 +76,7 @@ impl Splash {
                     .and_then(|(logo, format)| {
                         Plate::from_helper(spec, helper, (&logo, format), scene, transform)
                     })
-                    .inspect_err(|e| eprintln!("vigil: splash logo {}: {e}", path.display()))
+                    .inspect_err(|e| vigil_log::say!("vigil: splash logo {}: {e}", path.display()))
                     .ok()
             })
             .unwrap_or_else(|| Plate::ground_only(spec, scene, transform));
@@ -692,7 +692,7 @@ mod tests {
         let s = Splash::with_helper(&cfg, &spec, (1920, 1080), 0, &helper);
         let took = start.elapsed();
         let grew = peak_rss_kib().saturating_sub(base);
-        println!("SPLASH {what}: {took:?}, parent grew {grew} KiB");
+        vigil_log::out!("SPLASH {what}: {took:?}, parent grew {grew} KiB");
         assert!(
             took < vigil_scene::DEFAULT_DEADLINE + Duration::from_millis(500),
             "{what}: {took:?}"
@@ -724,7 +724,7 @@ mod tests {
                 .lines()
                 .filter_map(|l| l.find("SPLASH ").map(|i| &l[i..]))
             {
-                println!("{line}");
+                vigil_log::out!("{line}");
             }
         }
     }

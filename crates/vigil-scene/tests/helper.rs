@@ -188,7 +188,7 @@ fn child_runs_one_review_input() {
             "{what}: the helper failed, not the logo: {got:?}"
         );
     }
-    println!(
+    vigil_log::out!(
         "REVIEW {what}: mask {:?}, layer {:?}, {took:?}, parent grew {grew} KiB",
         mask.as_ref().map(|_| "drawn"),
         drawn.as_ref().map(|_| "drawn")
@@ -209,7 +209,7 @@ fn every_review_input_returns_by_its_deadline_in_bounded_memory() {
             .lines()
             .filter_map(|l| l.find("REVIEW ").map(|i| &l[i..]))
         {
-            println!("{line}");
+            vigil_log::out!("{line}");
         }
     }
 }
@@ -230,7 +230,7 @@ fn child_draws_the_ground_in_place() {
         .unwrap();
     let grew = peak_rss_kib().saturating_sub(base);
     let result = out.len() as u64 / 1024;
-    println!("GROUND result {result} KiB, peak grew {grew} KiB");
+    vigil_log::out!("GROUND result {result} KiB, peak grew {grew} KiB");
     assert!(
         grew < result / 8,
         "the peak grew {grew} KiB for {result} KiB"
@@ -250,7 +250,7 @@ fn child_draws_the_ground_in_place() {
 #[test]
 fn the_ground_is_drawn_into_the_callers_buffer() {
     let out = in_fresh_process("child_draws_the_ground_in_place", "1");
-    println!(
+    vigil_log::out!(
         "{}",
         out.lines().find(|l| l.contains("GROUND")).unwrap_or("")
     );

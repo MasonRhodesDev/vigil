@@ -13,11 +13,11 @@ impl Device for Card {}
 impl ControlDevice for Card {}
 
 fn dump(card: &Card, label: &str) {
-    println!("== {label}");
+    vigil_log::out!("== {label}");
     let planes = match card.plane_handles() {
         Ok(p) => p,
         Err(e) => {
-            println!("  plane_handles: {e}");
+            vigil_log::out!("  plane_handles: {e}");
             return;
         }
     };
@@ -44,7 +44,7 @@ fn dump(card: &Card, label: &str) {
                     .iter()
                     .map(|f| f.to_le_bytes().map(|b| (b as char).to_string()).concat())
                     .collect();
-                println!(
+                vigil_log::out!(
                     "  plane {:?} {} crtcs={:?} formats=[{}]",
                     handle,
                     ty,
@@ -52,7 +52,7 @@ fn dump(card: &Card, label: &str) {
                     formats.join(" ")
                 );
             }
-            Err(e) => println!("  plane {handle:?}: {e}"),
+            Err(e) => vigil_log::out!("  plane {handle:?}: {e}"),
         }
     }
 }
@@ -70,13 +70,13 @@ fn main() {
     );
 
     let r = card.set_client_capability(ClientCapability::UniversalPlanes, true);
-    println!("UniversalPlanes: {r:?}");
+    vigil_log::out!("UniversalPlanes: {r:?}");
     dump(&card, "universal planes only");
 
     let r = card.set_client_capability(ClientCapability::Atomic, true);
-    println!("Atomic: {r:?}");
+    vigil_log::out!("Atomic: {r:?}");
     let r = card.set_client_capability(ClientCapability::CursorPlaneHotspot, true);
-    println!("CursorPlaneHotspot: {r:?}");
+    vigil_log::out!("CursorPlaneHotspot: {r:?}");
     dump(&card, "atomic + hotspot");
-    println!("MODESET OK (probe only; nothing was committed)");
+    vigil_log::out!("MODESET OK (probe only; nothing was committed)");
 }

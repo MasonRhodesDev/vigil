@@ -211,7 +211,7 @@ impl Helper {
         stdout.read_exact_at(out, 0).map_err(io)?;
         if let Some(notice) = notice(&stderr) {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| eprintln!("vigil-scene: the helper says: {notice}"));
+            ONCE.call_once(|| vigil_log::say!("vigil-scene: the helper says: {notice}"));
         }
         Ok(())
     }

@@ -1,7 +1,5 @@
 #![deny(unsafe_code)]
 
-use std::io::Write as _;
-
 pub use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Default)]
@@ -71,22 +69,22 @@ thread_local! {
 /// The first call in every main. A panic on any thread ends the process at once with status
 /// 101, so it never runs half alive with a dead PAM worker, a lost signal or a poisoned lock,
 /// and ext-session-lock keeps the session locked when its client dies. The report names only
-/// the place, since a panic message can quote typed text. Only work run through [`cosmetic`]
-/// survives its own panic.
+/// the place, since a panic message can quote typed text. It goes out through `vigil_log::say!`,
+/// which allocates nothing and never blocks or panics, so a broken stderr cannot hold up the
+/// exit. Only work run through [`cosmetic`] survives its own panic.
 pub fn exit_on_panic() {
     #[expect(clippy::disallowed_methods, reason = "this is the one panic hook")]
     std::panic::set_hook(Box::new(|info| {
-        let place = info
-            .location()
-            .map(|at| format!("{}:{}", at.file(), at.line()))
-            .unwrap_or_default();
         let cosmetic = COSMETIC.try_with(std::cell::Cell::get).unwrap_or(false);
         let then = if cosmetic {
             "going on without it"
         } else {
             "exiting"
         };
-        let _ = writeln!(std::io::stderr(), "panic at {place}; {then}");
+        match info.location() {
+            Some(at) => vigil_log::say!("panic at {}:{}; {then}", at.file(), at.line()),
+            None => vigil_log::say!("panic at an unknown place; {then}"),
+        }
         if !cosmetic {
             exit_now(101);
         }
@@ -177,7 +175,7 @@ mod tests {
         struct Unwound;
         impl Drop for Unwound {
             fn drop(&mut self) {
-                let _ = writeln!(std::io::stderr(), "unwound");
+                vigil_log::say!("unwound");
             }
         }
         if in_child() {

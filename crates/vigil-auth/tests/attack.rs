@@ -21,6 +21,7 @@ use vigil_core::{AuthUi, Secret, UiMessage};
 const USERS: [&str; 3] = ["alice", "bob", "carol"];
 const MARK: &str = "Zq7typed";
 const ECHO: &str = "{user}";
+const HEAD: usize = 32;
 const JOURNAL: &str = "VIGIL_ATTACK_JOURNAL";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -163,7 +164,7 @@ fn supervise() -> ! {
     if !status.success() {
         let text = std::fs::read(&path).unwrap_or_default();
         let tail = &text[text.len().saturating_sub(4096)..];
-        println!(
+        vigil_log::out!(
             "attack: the run ended with {status}; its stderr ends:\n{}",
             String::from_utf8_lossy(tail)
         );
@@ -371,6 +372,17 @@ fn markers(text: &str) -> impl Iterator<Item = &str> {
         .filter_map(move |(at, _)| text.get(at..at + MARK.len() + 4))
 }
 
+// A journal line is cut at 2048 bytes, which drops a marker typed after a
+// long run, and escaping passes ASCII alphanumerics through, so the head of
+// that run still shows the leak.
+fn head(text: &str) -> Option<&str> {
+    let run = text.len()
+        - text
+            .trim_start_matches(|c: char| c.is_ascii_alphanumeric())
+            .len();
+    (run >= HEAD).then(|| &text[..HEAD])
+}
+
 #[derive(Default)]
 struct Step {
     op: Option<Op>,
@@ -395,6 +407,7 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
     let mut busy = false;
     let mut session = vec!["session".to_owned()];
     let mut typed: Vec<String> = Vec::new();
+    let mut heads: Vec<String> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut heard: Vec<String> = Vec::new();
     let mut heard_now: Vec<String> = Vec::new();
@@ -415,6 +428,7 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                 }
                 if let Op::Type(text) = op {
                     typed.extend(markers(text).map(str::to_owned));
+                    heads.extend(head(text).map(str::to_owned));
                     if field == Some(("Username".to_owned(), false)) {
                         names.push(text.trim().to_owned());
                     }
@@ -558,7 +572,7 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                 }
             }
             Event::Log(text) => {
-                if let Some(mark) = typed.iter().find(|mark| text.contains(*mark)) {
+                if let Some(mark) = typed.iter().chain(&heads).find(|mark| text.contains(*mark)) {
                     return Err(format!("typed text ({mark}) is in the journal:\n{text}"));
                 }
                 if let Some(line) = text.lines().find(|line| !line.starts_with("vigil: ")) {
@@ -808,7 +822,7 @@ fn replays(seed: u64) -> bool {
     };
     let held = draw() == draw();
     if !held {
-        println!("attack: seed {seed} draws different cases on each run");
+        vigil_log::out!("attack: seed {seed} draws different cases on each run");
     }
     held
 }
@@ -822,14 +836,14 @@ fn attack(greetd: &Greetd, name: &str, conforming: bool, cases: u32, seed: u64) 
     });
     match outcome {
         Ok(()) => {
-            println!(
+            vigil_log::out!(
                 "attack: {name}: {cases} cases held in {:.1?}",
                 started.elapsed()
             );
             true
         }
         Err(failure) => {
-            println!("attack: {name}: FAILED with VIGIL_ATTACK_SEED={seed}\n{failure}");
+            vigil_log::out!("attack: {name}: FAILED with VIGIL_ATTACK_SEED={seed}\n{failure}");
             false
         }
     }
@@ -856,6 +870,24 @@ fn pinned() -> Vec<(&'static str, Case)> {
                 Op::Begin(None),
                 Op::Type(format!("{MARK}0001")),
                 Op::Type(format!("{MARK}0002")),
+            ],
+            &format!("no such user: {ECHO}"),
+        ),
+        refused(
+            "greetd's error repeats a typed name with a backslash and a control character",
+            vec![
+                Op::Begin(None),
+                Op::Type(format!("a\\b\u{1b}{MARK}0003\\\n")),
+                Op::Type(format!("{MARK}0004")),
+            ],
+            &format!("no such user: {ECHO}"),
+        ),
+        refused(
+            "greetd's error repeats a typed name too long for one journal line",
+            vec![
+                Op::Begin(None),
+                Op::Type(format!("{}{MARK}0005", "x".repeat(3000))),
+                Op::Type(format!("{MARK}0006")),
             ],
             &format!("no such user: {ECHO}"),
         ),
@@ -909,9 +941,9 @@ fn replay(greetd: &Greetd) -> bool {
     let mut held = true;
     for (name, case) in pinned() {
         match check(&case, &drive(greetd, &case)) {
-            Ok(()) => println!("attack: pinned: {name}: held"),
+            Ok(()) => vigil_log::out!("attack: pinned: {name}: held"),
             Err(why) => {
-                println!("attack: pinned: {name}: FAILED\n{why}");
+                vigil_log::out!("attack: pinned: {name}: FAILED\n{why}");
                 held = false;
             }
         }
@@ -926,7 +958,7 @@ fn main() {
     let greetd = match Greetd::bind() {
         Ok(greetd) => greetd,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            println!("attack: SKIP, unix sockets are not permitted here ({error})");
+            vigil_log::out!("attack: SKIP, unix sockets are not permitted here ({error})");
             std::process::exit(i32::from(std::env::var_os("CI").is_some()));
         }
         Err(error) => panic!("bind the scripted greetd: {error}"),
@@ -941,7 +973,7 @@ fn main() {
             .unwrap_or_else(|_| panic!("VIGIL_ATTACK_SEED is not a u64: {seed}")),
         Err(_) => RandomState::new().hash_one(()),
     };
-    println!("attack: seed {seed}; replay with VIGIL_ATTACK_SEED={seed}");
+    vigil_log::out!("attack: seed {seed}; replay with VIGIL_ATTACK_SEED={seed}");
     let held = replays(seed)
         & replay(&greetd)
         & attack(

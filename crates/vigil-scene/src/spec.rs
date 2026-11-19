@@ -120,7 +120,7 @@ impl Scene {
         }) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!(
+                vigil_log::say!(
                     "vigil: scene spec {}: {e}; using the built-in defaults",
                     path.display()
                 );
@@ -130,7 +130,7 @@ impl Scene {
         match Scene::parse(&text) {
             Ok(scene) => scene,
             Err(e) => {
-                eprintln!(
+                vigil_log::say!(
                     "vigil: scene spec {}: {e}; using the built-in defaults",
                     path.display()
                 );

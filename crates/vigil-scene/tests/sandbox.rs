@@ -87,9 +87,9 @@ fn main() {
             Some(libc::SIGSYS),
             "{act} in the sandbox: {confined:?}"
         );
-        println!("{act}: allowed outside the sandbox, SIGSYS inside it");
+        vigil_log::out!("{act}: allowed outside the sandbox, SIGSYS inside it");
     }
     let drawn = probe(true, "draw");
     assert!(drawn.success(), "a frame drawn in the sandbox: {drawn:?}");
-    println!("draw: a frame is drawn and the process exits 0 inside the sandbox");
+    vigil_log::out!("draw: a frame is drawn and the process exits 0 inside the sandbox");
 }

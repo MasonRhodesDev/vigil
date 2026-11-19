@@ -73,7 +73,7 @@ fn child_draws_one_logo() {
     let mask = Logo::svg(&data).unwrap().mask(MAX_EDGE).unwrap();
     let took = start.elapsed();
     assert_eq!(mask.edge(), MAX_EDGE);
-    println!("DREW {} {}", took.as_millis(), peak_rss_kib());
+    vigil_log::out!("DREW {} {}", took.as_millis(), peak_rss_kib());
 }
 
 fn draw_in_child(path: &Path) -> (Duration, u64) {
@@ -112,7 +112,7 @@ fn the_largest_accepted_inputs_draw_quickly_in_bounded_memory() {
         let path = dir.join(format!("{i}.svg"));
         std::fs::write(&path, family(n)).unwrap();
         let (took, kib) = draw_in_child(&path);
-        println!("{what}: {n} accepted, drawn at {MAX_EDGE} in {took:?}, peak {kib} KiB");
+        vigil_log::out!("{what}: {n} accepted, drawn at {MAX_EDGE} in {took:?}, peak {kib} KiB");
         assert!(took < Duration::from_secs(4), "{what} x{n}: {took:?}");
         assert!(kib < 512 * 1024, "{what} x{n}: peak {kib} KiB");
     }
@@ -135,7 +135,7 @@ fn the_reviews_glow_specs_draw_quickly() {
         let plate = Plate::new(&scene, &logo, (4096, 2160), 0).unwrap();
         let frame = plate.frame(0.42);
         let took = start.elapsed();
-        println!("{spec}: {took:?}");
+        vigil_log::out!("{spec}: {took:?}");
         assert_eq!(frame.len(), 4096 * 2160 * 4);
         assert!(took < Duration::from_secs(2), "{spec}: {took:?}");
     }

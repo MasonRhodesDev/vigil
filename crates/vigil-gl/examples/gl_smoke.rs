@@ -27,7 +27,7 @@ fn main() {
     let node = std::env::var("VIGIL_GL_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
 
     let context = GlContext::open(std::path::Path::new(&node)).expect("gl context");
-    println!("egl context on {node}: ok");
+    vigil_log::out!("egl context on {node}: ok");
 
     let window = GlWindow::new(context, PhysicalSize::new(W, H)).expect("window");
     window.set_size(PhysicalSize::new(W, H));
@@ -35,7 +35,7 @@ fn main() {
         window: RefCell::new(Some(window.clone())),
     }))
     .expect("set platform");
-    println!("slint platform + femtovg window adapter: ok");
+    vigil_log::out!("slint platform + femtovg window adapter: ok");
 
     let mut compiler = slint_interpreter::Compiler::default();
     compiler.set_style("fluent".into());
@@ -43,14 +43,14 @@ fn main() {
     let result = spin_on(compiler.build_from_source(source.into(), Default::default()));
     let mut failed = false;
     for diagnostic in result.diagnostics() {
-        eprintln!("theme: {diagnostic}");
+        vigil_log::say!("theme: {diagnostic}");
         failed = true;
     }
     let definition = result.component("DefaultTheme").expect("DefaultTheme");
     definition.create().expect("instantiate");
     assert!(!failed, "theme did not compile cleanly for the GL renderer");
-    println!("default theme compiles and instantiates under femtovg: ok");
-    println!("\nscanout is not wired up yet: see the crate docs (issue #17)");
+    vigil_log::out!("default theme compiles and instantiates under femtovg: ok");
+    vigil_log::out!("\nscanout is not wired up yet: see the crate docs (issue #17)");
 }
 
 #[allow(unsafe_code)]

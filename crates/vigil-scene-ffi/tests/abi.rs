@@ -505,7 +505,7 @@ fn child_calls_the_abi_with_one_review_input() {
     let (rc, _) = render_by(&helper, &req, &mut out);
     let took = start.elapsed();
     let grew = peak_rss_kib().saturating_sub(base);
-    println!("ABI {what}: code {rc}, {took:?}, parent grew {grew} KiB");
+    vigil_log::out!("ABI {what}: code {rc}, {took:?}, parent grew {grew} KiB");
     assert_ne!(
         rc, VIGIL_SCENE_ERR_HELPER,
         "{what}: the helper failed, not the logo"
@@ -543,7 +543,7 @@ fn every_review_input_returns_through_the_abi_by_its_deadline() {
             .lines()
             .filter_map(|l| l.find("ABI ").map(|i| &l[i..]))
         {
-            println!("{line}");
+            vigil_log::out!("{line}");
         }
     }
 }

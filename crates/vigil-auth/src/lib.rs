@@ -246,7 +246,7 @@ impl AuthMachine {
         };
         self.stage = format!("user={user} prompt={shown} {kind}{origin}");
         self.stage_key = key;
-        eprintln!("vigil: auth stage {}", self.stage);
+        vigil_log::say!("vigil: auth stage {}", self.stage);
     }
 
     // Escaped, so text from greetd cannot start a journal line of its own,
@@ -262,7 +262,7 @@ impl AuthMachine {
         self.stage.clear();
         self.stage_key.clear();
         let text = friendly_error(description);
-        eprintln!("vigil: auth: greetd error: {}", self.journaled(description));
+        vigil_log::say!("vigil: auth: greetd error: {}", self.journaled(description));
         ui.show_error(&text);
         text
     }
@@ -298,7 +298,7 @@ impl AuthMachine {
         self.user = Some(user.to_owned());
         self.typed = typed;
         if self.unprompted.as_deref() == Some(user) {
-            eprintln!("vigil: auth unasked user={}", self.logged_user());
+            vigil_log::say!("vigil: auth unasked user={}", self.logged_user());
             ui.reset_input();
             // The next submit is matched against this user's question, so a
             // failed open must not leave the previous user's field up.
@@ -342,7 +342,7 @@ impl AuthMachine {
             self.prompt_username(ui);
             return Ok(());
         };
-        eprintln!("vigil: auth open user={}", self.logged_user());
+        vigil_log::say!("vigil: auth open user={}", self.logged_user());
         self.asked = false;
         self.spoke = false;
         let response = self.transact(&Request::CreateSession { username: user }, ui)?;
@@ -384,10 +384,10 @@ impl AuthMachine {
             UiMessage::Cancel => {
                 self.close(ui)?;
                 if self.fixed_user {
-                    eprintln!("vigil: auth cancel -> restart user={}", self.logged_user());
+                    vigil_log::say!("vigil: auth cancel -> restart user={}", self.logged_user());
                     self.offer(ui);
                 } else {
-                    eprintln!("vigil: auth cancel -> username");
+                    vigil_log::say!("vigil: auth cancel -> username");
                     self.prompt_username(ui);
                 }
                 Ok(())
@@ -401,13 +401,13 @@ impl AuthMachine {
         if self.state != State::AwaitingPrompt {
             return Ok(());
         }
-        eprintln!("vigil: auth close user={} unanswered", self.logged_user());
+        vigil_log::say!("vigil: auth close user={} unanswered", self.logged_user());
         let response = self.transact(&Request::CancelSession, ui)?;
         self.state = State::Idle;
         match response {
             Response::Success => Ok(()),
             Response::Error { description, .. } => {
-                eprintln!(
+                vigil_log::say!(
                     "vigil: auth: greetd refused the cancel: {}",
                     self.journaled(&description)
                 );
@@ -426,7 +426,7 @@ impl AuthMachine {
 
     fn stop_opening_unasked(&mut self, why: &str) {
         if self.unprompted.is_some() && self.unprompted == self.user {
-            eprintln!(
+            vigil_log::say!(
                 "vigil: auth: {why} user={}; no longer opening unasked",
                 self.logged_user()
             );
@@ -470,7 +470,7 @@ impl AuthMachine {
                             continue;
                         }
                         Some(_) => {
-                            eprintln!(
+                            vigil_log::say!(
                                 "vigil: auth withheld user={}; the first question is not the one the field showed",
                                 self.logged_user()
                             );
@@ -497,7 +497,7 @@ impl AuthMachine {
                         self.transact(&Request::PostAuthMessageResponse { response: None }, ui)?;
                 }
                 Response::Success => {
-                    eprintln!(
+                    vigil_log::say!(
                         "vigil: [t+{}ms] auth: greetd accepted the credentials, sending start_session",
                         vigil_core::uptime_ms()
                     );
@@ -507,7 +507,7 @@ impl AuthMachine {
                     };
                     match self.transact(&request, ui)? {
                         Response::Success => {
-                            eprintln!(
+                            vigil_log::say!(
                                 "vigil: [t+{}ms] auth: start_session accepted",
                                 vigil_core::uptime_ms()
                             );
