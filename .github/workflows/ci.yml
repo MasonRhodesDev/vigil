@@ -18,8 +18,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo fmt --all --check
-      - run: ./tests/check-sim-safety.sh
-      - run: ./tests/check-warning-safety.sh
+      - name: Gate tests
+        run: python3 -I tests/gates/test_gate.py
+      - name: Safety gates from the base branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        # the base branch's copy judges the pull request, so a pull request cannot weaken the check that judges it
+        run: |
+          git fetch --no-tags --depth=1 origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+          base="origin/$BASE_REF"
+          if ! git cat-file -e "$base:tests/gates/gate.py" 2>/dev/null; then
+            echo "::notice::$base has no tests/gates/gate.py yet, so this pull request's own gates judge it"
+            exit 0
+          fi
+          judge="$RUNNER_TEMP/base-gates"
+          mkdir -p "$judge"
+          git archive "$base" tests/gates tests/check-sim-safety.sh tests/check-warning-safety.sh | tar -x -C "$judge"
+          python3 -I "$judge/tests/gates/gate.py" --root "$GITHUB_WORKSPACE" all
+          sh "$judge/tests/check-sim-safety.sh"
+          sh "$judge/tests/check-warning-safety.sh"
+      - name: Safety gates from this branch
+        env:
+          GATE_BASE: origin/${{ github.base_ref || 'main' }}
+        run: |
+          python3 -I tests/gates/gate.py all
+          ./tests/check-sim-safety.sh
+          ./tests/check-warning-safety.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: ./tests/check-sim-scenario.sh

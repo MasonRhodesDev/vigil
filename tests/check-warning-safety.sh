@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(pwd)
 
 if rg -n 'screencopy|image_copy_capture|image-copy-capture|portal.*capture' \
     "$root/crates/vigil-wayland" "$root/crates/vigil-lock"; then

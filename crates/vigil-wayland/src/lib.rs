@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read as _;
@@ -59,7 +61,7 @@ use wayland_protocols::wp::viewporter::client::{
 };
 
 use vigil_config::Lock;
-use vigil_core::{FrameTarget, InputEvent, OutputId, OutputInfo};
+use vigil_core::{FrameTarget, InputEvent, KeyText, OutputId, OutputInfo};
 pub use vigil_flow::LockOutcome;
 use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now, Signal};
 
@@ -1087,29 +1089,36 @@ impl<S: LockSession> App<S> {
 
 static TERMINATION_PIPE: AtomicI32 = AtomicI32::new(-1);
 
+#[allow(unsafe_code)]
 extern "C" fn on_termination_signal(signal: libc::c_int) {
     let fd = TERMINATION_PIPE.load(Ordering::Relaxed);
     if fd < 0 {
         return;
     }
     let byte = signal as u8;
+    // SAFETY: write is async-signal-safe, the fd is the pipe write end that
+    // arm_termination leaks for the life of the process, and `byte` is one live byte.
     unsafe {
-        libc::write(fd, (&byte as *const u8).cast(), 1);
+        libc::write(fd, (&raw const byte).cast(), 1);
     }
 }
 
+#[allow(unsafe_code)]
 fn arm_termination<'l, S: LockSession + 'static>(
     handle: &LoopHandle<'l, App<S>>,
 ) -> Result<(), LockError> {
     let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 writes exactly two fds into the two-element array.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
         return Err(err(format!(
             "termination pipe: {}",
             std::io::Error::last_os_error()
         )));
     }
-    let (read_end, write_end) =
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: pipe2 succeeded, so fds[0] is a fresh open fd nothing else owns.
+    let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: pipe2 succeeded, so fds[1] is a fresh open fd nothing else owns.
+    let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     if TERMINATION_PIPE
         .compare_exchange(
             -1,
@@ -1121,20 +1130,23 @@ fn arm_termination<'l, S: LockSession + 'static>(
     {
         return Err(err("termination handling armed twice in one process"));
     }
-    std::mem::forget(write_end);
+    let _ = std::os::fd::IntoRawFd::into_raw_fd(write_end);
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            let handler: extern "C" fn(libc::c_int) = on_termination_signal;
-            action.sa_sigaction = handler as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
-                return Err(err(format!(
-                    "sigaction({signal}): {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
+        // SAFETY: sigaction is plain integers, a mask and a handler slot, all
+        // valid when zero.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        let handler: extern "C" fn(libc::c_int) = on_termination_signal;
+        action.sa_sigaction = handler as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: the mask is a live field of a local sigaction.
+        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+        // SAFETY: the handler only loads an atomic and calls write, both
+        // async-signal-safe, and the old-action pointer may be null.
+        if unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) } != 0 {
+            return Err(err(format!(
+                "sigaction({signal}): {}",
+                std::io::Error::last_os_error()
+            )));
         }
     }
     handle
@@ -1351,6 +1363,10 @@ fn run_with_lock_body<S: LockSession + 'static>(
     if matches!(app.outcome, Some(LockOutcome::Terminated(_)))
         && let Some(lock) = app.lock.take()
     {
+        #[expect(
+            clippy::mem_forget,
+            reason = "the lock's Drop sends destroy; a terminated locker leaves the session locked"
+        )]
         std::mem::forget(lock);
     }
     match (&app.error, app.outcome) {
@@ -1507,7 +1523,7 @@ impl<S: LockSession> KeyboardHandler for App<S> {
     ) {
         self.deliver_input(InputEvent::Key {
             keysym: event.keysym.raw(),
-            utf8: event.utf8,
+            utf8: event.utf8.map(KeyText::from),
             pressed: true,
         });
     }
@@ -1521,7 +1537,7 @@ impl<S: LockSession> KeyboardHandler for App<S> {
     ) {
         self.deliver_input(InputEvent::Key {
             keysym: event.keysym.raw(),
-            utf8: event.utf8,
+            utf8: event.utf8.map(KeyText::from),
             pressed: true,
         });
     }

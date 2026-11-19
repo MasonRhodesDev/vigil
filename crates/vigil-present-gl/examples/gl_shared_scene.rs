@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::Arc;

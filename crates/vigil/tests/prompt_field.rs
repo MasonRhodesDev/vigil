@@ -1,7 +1,8 @@
+#![forbid(unsafe_code)]
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use vigil_core::{AuthUi, InputEvent, OutputId, UiMessage};
+use vigil_core::{AuthUi, InputEvent, KeyText, OutputId, UiMessage};
 use vigil_theme::Theme;
 use vigil_ui::{OutputWindow, VigilPlatform};
 
@@ -25,7 +26,7 @@ fn tap(window: &mut OutputWindow, keysym: u32, utf8: Option<&str>) {
     for pressed in [true, false] {
         window.dispatch(InputEvent::Key {
             keysym,
-            utf8: utf8.map(str::to_owned),
+            utf8: utf8.map(KeyText::from),
             pressed,
         });
     }

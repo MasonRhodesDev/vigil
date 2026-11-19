@@ -10,3 +10,8 @@ repository.workspace = true
 [dependencies]
 vigil-core.workspace = true
 greetd_ipc.workspace = true
+serde_json.workspace = true
+vigil-secret.workspace = true
+
+[lints]
+workspace = true
