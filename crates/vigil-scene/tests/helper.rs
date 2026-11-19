@@ -291,6 +291,7 @@ fn the_shipped_helper_draws_under_its_syscall_filter() {
         .args(["layer", "--mode", "4096x4096", "--transform", "0"])
         .args(["--layer", "frame", "--value", "1", "--spec-len", "0"])
         .args(["--svg-len", &svg.len().to_string(), "--deadline-ms", "5000"])
+        .args(["--abi", vigil_scene::HELPER_ABI])
         .stdin(reader)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -336,6 +337,8 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
             "64",
             "--deadline-ms",
             "2500",
+            "--abi",
+            vigil_scene::HELPER_ABI,
         ])
         .stdin(reader)
         .stdout(Stdio::null())
@@ -375,6 +378,55 @@ fn the_helper_confines_itself_before_it_reads_a_byte() {
     child.kill().unwrap();
     child.wait().unwrap();
     drop(writer);
+}
+
+#[test]
+fn the_helper_never_raises_a_soft_limit_it_inherits() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    let mut child = Command::new("sh")
+        .args(["-c", r#"ulimit -S -t 1 && exec "$@""#, "sh", BIN])
+        .args(["mask", "--format", "svg", "--edge", "64"])
+        .args(["--deadline-ms", "2500", "--abi", vigil_scene::HELPER_ABI])
+        .stdin(reader)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let start = Instant::now();
+    while status_field(pid, "NoNewPrivs:").as_deref() != Some("1") {
+        assert!(start.elapsed() < Duration::from_secs(10), "never confined");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let cpu = limits(pid)
+        .into_iter()
+        .find(|(name, _, _)| name == "Max cpu time")
+        .map(|(_, soft, hard)| (soft, hard));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(writer);
+    assert_eq!(cpu, Some(("1".into(), "4".into())));
+}
+
+#[test]
+fn a_helper_of_another_version_is_a_helper_fault() {
+    let out = Command::new(BIN)
+        .args([
+            "mask",
+            "--format",
+            "svg",
+            "--edge",
+            "8",
+            "--deadline-ms",
+            "1000",
+        ])
+        .args(["--abi", "0.0.0-elsewhere"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(14), "{said}");
+    assert!(said.contains("0.0.0-elsewhere"), "{said}");
 }
 
 // A script this process opened for writing cannot be run while any child
@@ -554,6 +606,8 @@ fn the_helper_dies_with_the_thread_that_started_it() {
                 "64",
                 "--deadline-ms",
                 "60000",
+                "--abi",
+                vigil_scene::HELPER_ABI,
             ])
             .stdin(reader)
             .stdout(Stdio::null())
