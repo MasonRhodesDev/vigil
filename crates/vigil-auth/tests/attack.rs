@@ -494,6 +494,9 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                 let conversing = matches!(last_request, Some(Req::Create(_) | Req::Answer(_)));
                 ack_due = false;
                 granted = false;
+                if let Reply::Refuse(text) = reply {
+                    heard.push(text.clone());
+                }
                 match (reply, &last_request) {
                     (Reply::Frame(_) | Reply::Claim(_), _) => {}
                     (Reply::Message(kind, text), _) if conversing => {
@@ -514,10 +517,7 @@ fn check(case: &Case, trace: &[Event]) -> Result<(), String> {
                         waiting = None;
                     }
                     (_, Some(Req::Cancel)) => waiting = None,
-                    (Reply::Refuse(text), _) if conversing => {
-                        heard.push(text.clone());
-                        waiting = None;
-                    }
+                    (Reply::Refuse(_), _) if conversing => waiting = None,
                     _ => {}
                 }
             }

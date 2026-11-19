@@ -75,13 +75,6 @@ pub fn read_response(stream: &mut impl Read) -> Result<Response, ResponseError> 
     serde_json::from_slice(&body).map_err(ResponseError::Malformed)
 }
 
-fn show_greetd_error(ui: &mut dyn AuthUi, description: &str) -> String {
-    let text = friendly_error(description);
-    eprintln!("vigil: auth: greetd error: {description}");
-    ui.show_error(&text);
-    text
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
@@ -254,10 +247,22 @@ impl AuthMachine {
         eprintln!("vigil: auth stage {}", self.stage);
     }
 
+    // Escaped, so text from greetd cannot start a journal line of its own,
+    // and hidden when it repeats a typed name, which may be a password.
+    fn journaled(&self, text: &str) -> String {
+        match &self.user {
+            Some(name) if self.typed && text.contains(name.as_str()) => "<hidden>".to_owned(),
+            _ => format!("{text:?}"),
+        }
+    }
+
     fn show_error(&mut self, ui: &mut dyn AuthUi, description: &str) -> String {
         self.stage.clear();
         self.stage_key.clear();
-        show_greetd_error(ui, description)
+        let text = friendly_error(description);
+        eprintln!("vigil: auth: greetd error: {}", self.journaled(description));
+        ui.show_error(&text);
+        text
     }
 
     pub fn begin(&mut self, user: Option<&str>, ui: &mut dyn AuthUi) -> Result<(), AuthError> {
@@ -401,7 +406,10 @@ impl AuthMachine {
         match response {
             Response::Success => Ok(()),
             Response::Error { description, .. } => {
-                eprintln!("vigil: auth: greetd refused the cancel: {description}");
+                eprintln!(
+                    "vigil: auth: greetd refused the cancel: {}",
+                    self.journaled(&description)
+                );
                 Ok(())
             }
             Response::AuthMessage { .. } => Err(AuthError(
@@ -541,7 +549,8 @@ impl AuthMachine {
                         // The body was never read, so the stream has lost its framing.
                         let _ = self.stream.shutdown(Shutdown::Both);
                     }
-                    AuthError(format!("greetd IPC: {error}"))
+                    // A decode error quotes the reply it could not read.
+                    AuthError(format!("greetd IPC: {}", error.to_string().escape_debug()))
                 })
             });
         ui.set_busy(false);
