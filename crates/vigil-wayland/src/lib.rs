@@ -331,6 +331,22 @@ struct Entry {
     pool: Option<SlotPool>,
     configured: bool,
     committed: bool,
+    pacer: Pacer,
+}
+
+const FRAME: Duration = Duration::from_nanos(16_666_667);
+
+#[derive(Default)]
+struct Pacer(Option<std::time::Instant>);
+
+impl Pacer {
+    fn hold(&self, _now: std::time::Instant) -> Option<std::time::Instant> {
+        None
+    }
+
+    fn committed(&mut self, at: std::time::Instant) {
+        self.0 = Some(at);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -689,6 +705,7 @@ impl<S: LockSession> App<S> {
             pool: None,
             configured: false,
             committed: false,
+            pacer: Pacer::default(),
         });
     }
 
@@ -745,6 +762,7 @@ impl<S: LockSession> App<S> {
             pool: None,
             configured: false,
             committed: false,
+            pacer: Pacer::default(),
         });
     }
 
@@ -843,6 +861,7 @@ impl<S: LockSession> App<S> {
         surface.commit();
         self.metrics.record_commit();
         self.entries[idx].committed = true;
+        self.entries[idx].pacer.committed(std::time::Instant::now());
         if frame_hash_enabled()
             && let Some(pool) = self.entries[idx].pool.as_mut()
         {
@@ -862,6 +881,10 @@ impl<S: LockSession> App<S> {
         let (w, h) = self.entries[idx].px;
         let force = !self.entries[idx].committed;
         let id = self.entries[idx].id;
+        if !force && let Some(due) = self.entries[idx].pacer.hold(std::time::Instant::now()) {
+            self.present_retry.entry(id).or_insert((due, 0));
+            return;
+        }
         let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
         let overlay = !self.entries[idx].role.is_lock();
         let surface_opacity = self.entries[idx].opacity.is_some();
@@ -959,6 +982,7 @@ impl<S: LockSession> App<S> {
         surface.commit();
         self.metrics.record_commit();
         self.entries[idx].committed = true;
+        self.entries[idx].pacer.committed(std::time::Instant::now());
         self.present_retry.remove(&id);
         let commit_elapsed = commit_started.elapsed();
         if render_elapsed >= Duration::from_millis(8) || commit_elapsed >= Duration::from_millis(8)
@@ -1830,6 +1854,31 @@ wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpAlph
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_running_animation_commits_once_a_frame_however_fast_buffers_come_back() {
+        let start = std::time::Instant::now();
+        let mut pacer = super::Pacer::default();
+        let mut commits = 0;
+        let release = Duration::from_micros(1_700);
+        let mut now = start;
+        while now < start + Duration::from_secs(2) {
+            if pacer.hold(now).is_none() {
+                pacer.committed(now);
+                commits += 1;
+            }
+            now += release;
+        }
+        assert!(
+            commits <= 121,
+            "a 2 s busy bar committed {commits} times, one per buffer release"
+        );
+        let quiet = now + Duration::from_secs(1);
+        assert!(
+            pacer.hold(quiet).is_none(),
+            "a change after a quiet second waited for a frame"
+        );
+    }
+
     use std::time::{Duration, Instant};
 
     use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now};
