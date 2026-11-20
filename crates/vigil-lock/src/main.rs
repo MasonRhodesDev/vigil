@@ -2804,6 +2804,116 @@ mod tests {
             "an hour locked with the card up should cost one frame per minute"
         );
     }
+
+    #[test]
+    fn every_format_that_shows_seconds_turns_each_second() {
+        for (format, secs) in [
+            ("%H:%M", 60),
+            ("%Y-%m-%d", 60),
+            ("%I:%M %p", 60),
+            ("%%S", 60),
+            ("trailing %", 60),
+            ("%H:%M:%S", 1),
+            ("%-S", 1),
+            ("%_S", 1),
+            ("%02S", 1),
+            ("%OS", 1),
+            ("%%%S", 1),
+            ("%T", 1),
+            ("%r", 1),
+            ("%X", 1),
+            ("%EX", 1),
+            ("%c", 1),
+            ("%Ec", 1),
+            ("%s", 1),
+        ] {
+            assert_eq!(
+                clock_interval(format),
+                Duration::from_secs(secs),
+                "format {format:?}"
+            );
+        }
+    }
+
+    // A TZif file of one zone with no transitions.
+    fn zone_file(offset_secs: i32, name: &str) -> Vec<u8> {
+        let mut file = b"TZif".to_vec();
+        file.extend([0_u8; 16]);
+        for count in [0, 0, 0, 0, 1, name.len() as u32 + 1] {
+            file.extend(u32::to_be_bytes(count));
+        }
+        file.extend(offset_secs.to_be_bytes());
+        file.extend([0, 0]);
+        file.extend(name.as_bytes());
+        file.push(0);
+        file
+    }
+
+    #[test]
+    fn the_clock_follows_a_timezone_change_made_while_locked() {
+        const TEST: &str = "tests::the_clock_follows_a_timezone_change_made_while_locked";
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        if let Some(zones) = std::env::var_os("VIGIL_LOCK_ZONE_PROBE") {
+            let zones = PathBuf::from(zones);
+            let point_at = |zone: &str| {
+                let status = std::process::Command::new("mount")
+                    .arg("--bind")
+                    .arg(zones.join(zone))
+                    .arg("/etc/localtime")
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "could not point /etc/localtime at {zone}");
+            };
+            point_at("before");
+            let before = clock_text("%H:%M %Z", at);
+            point_at("after");
+            let after = clock_text("%H:%M %Z", at);
+            assert_eq!(
+                (before.as_str(), after.as_str()),
+                ("08:00 AAA", "17:00 BBB"),
+                "the clock kept the zone it read first"
+            );
+            return;
+        }
+        let namespace = || {
+            let mut unshare = std::process::Command::new("unshare");
+            unshare.args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ]);
+            unshare
+        };
+        let usable = std::path::Path::new("/etc/localtime").exists()
+            && namespace()
+                .arg("true")
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+        if !usable {
+            eprintln!("SKIP: needs /etc/localtime and an unprivileged mount namespace");
+            return;
+        }
+        let zones = std::env::temp_dir().join(format!("vigil-lock-zones-{}", std::process::id()));
+        std::fs::create_dir_all(&zones).unwrap();
+        std::fs::write(zones.join("before"), zone_file(0, "AAA")).unwrap();
+        std::fs::write(zones.join("after"), zone_file(9 * 3600, "BBB")).unwrap();
+        let output = namespace()
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env("VIGIL_LOCK_ZONE_PROBE", &zones)
+            .env_remove("TZ")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&zones);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 #[test]
 fn static_clock_uses_minute_deadline() {
