@@ -36,14 +36,16 @@ struct Cli {
 }
 
 fn clock_interval(format: &str) -> Duration {
-    if ["%S", "%T", "%X", "%r"]
-        .iter()
-        .any(|token| format.contains(token))
-    {
-        Duration::from_secs(1)
-    } else {
-        Duration::from_secs(60)
+    let mut chars = format.chars();
+    while chars.by_ref().any(|c| c == '%') {
+        let conversion = chars
+            .by_ref()
+            .find(|c| !matches!(c, '_' | '-' | '^' | '#' | 'E' | 'O' | '0'..='9'));
+        if matches!(conversion, Some('S' | 'T' | 'X' | 'r' | 'c' | 's')) {
+            return Duration::from_secs(1);
+        }
     }
+    Duration::from_secs(60)
 }
 
 fn parse_cli() -> Result<Cli, String> {
@@ -1257,6 +1259,11 @@ impl Clock {
 
 #[allow(unsafe_code)]
 fn clock_text(format: &str, at: SystemTime) -> String {
+    // The libc crate binds tzset only for Windows. It takes nothing, and its
+    // read of TZ can race only std::env::set_var, whose caller answers for it.
+    unsafe extern "C" {
+        safe fn tzset();
+    }
     let Ok(fmt) = std::ffi::CString::new(format) else {
         return String::new();
     };
@@ -1269,6 +1276,8 @@ fn clock_text(format: &str, at: SystemTime) -> String {
     };
     // SAFETY: tm is integers and a nullable tm_zone pointer, all valid when zero.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // localtime_r reads the zone once per process; tzset reads it again.
+    tzset();
     // SAFETY: both pointers are live locals of the right types, and localtime_r
     // is the reentrant form.
     if unsafe { libc::localtime_r(&raw const now, &raw mut tm) }.is_null() {
@@ -2893,7 +2902,7 @@ mod tests {
                 .status()
                 .is_ok_and(|status| status.success());
         if !usable {
-            eprintln!("SKIP: needs /etc/localtime and an unprivileged mount namespace");
+            vigil_log::say!("SKIP: needs /etc/localtime and an unprivileged mount namespace");
             return;
         }
         let zones = std::env::temp_dir().join(format!("vigil-lock-zones-{}", std::process::id()));
