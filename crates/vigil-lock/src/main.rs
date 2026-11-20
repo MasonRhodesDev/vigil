@@ -7,7 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use vigil_config::{Config, LockTransition};
@@ -36,14 +36,16 @@ struct Cli {
 }
 
 fn clock_interval(format: &str) -> Duration {
-    if ["%S", "%T", "%X", "%r"]
-        .iter()
-        .any(|token| format.contains(token))
-    {
-        Duration::from_secs(1)
-    } else {
-        Duration::from_secs(60)
+    let mut chars = format.chars();
+    while chars.by_ref().any(|c| c == '%') {
+        let conversion = chars
+            .by_ref()
+            .find(|c| !matches!(c, '_' | '-' | '^' | '#' | 'E' | 'O' | '0'..='9'));
+        if matches!(conversion, Some('S' | 'T' | 'X' | 'r' | 'c' | 's')) {
+            return Duration::from_secs(1);
+        }
     }
+    Duration::from_secs(60)
 }
 
 fn parse_cli() -> Result<Cli, String> {
@@ -433,7 +435,7 @@ struct Locker {
     appearance_registry: appearance_profiles::Registry,
     appearance_bundle: Option<appearance_profiles::PreparedBundle>,
     monitor_profiles: Vec<monitor_profiles::Profile>,
-    clock_format: String,
+    clock: Clock,
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
     auth: AuthTrack,
@@ -447,7 +449,6 @@ struct Locker {
     appearance_tx: mpsc::Sender<AppearanceEvent>,
     scheme: ColorScheme,
     unlocked: bool,
-    last_clock: (Instant, String),
     ready_fd: Option<OwnedFd>,
     pending: Vec<FlowEvent>,
     wallpaper_ready: bool,
@@ -594,7 +595,7 @@ impl Locker {
             .ok_or("user not resolved before Locker::new")?;
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
-        let clock_format = config.look.clock_format.clone();
+        let clock = Clock::new(config.look.clock_format.clone(), SystemTime::now());
         let event_waker = Arc::new(Mutex::new(None));
         let (login_tx, login_rx) = forwarded_channel(event_waker.clone());
         let (appearance_tx, appearance_rx) = forwarded_channel(event_waker.clone());
@@ -638,7 +639,7 @@ impl Locker {
             ),
             appearance_bundle,
             monitor_profiles,
-            clock_format: clock_format.clone(),
+            clock,
             caps_lock: false,
             queue: Rc::default(),
             auth: AuthTrack::new(),
@@ -652,7 +653,6 @@ impl Locker {
             appearance_tx,
             scheme: ColorScheme::default(),
             unlocked: false,
-            last_clock: (Instant::now(), clock_text(&clock_format)),
             ready_fd: cli.ready_fd,
             pending: Vec::new(),
             wallpaper_ready: vigil_flow::WALLPAPER_READY_DEFAULT,
@@ -971,7 +971,7 @@ impl LockSession for Locker {
             resolved.path,
             Some(appearance_fit(resolved.fit)),
         );
-        window.set_clock(&self.last_clock.1);
+        window.set_clock(self.clock.shown());
         window.set_caps_lock(self.caps_lock);
         window.set_panel_visible(false);
         window.set_power_visible(false);
@@ -1170,12 +1170,9 @@ impl LockSession for Locker {
 
     fn tick(&mut self) {
         vigil_ui::advance_timers();
-        if self.last_clock.0.elapsed() >= clock_interval(&self.clock_format) {
-            let text = clock_text(&self.clock_format);
-            if text != self.last_clock.1 {
-                self.each_window(|w| w.set_clock(&text));
-            }
-            self.last_clock = (Instant::now(), text);
+        if let Some(text) = self.clock.advance(SystemTime::now()) {
+            let text = text.to_owned();
+            self.each_window(|w| w.set_clock(&text));
         }
         self.pump_auth();
         self.pump_login();
@@ -1204,7 +1201,7 @@ impl LockSession for Locker {
         let slint = self
             .scheduler
             .from_slint(self.entries.iter().map(|entry| entry.window.slint_window()));
-        let clock = clock_interval(&self.clock_format).saturating_sub(self.last_clock.0.elapsed());
+        let clock = self.clock.wait(SystemTime::now());
         match slint {
             WaitDecision::Frame(delay) => WaitDecision::Frame(delay.min(clock)),
             WaitDecision::Timer(delay) => WaitDecision::Timer(delay.min(clock)),
@@ -1213,15 +1210,74 @@ impl LockSession for Locker {
     }
 }
 
+// The wait runs to the end of the period the shown text was read in, so a
+// minute that turns between a tick and the next wait is shown at once.
+struct Clock {
+    format: String,
+    shown: String,
+    read_at: SystemTime,
+}
+
+impl Clock {
+    fn new(format: String, now: SystemTime) -> Self {
+        let shown = clock_text(&format, now);
+        Self {
+            format,
+            shown,
+            read_at: now,
+        }
+    }
+
+    fn shown(&self) -> &str {
+        &self.shown
+    }
+
+    fn advance(&mut self, now: SystemTime) -> Option<&str> {
+        self.read_at = now;
+        let text = clock_text(&self.format, now);
+        if text == self.shown {
+            return None;
+        }
+        self.shown = text;
+        Some(&self.shown)
+    }
+
+    fn wait(&self, now: SystemTime) -> Duration {
+        let period = clock_interval(&self.format).as_nanos();
+        let epoch_ns = |at: SystemTime| {
+            at.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        };
+        let read = epoch_ns(self.read_at);
+        let turns = read - read % period + period;
+        // The loop sleeps in whole milliseconds, so round up to land after the boundary.
+        let left_ms = turns.saturating_sub(epoch_ns(now)).div_ceil(1_000_000);
+        Duration::from_millis(u64::try_from(left_ms).unwrap_or(u64::MAX))
+    }
+}
+
 #[allow(unsafe_code)]
-fn clock_text(format: &str) -> String {
+fn clock_text(format: &str, at: SystemTime) -> String {
+    // The libc crate binds tzset only for Windows. It takes nothing, and its
+    // read of TZ can race only std::env::set_var, whose caller answers for it.
+    unsafe extern "C" {
+        safe fn tzset();
+    }
     let Ok(fmt) = std::ffi::CString::new(format) else {
         return String::new();
     };
-    // SAFETY: time accepts a null output pointer.
-    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let Ok(now) = libc::time_t::try_from(
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    ) else {
+        return String::new();
+    };
     // SAFETY: tm is integers and a nullable tm_zone pointer, all valid when zero.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // localtime_r reads the zone once per process; tzset reads it again.
+    tzset();
     // SAFETY: both pointers are live locals of the right types, and localtime_r
     // is the reentrant form.
     if unsafe { libc::localtime_r(&raw const now, &raw mut tm) }.is_null() {
@@ -1628,7 +1684,7 @@ mod tests {
     #[test]
     fn clock_text_matches_what_date_would_have_printed() {
         for format in ["%H:%M", "%Y-%m-%d", "%A", "%I:%M %p"] {
-            let mine = super::clock_text(format);
+            let mine = super::clock_text(format, std::time::SystemTime::now());
             let theirs = std::process::Command::new("date")
                 .arg(format!("+{format}"))
                 .output()
@@ -1637,7 +1693,11 @@ mod tests {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
             if mine != theirs {
-                assert_eq!(super::clock_text(format), theirs, "format {format}");
+                assert_eq!(
+                    super::clock_text(format, std::time::SystemTime::now()),
+                    theirs,
+                    "format {format}"
+                );
             }
             assert!(!mine.is_empty(), "format {format} produced nothing");
         }
@@ -1645,9 +1705,10 @@ mod tests {
 
     #[test]
     fn clock_text_survives_a_hostile_format() {
-        assert_eq!(super::clock_text("with\0nul"), "");
-        let _ = super::clock_text("");
-        let _ = super::clock_text(&"%Y".repeat(300));
+        let now = std::time::SystemTime::now();
+        assert_eq!(super::clock_text("with\0nul", now), "");
+        let _ = super::clock_text("", now);
+        let _ = super::clock_text(&"%Y".repeat(300), now);
     }
 
     use super::*;
@@ -2658,6 +2719,209 @@ mod tests {
         let (guard, _state) = start_lock_ipc_at(path.clone()).unwrap();
         assert!(UnixStream::connect(&path).is_ok());
         drop(guard);
+    }
+
+    const LOCKED_AT_SECOND_58: Duration = Duration::from_millis(1_800_000_058_400);
+
+    #[test]
+    fn the_clock_turns_as_each_minute_starts_and_wakes_only_then() {
+        for (format, period) in [("%H:%M", 60_000), ("%H:%M:%S", 1_000)] {
+            let locked = std::time::UNIX_EPOCH + LOCKED_AT_SECOND_58;
+            let mut clock = Clock::new(format.into(), locked);
+            let mut now = locked;
+            for wake in 0..60 {
+                now += clock.wait(now);
+                let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+                assert!(
+                    clock.advance(now).is_some(),
+                    "{format}: wake {wake} at {since_epoch:?} changed nothing"
+                );
+                assert!(
+                    since_epoch.as_millis() % period <= 1,
+                    "{format}: wake {wake} turned the clock at {since_epoch:?}, not as the period began"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_minute_read_just_before_it_turned_is_not_slept_through() {
+        let minute = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_060);
+        let mut clock = Clock::new("%H:%M".into(), minute - Duration::from_secs(30));
+        assert!(clock.advance(minute - Duration::from_millis(2)).is_none());
+        let wait = clock.wait(minute + Duration::from_millis(3));
+        assert!(
+            wait <= Duration::from_millis(1),
+            "a tick 2 ms before the minute and a wait 3 ms after it slept {wait:?} on the old minute"
+        );
+    }
+
+    #[test]
+    fn an_idle_lock_presents_once_a_minute_while_the_compositor_echoes_the_pointer() {
+        const W: u32 = 640;
+        const H: u32 = 400;
+        const POINTER: vigil_core::InputEvent =
+            vigil_core::InputEvent::PointerAbsolute { x: 200.0, y: 120.0 };
+        let platform = VigilPlatform::install().unwrap();
+        let component = Theme::load_or_default(None).instantiate().unwrap();
+        let adapter = platform.claim_last_adapter().unwrap();
+        let mut window = OutputWindow::new(OutputId(1), W, H, 1.0, adapter, component).unwrap();
+        let locked = std::time::UNIX_EPOCH + LOCKED_AT_SECOND_58;
+        let mut clock = Clock::new("%H:%M".into(), locked);
+        window.set_clock(clock.shown());
+        window.set_panel_visible(true);
+        window.set_cursor_visible(true);
+        window.show_prompt("Password", true);
+        Refusal::default().show("Authentication failure", &mut window);
+        window.dispatch(POINTER);
+        let mut buf = vec![0u8; (W * H * 4) as usize];
+        let mut present = |window: &mut OutputWindow| {
+            vigil_ui::advance_timers();
+            window.scene_needs_present()
+                && window.render_if_needed(FrameTarget {
+                    buffer: &mut buf,
+                    width: W,
+                    height: H,
+                    stride: (W * 4) as usize,
+                    damage: None,
+                })
+        };
+        for _ in 0..100 {
+            present(&mut window);
+            if !window.slint_window().has_active_animations() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let end = locked + Duration::from_secs(3600);
+        let (mut now, mut frames) = (locked, 0);
+        while now < end && frames <= 120 {
+            if present(&mut window) {
+                frames += 1;
+                window.dispatch(POINTER);
+                now += Duration::from_millis(16);
+            } else {
+                now += clock.wait(now);
+                if let Some(text) = clock.advance(now) {
+                    window.set_clock(text);
+                }
+            }
+        }
+        assert_eq!(
+            frames, 60,
+            "an hour locked with the card up should cost one frame per minute"
+        );
+    }
+
+    #[test]
+    fn every_format_that_shows_seconds_turns_each_second() {
+        for (format, secs) in [
+            ("%H:%M", 60),
+            ("%Y-%m-%d", 60),
+            ("%I:%M %p", 60),
+            ("%%S", 60),
+            ("trailing %", 60),
+            ("%H:%M:%S", 1),
+            ("%-S", 1),
+            ("%_S", 1),
+            ("%02S", 1),
+            ("%OS", 1),
+            ("%%%S", 1),
+            ("%T", 1),
+            ("%r", 1),
+            ("%X", 1),
+            ("%EX", 1),
+            ("%c", 1),
+            ("%Ec", 1),
+            ("%s", 1),
+        ] {
+            assert_eq!(
+                clock_interval(format),
+                Duration::from_secs(secs),
+                "format {format:?}"
+            );
+        }
+    }
+
+    // A TZif file of one zone with no transitions.
+    fn zone_file(offset_secs: i32, name: &str) -> Vec<u8> {
+        let mut file = b"TZif".to_vec();
+        file.extend([0_u8; 16]);
+        for count in [0, 0, 0, 0, 1, name.len() as u32 + 1] {
+            file.extend(u32::to_be_bytes(count));
+        }
+        file.extend(offset_secs.to_be_bytes());
+        file.extend([0, 0]);
+        file.extend(name.as_bytes());
+        file.push(0);
+        file
+    }
+
+    #[test]
+    fn the_clock_follows_a_timezone_change_made_while_locked() {
+        const TEST: &str = "tests::the_clock_follows_a_timezone_change_made_while_locked";
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        if let Some(zones) = std::env::var_os("VIGIL_LOCK_ZONE_PROBE") {
+            let zones = PathBuf::from(zones);
+            let point_at = |zone: &str| {
+                let status = std::process::Command::new("mount")
+                    .arg("--bind")
+                    .arg(zones.join(zone))
+                    .arg("/etc/localtime")
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "could not point /etc/localtime at {zone}");
+            };
+            point_at("before");
+            let before = clock_text("%H:%M %Z", at);
+            point_at("after");
+            let after = clock_text("%H:%M %Z", at);
+            assert_eq!(
+                (before.as_str(), after.as_str()),
+                ("08:00 AAA", "17:00 BBB"),
+                "the clock kept the zone it read first"
+            );
+            return;
+        }
+        let namespace = || {
+            let mut unshare = std::process::Command::new("unshare");
+            unshare.args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ]);
+            unshare
+        };
+        let usable = std::path::Path::new("/etc/localtime").exists()
+            && namespace()
+                .arg("true")
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+        if !usable {
+            vigil_log::say!("SKIP: needs /etc/localtime and an unprivileged mount namespace");
+            return;
+        }
+        let zones = std::env::temp_dir().join(format!("vigil-lock-zones-{}", std::process::id()));
+        std::fs::create_dir_all(&zones).unwrap();
+        std::fs::write(zones.join("before"), zone_file(0, "AAA")).unwrap();
+        std::fs::write(zones.join("after"), zone_file(9 * 3600, "BBB")).unwrap();
+        let output = namespace()
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env("VIGIL_LOCK_ZONE_PROBE", &zones)
+            .env_remove("TZ")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&zones);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 #[test]

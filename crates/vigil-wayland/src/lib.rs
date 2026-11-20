@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -331,6 +331,39 @@ struct Entry {
     pool: Option<SlotPool>,
     configured: bool,
     committed: bool,
+    pacer: Pacer,
+    retry: Option<(std::time::Instant, u32)>,
+}
+
+const FRAME: Duration = Duration::from_nanos(16_666_667);
+
+// Every buffer the compositor hands back wakes the loop, so a surface that is
+// still animating would commit once per release. A surface commits at most
+// once a frame, and a held present is due when that frame ends. The surface
+// keeps that deadline itself because an overlay shares its output's id.
+#[derive(Default)]
+struct Pacer {
+    last: Option<std::time::Instant>,
+    due: Option<std::time::Instant>,
+}
+
+impl Pacer {
+    fn hold(&mut self, now: std::time::Instant, forced: bool) -> bool {
+        self.due = self
+            .last
+            .map(|last| last + FRAME)
+            .filter(|due| !forced && now < *due);
+        self.due.is_some()
+    }
+
+    fn committed(&mut self, at: std::time::Instant) {
+        self.last = Some(at);
+        self.due = None;
+    }
+
+    fn due(&self) -> Option<std::time::Instant> {
+        self.due
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -370,7 +403,6 @@ struct App<S: LockSession + 'static> {
     dirty: Arc<DirtySet<OutputId>>,
     metrics: Arc<Metrics>,
     qh: QueueHandle<App<S>>,
-    present_retry: BTreeMap<OutputId, (std::time::Instant, u32)>,
     pending_scenes: Vec<(OutputId, bool)>,
     flow: LockFlow,
     started: std::time::Instant,
@@ -416,18 +448,6 @@ fn exit_session<S: LockSession>(
 ) {
     *slot = Some(outcome);
     session.flow_command(&FlowCmd::Exit(outcome));
-}
-
-fn soonest_retry(
-    retries: &BTreeMap<OutputId, (std::time::Instant, u32)>,
-    live: impl Fn(OutputId) -> bool,
-    now: std::time::Instant,
-) -> Option<Duration> {
-    retries
-        .iter()
-        .filter(|(id, _)| live(**id))
-        .map(|(_, (deadline, _))| deadline.saturating_duration_since(now))
-        .min()
 }
 
 impl<S: LockSession> App<S> {
@@ -538,14 +558,13 @@ impl<S: LockSession> App<S> {
             }
         }
     }
-    fn schedule_present_retry(&mut self, id: OutputId) {
-        let attempt = self
-            .present_retry
-            .get(&id)
+    fn schedule_present_retry(&mut self, idx: usize, now: std::time::Instant) {
+        let entry = &mut self.entries[idx];
+        let attempt = entry
+            .retry
             .map_or(0, |(_, attempt)| attempt.saturating_add(1));
         let delay = Duration::from_millis(100 * (1_u64 << attempt.min(5)));
-        self.present_retry
-            .insert(id, (std::time::Instant::now() + delay, attempt));
+        entry.retry = Some((now + delay, attempt));
     }
 
     fn output_info(&self, idx: usize) -> OutputInfo {
@@ -689,6 +708,8 @@ impl<S: LockSession> App<S> {
             pool: None,
             configured: false,
             committed: false,
+            pacer: Pacer::default(),
+            retry: None,
         });
     }
 
@@ -745,6 +766,8 @@ impl<S: LockSession> App<S> {
             pool: None,
             configured: false,
             committed: false,
+            pacer: Pacer::default(),
+            retry: None,
         });
     }
 
@@ -812,14 +835,14 @@ impl<S: LockSession> App<S> {
         let role = self.entries[idx].role.name();
         self.session.force_copy_out(id);
         let Some(pool) = self.entries[idx].pool.as_mut() else {
-            self.schedule_present_retry(id);
+            self.schedule_present_retry(idx, std::time::Instant::now());
             return;
         };
         let stride = w as usize * 4;
         let Ok((buffer, canvas)) =
             pool.create_buffer(w as i32, h as i32, stride as i32, wl_shm::Format::Xrgb8888)
         else {
-            self.schedule_present_retry(id);
+            self.schedule_present_retry(idx, std::time::Instant::now());
             return;
         };
         self.metrics.record_buffer_acquire();
@@ -843,6 +866,7 @@ impl<S: LockSession> App<S> {
         surface.commit();
         self.metrics.record_commit();
         self.entries[idx].committed = true;
+        self.entries[idx].pacer.committed(std::time::Instant::now());
         if frame_hash_enabled()
             && let Some(pool) = self.entries[idx].pool.as_mut()
         {
@@ -850,18 +874,20 @@ impl<S: LockSession> App<S> {
         }
     }
 
-    fn present(&mut self, idx: usize) {
+    fn present(&mut self, idx: usize, now: std::time::Instant) {
         if !self.entries[idx].configured {
             return;
         }
         if self.unlock_sent && self.entries[idx].role.is_lock() {
-            let id = self.entries[idx].id;
-            self.present_retry.remove(&id);
+            self.entries[idx].retry = None;
             return;
         }
         let (w, h) = self.entries[idx].px;
         let force = !self.entries[idx].committed;
         let id = self.entries[idx].id;
+        if self.entries[idx].pacer.hold(now, force) {
+            return;
+        }
         let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
         let overlay = !self.entries[idx].role.is_lock();
         let surface_opacity = self.entries[idx].opacity.is_some();
@@ -869,11 +895,11 @@ impl<S: LockSession> App<S> {
         let role = self.entries[idx].role.name();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             vigil_log::say!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
-            self.schedule_present_retry(id);
+            self.schedule_present_retry(idx, now);
             return;
         };
         if !force && !self.session.scene_needs_present(id) {
-            self.present_retry.remove(&id);
+            self.entries[idx].retry = None;
             return;
         }
         self.metrics.record_buffer_acquire();
@@ -893,7 +919,7 @@ impl<S: LockSession> App<S> {
         let Ok((buffer, canvas)) = pool.create_buffer(w as i32, h as i32, stride as i32, format)
         else {
             vigil_log::say!("vigil-lock: output {id:?}: shm buffer {w}x{h} failed");
-            self.schedule_present_retry(id);
+            self.schedule_present_retry(idx, now);
             return;
         };
         if force {
@@ -924,7 +950,7 @@ impl<S: LockSession> App<S> {
             );
         }
         if !drew && !force {
-            self.present_retry.remove(&id);
+            self.entries[idx].retry = None;
             return;
         }
         if let Some((frost, wallpaper)) = overlay_progress {
@@ -959,7 +985,8 @@ impl<S: LockSession> App<S> {
         surface.commit();
         self.metrics.record_commit();
         self.entries[idx].committed = true;
-        self.present_retry.remove(&id);
+        self.entries[idx].pacer.committed(now);
+        self.entries[idx].retry = None;
         let commit_elapsed = commit_started.elapsed();
         if render_elapsed >= Duration::from_millis(8) || commit_elapsed >= Duration::from_millis(8)
         {
@@ -983,9 +1010,9 @@ impl<S: LockSession> App<S> {
 
     fn tick(&mut self) {
         let now = std::time::Instant::now();
-        for (&id, &(deadline, _)) in &self.present_retry {
-            if deadline <= now {
-                self.dirty.mark(id);
+        for entry in &self.entries {
+            if entry.retry.is_some_and(|(deadline, _)| deadline <= now) {
+                self.dirty.mark(entry.id);
             }
         }
         for (id, is_lock) in std::mem::take(&mut self.pending_scenes) {
@@ -1042,18 +1069,53 @@ impl<S: LockSession> App<S> {
                 .map_or(-1i64, |d| d.as_millis() as i64)
         );
         let _ = self.dirty.take_all();
-        for lock_pass in [0, 1] {
-            for idx in 0..self.entries.len() {
-                if present_priority(self.entries[idx].role.is_lock()) == lock_pass {
-                    self.present(idx);
-                }
-            }
-        }
+        self.present_all(std::time::Instant::now());
         if !self.unlock_sent && self.reveal_entries_all_committed() {
             let cmds = self.flow.step(self.now(), FlowEvent::RevealOverlaysMapped);
             self.run(cmds);
         }
         self.cleanup_warning_surfaces();
+    }
+
+    // An overlay renders the scene of the output it shares an id with, and a
+    // render takes the scene's change. While the lock surface on that output
+    // waits for its frame, the overlay waits too, so the change is the lock's.
+    fn present_all(&mut self, now: std::time::Instant) {
+        let mut held = BTreeSet::new();
+        for lock_pass in [0, 1] {
+            for idx in 0..self.entries.len() {
+                let entry = &self.entries[idx];
+                if present_priority(entry.role.is_lock()) != lock_pass
+                    || (!entry.role.is_lock() && held.contains(&entry.id))
+                {
+                    continue;
+                }
+                self.present(idx, now);
+                let entry = &self.entries[idx];
+                if entry.role.is_lock() && !self.unlock_sent && entry.pacer.due().is_some() {
+                    held.insert(entry.id);
+                }
+            }
+        }
+    }
+
+    fn next_timeout(&self, now: std::time::Instant) -> Option<Duration> {
+        let session = match self.session.wait_decision() {
+            WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
+            WaitDecision::Indefinite => None,
+        };
+        let surfaces = self
+            .entries
+            .iter()
+            .filter(|e| !(self.unlock_sent && e.role.is_lock()))
+            .flat_map(|e| [e.pacer.due(), e.retry.map(|(deadline, _)| deadline)])
+            .flatten()
+            .map(|due| due.saturating_duration_since(now));
+        [session, self.flow.next_wake()]
+            .into_iter()
+            .flatten()
+            .chain(surfaces)
+            .min()
     }
 
     fn begin_lock(&mut self) {
@@ -1243,6 +1305,106 @@ pub fn run_with_lock<S: LockSession + 'static>(
     result
 }
 
+struct Runtime {
+    wake: WakeHandle,
+    dirty: Arc<DirtySet<OutputId>>,
+    metrics: Arc<Metrics>,
+    root: tracing::Span,
+}
+
+impl<S: LockSession + 'static> App<S> {
+    fn new(
+        session: S,
+        conn: &Connection,
+        globals: &wayland_client::globals::GlobalList,
+        qh: &QueueHandle<Self>,
+        runtime: Runtime,
+        lock_config: &Lock,
+        warning_ms_override: Option<u64>,
+    ) -> Result<(Self, Vec<FlowCmd>), LockError> {
+        let warning_enabled = warning_ms_override.unwrap_or(lock_config.warning.duration_ms) > 0;
+        let frost_alpha = lock_config.warning.frost_alpha.clamp(0.0, 1.0);
+        let reveal_blur = lock_config.transition.reveal_blurs();
+        let started = std::time::Instant::now();
+        let mut policy = lock_config.clone();
+        let layer_shell = match LayerShell::bind(globals, qh) {
+            Ok(layer_shell) => Some(layer_shell),
+            Err(error) if warning_enabled => return Err(err(error)),
+            Err(error) => {
+                if policy.transition.ramps_in() || policy.transition.reveals() {
+                    vigil_log::say!(
+                        "vigil-lock: layer-shell unavailable ({error}); locking immediately"
+                    );
+                }
+                policy.transition = vigil_config::LockTransition::immediate();
+                None
+            }
+        };
+        let (flow, boot_cmds) = LockFlow::new(
+            Now {
+                elapsed: Duration::ZERO,
+                mono: started,
+                wall: std::time::SystemTime::now(),
+            },
+            &policy,
+            warning_ms_override,
+        );
+        let pre_lock_overlays = flow.phase() == vigil_flow::FlowPhase::PreLock;
+        let phase_span = Some(tracing::info_span!(
+            target: "vigil",
+            parent: runtime.root.id(),
+            "flow.phase",
+            phase = %flow.phase()
+        ));
+        let compositor_proxy: wl_compositor::WlCompositor =
+            globals.bind(qh, 1..=6, ()).map_err(err)?;
+        let app = App {
+            session,
+            conn: conn.clone(),
+            registry: RegistryState::new(globals),
+            outputs: OutputState::new(globals, qh),
+            compositor: CompositorState::bind(globals, qh).map_err(err)?,
+            seats: SeatState::new(globals, qh),
+            shm: Shm::bind(globals, qh).map_err(err)?,
+            lock_state: SessionLockState::new(globals, qh),
+            layer_shell,
+            background_effects: BackgroundEffectState::new(globals, qh),
+            hyprland_surfaces: globals.bind(qh, 1..=2, ()).ok(),
+            alpha_modifiers: globals.bind(qh, 1..=1, ()).ok(),
+            compositor_proxy,
+            lock: None,
+            viewporter: globals.bind(qh, 1..=1, ()).ok(),
+            fractional_mgr: globals.bind(qh, 1..=1, ()).ok(),
+            entries: Vec::new(),
+            keyboard: None,
+            held_keys: vigil_core::HeldKeys::default(),
+            pointer: None,
+            got_locked: false,
+            outcome: None,
+            error: None,
+            wake: runtime.wake,
+            dirty: runtime.dirty,
+            metrics: runtime.metrics,
+            qh: qh.clone(),
+            pending_scenes: Vec::new(),
+            flow,
+            started,
+            overlay_progress: (0.0, 0.0),
+            frost_alpha,
+            reveal_blur,
+            pre_lock_overlays,
+            scene_ids: BTreeSet::new(),
+            initial_outputs_added: false,
+            unlock_sent: false,
+            ramp_scene_synced: false,
+            root_span: runtime.root,
+            phase_span,
+            protocol_events: Vec::new(),
+        };
+        Ok((app, boot_cmds))
+    }
+}
+
 fn run_with_lock_body<S: LockSession + 'static>(
     session: S,
     lock_config: &Lock,
@@ -1265,86 +1427,20 @@ fn run_with_lock_body<S: LockSession + 'static>(
     let dirty = Arc::new(DirtySet::new());
     let metrics = Arc::new(Metrics::new());
 
-    let warning_enabled = warning_ms_override.unwrap_or(lock_config.warning.duration_ms) > 0;
-    let frost_alpha = lock_config.warning.frost_alpha.clamp(0.0, 1.0);
-    let reveal_blur = lock_config.transition.reveal_blurs();
-    let started = std::time::Instant::now();
-    let mut policy = lock_config.clone();
-    let layer_shell = match LayerShell::bind(&globals, &qh) {
-        Ok(layer_shell) => Some(layer_shell),
-        Err(error) if warning_enabled => return Err(err(error)),
-        Err(error) => {
-            if policy.transition.ramps_in() || policy.transition.reveals() {
-                vigil_log::say!(
-                    "vigil-lock: layer-shell unavailable ({error}); locking immediately"
-                );
-            }
-            policy.transition = vigil_config::LockTransition::immediate();
-            None
-        }
-    };
-    let (flow, boot_cmds) = LockFlow::new(
-        Now {
-            elapsed: Duration::ZERO,
-            mono: started,
-            wall: std::time::SystemTime::now(),
-        },
-        &policy,
-        warning_ms_override,
-    );
-    let pre_lock_overlays = flow.phase() == vigil_flow::FlowPhase::PreLock;
-    let phase_span = Some(tracing::info_span!(
-        target: "vigil",
-        parent: root.id(),
-        "flow.phase",
-        phase = %flow.phase()
-    ));
-    let compositor_proxy: wl_compositor::WlCompositor =
-        globals.bind(&qh, 1..=6, ()).map_err(err)?;
-    let mut app = App {
+    let (mut app, boot_cmds) = App::new(
         session,
-        conn: conn.clone(),
-        registry: RegistryState::new(&globals),
-        outputs: OutputState::new(&globals, &qh),
-        compositor: CompositorState::bind(&globals, &qh).map_err(err)?,
-        seats: SeatState::new(&globals, &qh),
-        shm: Shm::bind(&globals, &qh).map_err(err)?,
-        lock_state: SessionLockState::new(&globals, &qh),
-        layer_shell,
-        background_effects: BackgroundEffectState::new(&globals, &qh),
-        hyprland_surfaces: globals.bind(&qh, 1..=2, ()).ok(),
-        alpha_modifiers: globals.bind(&qh, 1..=1, ()).ok(),
-        compositor_proxy,
-        lock: None,
-        viewporter: globals.bind(&qh, 1..=1, ()).ok(),
-        fractional_mgr: globals.bind(&qh, 1..=1, ()).ok(),
-        entries: Vec::new(),
-        keyboard: None,
-        held_keys: vigil_core::HeldKeys::default(),
-        pointer: None,
-        got_locked: false,
-        outcome: None,
-        error: None,
-        wake: wake.clone(),
-        dirty: dirty.clone(),
-        metrics: metrics.clone(),
-        qh: qh.clone(),
-        present_retry: BTreeMap::new(),
-        pending_scenes: Vec::new(),
-        flow,
-        started,
-        overlay_progress: (0.0, 0.0),
-        frost_alpha,
-        reveal_blur,
-        pre_lock_overlays,
-        scene_ids: BTreeSet::new(),
-        initial_outputs_added: false,
-        unlock_sent: false,
-        ramp_scene_synced: false,
-        root_span: root.clone(),
-        phase_span,
-        protocol_events: Vec::new(),
-    };
+        &conn,
+        &globals,
+        &qh,
+        Runtime {
+            wake: wake.clone(),
+            dirty: dirty.clone(),
+            metrics: metrics.clone(),
+            root,
+        },
+        lock_config,
+        warning_ms_override,
+    )?;
     vigil_log::say!(
         "vigil-lock: frost opacity lever: {}",
         if app.hyprland_surfaces.is_some() {
@@ -1375,24 +1471,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
     let started = std::time::Instant::now();
     let metrics_at_start = app.metrics.snapshot();
     while app.outcome.is_none() && app.error.is_none() {
-        let mut timeout = match app.session.wait_decision() {
-            WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
-            WaitDecision::Indefinite => None,
-        };
-        if let Some(animation) = app.flow.next_wake() {
-            timeout = Some(timeout.map_or(animation, |current| current.min(animation)));
-        }
-        if let Some(retry) = soonest_retry(
-            &app.present_retry,
-            |id| {
-                app.entries
-                    .iter()
-                    .any(|e| e.id == id && !(app.unlock_sent && e.role.is_lock()))
-            },
-            std::time::Instant::now(),
-        ) {
-            timeout = Some(timeout.map_or(retry, |current| current.min(retry)));
-        }
+        let timeout = app.next_timeout(std::time::Instant::now());
         let _iteration = tracing::debug_span!(target: "vigil", "loop.iteration").entered();
         event_loop.dispatch(timeout, &mut app).map_err(err)?;
         app.wake.acknowledge();
@@ -1789,7 +1868,6 @@ impl<S: LockSession> OutputHandler for App<S> {
             }
             self.entries.retain(|entry| entry.output != output);
             self.scene_ids.remove(&id);
-            self.present_retry.remove(&id);
             self.session.output_gone(id);
         }
     }
@@ -1829,8 +1907,48 @@ wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpAlph
 wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpAlphaModifierSurfaceV1);
 
 #[cfg(test)]
+mod present_tests;
+
+#[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    #[test]
+    fn a_running_animation_commits_once_a_frame_however_fast_buffers_come_back() {
+        let start = std::time::Instant::now();
+        let mut pacer = super::Pacer::default();
+        let mut commits = 0;
+        let release = Duration::from_micros(1_700);
+        let mut now = start;
+        while now < start + Duration::from_secs(2) {
+            if !pacer.hold(now, false) {
+                pacer.committed(now);
+                commits += 1;
+            }
+            now += release;
+        }
+        assert!(
+            commits <= 121,
+            "a 2 s busy bar committed {commits} times, one per buffer release"
+        );
+        assert!(
+            pacer.hold(now, false),
+            "the last present of the run was not held"
+        );
+        assert!(
+            pacer.due().is_some(),
+            "a held present has no deadline to wake the loop"
+        );
+        let quiet = now + Duration::from_secs(1);
+        assert!(
+            !pacer.hold(quiet, false),
+            "a change after a quiet second waited for a frame"
+        );
+        assert!(
+            pacer.due().is_none(),
+            "a present that went out still holds a deadline"
+        );
+    }
+
+    use std::time::Duration;
 
     use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now};
 
@@ -1914,39 +2032,6 @@ mod tests {
                 pressed: true,
             }),
             "a held letter still repeats"
-        );
-    }
-
-    #[test]
-    fn a_retry_for_a_departed_output_cannot_steer_the_loop() {
-        let now = Instant::now();
-        let mut retries = super::BTreeMap::new();
-        retries.insert(super::OutputId(1), (now - Duration::from_secs(60), 3_u32));
-        assert_eq!(
-            super::soonest_retry(&retries, |_| false, now),
-            None,
-            "a retry with no live output must not be considered"
-        );
-        assert_eq!(
-            super::soonest_retry(&retries, |_| true, now),
-            Some(Duration::ZERO),
-            "a live output past its deadline is due now"
-        );
-    }
-
-    #[test]
-    fn the_soonest_live_deadline_wins() {
-        let now = Instant::now();
-        let mut retries = super::BTreeMap::new();
-        retries.insert(super::OutputId(1), (now + Duration::from_millis(800), 0));
-        retries.insert(super::OutputId(2), (now + Duration::from_millis(200), 0));
-        assert_eq!(
-            super::soonest_retry(&retries, |_| true, now),
-            Some(Duration::from_millis(200))
-        );
-        assert_eq!(
-            super::soonest_retry(&retries, |id| id == super::OutputId(1), now),
-            Some(Duration::from_millis(800))
         );
     }
 
