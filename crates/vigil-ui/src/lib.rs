@@ -618,30 +618,11 @@ impl OutputWindow {
         ) {
             self.touch();
         }
-        let window = self.component.window();
         match event {
             InputEvent::PointerMotion { dx, dy } => {
-                self.pointer_x =
-                    (self.pointer_x + dx).clamp(0.0, self.width.saturating_sub(1) as f64);
-                self.pointer_y =
-                    (self.pointer_y + dy).clamp(0.0, self.height.saturating_sub(1) as f64);
-                window.dispatch_event(WindowEvent::PointerMoved {
-                    position: self.pointer_position(),
-                });
-                if self.cursor_visible {
-                    self.request_present();
-                }
+                self.move_pointer(self.pointer_x + dx, self.pointer_y + dy);
             }
-            InputEvent::PointerAbsolute { x, y } => {
-                self.pointer_x = x.clamp(0.0, self.width.saturating_sub(1) as f64);
-                self.pointer_y = y.clamp(0.0, self.height.saturating_sub(1) as f64);
-                window.dispatch_event(WindowEvent::PointerMoved {
-                    position: self.pointer_position(),
-                });
-                if self.cursor_visible {
-                    self.request_present();
-                }
-            }
+            InputEvent::PointerAbsolute { x, y } => self.move_pointer(x, y),
             InputEvent::PointerButton { button, pressed } => {
                 if pressed && !matches!(self.focus.stop, Stop::Cancel(_) | Stop::Confirm(_)) {
                     self.focus = Focus::default();
@@ -666,6 +647,27 @@ impl OutputWindow {
                 self.key(keysym, utf8, pressed);
                 self.watch_reveal();
             }
+        }
+    }
+
+    // Hyprland answers each lock surface commit with a motion to where the
+    // pointer already is, so drawing for one would bring the next.
+    fn move_pointer(&mut self, x: f64, y: f64) {
+        let to = (
+            x.clamp(0.0, self.width.saturating_sub(1) as f64),
+            y.clamp(0.0, self.height.saturating_sub(1) as f64),
+        );
+        if to == (self.pointer_x, self.pointer_y) {
+            return;
+        }
+        (self.pointer_x, self.pointer_y) = to;
+        self.component
+            .window()
+            .dispatch_event(WindowEvent::PointerMoved {
+                position: self.pointer_position(),
+            });
+        if self.cursor_visible {
+            self.request_present();
         }
     }
 
