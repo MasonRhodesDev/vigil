@@ -650,8 +650,9 @@ impl OutputWindow {
         }
     }
 
-    // Hyprland answers each lock surface commit with a motion to where the
-    // pointer already is, so drawing for one would bring the next.
+    // While its focus state holds no surface, Hyprland answers each lock
+    // surface commit with a motion to where the pointer already is, so drawing
+    // for one would bring the next.
     fn move_pointer(&mut self, x: f64, y: f64) {
         let to = (
             x.clamp(0.0, self.width.saturating_sub(1) as f64),
