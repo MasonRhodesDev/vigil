@@ -336,12 +336,16 @@ struct Entry {
 
 const FRAME: Duration = Duration::from_nanos(16_666_667);
 
+// Every buffer the compositor hands back wakes the loop, so a surface that is
+// still animating would commit once per release. A surface commits at most
+// once a frame; a held present is due when that frame ends.
 #[derive(Default)]
 struct Pacer(Option<std::time::Instant>);
 
 impl Pacer {
-    fn hold(&self, _now: std::time::Instant) -> Option<std::time::Instant> {
-        None
+    fn hold(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let due = self.0? + FRAME;
+        (now < due).then_some(due)
     }
 
     fn committed(&mut self, at: std::time::Instant) {
@@ -882,7 +886,8 @@ impl<S: LockSession> App<S> {
         let force = !self.entries[idx].committed;
         let id = self.entries[idx].id;
         if !force && let Some(due) = self.entries[idx].pacer.hold(std::time::Instant::now()) {
-            self.present_retry.entry(id).or_insert((due, 0));
+            let retry = self.present_retry.entry(id).or_insert((due, 0));
+            retry.0 = retry.0.max(due);
             return;
         }
         let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
