@@ -1208,20 +1208,18 @@ impl LockSession for Locker {
     }
 }
 
+// Each wake reads the wall clock once, and both the text and the wait come from
+// that reading, so a wake on the boundary cannot see the old minute and sleep
+// through the new one.
 struct Clock {
     format: String,
     shown: String,
-    read_at: SystemTime,
 }
 
 impl Clock {
     fn new(format: String, now: SystemTime) -> Self {
         let shown = clock_text(&format, now);
-        Self {
-            format,
-            shown,
-            read_at: now,
-        }
+        Self { format, shown }
     }
 
     fn shown(&self) -> &str {
@@ -1229,10 +1227,6 @@ impl Clock {
     }
 
     fn advance(&mut self, now: SystemTime) -> Option<&str> {
-        if now.duration_since(self.read_at).unwrap_or_default() < clock_interval(&self.format) {
-            return None;
-        }
-        self.read_at = now;
         let text = clock_text(&self.format, now);
         if text == self.shown {
             return None;
@@ -1242,8 +1236,14 @@ impl Clock {
     }
 
     fn wait(&self, now: SystemTime) -> Duration {
-        clock_interval(&self.format)
-            .saturating_sub(now.duration_since(self.read_at).unwrap_or_default())
+        let period = clock_interval(&self.format).as_nanos();
+        let since_epoch = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        // The loop sleeps in whole milliseconds, so round up to land after the boundary.
+        let left_ms = (period - since_epoch % period).div_ceil(1_000_000);
+        Duration::from_millis(u64::try_from(left_ms).unwrap_or(u64::MAX))
     }
 }
 
