@@ -567,14 +567,13 @@ impl<S: LockSession> App<S> {
             }
         }
     }
-    fn schedule_present_retry(&mut self, id: OutputId) {
+    fn schedule_present_retry(&mut self, id: OutputId, now: std::time::Instant) {
         let attempt = self
             .present_retry
             .get(&id)
             .map_or(0, |(_, attempt)| attempt.saturating_add(1));
         let delay = Duration::from_millis(100 * (1_u64 << attempt.min(5)));
-        self.present_retry
-            .insert(id, (std::time::Instant::now() + delay, attempt));
+        self.present_retry.insert(id, (now + delay, attempt));
     }
 
     fn output_info(&self, idx: usize) -> OutputInfo {
@@ -843,14 +842,14 @@ impl<S: LockSession> App<S> {
         let role = self.entries[idx].role.name();
         self.session.force_copy_out(id);
         let Some(pool) = self.entries[idx].pool.as_mut() else {
-            self.schedule_present_retry(id);
+            self.schedule_present_retry(id, std::time::Instant::now());
             return;
         };
         let stride = w as usize * 4;
         let Ok((buffer, canvas)) =
             pool.create_buffer(w as i32, h as i32, stride as i32, wl_shm::Format::Xrgb8888)
         else {
-            self.schedule_present_retry(id);
+            self.schedule_present_retry(id, std::time::Instant::now());
             return;
         };
         self.metrics.record_buffer_acquire();
@@ -882,7 +881,7 @@ impl<S: LockSession> App<S> {
         }
     }
 
-    fn present(&mut self, idx: usize) {
+    fn present(&mut self, idx: usize, now: std::time::Instant) {
         if !self.entries[idx].configured {
             return;
         }
@@ -894,7 +893,7 @@ impl<S: LockSession> App<S> {
         let (w, h) = self.entries[idx].px;
         let force = !self.entries[idx].committed;
         let id = self.entries[idx].id;
-        if !force && self.entries[idx].pacer.hold(std::time::Instant::now()) {
+        if !force && self.entries[idx].pacer.hold(now) {
             return;
         }
         let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
@@ -904,7 +903,7 @@ impl<S: LockSession> App<S> {
         let role = self.entries[idx].role.name();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             vigil_log::say!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
-            self.schedule_present_retry(id);
+            self.schedule_present_retry(id, now);
             return;
         };
         if !force && !self.session.scene_needs_present(id) {
@@ -928,7 +927,7 @@ impl<S: LockSession> App<S> {
         let Ok((buffer, canvas)) = pool.create_buffer(w as i32, h as i32, stride as i32, format)
         else {
             vigil_log::say!("vigil-lock: output {id:?}: shm buffer {w}x{h} failed");
-            self.schedule_present_retry(id);
+            self.schedule_present_retry(id, now);
             return;
         };
         if force {
@@ -994,7 +993,7 @@ impl<S: LockSession> App<S> {
         surface.commit();
         self.metrics.record_commit();
         self.entries[idx].committed = true;
-        self.entries[idx].pacer.committed(std::time::Instant::now());
+        self.entries[idx].pacer.committed(now);
         self.present_retry.remove(&id);
         let commit_elapsed = commit_started.elapsed();
         if render_elapsed >= Duration::from_millis(8) || commit_elapsed >= Duration::from_millis(8)
@@ -1078,18 +1077,54 @@ impl<S: LockSession> App<S> {
                 .map_or(-1i64, |d| d.as_millis() as i64)
         );
         let _ = self.dirty.take_all();
-        for lock_pass in [0, 1] {
-            for idx in 0..self.entries.len() {
-                if present_priority(self.entries[idx].role.is_lock()) == lock_pass {
-                    self.present(idx);
-                }
-            }
-        }
+        self.present_all(std::time::Instant::now());
         if !self.unlock_sent && self.reveal_entries_all_committed() {
             let cmds = self.flow.step(self.now(), FlowEvent::RevealOverlaysMapped);
             self.run(cmds);
         }
         self.cleanup_warning_surfaces();
+    }
+
+    fn present_all(&mut self, now: std::time::Instant) {
+        for lock_pass in [0, 1] {
+            for idx in 0..self.entries.len() {
+                if present_priority(self.entries[idx].role.is_lock()) == lock_pass {
+                    self.present(idx, now);
+                }
+            }
+        }
+    }
+
+    fn next_timeout(&self, now: std::time::Instant) -> Option<Duration> {
+        let mut timeout = match self.session.wait_decision() {
+            WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
+            WaitDecision::Indefinite => None,
+        };
+        if let Some(animation) = self.flow.next_wake() {
+            timeout = Some(timeout.map_or(animation, |current| current.min(animation)));
+        }
+        if let Some(retry) = soonest_retry(
+            &self.present_retry,
+            |id| {
+                self.entries
+                    .iter()
+                    .any(|e| e.id == id && !(self.unlock_sent && e.role.is_lock()))
+            },
+            now,
+        ) {
+            timeout = Some(timeout.map_or(retry, |current| current.min(retry)));
+        }
+        if let Some(paced) = self
+            .entries
+            .iter()
+            .filter(|e| !(self.unlock_sent && e.role.is_lock()))
+            .filter_map(|e| e.pacer.due())
+            .map(|due| due.saturating_duration_since(now))
+            .min()
+        {
+            timeout = Some(timeout.map_or(paced, |current| current.min(paced)));
+        }
+        timeout
     }
 
     fn begin_lock(&mut self) {
@@ -1279,6 +1314,107 @@ pub fn run_with_lock<S: LockSession + 'static>(
     result
 }
 
+struct Runtime {
+    wake: WakeHandle,
+    dirty: Arc<DirtySet<OutputId>>,
+    metrics: Arc<Metrics>,
+    root: tracing::Span,
+}
+
+impl<S: LockSession + 'static> App<S> {
+    fn new(
+        session: S,
+        conn: &Connection,
+        globals: &wayland_client::globals::GlobalList,
+        qh: &QueueHandle<Self>,
+        runtime: Runtime,
+        lock_config: &Lock,
+        warning_ms_override: Option<u64>,
+    ) -> Result<(Self, Vec<FlowCmd>), LockError> {
+        let warning_enabled = warning_ms_override.unwrap_or(lock_config.warning.duration_ms) > 0;
+        let frost_alpha = lock_config.warning.frost_alpha.clamp(0.0, 1.0);
+        let reveal_blur = lock_config.transition.reveal_blurs();
+        let started = std::time::Instant::now();
+        let mut policy = lock_config.clone();
+        let layer_shell = match LayerShell::bind(globals, qh) {
+            Ok(layer_shell) => Some(layer_shell),
+            Err(error) if warning_enabled => return Err(err(error)),
+            Err(error) => {
+                if policy.transition.ramps_in() || policy.transition.reveals() {
+                    vigil_log::say!(
+                        "vigil-lock: layer-shell unavailable ({error}); locking immediately"
+                    );
+                }
+                policy.transition = vigil_config::LockTransition::immediate();
+                None
+            }
+        };
+        let (flow, boot_cmds) = LockFlow::new(
+            Now {
+                elapsed: Duration::ZERO,
+                mono: started,
+                wall: std::time::SystemTime::now(),
+            },
+            &policy,
+            warning_ms_override,
+        );
+        let pre_lock_overlays = flow.phase() == vigil_flow::FlowPhase::PreLock;
+        let phase_span = Some(tracing::info_span!(
+            target: "vigil",
+            parent: runtime.root.id(),
+            "flow.phase",
+            phase = %flow.phase()
+        ));
+        let compositor_proxy: wl_compositor::WlCompositor =
+            globals.bind(qh, 1..=6, ()).map_err(err)?;
+        let app = App {
+            session,
+            conn: conn.clone(),
+            registry: RegistryState::new(globals),
+            outputs: OutputState::new(globals, qh),
+            compositor: CompositorState::bind(globals, qh).map_err(err)?,
+            seats: SeatState::new(globals, qh),
+            shm: Shm::bind(globals, qh).map_err(err)?,
+            lock_state: SessionLockState::new(globals, qh),
+            layer_shell,
+            background_effects: BackgroundEffectState::new(globals, qh),
+            hyprland_surfaces: globals.bind(qh, 1..=2, ()).ok(),
+            alpha_modifiers: globals.bind(qh, 1..=1, ()).ok(),
+            compositor_proxy,
+            lock: None,
+            viewporter: globals.bind(qh, 1..=1, ()).ok(),
+            fractional_mgr: globals.bind(qh, 1..=1, ()).ok(),
+            entries: Vec::new(),
+            keyboard: None,
+            held_keys: vigil_core::HeldKeys::default(),
+            pointer: None,
+            got_locked: false,
+            outcome: None,
+            error: None,
+            wake: runtime.wake,
+            dirty: runtime.dirty,
+            metrics: runtime.metrics,
+            qh: qh.clone(),
+            present_retry: BTreeMap::new(),
+            pending_scenes: Vec::new(),
+            flow,
+            started,
+            overlay_progress: (0.0, 0.0),
+            frost_alpha,
+            reveal_blur,
+            pre_lock_overlays,
+            scene_ids: BTreeSet::new(),
+            initial_outputs_added: false,
+            unlock_sent: false,
+            ramp_scene_synced: false,
+            root_span: runtime.root,
+            phase_span,
+            protocol_events: Vec::new(),
+        };
+        Ok((app, boot_cmds))
+    }
+}
+
 fn run_with_lock_body<S: LockSession + 'static>(
     session: S,
     lock_config: &Lock,
@@ -1301,86 +1437,20 @@ fn run_with_lock_body<S: LockSession + 'static>(
     let dirty = Arc::new(DirtySet::new());
     let metrics = Arc::new(Metrics::new());
 
-    let warning_enabled = warning_ms_override.unwrap_or(lock_config.warning.duration_ms) > 0;
-    let frost_alpha = lock_config.warning.frost_alpha.clamp(0.0, 1.0);
-    let reveal_blur = lock_config.transition.reveal_blurs();
-    let started = std::time::Instant::now();
-    let mut policy = lock_config.clone();
-    let layer_shell = match LayerShell::bind(&globals, &qh) {
-        Ok(layer_shell) => Some(layer_shell),
-        Err(error) if warning_enabled => return Err(err(error)),
-        Err(error) => {
-            if policy.transition.ramps_in() || policy.transition.reveals() {
-                vigil_log::say!(
-                    "vigil-lock: layer-shell unavailable ({error}); locking immediately"
-                );
-            }
-            policy.transition = vigil_config::LockTransition::immediate();
-            None
-        }
-    };
-    let (flow, boot_cmds) = LockFlow::new(
-        Now {
-            elapsed: Duration::ZERO,
-            mono: started,
-            wall: std::time::SystemTime::now(),
-        },
-        &policy,
-        warning_ms_override,
-    );
-    let pre_lock_overlays = flow.phase() == vigil_flow::FlowPhase::PreLock;
-    let phase_span = Some(tracing::info_span!(
-        target: "vigil",
-        parent: root.id(),
-        "flow.phase",
-        phase = %flow.phase()
-    ));
-    let compositor_proxy: wl_compositor::WlCompositor =
-        globals.bind(&qh, 1..=6, ()).map_err(err)?;
-    let mut app = App {
+    let (mut app, boot_cmds) = App::new(
         session,
-        conn: conn.clone(),
-        registry: RegistryState::new(&globals),
-        outputs: OutputState::new(&globals, &qh),
-        compositor: CompositorState::bind(&globals, &qh).map_err(err)?,
-        seats: SeatState::new(&globals, &qh),
-        shm: Shm::bind(&globals, &qh).map_err(err)?,
-        lock_state: SessionLockState::new(&globals, &qh),
-        layer_shell,
-        background_effects: BackgroundEffectState::new(&globals, &qh),
-        hyprland_surfaces: globals.bind(&qh, 1..=2, ()).ok(),
-        alpha_modifiers: globals.bind(&qh, 1..=1, ()).ok(),
-        compositor_proxy,
-        lock: None,
-        viewporter: globals.bind(&qh, 1..=1, ()).ok(),
-        fractional_mgr: globals.bind(&qh, 1..=1, ()).ok(),
-        entries: Vec::new(),
-        keyboard: None,
-        held_keys: vigil_core::HeldKeys::default(),
-        pointer: None,
-        got_locked: false,
-        outcome: None,
-        error: None,
-        wake: wake.clone(),
-        dirty: dirty.clone(),
-        metrics: metrics.clone(),
-        qh: qh.clone(),
-        present_retry: BTreeMap::new(),
-        pending_scenes: Vec::new(),
-        flow,
-        started,
-        overlay_progress: (0.0, 0.0),
-        frost_alpha,
-        reveal_blur,
-        pre_lock_overlays,
-        scene_ids: BTreeSet::new(),
-        initial_outputs_added: false,
-        unlock_sent: false,
-        ramp_scene_synced: false,
-        root_span: root.clone(),
-        phase_span,
-        protocol_events: Vec::new(),
-    };
+        &conn,
+        &globals,
+        &qh,
+        Runtime {
+            wake: wake.clone(),
+            dirty: dirty.clone(),
+            metrics: metrics.clone(),
+            root,
+        },
+        lock_config,
+        warning_ms_override,
+    )?;
     vigil_log::say!(
         "vigil-lock: frost opacity lever: {}",
         if app.hyprland_surfaces.is_some() {
@@ -1411,35 +1481,7 @@ fn run_with_lock_body<S: LockSession + 'static>(
     let started = std::time::Instant::now();
     let metrics_at_start = app.metrics.snapshot();
     while app.outcome.is_none() && app.error.is_none() {
-        let mut timeout = match app.session.wait_decision() {
-            WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
-            WaitDecision::Indefinite => None,
-        };
-        if let Some(animation) = app.flow.next_wake() {
-            timeout = Some(timeout.map_or(animation, |current| current.min(animation)));
-        }
-        if let Some(retry) = soonest_retry(
-            &app.present_retry,
-            |id| {
-                app.entries
-                    .iter()
-                    .any(|e| e.id == id && !(app.unlock_sent && e.role.is_lock()))
-            },
-            std::time::Instant::now(),
-        ) {
-            timeout = Some(timeout.map_or(retry, |current| current.min(retry)));
-        }
-        let now = std::time::Instant::now();
-        if let Some(paced) = app
-            .entries
-            .iter()
-            .filter(|e| !(app.unlock_sent && e.role.is_lock()))
-            .filter_map(|e| e.pacer.due())
-            .map(|due| due.saturating_duration_since(now))
-            .min()
-        {
-            timeout = Some(timeout.map_or(paced, |current| current.min(paced)));
-        }
+        let timeout = app.next_timeout(std::time::Instant::now());
         let _iteration = tracing::debug_span!(target: "vigil", "loop.iteration").entered();
         event_loop.dispatch(timeout, &mut app).map_err(err)?;
         app.wake.acknowledge();
@@ -1874,6 +1916,9 @@ wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore Hyprla
 wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore HyprlandSurfaceV1);
 wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpAlphaModifierV1);
 wayland_client::delegate_noop!(@<S: LockSession + 'static> App<S>: ignore WpAlphaModifierSurfaceV1);
+
+#[cfg(test)]
+mod present_tests;
 
 #[cfg(test)]
 mod tests {
