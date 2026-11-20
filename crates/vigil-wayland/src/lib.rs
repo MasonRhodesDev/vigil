@@ -338,18 +338,27 @@ const FRAME: Duration = Duration::from_nanos(16_666_667);
 
 // Every buffer the compositor hands back wakes the loop, so a surface that is
 // still animating would commit once per release. A surface commits at most
-// once a frame; a held present is due when that frame ends.
+// once a frame, and a held present is due when that frame ends. The surface
+// keeps that deadline itself because an overlay shares its output's id.
 #[derive(Default)]
-struct Pacer(Option<std::time::Instant>);
+struct Pacer {
+    last: Option<std::time::Instant>,
+    due: Option<std::time::Instant>,
+}
 
 impl Pacer {
-    fn hold(&self, now: std::time::Instant) -> Option<std::time::Instant> {
-        let due = self.0? + FRAME;
-        (now < due).then_some(due)
+    fn hold(&mut self, now: std::time::Instant) -> bool {
+        self.due = self.last.map(|last| last + FRAME).filter(|due| now < *due);
+        self.due.is_some()
     }
 
     fn committed(&mut self, at: std::time::Instant) {
-        self.0 = Some(at);
+        self.last = Some(at);
+        self.due = None;
+    }
+
+    fn due(&self) -> Option<std::time::Instant> {
+        self.due
     }
 }
 
@@ -885,9 +894,7 @@ impl<S: LockSession> App<S> {
         let (w, h) = self.entries[idx].px;
         let force = !self.entries[idx].committed;
         let id = self.entries[idx].id;
-        if !force && let Some(due) = self.entries[idx].pacer.hold(std::time::Instant::now()) {
-            let retry = self.present_retry.entry(id).or_insert((due, 0));
-            retry.0 = retry.0.max(due);
+        if !force && self.entries[idx].pacer.hold(std::time::Instant::now()) {
             return;
         }
         let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
@@ -1422,6 +1429,17 @@ fn run_with_lock_body<S: LockSession + 'static>(
         ) {
             timeout = Some(timeout.map_or(retry, |current| current.min(retry)));
         }
+        let now = std::time::Instant::now();
+        if let Some(paced) = app
+            .entries
+            .iter()
+            .filter(|e| !(app.unlock_sent && e.role.is_lock()))
+            .filter_map(|e| e.pacer.due())
+            .map(|due| due.saturating_duration_since(now))
+            .min()
+        {
+            timeout = Some(timeout.map_or(paced, |current| current.min(paced)));
+        }
         let _iteration = tracing::debug_span!(target: "vigil", "loop.iteration").entered();
         event_loop.dispatch(timeout, &mut app).map_err(err)?;
         app.wake.acknowledge();
@@ -1867,7 +1885,7 @@ mod tests {
         let release = Duration::from_micros(1_700);
         let mut now = start;
         while now < start + Duration::from_secs(2) {
-            if pacer.hold(now).is_none() {
+            if !pacer.hold(now) {
                 pacer.committed(now);
                 commits += 1;
             }
@@ -1877,10 +1895,19 @@ mod tests {
             commits <= 121,
             "a 2 s busy bar committed {commits} times, one per buffer release"
         );
+        assert!(pacer.hold(now), "the last present of the run was not held");
+        assert!(
+            pacer.due().is_some(),
+            "a held present has no deadline to wake the loop"
+        );
         let quiet = now + Duration::from_secs(1);
         assert!(
-            pacer.hold(quiet).is_none(),
+            !pacer.hold(quiet),
             "a change after a quiet second waited for a frame"
+        );
+        assert!(
+            pacer.due().is_none(),
+            "a present that went out still holds a deadline"
         );
     }
 
