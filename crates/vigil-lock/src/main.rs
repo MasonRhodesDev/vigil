@@ -2728,6 +2728,18 @@ mod tests {
     }
 
     #[test]
+    fn a_minute_read_just_before_it_turned_is_not_slept_through() {
+        let minute = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_060);
+        let mut clock = Clock::new("%H:%M".into(), minute - Duration::from_secs(30));
+        assert!(clock.advance(minute - Duration::from_millis(2)).is_none());
+        let wait = clock.wait(minute + Duration::from_millis(3));
+        assert!(
+            wait <= Duration::from_millis(1),
+            "a tick 2 ms before the minute and a wait 3 ms after it slept {wait:?} on the old minute"
+        );
+    }
+
+    #[test]
     fn an_idle_lock_presents_once_a_minute_while_the_compositor_echoes_the_pointer() {
         const W: u32 = 640;
         const H: u32 = 400;
