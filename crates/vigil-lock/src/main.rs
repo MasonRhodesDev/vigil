@@ -7,7 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use slint_idle_runtime::{DirtySet, IdleScheduler, Metrics, WaitDecision, WakeHandle};
 use vigil_config::{Config, LockTransition};
@@ -433,7 +433,7 @@ struct Locker {
     appearance_registry: appearance_profiles::Registry,
     appearance_bundle: Option<appearance_profiles::PreparedBundle>,
     monitor_profiles: Vec<monitor_profiles::Profile>,
-    clock_format: String,
+    clock: Clock,
     caps_lock: bool,
     queue: Rc<std::cell::RefCell<VecDeque<UiMessage>>>,
     auth: AuthTrack,
@@ -447,7 +447,6 @@ struct Locker {
     appearance_tx: mpsc::Sender<AppearanceEvent>,
     scheme: ColorScheme,
     unlocked: bool,
-    last_clock: (Instant, String),
     ready_fd: Option<OwnedFd>,
     pending: Vec<FlowEvent>,
     wallpaper_ready: bool,
@@ -594,7 +593,7 @@ impl Locker {
             .ok_or("user not resolved before Locker::new")?;
         let platform = VigilPlatform::install().map_err(|e| e.to_string())?;
         let theme = Theme::load_or_default(cli.theme.as_deref());
-        let clock_format = config.look.clock_format.clone();
+        let clock = Clock::new(config.look.clock_format.clone(), SystemTime::now());
         let event_waker = Arc::new(Mutex::new(None));
         let (login_tx, login_rx) = forwarded_channel(event_waker.clone());
         let (appearance_tx, appearance_rx) = forwarded_channel(event_waker.clone());
@@ -638,7 +637,7 @@ impl Locker {
             ),
             appearance_bundle,
             monitor_profiles,
-            clock_format: clock_format.clone(),
+            clock,
             caps_lock: false,
             queue: Rc::default(),
             auth: AuthTrack::new(),
@@ -652,7 +651,6 @@ impl Locker {
             appearance_tx,
             scheme: ColorScheme::default(),
             unlocked: false,
-            last_clock: (Instant::now(), clock_text(&clock_format)),
             ready_fd: cli.ready_fd,
             pending: Vec::new(),
             wallpaper_ready: vigil_flow::WALLPAPER_READY_DEFAULT,
@@ -971,7 +969,7 @@ impl LockSession for Locker {
             resolved.path,
             Some(appearance_fit(resolved.fit)),
         );
-        window.set_clock(&self.last_clock.1);
+        window.set_clock(self.clock.shown());
         window.set_caps_lock(self.caps_lock);
         window.set_panel_visible(false);
         window.set_power_visible(false);
@@ -1170,12 +1168,9 @@ impl LockSession for Locker {
 
     fn tick(&mut self) {
         vigil_ui::advance_timers();
-        if self.last_clock.0.elapsed() >= clock_interval(&self.clock_format) {
-            let text = clock_text(&self.clock_format);
-            if text != self.last_clock.1 {
-                self.each_window(|w| w.set_clock(&text));
-            }
-            self.last_clock = (Instant::now(), text);
+        if let Some(text) = self.clock.advance(SystemTime::now()) {
+            let text = text.to_owned();
+            self.each_window(|w| w.set_clock(&text));
         }
         self.pump_auth();
         self.pump_login();
@@ -1204,7 +1199,7 @@ impl LockSession for Locker {
         let slint = self
             .scheduler
             .from_slint(self.entries.iter().map(|entry| entry.window.slint_window()));
-        let clock = clock_interval(&self.clock_format).saturating_sub(self.last_clock.0.elapsed());
+        let clock = self.clock.wait(SystemTime::now());
         match slint {
             WaitDecision::Frame(delay) => WaitDecision::Frame(delay.min(clock)),
             WaitDecision::Timer(delay) => WaitDecision::Timer(delay.min(clock)),
@@ -1213,13 +1208,57 @@ impl LockSession for Locker {
     }
 }
 
+struct Clock {
+    format: String,
+    shown: String,
+    read_at: SystemTime,
+}
+
+impl Clock {
+    fn new(format: String, now: SystemTime) -> Self {
+        let shown = clock_text(&format, now);
+        Self {
+            format,
+            shown,
+            read_at: now,
+        }
+    }
+
+    fn shown(&self) -> &str {
+        &self.shown
+    }
+
+    fn advance(&mut self, now: SystemTime) -> Option<&str> {
+        if now.duration_since(self.read_at).unwrap_or_default() < clock_interval(&self.format) {
+            return None;
+        }
+        self.read_at = now;
+        let text = clock_text(&self.format, now);
+        if text == self.shown {
+            return None;
+        }
+        self.shown = text;
+        Some(&self.shown)
+    }
+
+    fn wait(&self, now: SystemTime) -> Duration {
+        clock_interval(&self.format)
+            .saturating_sub(now.duration_since(self.read_at).unwrap_or_default())
+    }
+}
+
 #[allow(unsafe_code)]
-fn clock_text(format: &str) -> String {
+fn clock_text(format: &str, at: SystemTime) -> String {
     let Ok(fmt) = std::ffi::CString::new(format) else {
         return String::new();
     };
-    // SAFETY: time accepts a null output pointer.
-    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let Ok(now) = libc::time_t::try_from(
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    ) else {
+        return String::new();
+    };
     // SAFETY: tm is integers and a nullable tm_zone pointer, all valid when zero.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers are live locals of the right types, and localtime_r
@@ -1628,7 +1667,7 @@ mod tests {
     #[test]
     fn clock_text_matches_what_date_would_have_printed() {
         for format in ["%H:%M", "%Y-%m-%d", "%A", "%I:%M %p"] {
-            let mine = super::clock_text(format);
+            let mine = super::clock_text(format, std::time::SystemTime::now());
             let theirs = std::process::Command::new("date")
                 .arg(format!("+{format}"))
                 .output()
@@ -1637,7 +1676,11 @@ mod tests {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
             if mine != theirs {
-                assert_eq!(super::clock_text(format), theirs, "format {format}");
+                assert_eq!(
+                    super::clock_text(format, std::time::SystemTime::now()),
+                    theirs,
+                    "format {format}"
+                );
             }
             assert!(!mine.is_empty(), "format {format} produced nothing");
         }
@@ -1645,9 +1688,10 @@ mod tests {
 
     #[test]
     fn clock_text_survives_a_hostile_format() {
-        assert_eq!(super::clock_text("with\0nul"), "");
-        let _ = super::clock_text("");
-        let _ = super::clock_text(&"%Y".repeat(300));
+        let now = std::time::SystemTime::now();
+        assert_eq!(super::clock_text("with\0nul", now), "");
+        let _ = super::clock_text("", now);
+        let _ = super::clock_text(&"%Y".repeat(300), now);
     }
 
     use super::*;
@@ -2658,6 +2702,87 @@ mod tests {
         let (guard, _state) = start_lock_ipc_at(path.clone()).unwrap();
         assert!(UnixStream::connect(&path).is_ok());
         drop(guard);
+    }
+
+    const LOCKED_AT_SECOND_58: Duration = Duration::from_millis(1_800_000_058_400);
+
+    #[test]
+    fn the_clock_turns_as_each_minute_starts_and_wakes_only_then() {
+        for (format, period) in [("%H:%M", 60_000), ("%H:%M:%S", 1_000)] {
+            let locked = std::time::UNIX_EPOCH + LOCKED_AT_SECOND_58;
+            let mut clock = Clock::new(format.into(), locked);
+            let mut now = locked;
+            for wake in 0..60 {
+                now += clock.wait(now);
+                let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+                assert!(
+                    clock.advance(now).is_some(),
+                    "{format}: wake {wake} at {since_epoch:?} changed nothing"
+                );
+                assert!(
+                    since_epoch.as_millis() % period <= 1,
+                    "{format}: wake {wake} turned the clock at {since_epoch:?}, not as the period began"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_idle_lock_presents_once_a_minute_while_the_compositor_echoes_the_pointer() {
+        const W: u32 = 640;
+        const H: u32 = 400;
+        const POINTER: vigil_core::InputEvent =
+            vigil_core::InputEvent::PointerAbsolute { x: 200.0, y: 120.0 };
+        let platform = VigilPlatform::install().unwrap();
+        let component = Theme::load_or_default(None).instantiate().unwrap();
+        let adapter = platform.claim_last_adapter().unwrap();
+        let mut window = OutputWindow::new(OutputId(1), W, H, 1.0, adapter, component).unwrap();
+        let locked = std::time::UNIX_EPOCH + LOCKED_AT_SECOND_58;
+        let mut clock = Clock::new("%H:%M".into(), locked);
+        window.set_clock(clock.shown());
+        window.set_panel_visible(true);
+        window.set_cursor_visible(true);
+        window.show_prompt("Password", true);
+        Refusal::default().show("Authentication failure", &mut window);
+        window.dispatch(POINTER);
+        let mut buf = vec![0u8; (W * H * 4) as usize];
+        let mut present = |window: &mut OutputWindow| {
+            vigil_ui::advance_timers();
+            window.scene_needs_present()
+                && window.render_if_needed(FrameTarget {
+                    buffer: &mut buf,
+                    width: W,
+                    height: H,
+                    stride: (W * 4) as usize,
+                    damage: None,
+                })
+        };
+        for _ in 0..100 {
+            present(&mut window);
+            if !window.slint_window().has_active_animations() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let end = locked + Duration::from_secs(3600);
+        let (mut now, mut frames) = (locked, 0);
+        while now < end && frames <= 120 {
+            if present(&mut window) {
+                frames += 1;
+                window.dispatch(POINTER);
+                now += Duration::from_millis(16);
+            } else {
+                now += clock.wait(now);
+                if let Some(text) = clock.advance(now) {
+                    window.set_clock(text);
+                }
+            }
+        }
+        assert_eq!(
+            frames, 60,
+            "an hour locked with the card up should cost one frame per minute"
+        );
     }
 }
 #[test]
