@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -332,6 +332,7 @@ struct Entry {
     configured: bool,
     committed: bool,
     pacer: Pacer,
+    retry: Option<(std::time::Instant, u32)>,
 }
 
 const FRAME: Duration = Duration::from_nanos(16_666_667);
@@ -347,8 +348,11 @@ struct Pacer {
 }
 
 impl Pacer {
-    fn hold(&mut self, now: std::time::Instant) -> bool {
-        self.due = self.last.map(|last| last + FRAME).filter(|due| now < *due);
+    fn hold(&mut self, now: std::time::Instant, forced: bool) -> bool {
+        self.due = self
+            .last
+            .map(|last| last + FRAME)
+            .filter(|due| !forced && now < *due);
         self.due.is_some()
     }
 
@@ -399,7 +403,6 @@ struct App<S: LockSession + 'static> {
     dirty: Arc<DirtySet<OutputId>>,
     metrics: Arc<Metrics>,
     qh: QueueHandle<App<S>>,
-    present_retry: BTreeMap<OutputId, (std::time::Instant, u32)>,
     pending_scenes: Vec<(OutputId, bool)>,
     flow: LockFlow,
     started: std::time::Instant,
@@ -445,18 +448,6 @@ fn exit_session<S: LockSession>(
 ) {
     *slot = Some(outcome);
     session.flow_command(&FlowCmd::Exit(outcome));
-}
-
-fn soonest_retry(
-    retries: &BTreeMap<OutputId, (std::time::Instant, u32)>,
-    live: impl Fn(OutputId) -> bool,
-    now: std::time::Instant,
-) -> Option<Duration> {
-    retries
-        .iter()
-        .filter(|(id, _)| live(**id))
-        .map(|(_, (deadline, _))| deadline.saturating_duration_since(now))
-        .min()
 }
 
 impl<S: LockSession> App<S> {
@@ -567,13 +558,13 @@ impl<S: LockSession> App<S> {
             }
         }
     }
-    fn schedule_present_retry(&mut self, id: OutputId, now: std::time::Instant) {
-        let attempt = self
-            .present_retry
-            .get(&id)
+    fn schedule_present_retry(&mut self, idx: usize, now: std::time::Instant) {
+        let entry = &mut self.entries[idx];
+        let attempt = entry
+            .retry
             .map_or(0, |(_, attempt)| attempt.saturating_add(1));
         let delay = Duration::from_millis(100 * (1_u64 << attempt.min(5)));
-        self.present_retry.insert(id, (now + delay, attempt));
+        entry.retry = Some((now + delay, attempt));
     }
 
     fn output_info(&self, idx: usize) -> OutputInfo {
@@ -718,6 +709,7 @@ impl<S: LockSession> App<S> {
             configured: false,
             committed: false,
             pacer: Pacer::default(),
+            retry: None,
         });
     }
 
@@ -775,6 +767,7 @@ impl<S: LockSession> App<S> {
             configured: false,
             committed: false,
             pacer: Pacer::default(),
+            retry: None,
         });
     }
 
@@ -842,14 +835,14 @@ impl<S: LockSession> App<S> {
         let role = self.entries[idx].role.name();
         self.session.force_copy_out(id);
         let Some(pool) = self.entries[idx].pool.as_mut() else {
-            self.schedule_present_retry(id, std::time::Instant::now());
+            self.schedule_present_retry(idx, std::time::Instant::now());
             return;
         };
         let stride = w as usize * 4;
         let Ok((buffer, canvas)) =
             pool.create_buffer(w as i32, h as i32, stride as i32, wl_shm::Format::Xrgb8888)
         else {
-            self.schedule_present_retry(id, std::time::Instant::now());
+            self.schedule_present_retry(idx, std::time::Instant::now());
             return;
         };
         self.metrics.record_buffer_acquire();
@@ -886,14 +879,13 @@ impl<S: LockSession> App<S> {
             return;
         }
         if self.unlock_sent && self.entries[idx].role.is_lock() {
-            let id = self.entries[idx].id;
-            self.present_retry.remove(&id);
+            self.entries[idx].retry = None;
             return;
         }
         let (w, h) = self.entries[idx].px;
         let force = !self.entries[idx].committed;
         let id = self.entries[idx].id;
-        if !force && self.entries[idx].pacer.hold(now) {
+        if self.entries[idx].pacer.hold(now, force) {
             return;
         }
         let overlay_progress = (!self.entries[idx].role.is_lock()).then_some(self.overlay_progress);
@@ -903,11 +895,11 @@ impl<S: LockSession> App<S> {
         let role = self.entries[idx].role.name();
         let Some(pool) = self.entries[idx].pool.as_mut() else {
             vigil_log::say!("vigil-lock: output {id:?}: no shm pool ({w}x{h})");
-            self.schedule_present_retry(id, now);
+            self.schedule_present_retry(idx, now);
             return;
         };
         if !force && !self.session.scene_needs_present(id) {
-            self.present_retry.remove(&id);
+            self.entries[idx].retry = None;
             return;
         }
         self.metrics.record_buffer_acquire();
@@ -927,7 +919,7 @@ impl<S: LockSession> App<S> {
         let Ok((buffer, canvas)) = pool.create_buffer(w as i32, h as i32, stride as i32, format)
         else {
             vigil_log::say!("vigil-lock: output {id:?}: shm buffer {w}x{h} failed");
-            self.schedule_present_retry(id, now);
+            self.schedule_present_retry(idx, now);
             return;
         };
         if force {
@@ -958,7 +950,7 @@ impl<S: LockSession> App<S> {
             );
         }
         if !drew && !force {
-            self.present_retry.remove(&id);
+            self.entries[idx].retry = None;
             return;
         }
         if let Some((frost, wallpaper)) = overlay_progress {
@@ -994,7 +986,7 @@ impl<S: LockSession> App<S> {
         self.metrics.record_commit();
         self.entries[idx].committed = true;
         self.entries[idx].pacer.committed(now);
-        self.present_retry.remove(&id);
+        self.entries[idx].retry = None;
         let commit_elapsed = commit_started.elapsed();
         if render_elapsed >= Duration::from_millis(8) || commit_elapsed >= Duration::from_millis(8)
         {
@@ -1018,9 +1010,9 @@ impl<S: LockSession> App<S> {
 
     fn tick(&mut self) {
         let now = std::time::Instant::now();
-        for (&id, &(deadline, _)) in &self.present_retry {
-            if deadline <= now {
-                self.dirty.mark(id);
+        for entry in &self.entries {
+            if entry.retry.is_some_and(|(deadline, _)| deadline <= now) {
+                self.dirty.mark(entry.id);
             }
         }
         for (id, is_lock) in std::mem::take(&mut self.pending_scenes) {
@@ -1085,46 +1077,45 @@ impl<S: LockSession> App<S> {
         self.cleanup_warning_surfaces();
     }
 
+    // An overlay renders the scene of the output it shares an id with, and a
+    // render takes the scene's change. While the lock surface on that output
+    // waits for its frame, the overlay waits too, so the change is the lock's.
     fn present_all(&mut self, now: std::time::Instant) {
+        let mut held = BTreeSet::new();
         for lock_pass in [0, 1] {
             for idx in 0..self.entries.len() {
-                if present_priority(self.entries[idx].role.is_lock()) == lock_pass {
-                    self.present(idx, now);
+                let entry = &self.entries[idx];
+                if present_priority(entry.role.is_lock()) != lock_pass
+                    || (!entry.role.is_lock() && held.contains(&entry.id))
+                {
+                    continue;
+                }
+                self.present(idx, now);
+                let entry = &self.entries[idx];
+                if entry.role.is_lock() && !self.unlock_sent && entry.pacer.due().is_some() {
+                    held.insert(entry.id);
                 }
             }
         }
     }
 
     fn next_timeout(&self, now: std::time::Instant) -> Option<Duration> {
-        let mut timeout = match self.session.wait_decision() {
+        let session = match self.session.wait_decision() {
             WaitDecision::Frame(delay) | WaitDecision::Timer(delay) => Some(delay),
             WaitDecision::Indefinite => None,
         };
-        if let Some(animation) = self.flow.next_wake() {
-            timeout = Some(timeout.map_or(animation, |current| current.min(animation)));
-        }
-        if let Some(retry) = soonest_retry(
-            &self.present_retry,
-            |id| {
-                self.entries
-                    .iter()
-                    .any(|e| e.id == id && !(self.unlock_sent && e.role.is_lock()))
-            },
-            now,
-        ) {
-            timeout = Some(timeout.map_or(retry, |current| current.min(retry)));
-        }
-        if let Some(paced) = self
+        let surfaces = self
             .entries
             .iter()
             .filter(|e| !(self.unlock_sent && e.role.is_lock()))
-            .filter_map(|e| e.pacer.due())
-            .map(|due| due.saturating_duration_since(now))
+            .flat_map(|e| [e.pacer.due(), e.retry.map(|(deadline, _)| deadline)])
+            .flatten()
+            .map(|due| due.saturating_duration_since(now));
+        [session, self.flow.next_wake()]
+            .into_iter()
+            .flatten()
+            .chain(surfaces)
             .min()
-        {
-            timeout = Some(timeout.map_or(paced, |current| current.min(paced)));
-        }
-        timeout
     }
 
     fn begin_lock(&mut self) {
@@ -1395,7 +1386,6 @@ impl<S: LockSession + 'static> App<S> {
             dirty: runtime.dirty,
             metrics: runtime.metrics,
             qh: qh.clone(),
-            present_retry: BTreeMap::new(),
             pending_scenes: Vec::new(),
             flow,
             started,
@@ -1878,7 +1868,6 @@ impl<S: LockSession> OutputHandler for App<S> {
             }
             self.entries.retain(|entry| entry.output != output);
             self.scene_ids.remove(&id);
-            self.present_retry.remove(&id);
             self.session.output_gone(id);
         }
     }
@@ -1930,7 +1919,7 @@ mod tests {
         let release = Duration::from_micros(1_700);
         let mut now = start;
         while now < start + Duration::from_secs(2) {
-            if !pacer.hold(now) {
+            if !pacer.hold(now, false) {
                 pacer.committed(now);
                 commits += 1;
             }
@@ -1940,14 +1929,17 @@ mod tests {
             commits <= 121,
             "a 2 s busy bar committed {commits} times, one per buffer release"
         );
-        assert!(pacer.hold(now), "the last present of the run was not held");
+        assert!(
+            pacer.hold(now, false),
+            "the last present of the run was not held"
+        );
         assert!(
             pacer.due().is_some(),
             "a held present has no deadline to wake the loop"
         );
         let quiet = now + Duration::from_secs(1);
         assert!(
-            !pacer.hold(quiet),
+            !pacer.hold(quiet, false),
             "a change after a quiet second waited for a frame"
         );
         assert!(
@@ -1956,7 +1948,7 @@ mod tests {
         );
     }
 
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use vigil_flow::{FlowCmd, FlowEvent, LockFlow, Now};
 
@@ -2040,39 +2032,6 @@ mod tests {
                 pressed: true,
             }),
             "a held letter still repeats"
-        );
-    }
-
-    #[test]
-    fn a_retry_for_a_departed_output_cannot_steer_the_loop() {
-        let now = Instant::now();
-        let mut retries = super::BTreeMap::new();
-        retries.insert(super::OutputId(1), (now - Duration::from_secs(60), 3_u32));
-        assert_eq!(
-            super::soonest_retry(&retries, |_| false, now),
-            None,
-            "a retry with no live output must not be considered"
-        );
-        assert_eq!(
-            super::soonest_retry(&retries, |_| true, now),
-            Some(Duration::ZERO),
-            "a live output past its deadline is due now"
-        );
-    }
-
-    #[test]
-    fn the_soonest_live_deadline_wins() {
-        let now = Instant::now();
-        let mut retries = super::BTreeMap::new();
-        retries.insert(super::OutputId(1), (now + Duration::from_millis(800), 0));
-        retries.insert(super::OutputId(2), (now + Duration::from_millis(200), 0));
-        assert_eq!(
-            super::soonest_retry(&retries, |_| true, now),
-            Some(Duration::from_millis(200))
-        );
-        assert_eq!(
-            super::soonest_retry(&retries, |id| id == super::OutputId(1), now),
-            Some(Duration::from_millis(800))
         );
     }
 

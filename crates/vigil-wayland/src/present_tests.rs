@@ -324,11 +324,17 @@ fn a_failed_forced_present_leaves_no_stale_deadline() {
 
     h.app.entries[lock].committed = false;
     h.app.entries[lock].pool = None;
+    h.app.present_all(t0 + 6 * MS);
+    assert_eq!(
+        h.app.next_timeout(t0 + 6 * MS),
+        Some(100 * MS),
+        "a forced present that failed still waits on the frame it was never held for"
+    );
     let later = t0 + Duration::from_secs(1);
     h.app.present_all(later);
     assert_eq!(
         h.app.next_timeout(later),
-        Some(Duration::from_millis(100)),
+        Some(200 * MS),
         "the loop waits on a frame deadline that passed instead of the retry"
     );
 }
@@ -350,5 +356,42 @@ fn an_overlay_present_keeps_the_lock_surface_retry() {
         h.app.next_timeout(t0),
         Some(Duration::from_millis(100)),
         "the warning's present dropped the lock surface's retry"
+    );
+}
+
+#[test]
+fn the_soonest_live_retry_wakes_the_loop() {
+    let mut h = Harness::new();
+    let warning = h.warning();
+    let lock = h.lock_surface();
+    let now = Instant::now();
+    h.app.entries[warning].retry = Some((now + 800 * MS, 0));
+    h.app.entries[lock].retry = Some((now + 200 * MS, 0));
+    assert_eq!(h.app.next_timeout(now), Some(200 * MS));
+    h.app.unlock_sent = true;
+    assert_eq!(
+        h.app.next_timeout(now),
+        Some(800 * MS),
+        "a lock surface that stopped presenting still steers the loop"
+    );
+}
+
+#[test]
+fn a_retry_for_a_departed_output_cannot_steer_the_loop() {
+    let mut h = Harness::new();
+    let lock = h.lock_surface();
+    let now = Instant::now();
+    h.app.entries[lock].retry = Some((now - Duration::from_secs(60), 3));
+    assert_eq!(
+        h.app.next_timeout(now),
+        Some(Duration::ZERO),
+        "a live output past its deadline is due now"
+    );
+    let (conn, qh, output) = (h.app.conn.clone(), h.app.qh.clone(), h.output());
+    smithay_client_toolkit::output::OutputHandler::output_destroyed(&mut h.app, &conn, &qh, output);
+    assert_eq!(
+        h.app.next_timeout(now),
+        None,
+        "a retry with no live output must not be considered"
     );
 }
